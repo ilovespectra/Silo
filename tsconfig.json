@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "outDir": "./electron-dist",
+    "rootDir": "./src"
+  },
+  "include": [
+    "src/main.ts",
+    "src/semanticWorker.ts",
+    "src/documentPreviewWorker.ts"
+  ],
+  "exclude": ["node_modules"]
+}

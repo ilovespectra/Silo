@@ -1,0 +1,150 @@
+.address-book-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.address-book-container {
+  background: white;
+  border-radius: 8px;
+  box-shadow:
+    0 4px 6px rgba(0, 0, 0, 0.1),
+    0 10px 30px rgba(0, 0, 0, 0.2);
+  width: 90%;
+  max-width: 600px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.address-book-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  border-bottom: 1px solid #e0e0e0;
+  flex-shrink: 0;
+}
+
+.address-book-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.close-button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  border-radius: 4px;
+  transition:
+    background 0.2s,
+    color 0.2s;
+}
+
+.close-button:hover {
+  background: #f0f0f0;
+  color: #333;
+}
+
+.address-book-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.address-book-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid #f0f0f0;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.address-book-item:hover {
+  background: #f9f9f9;
+}
+
+.address-book-entry {
+  flex: 1;
+}
+
+.address-book-name {
+  font-weight: 500;
+  color: #333;
+  font-size: 14px;
+}
+
+.address-book-phone {
+  font-size: 12px;
+  color: #999;
+  font-family: monospace;
+}
+
+.address-book-input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.address-book-action {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition:
+    background 0.2s,
+    color 0.2s;
+  color: #666;
+}
+
+.address-book-action:hover {
+  background: #f0f0f0;
+  color: #333;
+}
+
+.address-book-action.delete {
+  color: #d32f2f;
+}
+
+.address-book-action.delete:hover {
+  background: #ffebee;
+}
+
+.address-book-action.save {
+  color: #388e3c;
+}
+
+.address-book-action.save:hover {
+  background: #e8f5e9;
+}
+
+.address-book-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  text-align: center;
+  color: #999;
+  font-size: 14px;
+  height: 100%;
+}

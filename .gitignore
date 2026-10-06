@@ -1,0 +1,134 @@
+# Dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# Testing
+/coverage
+
+# Production
+/build
+/dist
+
+# Misc
+.DS_Store
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Electron
+out/
+/release/
+
+# User data and state
+stateStore.json
+*.stateStore
+.cache/
+cache/
+user-data/
+/browser-state.json
+/content-settings.json
+/google-accounts.json
+/contacts.json
+/phone-cache/
+/cloud-cache/
+/thumbnail-cache/
+/preview-cache/
+/media-cache/
+/media-conversions/
+/diagnostics/
+/runtime-logs/
+/face-index/
+/pets/
+/geo-index.jsonl
+/geocode-cache.json
+/geocode-search-cache.json
+/duplicate-index.json
+/aesthetic-index.jsonl
+/audio-library-index.json
+/content-safety-index.json
+/content-safety-index.jsonl
+/phone-backups/
+/message-backups/
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.siloconfig
+.config-import-staging/
+.config-import-ready
+
+# Model caches
+clip-model-cache/
+face-models/
+face-wasm/
+/.model-test-cache/
+
+# Personal metadata
+.timemachine/
+snapshots/
+backups/
+*.backup
+*.previous
+
+# Custom folders and indices
+digital-folders/
+search-index/
+semantic-cache/
+semantic-index/
+
+# App generated files
+app-update.yml
+
+# Local secrets and diagnostic output (keep the checked-in template)
+.env.*
+!.env.example
+*.log
+
+# Silo app data, should a data directory ever point inside the repo
+# (FILE_BROWSER_USER_DATA_DIR); mirrors ~/Library/Application Support/file-browser-electron
+/memories/
+/memory-image-cache/
+/message-history/
+/ios-message-backups/
+/phone-mounts/
+/duplicate-trash/
+/duplicate-trash.json
+/library-stats.json
+/topic-profile.json
+/IndexedDB/
+/Local Storage/
+/Session Storage/
+/Cookies*
+/Crashpad/
+/GPUCache/
+/blob_storage/
+Silo Memories/
+Silo Source Clone*/
+silo-clone-manifest.json
+.silo-clone-in-progress.json
+.memory-export-*/
+runtime.jsonl
+*.backup-*.json
+
+# Personal media, renders and backups
+*.mp4
+*.mov
+*.heic
+*.HEIC
+*.ipsw
+*.mobilebackup
+*.icloud

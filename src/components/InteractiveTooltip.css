@@ -1,0 +1,17 @@
+.interactive-tooltip {
+  position: fixed;
+  z-index: 12000;
+  max-width: min(260px, calc(100vw - 24px));
+  max-height: min(120px, calc(100vh - 16px));
+  padding: 7px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-popover);
+  color: var(--text);
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.28);
+  font-size: 11px;
+  line-height: 1.4;
+  pointer-events: none;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}

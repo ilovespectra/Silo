@@ -1,0 +1,941 @@
+.messages-browser {
+  display: flex;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.messages-page {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Platform themes: iMessage (iOS dark mode) and Google Messages (Material You dark). */
+.messages-browser.platform-ios {
+  --msg-font:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    sans-serif;
+  --msg-list-bg: #000;
+  --msg-text: #fff;
+  --msg-muted: #8e8e93;
+  --msg-separator: #38383a;
+  --msg-active: #2c2c2e;
+  --msg-search-bg: #1c1c1e;
+  --msg-thread-bg: #000;
+  --msg-header-bg: rgba(28, 28, 30, 0.92);
+  --msg-sent-bg: #0a84ff;
+  --msg-sent-text: #fff;
+  --msg-received-bg: #262629;
+  --msg-received-text: #fff;
+  --msg-bubble-radius: 18px;
+  --msg-avatar-bg: linear-gradient(180deg, #a5abb8 0%, #858994 100%);
+  --msg-avatar-text: #fff;
+  --msg-hover: rgba(255, 255, 255, 0.04);
+  --msg-active-subtext: rgba(255, 255, 255, 0.85);
+  --msg-action-bg: rgba(60, 60, 67, 0.9);
+  --msg-action-text: #fff;
+  --msg-frame-radius: 52px;
+}
+
+.messages-browser.platform-android {
+  --msg-font: "Google Sans Text", "Google Sans", Roboto, "Segoe UI", sans-serif;
+  --msg-list-bg: #131314;
+  --msg-text: #e3e3e3;
+  --msg-muted: #c4c7c5;
+  --msg-separator: transparent;
+  --msg-active: #2a2f3a;
+  --msg-search-bg: #282a2c;
+  --msg-thread-bg: #131314;
+  --msg-header-bg: #131314;
+  --msg-sent-bg: #004a77;
+  --msg-sent-text: #c2e7ff;
+  --msg-received-bg: #2a2a2e;
+  --msg-received-text: #e3e3e3;
+  --msg-bubble-radius: 20px;
+  --msg-avatar-bg: #a8c7fa;
+  --msg-avatar-text: #0b1d36;
+  --msg-hover: rgba(255, 255, 255, 0.04);
+  --msg-active-subtext: rgba(255, 255, 255, 0.85);
+  --msg-action-bg: rgba(60, 60, 67, 0.9);
+  --msg-action-text: #fff;
+  --msg-frame-radius: 36px;
+}
+
+:root[data-theme="light"] .messages-browser.platform-ios {
+  --msg-list-bg: #f2f2f7;
+  --msg-text: #1c1c1e;
+  --msg-muted: #6e6e73;
+  --msg-separator: #d1d1d6;
+  --msg-active: #e5e5ea;
+  --msg-search-bg: #e5e5ea;
+  --msg-thread-bg: #fff;
+  --msg-header-bg: rgba(249, 249, 249, 0.94);
+  --msg-sent-bg: #007aff;
+  --msg-sent-text: #fff;
+  --msg-received-bg: #e5e5ea;
+  --msg-received-text: #1c1c1e;
+  --msg-hover: rgba(0, 0, 0, 0.035);
+  --msg-active-subtext: rgba(255, 255, 255, 0.9);
+  --msg-action-bg: #e5e5ea;
+  --msg-action-text: #1c1c1e;
+}
+
+:root[data-theme="light"] .messages-browser.platform-android {
+  --msg-list-bg: #f8f9ff;
+  --msg-text: #1a1c1e;
+  --msg-muted: #5f6368;
+  --msg-separator: #e2e5e9;
+  --msg-active: #e8f0fe;
+  --msg-search-bg: #e8eaed;
+  --msg-thread-bg: #fff;
+  --msg-header-bg: #f8f9ff;
+  --msg-sent-bg: #d3e3fd;
+  --msg-sent-text: #041e49;
+  --msg-received-bg: #f1f3f4;
+  --msg-received-text: #1f1f1f;
+  --msg-hover: rgba(0, 0, 0, 0.035);
+  --msg-active-subtext: #174ea6;
+  --msg-action-bg: #e8eaed;
+  --msg-action-text: #1a1c1e;
+}
+
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] .messages-browser.platform-ios {
+    --msg-list-bg: #f2f2f7;
+    --msg-text: #1c1c1e;
+    --msg-muted: #6e6e73;
+    --msg-separator: #d1d1d6;
+    --msg-active: #e5e5ea;
+    --msg-search-bg: #e5e5ea;
+    --msg-thread-bg: #fff;
+    --msg-header-bg: rgba(249, 249, 249, 0.94);
+    --msg-sent-bg: #007aff;
+    --msg-sent-text: #fff;
+    --msg-received-bg: #e5e5ea;
+    --msg-received-text: #1c1c1e;
+    --msg-hover: rgba(0, 0, 0, 0.035);
+    --msg-active-subtext: rgba(255, 255, 255, 0.9);
+    --msg-action-bg: #e5e5ea;
+    --msg-action-text: #1c1c1e;
+  }
+
+  :root[data-theme="system"] .messages-browser.platform-android {
+    --msg-list-bg: #f8f9ff;
+    --msg-text: #1a1c1e;
+    --msg-muted: #5f6368;
+    --msg-separator: #e2e5e9;
+    --msg-active: #e8f0fe;
+    --msg-search-bg: #e8eaed;
+    --msg-thread-bg: #fff;
+    --msg-header-bg: #f8f9ff;
+    --msg-sent-bg: #d3e3fd;
+    --msg-sent-text: #041e49;
+    --msg-received-bg: #f1f3f4;
+    --msg-received-text: #1f1f1f;
+    --msg-hover: rgba(0, 0, 0, 0.035);
+    --msg-active-subtext: #174ea6;
+    --msg-action-bg: #e8eaed;
+    --msg-action-text: #1a1c1e;
+  }
+}
+
+.messages-toolbar {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto minmax(220px, 320px) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.messages-toolbar h2 {
+  margin: 1px 0 0;
+  font-size: 18px;
+}
+
+.messages-toolbar button,
+.messages-toolbar select,
+.message-export-sidebar button,
+.message-export-sidebar select {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--raised);
+  color: var(--text);
+}
+
+.messages-toolbar button,
+.message-export-sidebar button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.messages-toolbar .primary,
+.message-export-sidebar .primary {
+  border-color: var(--orange);
+  background: var(--orange);
+  color: #17110c;
+  font-weight: 700;
+}
+
+.messages-toolbar button:disabled,
+.message-export-sidebar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.messages-notice {
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--border-warning);
+  background: var(--success-surface);
+  color: var(--success-text);
+  font-size: 11px;
+}
+
+.messages-notice.error {
+  border-color: var(--error-border);
+  background: var(--error-surface);
+  color: var(--error-text);
+}
+
+.messages-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 360px) minmax(360px, 1fr) 230px;
+  grid-template-rows: minmax(0, 1fr);
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Conversation list */
+.conversation-directory {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  border-right: 1px solid var(--line);
+  background: var(--msg-list-bg);
+  color: var(--msg-text);
+  font-family: var(--msg-font);
+}
+
+.conversation-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 12px 8px;
+}
+
+.conversation-search {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border-radius: 10px;
+  background: var(--msg-search-bg);
+  color: var(--msg-muted);
+}
+
+.platform-android .conversation-search {
+  border-radius: 28px;
+  padding: 0 16px;
+}
+
+.conversation-search input {
+  width: 100%;
+  height: 36px;
+  border: 0;
+  background: transparent;
+  color: var(--msg-text);
+  font: inherit;
+  font-size: 15px;
+  outline: 0;
+}
+
+.conversation-search input::placeholder {
+  color: var(--msg-muted);
+}
+
+.address-book-button {
+  display: grid;
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--msg-search-bg);
+  color: var(--msg-text);
+  font-size: 0;
+  cursor: pointer;
+}
+
+.address-book-button svg {
+  font-size: 16px;
+}
+
+.conversation-list {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.conversation-item {
+  position: relative;
+  display: flex;
+  width: 100%;
+}
+
+.platform-ios .conversation-item::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 72px;
+  height: 1px;
+  background: var(--msg-separator);
+  transform: scaleY(0.5);
+}
+
+.conversation-button {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px 10px 16px;
+  border: 0;
+  background: transparent;
+  color: var(--msg-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.platform-android .conversation-button {
+  gap: 16px;
+  margin: 1px 8px;
+  padding: 12px 14px;
+  border-radius: 16px;
+}
+
+.conversation-item:hover .conversation-button {
+  background: var(--msg-hover);
+}
+
+.conversation-item.active .conversation-button {
+  background: var(--msg-active);
+}
+
+.platform-ios .conversation-item.active .conversation-button {
+  background: var(--msg-sent-bg);
+}
+
+.platform-ios .conversation-item.active .conversation-preview,
+.platform-ios .conversation-item.active time {
+  color: var(--msg-active-subtext);
+}
+
+.conversation-avatar {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--msg-avatar-bg);
+  color: var(--msg-avatar-text);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.conversation-avatar svg {
+  width: 55%;
+  height: 55%;
+}
+
+.platform-ios .conversation-avatar svg {
+  stroke-width: 2.4;
+}
+
+.conversation-text {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.conversation-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.conversation-title-row strong {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 16px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.platform-android .conversation-title-row strong {
+  font-weight: 500;
+}
+
+.conversation-title-row time {
+  flex-shrink: 0;
+  color: var(--msg-muted);
+  font-size: 14px;
+}
+
+.platform-ios .conversation-title-row time::after {
+  content: "\203A";
+  margin-left: 6px;
+  font-size: 17px;
+  opacity: 0.6;
+}
+
+.platform-android .conversation-title-row time {
+  font-size: 13px;
+}
+
+.conversation-preview {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--msg-muted);
+  font-size: 14px;
+  line-height: 1.3;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+
+.platform-android .conversation-preview {
+  -webkit-line-clamp: 1;
+}
+
+/* The rename button floats over the row so it never changes row width. */
+.thread-action-edit {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--msg-action-bg);
+  color: var(--msg-action-text);
+  opacity: 0;
+  transform: translateY(-50%);
+  cursor: pointer;
+  transition: opacity 0.12s ease;
+}
+
+.conversation-item:hover .thread-action-edit,
+.thread-action-edit:focus-visible {
+  opacity: 1;
+}
+
+.thread-edit-container {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+}
+
+.thread-edit-container input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--msg-sent-bg);
+  border-radius: 8px;
+  background: var(--msg-search-bg);
+  color: var(--msg-text);
+  font: inherit;
+  outline: 0;
+}
+
+.thread-action-save,
+.thread-action-cancel {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--msg-search-bg);
+  color: var(--msg-text);
+  cursor: pointer;
+}
+
+.thread-action-save {
+  background: var(--msg-sent-bg);
+  color: var(--msg-sent-text);
+}
+
+/* Conversation shown inside a phone frame */
+.message-history {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: var(--surface-inset);
+}
+
+.phone-frame {
+  display: flex;
+  width: min(410px, 100%);
+  height: 100%;
+  min-height: 0;
+  max-height: 860px;
+  flex-direction: column;
+  overflow: hidden;
+  border: 10px solid #1d1d1f;
+  border-radius: var(--msg-frame-radius);
+  background: var(--msg-thread-bg);
+  box-shadow:
+    0 0 0 2px #3a3a3c,
+    0 30px 80px rgba(0, 0, 0, 0.6);
+  color: var(--msg-text);
+  font-family: var(--msg-font);
+}
+
+.phone-status-bar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  flex-shrink: 0;
+  height: 44px;
+  padding: 0 26px;
+  background: var(--msg-header-bg);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.platform-android .phone-status-bar {
+  height: 32px;
+  padding: 0 20px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.phone-camera {
+  display: block;
+  width: 110px;
+  height: 30px;
+  border-radius: 20px;
+  background: #000;
+}
+
+.platform-android .phone-camera {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #050505;
+  box-shadow: 0 0 0 2px #1d1d1f;
+}
+
+.phone-status-icons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  font-size: 15px;
+}
+
+.phone-thread-header {
+  position: relative;
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 14px 10px;
+  background: var(--msg-header-bg);
+  backdrop-filter: blur(20px);
+}
+
+.platform-ios .phone-thread-header {
+  flex-direction: column;
+  gap: 4px;
+  border-bottom: 0.5px solid var(--msg-separator);
+}
+
+.phone-back {
+  display: grid;
+  place-items: center;
+  font-size: 26px;
+  color: var(--msg-text);
+}
+
+.platform-ios .phone-back {
+  position: absolute;
+  top: 12px;
+  left: 8px;
+  color: var(--msg-sent-bg);
+  font-size: 30px;
+}
+
+.phone-thread-title {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.platform-ios .phone-thread-title {
+  align-items: center;
+  max-width: 80%;
+}
+
+.phone-thread-title strong {
+  overflow: hidden;
+  font-size: 16px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.platform-ios .phone-thread-title strong {
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.phone-thread-title span {
+  color: var(--msg-muted);
+  font-size: 11px;
+}
+
+.message-bubbles {
+  display: flex;
+  flex: 1 1 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 10px 14px 14px;
+  background: var(--msg-thread-bg);
+}
+
+.message-row {
+  flex: 0 0 auto;
+}
+
+.message-export-sidebar {
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.message-date {
+  align-self: center;
+  margin: 14px 0 8px;
+  color: var(--msg-muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.message-date strong {
+  font-weight: 600;
+}
+
+.platform-android .message-date strong {
+  font-weight: 500;
+}
+
+.message-row {
+  display: flex;
+  flex-direction: column;
+  margin-top: 2px;
+}
+
+.message-row.first-in-group {
+  margin-top: 10px;
+}
+
+.message-row.sent {
+  align-items: flex-end;
+}
+
+.message-row.received {
+  align-items: flex-start;
+}
+
+.message-bubble {
+  position: relative;
+  max-width: 75%;
+  padding: 7px 12px 8px;
+  border-radius: var(--msg-bubble-radius);
+  overflow-wrap: anywhere;
+}
+
+.message-bubble p {
+  position: relative;
+  z-index: 1;
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.32;
+  white-space: pre-wrap;
+}
+
+.message-attachment {
+  display: flex;
+  max-width: 100%;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.message-attachment img,
+.message-attachment video {
+  display: block;
+  max-width: min(280px, 100%);
+  max-height: 300px;
+  border-radius: 10px;
+  object-fit: contain;
+}
+
+.message-attachment audio {
+  max-width: min(280px, 100%);
+}
+
+.message-attachment-load,
+.message-attachment a,
+.message-attachment-status {
+  align-self: flex-start;
+  color: inherit;
+  font-size: 12px;
+}
+
+.message-attachment-load {
+  padding: 5px 8px;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.message-attachment-status {
+  opacity: 0.75;
+}
+
+.message-row.sent .message-bubble {
+  background: var(--msg-sent-bg);
+  color: var(--msg-sent-text);
+}
+
+.message-row.received .message-bubble {
+  background: var(--msg-received-bg);
+  color: var(--msg-received-text);
+}
+
+/* iMessage tail on the last bubble of each run. */
+.platform-ios .message-row.last-in-group .message-bubble::before,
+.platform-ios .message-row.last-in-group .message-bubble::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  height: 20px;
+}
+
+.platform-ios .message-row.sent.last-in-group .message-bubble::before {
+  right: -7px;
+  width: 20px;
+  background: var(--msg-sent-bg);
+  border-bottom-left-radius: 16px 14px;
+}
+
+.platform-ios .message-row.sent.last-in-group .message-bubble::after {
+  right: -26px;
+  width: 26px;
+  background: var(--msg-thread-bg);
+  border-bottom-left-radius: 10px;
+}
+
+.platform-ios .message-row.received.last-in-group .message-bubble::before {
+  left: -7px;
+  width: 20px;
+  background: var(--msg-received-bg);
+  border-bottom-right-radius: 16px 14px;
+}
+
+.platform-ios .message-row.received.last-in-group .message-bubble::after {
+  left: -26px;
+  width: 26px;
+  background: var(--msg-thread-bg);
+  border-bottom-right-radius: 10px;
+}
+
+/* Google Messages: tighter corners on the sender's side within a run. */
+.platform-android .message-row.sent:not(.first-in-group) .message-bubble {
+  border-top-right-radius: 4px;
+}
+.platform-android .message-row.sent:not(.last-in-group) .message-bubble {
+  border-bottom-right-radius: 4px;
+}
+.platform-android .message-row.received:not(.first-in-group) .message-bubble {
+  border-top-left-radius: 4px;
+}
+.platform-android .message-row.received:not(.last-in-group) .message-bubble {
+  border-bottom-left-radius: 4px;
+}
+
+.platform-android .message-bubble {
+  padding: 9px 14px;
+}
+
+.message-row time {
+  margin: 4px 6px 0;
+  color: var(--msg-muted);
+  font-size: 11px;
+}
+
+.phone-compose {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 22px;
+  background: var(--msg-thread-bg);
+}
+
+.platform-android .phone-compose {
+  padding-bottom: 16px;
+}
+
+.phone-compose-plus {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--msg-search-bg);
+  color: var(--msg-muted);
+  font-size: 18px;
+}
+
+.phone-compose-field {
+  flex: 1;
+  padding: 7px 14px;
+  border: 1px solid var(--msg-separator);
+  border-radius: 18px;
+  background: var(--msg-thread-bg);
+  color: var(--msg-text);
+  font-size: 15px;
+}
+
+.platform-android .phone-compose-field {
+  padding: 12px 18px;
+  border: 0;
+  border-radius: 28px;
+  background: var(--msg-search-bg);
+  color: var(--msg-muted);
+}
+
+.phone-compose-send {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--msg-search-bg);
+  color: var(--msg-muted);
+  font-size: 18px;
+}
+
+/* Export sidebar */
+.message-export-sidebar {
+  min-height: 0;
+  padding: 14px;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.message-export-sidebar h3 {
+  margin: 0 0 5px;
+  font-size: 13px;
+}
+.message-export-sidebar p {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+.message-export-sidebar button,
+.message-export-sidebar select {
+  width: 100%;
+  margin-top: 8px;
+}
+.export-path {
+  display: block;
+  overflow: hidden;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ios-backup-note {
+  margin-top: 16px !important;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.messages-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 160px;
+  padding: 20px;
+  color: var(--msg-muted, var(--muted));
+  font-size: 13px;
+  text-align: center;
+}
+
+.messages-empty.history {
+  flex: 1;
+  flex-direction: column;
+}
+.messages-empty svg {
+  font-size: 24px;
+}
+
+@media (max-width: 1100px) {
+  .messages-layout {
+    grid-template-columns: minmax(280px, 320px) minmax(340px, 1fr);
+  }
+  .message-export-sidebar {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .messages-toolbar {
+    grid-template-columns: 1fr auto;
+  }
+  .messages-toolbar select {
+    grid-column: 1 / 2;
+  }
+}

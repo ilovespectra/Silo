@@ -1,0 +1,229 @@
+.local-help-backdrop {
+  position: fixed;
+  z-index: 9500;
+  inset: 0;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(5, 6, 7, 0.48);
+}
+
+.local-help-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(520px, 100vw);
+  height: 100%;
+  color: var(--text);
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  box-shadow: -18px 0 50px rgba(0, 0, 0, 0.3);
+}
+
+.local-help-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.local-help-header > div {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.local-help-header > div > svg {
+  margin-top: 3px;
+  color: var(--orange);
+  font-size: 20px;
+}
+
+.local-help-header h2 {
+  margin: 0 0 4px;
+  font-size: 19px;
+}
+
+.local-help-header p {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.local-help-header > button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-control);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.local-help-question {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  margin: 16px 20px 10px;
+  padding: 7px 8px 7px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-inset);
+  color: var(--orange);
+}
+
+.local-help-question input {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.local-help-question input::placeholder {
+  color: var(--muted);
+}
+
+.local-help-question button,
+.local-help-tour {
+  min-height: 32px;
+  padding: 6px 11px;
+  border: 1px solid var(--orange);
+  border-radius: 6px;
+  background: var(--orange);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.local-help-conversation {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 20px 20px;
+}
+
+.local-help-user-bubble {
+  max-width: 84%;
+  margin: 0 0 14px auto;
+  padding: 10px 13px;
+  border-radius: 14px 14px 4px 14px;
+  background: var(--surface-active);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.local-help-answer {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 4px 14px 14px 14px;
+  background: var(--surface-card);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.local-help-answer h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.local-help-answer h3 svg {
+  flex: 0 0 auto;
+  color: var(--orange);
+}
+
+.local-help-show-control {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  margin-top: 12px;
+  padding: 6px 10px;
+  border: 1px solid var(--orange);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--orange-bright);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.local-help-related {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.local-help-related span {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.local-help-related button {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-control);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.local-help-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.local-help-panel button:focus-visible,
+.local-help-question input:focus-visible {
+  outline: 2px solid var(--orange-bright);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .local-help-panel {
+    width: 100vw;
+    border-left: 0;
+  }
+
+  .local-help-header,
+  .local-help-footer {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .local-help-question {
+    margin-left: 16px;
+    margin-right: 16px;
+  }
+
+  .local-help-conversation {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}

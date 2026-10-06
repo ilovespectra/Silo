@@ -1,0 +1,145 @@
+{
+  "name": "silo",
+  "version": "2.0.0",
+  "description": "A local-first media library with semantic search, people, maps, messages, and duplicate management.",
+  "main": "electron-dist/main.js",
+  "homepage": "./",
+  "private": true,
+  "scripts": {
+    "react-start": "PORT=8787 react-scripts start",
+    "react-build": "react-scripts build",
+    "react-test": "react-scripts test",
+    "test:auto-indexing": "node test/runAutoIndexingTests.cjs",
+    "test:semantic-isolation": "node test/runSemanticIsolationTests.cjs",
+    "test:face-clustering": "node test/runFaceClusteringTests.cjs",
+    "test:message-coverage": "node test/runMessageCoverageTests.cjs",
+    "test:beta-license": "node test/runBetaLicenseTests.cjs && node test/runBetaReleaseCheckTests.cjs && node --check scripts/beta-license.cjs && node --check scripts/check-beta-release.cjs",
+    "test:lifetime-payment": "node test/runLifetimePaymentTests.cjs",
+    "release:check": "npm run test:beta-license && npm run test:lifetime-payment && node scripts/check-beta-release.cjs",
+    "react-eject": "react-scripts eject",
+    "electron-start": "wait-on http://localhost:8787 && electron .",
+    "start": "concurrently -k \"npm run react-start\" \"wait-on http://localhost:8787 && electron .\"",
+    "build": "npm run react-build && tsc",
+    "eject": "react-scripts eject",
+    "dev": "node scripts/dev.cjs",
+    "beta:keys": "node scripts/beta-license.cjs init",
+    "beta:grant": "node scripts/beta-license.cjs grant",
+    "brand-dev": "node scripts/brand-dev-app.js",
+    "unbrand-dev": "node scripts/brand-dev-app.js --restore",
+    "dist": "npm run react-build && tsc && npm run release:check && electron-builder",
+    "test:clone-archive": "node test/runCloneArchiveTests.cjs && node test/runSourceCloneTests.cjs",
+    "test:access-branding": "node test/runAccessBrandingTests.cjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
+    "@types/three": "^0.180.0",
+    "@vladmandic/face-api": "^1.7.15",
+    "archiver": "^7.0.1",
+    "electron-is-dev": "^2.0.0",
+    "exifr": "^7.1.3",
+    "fflate": "^0.8.3",
+    "ffmpeg-static": "^5.3.0",
+    "globe.gl": "^2.46.2",
+    "highlight.js": "^11.12.0",
+    "mammoth": "^1.13.0",
+    "mime": "^3.0.0",
+    "pdf-parse": "^2.4.5",
+    "pdfkit": "^0.13.0",
+    "qrcode.react": "^4.2.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-icons": "^5.0.1",
+    "react-markdown": "^8.0.7",
+    "remark-gfm": "^3.0.1",
+    "sharp": "^0.34.5",
+    "three": "^0.180.0",
+    "yauzl": "^3.4.0"
+  },
+  "devDependencies": {
+    "@types/archiver": "^6.0.4",
+    "@types/node": "^20.0.0",
+    "@types/pdfkit": "^0.12.12",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@types/yauzl": "^3.4.0",
+    "concurrently": "^8.2.0",
+    "electron": "^43.4.0",
+    "electron-builder": "^24.6.0",
+    "react-scripts": "5.0.1",
+    "typescript": "^4.9.5",
+    "wait-on": "^7.0.0"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "build": {
+    "extends": null,
+    "appId": "com.solosilo.app",
+    "productName": "Silo",
+    "mac": {
+      "category": "public.app-category.utilities",
+      "extendInfo": {
+        "CFBundleName": "Silo",
+        "CFBundleDisplayName": "Silo",
+        "NSDesktopFolderUsageDescription": "Silo needs access to browse and index files on your Desktop.",
+        "NSDocumentsFolderUsageDescription": "Silo needs access to browse and index files in your Documents.",
+        "NSDownloadsFolderUsageDescription": "Silo needs access to browse and index files in your Downloads.",
+        "NSRemovableVolumesUsageDescription": "Silo needs access to read Time Machine backups and files on external drives.",
+        "NSNetworkVolumesUsageDescription": "Silo needs access to read backups and files on network volumes.",
+        "NSPhotoLibraryUsageDescription": "Silo needs access to read photos you choose to browse."
+      },
+      "icon": "public/icon.icns"
+    },
+    "files": [
+      "build/**/*",
+      "electron-dist/**/*",
+      "public/preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".model-test-cache",
+        "to": "clip-model-cache"
+      },
+      {
+        "from": "node_modules/@vladmandic/face-api/model",
+        "to": "face-models"
+      },
+      {
+        "from": "node_modules/@tensorflow/tfjs-backend-wasm/dist",
+        "to": "face-wasm",
+        "filter": [
+          "*.wasm"
+        ]
+      }
+    ],
+    "asarUnpack": [
+      "node_modules/onnxruntime-node/**/*",
+      "node_modules/sharp/**/*",
+      "node_modules/@img/**/*",
+      "node_modules/ffmpeg-static/**/*"
+    ],
+    "directories": {
+      "buildResources": "public",
+      "output": "release"
+    },
+    "win": {
+      "icon": "public/icon.png"
+    },
+    "linux": {
+      "icon": "public/icon.png"
+    }
+  },
+  "productName": "Silo"
+}
