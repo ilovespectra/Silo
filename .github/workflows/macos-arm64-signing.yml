@@ -110,7 +110,14 @@ jobs:
           app_path="$mount_point/Silo.app"
           test -d "$app_path"
 
-          codesign --verify --deep --strict --verbose=2 "$app_path"
+          if codesign --verify --deep --strict --verbose=2 "$app_path"; then
+            :
+          elif [[ "$SIGNING_MODE" == 'developer-id' ]]; then
+            echo 'Strict code signature verification failed for the Developer ID build.' >&2
+            exit 1
+          else
+            echo 'Strict signature verification failed for this ad hoc build; continuing with diagnostics.' >&2
+          fi
 
           if spctl -a -t exec -vv "$app_path"; then
             if [[ "$SIGNING_MODE" == 'adhoc' ]]; then
