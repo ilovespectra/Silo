@@ -19,6 +19,10 @@ ipcRenderer.on("phone-backup-progress", (_event, progress) => {
 });
 
 contextBridge.exposeInMainWorld("electron", {
+    isDemoMode: () => ipcRenderer.invoke("is-demo-mode"),
+    getBugReportStatus: () => ipcRenderer.invoke("get-bug-report-status"),
+    captureBugReportScreenshot: () => ipcRenderer.invoke("capture-bug-report-screenshot"),
+    submitBugReport: (report) => ipcRenderer.invoke("submit-bug-report", report),
     getMemories: (prepareViews) => ipcRenderer.invoke("get-memories", Boolean(prepareViews)),
     generateMemories: (replace, customTopic) => ipcRenderer.invoke("generate-memories", Boolean(replace), customTopic),
     dismissMemory: (id) => ipcRenderer.invoke("dismiss-memory", id),

@@ -548,6 +548,9 @@ app.on("second-instance", () => {
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const)
   process.on(signal, () => app.quit());
 const diagnosticsPath = path.join(diagnosticsDirectory, "runtime.jsonl");
+const maxBugReportScreenshotBytes = 3 * 1024 * 1024;
+const defaultBugReportEndpoint =
+  "https://silo-bug-report-relay.vercel.app/api/bug-report";
 fs.mkdirSync(diagnosticsDirectory, { recursive: true });
 crashReporter.start({
   productName: "silo",
@@ -669,6 +672,8 @@ const EARLY_IPC_CHANNELS = new Set([
   "get-startup-state",
   "get-content-settings",
   "get-lifetime-license",
+  "is-demo-mode",
+  "get-bug-report-status",
   "get-beta-activation-info",
   "activate-beta-license",
   "verify-lifetime-payment",
@@ -8035,6 +8040,113 @@ ipcMain.handle(
 
 // Handle isDev check for client
 ipcMain.handle("get-lifetime-license", () => readLifetimeLicense());
+ipcMain.handle("is-demo-mode", () => !fullAccessEnabled());
+ipcMain.handle("get-bug-report-status", () => {
+  const configuredEndpoint =
+    process.env.SILO_BUG_REPORT_ENDPOINT?.trim() || defaultBugReportEndpoint;
+  try {
+    const endpoint = new URL(configuredEndpoint);
+    if (endpoint.protocol !== "https:")
+      throw new Error("HTTPS is required for the report relay.");
+    return { available: true, message: "Reports are sent securely by email." };
+  } catch {
+    return {
+      available: false,
+      message: "The report relay needs a valid HTTPS endpoint.",
+    };
+  }
+});
+ipcMain.handle("capture-bug-report-screenshot", async (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents)
+    throw new Error("The Silo window is not available for capture.");
+  const screenshot = await event.sender.capturePage();
+  const size = screenshot.getSize();
+  const resized =
+    size.width > 1600
+      ? screenshot.resize({ width: 1600 })
+      : screenshot;
+  return `data:image/jpeg;base64,${resized.toJPEG(72).toString("base64")}`;
+});
+ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents)
+    throw new Error("The Silo window is not available to send a report.");
+  const configuredEndpoint =
+    process.env.SILO_BUG_REPORT_ENDPOINT?.trim() || defaultBugReportEndpoint;
+
+  let endpoint: URL;
+  try {
+    endpoint = new URL(configuredEndpoint);
+  } catch {
+    return { ok: false, error: "The report relay endpoint is invalid." };
+  }
+  if (endpoint.protocol !== "https:")
+    return { ok: false, error: "The report relay must use HTTPS." };
+
+  if (!input || typeof input !== "object")
+    return { ok: false, error: "Enter a short description before sending." };
+  const report = input as {
+    message?: unknown;
+    feature?: unknown;
+    screenshotDataUrl?: unknown;
+  };
+  const message =
+    typeof report.message === "string" ? report.message.trim() : "";
+  if (!message || message.length > 5000)
+    return {
+      ok: false,
+      error: "Write a report between 1 and 5,000 characters.",
+    };
+  const feature =
+    typeof report.feature === "string" ? report.feature.trim() : "";
+  if (feature.length > 180)
+    return { ok: false, error: "The selected feature label is too long." };
+
+  let screenshotBase64: string | null = null;
+  if (report.screenshotDataUrl !== undefined && report.screenshotDataUrl !== null) {
+    if (
+      typeof report.screenshotDataUrl !== "string" ||
+      report.screenshotDataUrl.length > maxBugReportScreenshotBytes * 1.4
+    )
+      return { ok: false, error: "The screenshot exceeds the attachment limit." };
+    const match = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(
+      report.screenshotDataUrl,
+    );
+    if (!match || Buffer.from(match[1], "base64").length > maxBugReportScreenshotBytes)
+      return { ok: false, error: "The screenshot attachment is invalid or too large." };
+    screenshotBase64 = match[1];
+  }
+
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), 15000);
+  try {
+    const response = await net.fetch(endpoint.href, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message,
+        feature: feature || null,
+        screenshotBase64,
+        appVersion: app.getVersion(),
+        platform: process.platform,
+        createdAt: new Date().toISOString(),
+      }),
+      signal: abortController.signal,
+    });
+    if (!response.ok)
+      return {
+        ok: false,
+        error: `The report relay returned HTTP ${response.status}.`,
+      };
+    return { ok: true };
+  } catch {
+    return {
+      ok: false,
+      error: "Silo could not reach the report relay. Your report is still here.",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+});
 ipcMain.handle("get-demo-testing-mode", () => ({
   available: lifetimeLicensed,
   enabled: lifetimeLicensed && demoTestingModeEnabled,

@@ -1,4 +1,4 @@
-import React, { FormEvent, useEffect, useState } from "react";
+import React, { FormEvent, useEffect, useRef, useState } from "react";
 import { FiCheck, FiCopy, FiLock, FiMail, FiX } from "react-icons/fi";
 import { QRCodeSVG } from "qrcode.react";
 import type {
@@ -16,10 +16,22 @@ import type {
 } from "../betaLicense";
 import "./LifetimeUnlockPanel.css";
 
+type PaywallAction = "bug" | "survey" | "payment";
+
+type BeetleCue = {
+  left: number;
+  top: number;
+  phase: "rising" | "pointing" | "jiggling" | "returning" | "resting";
+};
+
+const SURVEY_FORM_URL =
+  "https://docs.google.com/forms/d/e/1FAIpQLSdmJUIwdorndOfe6_45kXND8P2aSvgKid2iIoqQtz8WqVzdpQ/viewform?usp=publish-editor";
+
 interface LifetimeUnlockPanelProps {
   license: LifetimeLicenseState;
   demoTestingModeActive?: boolean;
   onClose: () => void;
+  onOpenBugReport: () => void;
   onVerified: (license: LifetimeLicenseState) => void;
 }
 
@@ -27,6 +39,7 @@ export default function LifetimeUnlockPanel({
   license,
   demoTestingModeActive = false,
   onClose,
+  onOpenBugReport,
   onVerified,
 }: LifetimeUnlockPanelProps) {
   const [paymentRequest] = useState(() => {
@@ -64,6 +77,73 @@ export default function LifetimeUnlockPanel({
     BetaActivationResult["status"] | "idle"
   >("idle");
   const [activatingBeta, setActivatingBeta] = useState(false);
+  const [videoTime, setVideoTime] = useState(0);
+  const [surveyOpen, setSurveyOpen] = useState(false);
+  const [surveyPosition, setSurveyPosition] = useState<{
+    left: number;
+    top: number;
+  } | null>(null);
+  const [paymentOpen, setPaymentOpen] = useState(false);
+  const [beetleCue, setBeetleCue] = useState<BeetleCue | null>(null);
+  const videoFrameRef = useRef<HTMLDivElement>(null);
+
+  const videoCue: PaywallAction | null =
+    videoTime >= 12.5 && videoTime < 19
+      ? "bug"
+      : videoTime >= 27 && videoTime < 35
+        ? "survey"
+        : videoTime >= 43 && videoTime < 54
+          ? "payment"
+          : null;
+
+  useEffect(() => {
+    if (videoCue !== "bug") {
+      setBeetleCue(null);
+      return;
+    }
+
+    const launcher = document.querySelector<HTMLElement>(".bug-report-launcher");
+    const frame = videoFrameRef.current?.getBoundingClientRect();
+    if (!frame) return;
+
+    const launcherBounds = launcher?.getBoundingClientRect();
+    const start = launcherBounds
+      ? {
+          left: launcherBounds.left + launcherBounds.width / 2,
+          top: launcherBounds.top + launcherBounds.height / 2,
+        }
+      : { left: window.innerWidth - 40, top: window.innerHeight - 40 };
+    const point = {
+      left: frame.left + frame.width * 0.72,
+      top: frame.top + frame.height * 0.74,
+    };
+
+    setBeetleCue({ ...start, phase: "rising" });
+    const moveFrame = window.requestAnimationFrame(() => {
+      setBeetleCue({ ...point, phase: "pointing" });
+    });
+    const jiggleTimer = window.setTimeout(
+      () => setBeetleCue((current) => current && { ...current, phase: "jiggling" }),
+      760,
+    );
+    const returnTimer = window.setTimeout(
+      () => setBeetleCue({ ...start, phase: "returning" }),
+      1320,
+    );
+    const flashTimer = window.setTimeout(
+      () => setBeetleCue((current) => current && { ...current, phase: "resting" }),
+      1940,
+    );
+    const finishTimer = window.setTimeout(() => setBeetleCue(null), 3450);
+
+    return () => {
+      window.cancelAnimationFrame(moveFrame);
+      window.clearTimeout(jiggleTimer);
+      window.clearTimeout(returnTimer);
+      window.clearTimeout(flashTimer);
+      window.clearTimeout(finishTimer);
+    };
+  }, [videoCue]);
 
   useEffect(() => {
     let disposed = false;
@@ -223,6 +303,31 @@ export default function LifetimeUnlockPanel({
     }
   };
 
+  const activatePaywallAction = (action: PaywallAction) => {
+    if (action === "bug") {
+      onOpenBugReport();
+      return;
+    }
+    if (action === "survey") {
+      const frame = videoFrameRef.current?.getBoundingClientRect();
+      if (frame) {
+        const width = Math.min(560, window.innerWidth - 24);
+        const height = Math.min(640, window.innerHeight - 24);
+        const pointX = frame.left + frame.width * 0.72;
+        const pointY = frame.top + frame.height * 0.72;
+        setSurveyPosition({
+          left: Math.max(12, Math.min(pointX - width / 2, window.innerWidth - width - 12)),
+          top: Math.max(12, Math.min(pointY - height / 2, window.innerHeight - height - 12)),
+        });
+      } else {
+        setSurveyPosition(null);
+      }
+      setSurveyOpen(true);
+      return;
+    }
+    setPaymentOpen(true);
+  };
+
   return (
     <div
       className="lifetime-unlock-backdrop"
@@ -231,29 +336,111 @@ export default function LifetimeUnlockPanel({
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <section
-        className="lifetime-unlock-panel"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="lifetime-unlock-title"
-      >
-        <header className="lifetime-unlock-header">
-          <div className="lifetime-unlock-mark" aria-hidden="true">
-            <FiLock />
-          </div>
-          <div>
-            <span className="lifetime-unlock-eyebrow">LIFETIME ACCESS</span>
-            <h2 id="lifetime-unlock-title">Make Silo yours</h2>
-          </div>
-          <button
-            className="lifetime-unlock-close"
-            type="button"
-            aria-label="Close lifetime unlock"
-            onClick={onClose}
+      <div className="lifetime-unlock-composition">
+        {!license.isLicensed && (
+          <section
+            className="lifetime-unlock-video-section"
+            aria-label="A thank-you message for trying Silo"
           >
-            <FiX />
-          </button>
-        </header>
+            <div
+              className="lifetime-video-actions"
+              role="group"
+              aria-label="Paywall links"
+            >
+              <button type="button" onClick={() => activatePaywallAction("bug")}>
+                Report a Bug
+              </button>
+              <button type="button" onClick={() => activatePaywallAction("survey")}>
+                Complete Survey
+              </button>
+              <button type="button" onClick={() => activatePaywallAction("payment")}>
+                Pay with Solana
+              </button>
+            </div>
+            <div className="lifetime-unlock-video-frame" ref={videoFrameRef}>
+              <video
+                className="lifetime-unlock-video"
+                controls
+                preload="metadata"
+                playsInline
+                onLoadedMetadata={(event) => {
+                  const video = event.currentTarget;
+                  video.preservesPitch = true;
+                  video.defaultPlaybackRate = 1.1;
+                  video.playbackRate = 1.1;
+                }}
+                poster={`${process.env.PUBLIC_URL}/lifetime-thank-you-paywall-refined-poster.jpg`}
+                aria-label="A thank-you video from Tanny"
+                onTimeUpdate={(event) =>
+                  setVideoTime(event.currentTarget.currentTime)
+                }
+              >
+                <source
+                  src={`${process.env.PUBLIC_URL}/lifetime-thank-you-paywall-refined.mp4`}
+                  type="video/mp4"
+                />
+                Your browser does not support this video.
+              </video>
+              {videoCue && (
+                <button
+                  className="lifetime-video-cue"
+                  type="button"
+                  onClick={() => activatePaywallAction(videoCue)}
+                >
+                  {videoCue === "bug"
+                    ? "Report a Bug"
+                    : videoCue === "survey"
+                      ? "Complete Survey"
+                      : "See Solana Payment"}
+                </button>
+              )}
+            </div>
+            {beetleCue && (
+              <div
+                className={`lifetime-video-beetle ${beetleCue.phase}`}
+                style={{ left: beetleCue.left, top: beetleCue.top }}
+                aria-hidden="true"
+              >
+                <svg viewBox="0 0 48 48" focusable="false">
+                  <path d="m18 13-5-6m17 6 5-6M13 23l-7-3m29 3 7-3M13 31l-7 3m29-3 7 3" />
+                  <path className="beetle-shell" d="M24 13c-8 0-13 6-13 15 0 8 5 14 13 14s13-6 13-14c0-9-5-15-13-15Z" />
+                  <path className="beetle-seam" d="M24 15v25" />
+                  <circle className="beetle-spot" cx="18" cy="23" r="2.1" />
+                  <circle className="beetle-spot" cx="30" cy="23" r="2.1" />
+                  <circle className="beetle-spot" cx="18" cy="32" r="2.1" />
+                  <circle className="beetle-spot" cx="30" cy="32" r="2.1" />
+                  <path className="beetle-head" d="M18 13c0-4 2.4-7 6-7s6 3 6 7" />
+                  <circle className="beetle-eye" cx="21.5" cy="10" r="1" />
+                  <circle className="beetle-eye" cx="26.5" cy="10" r="1" />
+                </svg>
+              </div>
+            )}
+          </section>
+        )}
+
+        <section
+          className="lifetime-unlock-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="lifetime-unlock-title"
+        >
+          <header className="lifetime-unlock-header">
+            <div className="lifetime-unlock-mark" aria-hidden="true">
+              <FiLock />
+            </div>
+            <div>
+              <span className="lifetime-unlock-eyebrow">LIFETIME ACCESS</span>
+              <h2 id="lifetime-unlock-title">Make Silo yours</h2>
+            </div>
+            <button
+              className="lifetime-unlock-close"
+              type="button"
+              aria-label="Close lifetime unlock"
+              onClick={onClose}
+            >
+              <FiX />
+            </button>
+          </header>
 
         <div className="lifetime-unlock-price">
           <strong>$25</strong>
@@ -296,10 +483,7 @@ export default function LifetimeUnlockPanel({
           </div>
         ) : (
           <>
-            <section
-              className="lifetime-solana-pay"
-              aria-label="Pay with Solana Pay"
-            >
+            <section className="lifetime-solana-pay" aria-label="Pay with Solana Pay">
               <div className="lifetime-unlock-step">
                 <span>01</span>
                 <div>
@@ -535,7 +719,133 @@ export default function LifetimeUnlockPanel({
           <span>Demo access stays available while you decide.</span>
           <span>Never enter a seed phrase or private key in Silo.</span>
         </footer>
-      </section>
+        </section>
+      {surveyOpen && (
+        <div
+          className="lifetime-action-backdrop lifetime-survey-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setSurveyOpen(false);
+          }}
+        >
+          <section
+            className="lifetime-survey-dialog"
+            style={surveyPosition ?? undefined}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="lifetime-survey-title"
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                setSurveyOpen(false);
+              }
+            }}
+          >
+            <header className="lifetime-survey-header">
+              <h2 id="lifetime-survey-title">Silo Demo Feedback</h2>
+              <button
+                className="lifetime-unlock-close"
+                type="button"
+                aria-label="Close feedback survey"
+                onClick={() => setSurveyOpen(false)}
+              >
+                <FiX />
+              </button>
+            </header>
+            <iframe
+              className="lifetime-survey-frame"
+              title="Silo Demo Feedback survey"
+              src={SURVEY_FORM_URL}
+              loading="lazy"
+              referrerPolicy="no-referrer-when-downgrade"
+            />
+          </section>
+        </div>
+      )}
+      {paymentOpen && (
+        <div
+          className="lifetime-action-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setPaymentOpen(false);
+          }}
+        >
+          <section
+            className="lifetime-payment-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="lifetime-payment-title"
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                setPaymentOpen(false);
+              }
+            }}
+          >
+            <header className="lifetime-survey-header">
+              <div>
+                <span className="lifetime-unlock-eyebrow">LIFETIME ACCESS</span>
+                <h2 id="lifetime-payment-title">Pay with Solana</h2>
+              </div>
+              <button
+                className="lifetime-unlock-close"
+                type="button"
+                aria-label="Close payment details"
+                onClick={() => setPaymentOpen(false)}
+              >
+                <FiX />
+              </button>
+            </header>
+            <p className="lifetime-action-payment-intro">
+              Scan the request with your Solana wallet. Silo checks for the $25
+              USDC payment and unlocks automatically.
+            </p>
+            <div className="lifetime-solana-qr">
+              {paymentRequest ? (
+                <QRCodeSVG
+                  value={paymentRequest.uri}
+                  size={190}
+                  level="M"
+                  marginSize={3}
+                  role="img"
+                  aria-label="Solana Pay request for 25 USDC"
+                />
+              ) : (
+                <p role="alert">Silo could not create a secure payment request.</p>
+              )}
+            </div>
+            {paymentRequest && (
+              <button
+                className="lifetime-solana-copy-link"
+                type="button"
+                onClick={() => void copyPaymentLink()}
+              >
+                {paymentLinkCopyState === "copied" ? <FiCheck /> : <FiCopy />}
+                {paymentLinkCopyState === "copied"
+                  ? "Payment link copied"
+                  : paymentLinkCopyState === "error"
+                    ? "Copy failed"
+                    : "Copy Solana Pay link"}
+              </button>
+            )}
+            <p className="lifetime-payment-safety-note">
+              Never enter a seed phrase or private key in Silo.
+            </p>
+            {paymentNotice && (
+              <p
+                className="lifetime-unlock-inline-note"
+                data-status={paymentStatus}
+                role="status"
+              >
+                {paymentNotice}
+              </p>
+            )}
+          </section>
+        </div>
+      )}
+      </div>
     </div>
   );
 }

@@ -59,6 +59,7 @@ import {
   FiZoomIn,
   FiZoomOut,
 } from "react-icons/fi";
+import { FaBug } from "react-icons/fa";
 import "./App.css";
 import { useDragSelect } from "./hooks/useDragSelect";
 import { useStableBusy } from "./utils/useStableBusy";
@@ -96,7 +97,9 @@ import IndexingPanel from "./components/IndexingPanel";
 import SourceClonePanel from "./components/SourceClonePanel";
 import LocationPicker from "./components/LocationPicker";
 import DuplicatesPage from "./components/DuplicatesPage";
-import SettingsPanel from "./components/SettingsPanel";
+import SettingsPanel, {
+  BugReportDialog,
+} from "./components/SettingsPanel";
 import StatsDashboard from "./components/StatsDashboard";
 import MagicTools from "./components/MagicTools";
 import PersonPicker from "./components/PersonPicker";
@@ -113,15 +116,52 @@ const MemoriesLauncher = React.lazy(() => import("./components/MemoriesLauncher"
 const LazyDocumentViewer = React.lazy(
   () => import("./components/DocumentViewer"),
 );
+class DocumentViewerErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error("Document viewer failed to load", error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="viewer-status document-viewer-load-error" role="alert">
+          <div>
+            <p>Document preview failed to load.</p>
+            <button
+              className="btn btn-primary"
+              onClick={() => window.location.reload()}
+            >
+              Reload Silo
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 function DocumentViewer(
   props: React.ComponentProps<typeof LazyDocumentViewer>,
 ) {
   return (
-    <React.Suspense
-      fallback={<div className="viewer-status">Loading document renderer…</div>}
-    >
-      <LazyDocumentViewer {...props} />
-    </React.Suspense>
+    <DocumentViewerErrorBoundary>
+      <React.Suspense
+        fallback={
+          <div className="viewer-status">Loading document renderer…</div>
+        }
+      >
+        <LazyDocumentViewer {...props} />
+      </React.Suspense>
+    </DocumentViewerErrorBoundary>
   );
 }
 // TEMP: reload once when removing diagnostic hooks from a hot-updated module.
@@ -631,7 +671,11 @@ function App() {
     defaultContentSettings,
   );
   const [showSettings, setShowSettings] = useState(false);
+  const [showBugReport, setShowBugReport] = useState(false);
+  const [selectingBugReportScreenshot, setSelectingBugReportScreenshot] =
+    useState(false);
   const [lifetimePromptRequest, setLifetimePromptRequest] = useState(0);
+  const [demoModeActive, setDemoModeActive] = useState<boolean | null>(null);
   const [showGuidedTour, setShowGuidedTour] = useState(false);
   const [showLocalHelp, setShowLocalHelp] = useState(false);
   const [tourContextStep, setTourContextStep] = useState<GuidedTourStep | null>(
@@ -987,6 +1031,28 @@ function App() {
       setShowSettings(true);
       setLifetimePromptRequest((request) => request + 1);
     });
+  }, [electronAPI]);
+
+  useEffect(() => {
+    if (!electronAPI?.isDemoMode) return;
+    let active = true;
+    const refreshDemoMode = () =>
+      void electronAPI
+        .isDemoMode()
+        .then((enabled) => {
+          if (active) setDemoModeActive(enabled);
+        })
+        .catch(() => {
+          if (active) setDemoModeActive(null);
+        });
+    refreshDemoMode();
+    const removeAccessListener = electronAPI.onLifetimeAccessChanged?.(
+      refreshDemoMode,
+    );
+    return () => {
+      active = false;
+      removeAccessListener?.();
+    };
   }, [electronAPI]);
 
   useEffect(() => {
@@ -4325,7 +4391,7 @@ function App() {
               onClick={() => setShowSettings(true)}
               title="Settings"
               aria-label="Settings"
-              data-help="Open appearance, content protection, memory storage, configuration backup, and the button for the full library statistics dashboard."
+              data-help="Open appearance, content protection, memory storage, configuration backup, bug reporting, and full Library Statistics."
             >
               <FiSettings />
             </button>
@@ -7140,11 +7206,36 @@ function App() {
           settings={contentSettings}
           onChange={setContentSettings}
           onClose={() => setShowSettings(false)}
+          onOpenBugReport={() => setShowBugReport(true)}
           onOpenStatistics={() => {
             setAppSection("stats");
             setShowSettings(false);
           }}
           lifetimePromptRequest={lifetimePromptRequest}
+        />
+      )}
+
+      {!showBugReport && !selectingBugReportScreenshot && (
+        <button
+          className="bug-report-launcher"
+          type="button"
+          aria-label="Report a Bug"
+          title="Report a Bug"
+          onClick={() => setShowBugReport(true)}
+        >
+          <FaBug aria-hidden="true" />
+        </button>
+      )}
+      {showBugReport && (
+        <BugReportDialog
+          onClose={() => {
+            setShowBugReport(false);
+            setSelectingBugReportScreenshot(false);
+          }}
+          onScreenshotSelectionChange={(selecting) => {
+            setSelectingBugReportScreenshot(selecting);
+            if (selecting) setShowSettings(false);
+          }}
         />
       )}
 

@@ -1,6 +1,10 @@
 import React, { useEffect, useState } from "react";
+import { FaBug } from "react-icons/fa";
 import {
+  FiAlertCircle,
   FiBarChart2,
+  FiCamera,
+  FiCheck,
   FiDownload,
   FiFolder,
   FiHardDrive,
@@ -19,7 +23,457 @@ interface SettingsPanelProps {
   onChange: (settings: PublicContentSettings) => void;
   onClose: () => void;
   onOpenStatistics: () => void;
+  onOpenBugReport: () => void;
   lifetimePromptRequest?: number;
+}
+
+function ScreenshotBeetle() {
+  return (
+    <svg viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+      <path d="m18 13-5-6m17 6 5-6M13 23l-7-3m29 3 7-3M13 31l-7 3m29-3 7 3" />
+      <path className="beetle-shell" d="M24 13c-8 0-13 6-13 15 0 8 5 14 13 14s13-6 13-14c0-9-5-15-13-15Z" />
+      <path className="beetle-seam" d="M24 15v25" />
+      <circle className="beetle-spot" cx="18" cy="23" r="2.1" />
+      <circle className="beetle-spot" cx="30" cy="23" r="2.1" />
+      <circle className="beetle-spot" cx="18" cy="32" r="2.1" />
+      <circle className="beetle-spot" cx="30" cy="32" r="2.1" />
+      <path className="beetle-head" d="M18 13c0-4 2.4-7 6-7s6 3 6 7" />
+      <circle className="beetle-eye" cx="21.5" cy="10" r="1" />
+      <circle className="beetle-eye" cx="26.5" cy="10" r="1" />
+    </svg>
+  );
+}
+
+export function BugReportDialog({
+  onClose,
+  onScreenshotSelectionChange,
+}: {
+  onClose: () => void;
+  onScreenshotSelectionChange: (selecting: boolean) => void;
+}) {
+  const electronAPI = window.electron;
+  const [relayStatus, setRelayStatus] = useState<{
+    available: boolean;
+    message: string;
+  }>({
+    available: false,
+    message: "Checking secure email delivery…",
+  });
+  const [features, setFeatures] = useState<string[]>([]);
+  const [feature, setFeature] = useState("");
+  const [message, setMessage] = useState("");
+  const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(
+    null,
+  );
+  const [selectingScreenshot, setSelectingScreenshot] = useState(false);
+  const [capturingScreenshot, setCapturingScreenshot] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [sent, setSent] = useState(false);
+  const [beetleCue, setBeetleCue] = useState<{
+    left: number;
+    top: number;
+    phase: "rising" | "pointing" | "jiggling" | "returning" | "resting";
+  } | null>(null);
+  const [captureCueFlashing, setCaptureCueFlashing] = useState(false);
+  const captureButtonRef = React.useRef<HTMLButtonElement>(null);
+  const captureControlsRef = React.useRef<HTMLDivElement>(null);
+  const screenshotActionRef = React.useRef<HTMLButtonElement>(null);
+  const selectionWasActive = React.useRef(false);
+  const pointerPositionRef = React.useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    let active = true;
+    void electronAPI?.getBugReportStatus()
+      .then((status) => {
+        if (active) setRelayStatus(status);
+      })
+      .catch(() => {
+        if (active)
+          setRelayStatus({
+            available: false,
+            message: "Secure email delivery could not be checked.",
+          });
+      });
+
+    const labels = new Set<string>();
+    document.querySelectorAll<HTMLElement>("[data-help]").forEach((element) => {
+      const bounds = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      if (
+        bounds.width <= 0 ||
+        bounds.height <= 0 ||
+        bounds.bottom <= 0 ||
+        bounds.top >= window.innerHeight ||
+        style.visibility === "hidden" ||
+        style.display === "none"
+      )
+        return;
+      const label = (
+        element.getAttribute("aria-label") ||
+        element.getAttribute("title") ||
+        element.dataset.tour?.replace(/[-_]/g, " ") ||
+        element.dataset.help
+      )
+        ?.replace(/\s+/g, " ")
+        .trim();
+      if (label) labels.add(label.slice(0, 180));
+    });
+    setFeatures(Array.from(labels).slice(0, 100));
+    return () => {
+      active = false;
+    };
+  }, [electronAPI]);
+
+  useEffect(() => {
+    if (selectingScreenshot) {
+      selectionWasActive.current = true;
+      captureButtonRef.current?.focus();
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "Escape" && !capturingScreenshot) {
+          event.preventDefault();
+          setSelectingScreenshot(false);
+          onScreenshotSelectionChange(false);
+        }
+      };
+      window.addEventListener("keydown", handleKeyDown);
+      return () => window.removeEventListener("keydown", handleKeyDown);
+    }
+    if (selectionWasActive.current && !capturingScreenshot) {
+      selectionWasActive.current = false;
+      screenshotActionRef.current?.focus();
+    }
+  }, [selectingScreenshot, capturingScreenshot, onScreenshotSelectionChange]);
+
+  useEffect(() => {
+    if (!selectingScreenshot) {
+      setBeetleCue(null);
+      setCaptureCueFlashing(false);
+      return;
+    }
+
+    let pointerHasMoved = false;
+    let pointTimer: number | undefined;
+    let returnTimer: number | undefined;
+    let restTimer: number | undefined;
+    let flashTimer: number | undefined;
+    setBeetleCue({
+      left: window.innerWidth / 2,
+      top: window.innerHeight + 36,
+      phase: "rising",
+    });
+    const launchFrame = window.requestAnimationFrame(() => {
+      pointTimer = window.setTimeout(() => {
+        if (pointerHasMoved) {
+          setBeetleCue({
+            left: pointerPositionRef.current.x + 16,
+            top: pointerPositionRef.current.y - 30,
+            phase: "pointing",
+          });
+        }
+      }, 280);
+    });
+    const handlePointerMove = (event: PointerEvent) => {
+      pointerPositionRef.current = { x: event.clientX, y: event.clientY };
+      pointerHasMoved = true;
+    };
+    window.addEventListener("pointermove", handlePointerMove);
+
+    const jiggleTimer = window.setTimeout(() => {
+      setBeetleCue((current) =>
+        current ? { ...current, phase: "jiggling" } : current,
+      );
+      returnTimer = window.setTimeout(() => {
+        const bounds = captureControlsRef.current?.getBoundingClientRect();
+        if (!bounds) return;
+        setBeetleCue({
+          left: bounds.left + 18,
+          top: bounds.top - 10,
+          phase: "returning",
+        });
+        restTimer = window.setTimeout(() => {
+          setBeetleCue((current) =>
+            current ? { ...current, phase: "resting" } : current,
+          );
+          setCaptureCueFlashing(true);
+          flashTimer = window.setTimeout(() => setCaptureCueFlashing(false), 1900);
+        }, 650);
+      }, 750);
+    }, 1100);
+
+    return () => {
+      window.cancelAnimationFrame(launchFrame);
+      if (pointTimer !== undefined) window.clearTimeout(pointTimer);
+      window.clearTimeout(jiggleTimer);
+      if (returnTimer !== undefined) window.clearTimeout(returnTimer);
+      if (restTimer !== undefined) window.clearTimeout(restTimer);
+      if (flashTimer !== undefined) window.clearTimeout(flashTimer);
+      window.removeEventListener("pointermove", handlePointerMove);
+    };
+  }, [selectingScreenshot]);
+
+  const beginScreenshotSelection = (event: React.MouseEvent<HTMLButtonElement>) => {
+    pointerPositionRef.current = { x: event.clientX, y: event.clientY };
+    setNotice("");
+    setSelectingScreenshot(true);
+    onScreenshotSelectionChange(true);
+  };
+
+  const cancelScreenshotSelection = () => {
+    setSelectingScreenshot(false);
+    onScreenshotSelectionChange(false);
+  };
+
+  const captureScreenshot = async () => {
+    if (!electronAPI) return;
+    setBusy(true);
+    setNotice("");
+    setCapturingScreenshot(true);
+    try {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+      setScreenshotDataUrl(await electronAPI.captureBugReportScreenshot());
+    } catch (cause) {
+      setNotice(
+        cause instanceof Error
+          ? cause.message
+          : "Silo could not capture a screenshot.",
+      );
+    } finally {
+      setCapturingScreenshot(false);
+      setSelectingScreenshot(false);
+      onScreenshotSelectionChange(false);
+      setBusy(false);
+    }
+  };
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!electronAPI) {
+      setNotice("Secure report delivery is unavailable in this session.");
+      return;
+    }
+    if (!message.trim()) {
+      setNotice("Add a short description before sending your report.");
+      return;
+    }
+    if (!relayStatus.available) {
+      setNotice(relayStatus.message);
+      return;
+    }
+    setBusy(true);
+    setNotice("");
+    try {
+      const result = await electronAPI.submitBugReport({
+        message: message.trim(),
+        feature: feature || null,
+        screenshotDataUrl,
+      });
+      if (!result.ok) {
+        setNotice(result.error || "Silo could not send the report.");
+        return;
+      }
+      setSent(true);
+      setNotice("Your bug report was emailed to tani@kolektivkrog.si.");
+    } catch (cause) {
+      setNotice(
+        cause instanceof Error
+          ? cause.message
+          : "Silo could not send the report. Your text is still here.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <div
+        className={`bug-report-backdrop${selectingScreenshot ? " capture-hidden" : ""}`}
+        role="presentation"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !busy) onClose();
+        }}
+      >
+        <form
+        className="bug-report-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="bug-report-title"
+        onSubmit={(event) => void submit(event)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" && !busy) {
+            event.preventDefault();
+            onClose();
+          }
+        }}
+      >
+        <header>
+          <div>
+            <FaBug />
+            <h2 id="bug-report-title">Report a Bug</h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            title="Close bug report"
+            aria-label="Close bug report"
+            disabled={busy}
+          >
+            <FiX />
+          </button>
+        </header>
+        <p className="bug-report-intro">
+          Silo includes your note, selected feature, app version and platform.
+          A screenshot is attached only if you choose one; source paths are not
+          added automatically.
+        </p>
+        <label className="bug-report-field">
+          <span>What happened?</span>
+          <textarea
+            autoFocus
+            maxLength={5000}
+            rows={5}
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            placeholder="Describe what you expected and what went wrong…"
+            disabled={busy || sent}
+          />
+          <small>{message.length.toLocaleString()} / 5,000</small>
+        </label>
+        <label className="bug-report-field">
+          <span>Visible feature (optional)</span>
+          <select
+            value={feature}
+            onChange={(event) => setFeature(event.target.value)}
+            disabled={busy || sent}
+          >
+            <option value="">Choose a visible feature…</option>
+            {features.map((label) => (
+              <option key={label} value={label}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="bug-report-screenshot">
+          <div>
+            <strong>Screenshot (optional)</strong>
+            <small>
+              Hide this form and Settings, navigate to the area you want to
+              capture, then use the floating camera control. Review the image
+              for private information before sending.
+            </small>
+          </div>
+          <div className="bug-report-screenshot-actions">
+            <button
+              className="settings-secondary"
+              type="button"
+              ref={screenshotActionRef}
+              onClick={beginScreenshotSelection}
+              disabled={busy || sent || !electronAPI}
+            >
+              <FiCamera /> {screenshotDataUrl ? "Retake screenshot" : "Choose screenshot area"}
+            </button>
+            {screenshotDataUrl && (
+              <button
+                className="settings-secondary"
+                type="button"
+                onClick={() => setScreenshotDataUrl(null)}
+                disabled={busy || sent}
+              >
+                Remove
+              </button>
+            )}
+          </div>
+          {screenshotDataUrl && (
+            <img
+              className="bug-report-screenshot-preview"
+              src={screenshotDataUrl}
+              alt="Preview of the screenshot that will be attached"
+            />
+          )}
+        </div>
+        <p
+          className={`bug-report-relay ${relayStatus.available ? "ready" : ""}`}
+          role="status"
+        >
+          {relayStatus.message} Destination mailbox: tani@kolektivkrog.si.
+        </p>
+        {notice && (
+          <p
+            className={`bug-report-notice ${sent ? "success" : ""}`}
+            role={sent ? "status" : "alert"}
+          >
+            {sent ? <FiCheck /> : <FiAlertCircle />} {notice}
+          </p>
+        )}
+        <footer>
+          <button
+            className="settings-secondary"
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+          >
+            Close
+          </button>
+          <button
+            className="settings-save"
+            type="submit"
+            disabled={busy || sent}
+          >
+            {busy ? "Sending…" : sent ? "Report sent" : "Send report"}
+          </button>
+        </footer>
+        </form>
+      </div>
+      {selectingScreenshot && (
+        <>
+          <div
+            ref={captureControlsRef}
+            className={`bug-report-capture-controls${capturingScreenshot ? " capturing" : ""}${captureCueFlashing ? " cue-flash" : ""}`}
+            role="region"
+            aria-label="Screenshot capture controls"
+          >
+            <p>
+              {capturingScreenshot
+                ? "Capturing the current Silo view…"
+                : "Navigate to the area you want to capture."}
+            </p>
+            <button
+              ref={captureButtonRef}
+              className="bug-report-capture-button"
+              type="button"
+              onClick={() => void captureScreenshot()}
+              disabled={capturingScreenshot || !electronAPI}
+              aria-label="Capture screenshot"
+              title="Capture screenshot"
+            >
+              <FiCamera /> <span>Capture screenshot</span>
+            </button>
+            <button
+              className="bug-report-capture-cancel"
+              type="button"
+              onClick={cancelScreenshotSelection}
+              disabled={capturingScreenshot}
+            >
+              Cancel
+            </button>
+          </div>
+          {beetleCue && (
+            <div
+              className={`bug-report-beetle-cue ${beetleCue.phase}`}
+              style={{ left: beetleCue.left, top: beetleCue.top }}
+              aria-hidden="true"
+            >
+              <ScreenshotBeetle />
+            </div>
+          )}
+        </>
+      )}
+    </>
+  );
 }
 
 export default function SettingsPanel({
@@ -27,6 +481,7 @@ export default function SettingsPanel({
   onChange,
   onClose,
   onOpenStatistics,
+  onOpenBugReport,
   lifetimePromptRequest = 0,
 }: SettingsPanelProps) {
   const electronAPI = window.electron;
@@ -293,11 +748,13 @@ export default function SettingsPanel({
   };
 
   return (
+    <>
     <div
-      className="settings-backdrop"
+      className={`settings-backdrop${hideSettingsForScreenshot ? " capture-hidden" : ""}`}
       role="presentation"
+      aria-hidden={hideSettingsForScreenshot}
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (!hideSettingsForScreenshot && event.target === event.currentTarget) onClose();
       }}
     >
       <aside
@@ -375,6 +832,23 @@ export default function SettingsPanel({
               )}
             </div>
           )}
+        </section>
+
+        <section className="settings-bug-report">
+          <div className="settings-section-title">
+            <FaBug />
+            <div>
+              <h3>Report a Bug</h3>
+              <p>Send a note about a problem or confusing feature.</p>
+            </div>
+          </div>
+          <button
+            className="settings-secondary"
+            onClick={onOpenBugReport}
+            data-help="Describe a problem, identify a visible feature, and optionally attach a screenshot of the Silo window."
+          >
+            <FaBug /> Report a Bug
+          </button>
         </section>
 
         <LibraryShareSettings />
@@ -715,14 +1189,16 @@ export default function SettingsPanel({
         {error && <div className="settings-message error">{error}</div>}
         {notice && <div className="settings-message">{notice}</div>}
       </aside>
+    </div>
       {showLifetimeUnlock && (
         <LifetimeUnlockPanel
           license={lifetimeLicense}
           demoTestingModeActive={demoMode.enabled}
           onClose={() => setShowLifetimeUnlock(false)}
+          onOpenBugReport={onOpenBugReport}
           onVerified={setLifetimeLicense}
         />
       )}
-    </div>
+    </>
   );
 }

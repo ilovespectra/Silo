@@ -640,6 +640,14 @@ interface BannedFace {
 
 interface Window {
   electron?: {
+    isDemoMode(): Promise<boolean>;
+    getBugReportStatus(): Promise<{ available: boolean; message: string }>;
+    captureBugReportScreenshot(): Promise<string>;
+    submitBugReport(report: {
+      message: string;
+      feature: string | null;
+      screenshotDataUrl: string | null;
+    }): Promise<{ ok: boolean; error?: string }>;
     getLifetimeLicense(): Promise<import("./lifetimePayment").LifetimeLicenseState>;
     getDemoTestingMode(): Promise<{ available: boolean; enabled: boolean }>;
     setDemoTestingMode(enabled: boolean): Promise<{

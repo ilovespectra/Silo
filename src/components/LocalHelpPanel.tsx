@@ -316,7 +316,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Duplicate scan and review safety",
     keywords: "duplicates scan exact bytes retain protect keep select removed trash restore permanent delete",
     answer:
-      "Scan library compares exact file contents. The first retained file in each group is protected; selectable copies can be moved to Review removed, where they remain recoverable. Select items and use Restore to return them. Delete selected permanently or Clear all permanently cannot be undone, so verify the list and selection first.",
+      "Scan library compares exact file contents. The first retained file in each group is protected; selectable copies can be staged in Review removed, where they remain recoverable. Select items and use Restore to return them. Delete selected permanently or Clear all permanently cannot be undone, so verify the list and selection first.",
     section: "duplicates",
     target: '[data-tour="duplicate-trash-actions"]',
     fallbackTarget: '[data-tour="duplicates-review-tab"]',

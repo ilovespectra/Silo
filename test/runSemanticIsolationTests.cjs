@@ -287,8 +287,12 @@ test("runtime construction and preload failures checkpoint all pending files and
   for (const kind of ["construction", "preload"]) {
     const { indexer, userDataPath } = makeIndexer(t);
     await indexer.initialize();
+    const sourcePath = fs.mkdtempSync(
+      path.join(os.tmpdir(), "semantic-startup-source-"),
+    );
+    t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
     const files = Array.from({ length: 251 }, (_, i) => {
-      const file = path.join(userDataPath, `${i}.jpg`);
+      const file = path.join(sourcePath, `${i}.jpg`);
       fs.writeFileSync(file, "original");
       return file;
     });
@@ -303,8 +307,8 @@ test("runtime construction and preload failures checkpoint all pending files and
     indexer.appendFailure = async () =>
       assert.fail("Startup failure must not poison a file");
     await indexer.start(
-      [userDataPath],
-      new Map(files.map((file) => [file, userDataPath])),
+      [sourcePath],
+      new Map(files.map((file) => [file, sourcePath])),
     );
     assert.equal(indexer.getProgress().status, "error");
     assert.equal(indexer.getProgress().remaining, 251);
@@ -315,7 +319,7 @@ test("runtime construction and preload failures checkpoint all pending files and
     await restarted.initialize();
     assert.equal(restarted.filesToIndex.size, 251);
     assert.ok(
-      files.every((file) => restarted.filesToIndex.get(file) === userDataPath),
+      files.every((file) => restarted.filesToIndex.get(file) === sourcePath),
     );
   }
 });
@@ -325,8 +329,12 @@ test("three native image crashes persist across restarts, quarantine only unchan
     path.join(os.tmpdir(), "semantic-trap-test-"),
   );
   t.after(() => fs.rmSync(userDataPath, { recursive: true, force: true }));
-  const trap = path.join(userDataPath, "trap.heic");
-  const good = path.join(userDataPath, "good.jpg");
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-trap-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  const trap = path.join(sourcePath, "trap.heic");
+  const good = path.join(sourcePath, "good.jpg");
   fs.writeFileSync(trap, "original trap image");
   fs.writeFileSync(good, "original good image");
   const original = fs.readFileSync(trap);
@@ -337,10 +345,10 @@ test("three native image crashes persist across restarts, quarantine only unchan
     indexer = made.indexer;
     await indexer.initialize();
     await indexer.start(
-      [userDataPath],
+      [sourcePath],
       new Map([
-        [trap, userDataPath],
-        [good, userDataPath],
+        [trap, sourcePath],
+        [good, sourcePath],
       ]),
     );
     assert.equal(made.children.length, 1, "no retries inside the run");
@@ -399,28 +407,28 @@ test("three native image crashes persist across restarts, quarantine only unchan
   });
   await restarted.initialize();
   await restarted.start([]);
-  assert.equal(restarted.getIndexedImages([userDataPath]).length, 1);
-  const changes = await restarted.reconcileIndex([userDataPath]);
+  assert.equal(restarted.getIndexedImages([sourcePath]).length, 2);
+  const changes = await restarted.reconcileIndex([sourcePath]);
   assert.equal(changes.has(trap), false, "unchanged HEIC must not be retried");
   assert.ok(
     restarted.latestRecords.has(trap),
     "quarantine failure is retained",
   );
   restarted.filesToIndex = null;
-  await restarted.start([userDataPath]);
+  await restarted.start([sourcePath]);
   assert.equal(
     children.length,
     1,
     "full scan skips the unchanged repeat-crashing image",
   );
-  await restarted.start([userDataPath], new Map([[trap, userDataPath]]));
+  await restarted.start([sourcePath], new Map([[trap, sourcePath]]));
   assert.equal(
     children.length,
     1,
     "explicit unchanged incremental work is skipped",
   );
   fs.appendFileSync(trap, "modified");
-  await restarted.start([userDataPath], new Map([[trap, userDataPath]]));
+  await restarted.start([sourcePath], new Map([[trap, sourcePath]]));
   assert.equal(
     restarted.workerFailures.get(trap).attempts,
     1,
@@ -465,9 +473,13 @@ test("disconnect without exit uses a bounded fallback instead of leaving work hu
 test("failed recovery writes retain work and late queued starts cannot restart a dead worker", async (t) => {
   const { indexer, userDataPath, children } = makeIndexer(t);
   await indexer.initialize();
-  const trap = path.join(userDataPath, "trap.heic");
-  const good = path.join(userDataPath, "good.jpg");
-  const queuedRoot = path.join(userDataPath, "queued-root");
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-recovery-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  const trap = path.join(sourcePath, "trap.heic");
+  const good = path.join(sourcePath, "good.jpg");
+  const queuedRoot = path.join(sourcePath, "queued-root");
   fs.writeFileSync(trap, "unchanged");
   fs.writeFileSync(good, "unchanged");
   indexer.persistWorkerFailures = async () => {
@@ -475,14 +487,14 @@ test("failed recovery writes retain work and late queued starts cannot restart a
   };
   const checkpoint = indexer.checkpointPendingWork.bind(indexer);
   indexer.checkpointPendingWork = async (...args) => {
-    void indexer.start([queuedRoot], new Map([[good, userDataPath]]));
+    void indexer.start([queuedRoot], new Map([[good, sourcePath]]));
     await checkpoint(...args);
   };
   await indexer.start(
-    [userDataPath],
+    [sourcePath],
     new Map([
-      [trap, userDataPath],
-      [good, userDataPath],
+      [trap, sourcePath],
+      [good, sourcePath],
     ]),
   );
   assert.equal(indexer.getProgress().status, "error");

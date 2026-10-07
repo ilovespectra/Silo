@@ -166,7 +166,7 @@ export default function DuplicatesPage({
       setError(
         cause instanceof Error
           ? cause.message
-          : "The copy could not be moved to review.",
+          : "The copy could not be staged for review.",
       );
     } finally {
       setRemovingPath(null);
@@ -182,7 +182,7 @@ export default function DuplicatesPage({
 
     if (filesToRemove.length === 0) return;
 
-    const msg = `Move ${filesToRemove.length} duplicate file${filesToRemove.length === 1 ? "" : "s"} to review?\n\nThe unique original file in each group will be protected and retained.`;
+    const msg = `Stage ${filesToRemove.length} duplicate file${filesToRemove.length === 1 ? "" : "s"} for review?\n\nThe unique original file in each group will be protected and retained.`;
     if (!window.confirm(msg)) return;
 
     setBusy(true);
@@ -197,7 +197,7 @@ export default function DuplicatesPage({
       setError(
         cause instanceof Error
           ? cause.message
-          : "Could not move duplicates to review.",
+          : "Could not stage duplicates for review.",
       );
     } finally {
       setBusy(false);
@@ -405,13 +405,33 @@ export default function DuplicatesPage({
         </div>
         <button
           className="btn btn-primary"
-          onClick={() => void scan()}
+          onClick={() =>
+            view === "duplicates" && totalSelectedCount > 0
+              ? void removeSelectedDuplicates()
+              : void scan()
+          }
           disabled={busy || state.status === "scanning"}
-          data-tour="duplicates-scan"
-          data-help="Compare indexed file contents to find exact duplicate copies; review paths and keep the protected first copy before cleanup."
+          data-tour={
+            view === "duplicates" && totalSelectedCount > 0
+              ? "duplicates-stage-selected"
+              : "duplicates-scan"
+          }
+          data-help={
+            view === "duplicates" && totalSelectedCount > 0
+              ? "Stage selected duplicate copies in Review removed. The protected original stays in place."
+              : "Compare indexed file contents to find exact duplicate copies; review paths and keep the protected first copy before cleanup."
+          }
         >
-          <FiRefreshCw />{" "}
-          {state.status === "scanning" ? "Scanning..." : "Scan library"}
+          {view === "duplicates" && totalSelectedCount > 0 ? (
+            <>
+              <FiCheck /> Deduplicate selected ({totalSelectedCount})
+            </>
+          ) : (
+            <>
+              <FiRefreshCw />{" "}
+              {state.status === "scanning" ? "Scanning..." : "Scan library"}
+            </>
+          )}
         </button>
       </header>
 
@@ -424,7 +444,7 @@ export default function DuplicatesPage({
         </div>
       )}
 
-      <nav className="duplicate-tabs" data-tour="duplicates-tabs" data-help="Switch between duplicate groups and items already moved to the recoverable review area.">
+      <nav className="duplicate-tabs" data-tour="duplicates-tabs" data-help="Switch between duplicate groups and items staged in the recoverable review area.">
         <button
           className={view === "duplicates" ? "active" : ""}
           onClick={() => setView("duplicates")}
@@ -442,11 +462,11 @@ export default function DuplicatesPage({
 
       {view === "duplicates" ? (
         <>
-          <div className="duplicate-toolbar" data-tour="duplicates-actions" data-help="Select duplicate copies, change how groups are displayed, and move reviewed selections to the recoverable Review removed area.">
+          <div className="duplicate-toolbar" data-tour="duplicates-actions" data-help="Select duplicate copies and change how groups are displayed. Selected copies can be staged in the recoverable Review removed area.">
             <div className="duplicate-toolbar-left">
               <span>
                 The first retained file is protected. Selectable duplicates can
-                be moved to review.
+                be staged in Review removed.
               </span>
               {state.groups.length > 0 && (
                 <button
@@ -569,7 +589,7 @@ export default function DuplicatesPage({
             {processingProgress && (
               <div className="duplicate-processing-progress">
                 <span>
-                  Moving {processingProgress.current.toLocaleString()} /{" "}
+                  Staging {processingProgress.current.toLocaleString()} /{" "}
                   {processingProgress.total.toLocaleString()}...
                 </span>
                 <progress
@@ -584,13 +604,6 @@ export default function DuplicatesPage({
                   {totalSelectedCount} duplicate
                   {totalSelectedCount === 1 ? "" : "s"} selected
                 </strong>
-                <button
-                  disabled={busy}
-                  onClick={() => void removeSelectedDuplicates()}
-                  className="danger"
-                >
-                  <FiTrash2 /> Move to review
-                </button>
               </>
             )}
             {error && <strong className="duplicate-error">{error}</strong>}

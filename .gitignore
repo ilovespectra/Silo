@@ -126,6 +126,7 @@ runtime.jsonl
 
 # Personal media, renders and backups
 *.mp4
+!public/lifetime-thank-you-paywall-refined.mp4
 *.mov
 *.heic
 *.HEIC

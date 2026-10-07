@@ -298,7 +298,7 @@ export class DuplicateManager {
     await Promise.all([this.persistIndex(), this.persistTrash()]);
     this.recalculate(
       "complete",
-      `Moved exact duplicates to review. One original from each group was preserved.`,
+      `Staged exact duplicates for review. One original from each group was preserved.`,
     );
     return this.getState();
   }
@@ -318,7 +318,7 @@ export class DuplicateManager {
       try {
         this.listener({
           ...this.getState(),
-          message: `Moving ${processed} / ${total}...`,
+          message: `Staging ${processed} / ${total}...`,
           scanned: processed,
           total,
         });
@@ -412,7 +412,7 @@ export class DuplicateManager {
       group.reclaimableBytes = group.size * (group.files.length - 1);
     await Promise.all([this.persistIndex(), this.persistTrash()]);
 
-    let message = `Moved ${moved.toLocaleString()} duplicate${moved === 1 ? "" : "s"} to review. Every group kept its original.`;
+    let message = `Staged ${moved.toLocaleString()} duplicate${moved === 1 ? "" : "s"} in Review removed. Every group kept its original.`;
     if (missing > 0)
       message += ` ${missing.toLocaleString()} already-removed file${missing === 1 ? " was" : "s were"} cleared from the list.`;
     if (skipped > 0)

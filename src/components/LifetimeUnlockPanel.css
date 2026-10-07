@@ -19,18 +19,25 @@
   z-index: 1400;
   inset: 0;
   display: grid;
-  place-items: center;
+  place-items: start center;
   overflow-y: auto;
-  padding: 24px;
+  padding: clamp(24px, 5vh, 48px) 24px 40px;
   background: rgba(3, 4, 5, 0.78);
   backdrop-filter: blur(9px);
 }
 
-.lifetime-unlock-panel {
+.lifetime-unlock-composition {
+  position: relative;
   width: min(560px, 100%);
-  max-height: min(880px, calc(100vh - 48px));
-  overflow-y: auto;
-  padding: 24px;
+}
+
+.lifetime-unlock-panel {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-height: none;
+  overflow: visible;
+  padding: 112px 24px 24px;
   border: 1px solid var(--border-strong);
   border-radius: 14px;
   background:
@@ -87,6 +94,206 @@
   background: var(--surface-control);
   color: var(--text-secondary);
   cursor: pointer;
+}
+
+.lifetime-unlock-video-section {
+  position: relative;
+  z-index: 3;
+  width: 92%;
+  margin: 0 auto -78px;
+}
+
+.lifetime-unlock-video-frame {
+  position: relative;
+  z-index: 2;
+}
+
+.lifetime-video-beetle {
+  position: fixed;
+  z-index: 1410;
+  width: 40px;
+  height: 40px;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  transition: left 760ms cubic-bezier(0.2, 0.8, 0.25, 1), top 760ms cubic-bezier(0.2, 0.8, 0.25, 1);
+  filter: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.32));
+}
+
+.lifetime-video-beetle svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  fill: none;
+  stroke: #25201e;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.lifetime-video-beetle .beetle-shell { fill: #f26d59; stroke-width: 2.2; }
+.lifetime-video-beetle .beetle-seam { stroke: rgba(50, 29, 27, 0.72); stroke-width: 1.7; }
+.lifetime-video-beetle .beetle-spot,
+.lifetime-video-beetle .beetle-head { fill: #292321; }
+.lifetime-video-beetle .beetle-eye { fill: #fff6dc; stroke: none; }
+.lifetime-video-beetle.rising svg,
+.lifetime-video-beetle.pointing svg,
+.lifetime-video-beetle.returning svg { animation: lifetime-beetle-hover 420ms ease-in-out infinite alternate; }
+.lifetime-video-beetle.jiggling svg { animation: lifetime-beetle-jiggle 560ms ease-in-out 1; }
+.lifetime-video-beetle.resting { opacity: 0.48; }
+.lifetime-video-beetle.resting svg { animation: lifetime-beetle-flash 480ms ease-in-out 3 both; }
+
+@keyframes lifetime-beetle-hover {
+  from { transform: translateY(2px) rotate(-5deg); }
+  to { transform: translateY(-3px) rotate(5deg); }
+}
+
+@keyframes lifetime-beetle-jiggle {
+  0%, 100% { transform: rotate(0); }
+  18% { transform: rotate(-13deg) translateY(-2px); }
+  36% { transform: rotate(12deg) translateY(1px); }
+  54% { transform: rotate(-9deg) translateY(-1px); }
+  72% { transform: rotate(7deg); }
+}
+
+@keyframes lifetime-beetle-flash {
+  0%, 100% { opacity: 0.48; }
+  40%, 55% { opacity: 1; }
+}
+
+.lifetime-unlock-video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #050505;
+  object-fit: contain;
+}
+
+.lifetime-video-cue {
+  position: absolute;
+  z-index: 4;
+  left: 70%;
+  bottom: -17px;
+  min-height: 34px;
+  padding: 0 13px;
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--orange) 92%, #fff);
+  color: #17110c;
+  font-size: 11px;
+  font-weight: 800;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+
+.lifetime-video-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 7px;
+  position: relative;
+  z-index: 4;
+  margin: 0 0 -7px;
+}
+
+.lifetime-video-cue:hover,
+.lifetime-video-actions button:hover {
+  filter: brightness(1.08);
+}
+
+.lifetime-video-actions button {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-control);
+  color: var(--text);
+  font-size: 9px;
+  font-weight: 750;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+
+.lifetime-action-backdrop {
+  position: fixed;
+  z-index: 1420;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  overflow-y: auto;
+  padding: 22px;
+  background: rgba(3, 4, 5, 0.82);
+  backdrop-filter: blur(8px);
+}
+
+.lifetime-survey-dialog {
+  position: absolute;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(560px, calc(100vw - 24px));
+  height: min(640px, calc(100vh - 24px));
+  padding: 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: var(--surface-card);
+  color: var(--text);
+  box-shadow: 0 28px 100px rgba(0, 0, 0, 0.58);
+}
+
+.lifetime-survey-backdrop { display: block; }
+
+.lifetime-payment-dialog {
+  display: grid;
+  justify-items: center;
+  width: min(420px, 100%);
+  padding: 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: var(--surface-card);
+  color: var(--text);
+  box-shadow: 0 28px 100px rgba(0, 0, 0, 0.58);
+}
+
+.lifetime-payment-dialog .lifetime-survey-header {
+  width: 100%;
+}
+
+.lifetime-action-payment-intro,
+.lifetime-payment-safety-note {
+  max-width: 340px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.lifetime-payment-dialog .lifetime-solana-qr {
+  margin-top: 14px;
+}
+
+.lifetime-payment-safety-note {
+  margin-top: 10px;
+}
+
+.lifetime-survey-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+}
+
+.lifetime-survey-header h2 {
+  font-size: 16px;
+}
+
+.lifetime-survey-frame {
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 8px;
+  background: #fff;
 }
 
 .lifetime-unlock-price {
@@ -548,12 +755,33 @@
 
 @media (max-width: 560px) {
   .lifetime-unlock-backdrop {
-    padding: 12px;
+    padding: 24px 12px 30px;
   }
 
   .lifetime-unlock-panel {
-    max-height: calc(100vh - 24px);
-    padding: 18px;
+    padding: 102px 15px 18px;
+  }
+
+  .lifetime-unlock-video-section {
+    width: 94%;
+    margin-bottom: -68px;
+  }
+
+  .lifetime-video-actions {
+    gap: 4px;
+  }
+
+  .lifetime-video-actions button {
+    min-height: 28px;
+    padding: 0 8px;
+    font-size: 8px;
+  }
+
+  .lifetime-video-cue {
+    left: 62%;
+    min-height: 30px;
+    padding: 0 9px;
+    font-size: 9px;
   }
 
   .lifetime-unlock-benefits {
@@ -565,4 +793,9 @@
     flex-direction: column;
     gap: 4px;
   }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lifetime-video-beetle,
+  .lifetime-video-beetle svg { transition: none !important; animation: none !important; }
 }

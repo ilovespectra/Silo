@@ -33,7 +33,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "sources",
     title: "Add a source",
-    body: "In Files, use the plus beside Sources to choose a folder. Silo adds it to the library and starts indexing automatically. This guide never opens a picker or changes your sources.",
+    body: "In Files, use the plus beside Sources to choose a folder. Silo adds it to the library and starts indexing automatically.",
     target: '[data-tour="sources-add"]',
     section: "files",
   },
@@ -48,7 +48,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "source-clone",
     title: "Clone sources safely",
-    body: "This copy control clones all enabled sources. Choose destination folders and scan first to review the unique-file count and required space; then acknowledge the separate copy and choose Clone & verify. Silo verifies each unique file by SHA-256 and leaves the originals unchanged. The tour never starts a clone.",
+    body: "This copy control clones all enabled sources. Choose destination folders and scan first to review the unique-file count and required space; then acknowledge the separate copy and choose Clone & verify. Silo verifies each unique file by SHA-256 and leaves the originals unchanged.",
     target: '[data-tour="source-clone"]',
     fallbackTarget: '[data-tour="source-controls"]',
     section: "files",
@@ -56,7 +56,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "google-sources",
     title: "Connect another source type",
-    body: "The Files sidebar also has Google Accounts; use its account controls to connect or browse a Drive source. Phones and tablets are managed separately in Mobile. The tour never signs in or changes source availability.",
+    body: "The Files sidebar also has Google Accounts; use its account controls to connect or browse a Drive source.",
     target: '[data-tour="google-sources"]',
     fallbackTarget: '[data-tour="sources-add"]',
     section: "files",
@@ -64,14 +64,14 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "indexing",
     title: "Watch indexing",
-    body: "Progress appears here as Silo discovers and prepares files. It continues in the background, so you can browse while it works. People face detection is a separate, optional step.",
+    body: "Progress appears here as Silo discovers and prepares files. It continues in the background, so you can browse while it works.",
     target: '[data-tour="indexing-progress"]',
     section: "files",
   },
   {
     id: "search",
     title: "Search by meaning",
-    body: "Describe what you remember, such as “family sailing at sunset.” Semantic search uses the library’s local index; results improve as indexing completes. The tour will not run a search or send your query anywhere.",
+    body: "Describe what you remember, such as “family sailing at sunset”, or “rainy day at the park.“ Semantic search uses the library’s local index; results improve as indexing completes.",
     target: '[data-tour="semantic-search"]',
     section: "files",
   },
@@ -85,21 +85,21 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "file-actions",
     title: "Manage files carefully",
-    body: "Grid is the default thumbnail view; choose List for detailed rows. Sort & Filter opens file-type, year, people, and location filters plus sort order, and works in either view. Select a file to enable its actions. Move changes the file’s real location; New folder creates a real folder. Set virtual name changes Silo’s display/search label, not the filename on disk. This guide performs none of those actions.",
+    body: "Grid is the default thumbnail view; choose List for detailed rows. Sort & Filter opens file-type, year, people, and location filters plus sort order, and works in either view. Select a file to enable its actions. Move changes the file’s real location; New folder creates a real folder. Set virtual name changes Silo’s display/search label, not the filename on disk.",
     target: '[data-tour="file-actions"]',
     section: "files",
   },
   {
     id: "face-indexing",
     title: "Find people on this device",
-    body: "Face detection is a separate offline index. Start or pause it here when you choose; nothing starts during the tour. Silo groups detected faces so you can review them in People.",
+    body: "Face detection is a separate offline index. Start or pause it here when you choose. Silo groups detected faces so you can review them in People.",
     target: '[data-tour="face-indexing"]',
     section: "people",
   },
   {
     id: "people-create-edit",
     title: "Add and edit people",
-    body: "Create a named person here, then open a cluster to review it and use Rename. Confirming or correcting face matches helps keep the people view accurate. The tour won’t create or rename anyone.",
+    body: "Create a named person here, then open a cluster to review it and use Rename. Confirming or correcting face matches helps keep the people view accurate.",
     target: '[data-tour="new-person"]',
     fallbackTarget: '[data-tour="people-index"]',
     section: "people",
@@ -154,7 +154,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "map-relocate",
     title: "Relocate selected photos",
-    body: "After opening a map region and selecting photos, Relocate lets you search for a place or use the embedded location. Review your selection and the chosen place before applying; the tour does not select or relocate anything.",
+    body: "After opening a map region and selecting photos, Relocate lets you search for a place or use the embedded location. Review your selection and the chosen place before applying.",
     target: '[data-tour="map-relocate"]',
     fallbackTarget: '[data-tour="map-overview"]',
     section: "map",
@@ -162,14 +162,14 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "duplicates",
     title: "Review exact duplicates",
-    body: "Scan compares file contents, protects the first retained copy, and lets you review removable duplicates separately. Check the paths and the Review removed area before any permanent deletion.",
+    body: "Scan compares file contents source-independently, protects the first retained copy, and lets you stage removable duplicates in Review removed. This allows duplicate files across different sources, while deduplicating identical files in a single source. Check the paths and Review removed before any permanent deletion.",
     target: '[data-tour="duplicates-overview"]',
     section: "duplicates",
   },
   {
     id: "duplicate-controls",
     title: "Select and review duplicates",
-    body: "Switch between duplicate groups and Review removed. Select all, compare paths, and move chosen copies into the recoverable review area; the retained first copy is protected. Grid/list and zoom controls only change presentation.",
+    body: "Switch between duplicate groups and Review removed. Select all, compare paths, and stage chosen copies in the recoverable review area; the retained first copy is protected. Grid/list and zoom controls only change presentation.",
     target: '[data-tour="duplicates-actions"]',
     fallbackTarget: '[data-tour="duplicates-tabs"]',
     section: "duplicates",
@@ -177,7 +177,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "duplicate-groups",
     title: "Inspect duplicate groups",
-    body: "Each group lists matching files and their paths. The protected first copy is retained; select only the extra copies you intend to move into Review removed. Scanning and selection do not delete anything.",
+    body: "Each group lists matching files and their paths. The protected first copy is retained; select only the extra copies you intend to stage in Review removed. Scanning and selection do not delete anything.",
     target: '[data-tour="duplicate-groups"]',
     fallbackTarget: '[data-tour="duplicates-actions"]',
     section: "duplicates",
@@ -193,7 +193,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "mobile",
     title: "Manage phones and tablets",
-    body: "The Mobile page puts device discovery, browsing, naming, and backup controls first. Check the selected device, backup destination, and status before starting an operation. This guide will not connect to or back up a device.",
+    body: "The Mobile page puts device discovery, browsing, naming, and backup controls first. Check the selected device, backup destination, and status before starting an operation.",
     target: '[data-tour="mobile-devices"]',
     fallbackTarget: '[data-tour="mobile-overview"]',
     section: "mobile",
@@ -209,7 +209,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "mobile-messages",
     title: "Browse and export messages",
-    body: "Choose a connected phone or saved history, load it, then review the output destination and format before exporting. Updating history requires a connected, trusted phone. The guide never reads or exports messages.",
+    body: "Choose a connected phone or saved history, load it, then review the output destination and format before exporting. Updating history requires a connected, trusted phone.",
     target: '[data-tour="mobile-messages"]',
     fallbackTarget: '[data-tour="mobile-overview"]',
     section: "mobile",
@@ -225,14 +225,14 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "memories",
     title: "Make a Memory",
-    body: "Memories suggests stories from indexed photos and clips. Generate only when you choose; review the story, soundtrack, duration, and export location. Removing a suggestion keeps the original files, and Silo never creates movies during startup.",
+    body: "Memories suggests stories from indexed photos and clips. Generate only when you choose; review the story, soundtrack, duration, and export location. Edit video settings or make your own using semantic keywords, fully offline. Removing a suggestion keeps the original files.",
     target: '[data-tour="memories-overview"]',
     section: "memories",
   },
   {
     id: "memory-topic",
     title: "Create a Memory from a topic",
-    body: "Enter a phrase of at least three characters, such as “Rainy Sundays,” to search indexed photos on this device for a story on that topic. Silo creates one when matching material is available and selects a local soundtrack; it doesn’t modify your original media. This tour won’t submit a topic.",
+    body: "Enter a phrase of at least three characters, such as “Rainy Sundays,” to search indexed photos on this device for a story on that topic. Silo creates one when matching material is available and selects a local soundtrack; it doesn’t modify your original media.",
     target: '[data-tour="memory-topic"]',
     section: "memories",
   },
@@ -247,35 +247,35 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "settings-license",
     title: "Review the membership license",
-    body: "Silo offers a $25 USDC one-time lifetime membership, not a recurring subscription. It removes source, file, digital-folder, Memory-preview, and mapped-location limits. If active, this section shows the license status for this Mac; View lifetime license opens its information panel. The unlicensed panel offers Solana Pay, manual transaction-signature verification, and beta-access request options. In a build with the secured two-device flow, activate the first Mac through the Solana Pay request created on that Mac and wait for finalized confirmation; if verifying manually, use that request's signature. Its unique payment reference is bound to that installation, so an unrelated transaction signature alone cannot claim the first slot. On a second Mac, enter the original payment signature to create a pending request, then approve or decline it from an authorized Mac. The device manager supports naming, renaming, and removing devices, with a two-device maximum and at least one retained device. A removed Mac loses saved paid access on its next successful online authorization check; being offline or having a temporary relay failure does not revoke it. This checkout's manual signature verification is not reference-bound and does not enforce a shared device registry, and Settings has no device manager. The secured flow requires an updated client and a deployed, reachable licensing relay. The tour never starts a payment or submits a transaction.",
+    body: "Silo offers a $25 USDC one-time lifetime membership, not a recurring subscription. It removes source, file, digital-folder, Memory-preview, and mapped-location limits for 2 machines at a time, you can add/remove these in the settings menu.",
     target: '[data-tour="settings-license"]',
     section: "settings",
   },
   {
     id: "settings-library-share",
     title: "Share selected libraries on Wi-Fi",
-    body: "Choose indexed local libraries and select Start sharing to create a private-network link. Anyone with that link on the same network can browse, search, preview, and download included photos and videos. The link uses unencrypted local HTTP, so use trusted Wi-Fi only; stop sharing or quit Silo to end access. The tour never starts sharing.",
+    body: "Choose indexed local libraries and select Start sharing to create a private-network link. Anyone with that link on the same network can browse, search, preview, and download included photos and videos. The link uses unencrypted local HTTP, so use trusted Wi-Fi only; stop sharing or quit Silo to end access.",
     target: '[data-tour="library-share"]',
     section: "settings",
   },
   {
     id: "protection",
     title: "Review content protection",
-    body: "Settings controls whether explicit images appear, how banned people are shown, and parental-password protection. Protected settings stay as they are while you take the tour; review their descriptions before changing them.",
+    body: "Settings controls whether explicit images appear, how banned people are shown, and parental-password protection. Password creation is required for some settings modifications.",
     target: '[data-tour="content-protection"]',
     section: "settings",
   },
   {
     id: "settings-password",
     title: "Set a parental password",
-    body: "This section creates or changes the parental password used to authorize protected content-setting changes. Silo does not store the password itself. The walkthrough never changes this setting or asks for your password.",
+    body: "This section creates or changes the parental password used to authorize protected content-setting changes.",
     target: '[data-tour="settings-password"]',
     section: "settings",
   },
   {
     id: "settings-appearance",
     title: "Set appearance and behavior",
-    body: "Choose the theme here and decide whether the globe rotates automatically when Map opens. Changes take effect only when you use these controls; the tour leaves preferences untouched.",
+    body: "Choose the theme here and decide whether the globe rotates automatically when Map opens. Changes take effect only when you use these controls.",
     target: '[data-tour="settings-appearance"]',
     section: "settings",
   },
@@ -289,7 +289,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "settings-cache-destination",
     title: "Choose Silo’s cache destination",
-    body: "This shows where Silo stores indexes, face and place data, thumbnails, previews, and other generated cache files. Choose cache destination opens a folder picker; Silo restarts, verifies the cache copy, then removes the old cache. It does not move your original source files or Mac settings. Keep the destination drive connected; the tour never changes it.",
+    body: "This shows where Silo stores indexes, face and place data, thumbnails, previews, and other generated cache files. Choose cache destination opens a folder picker; Silo restarts, verifies the cache copy, then removes the old cache. It does not move your original source files or Mac settings. Keep the destination drive connected.",
     target: '[data-tour="settings-cache-destination"]',
     section: "settings",
   },
@@ -310,14 +310,14 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "fallout-shelter",
     title: "Set up Fallout Shelter",
-    body: "Fallout Shelter tracks verified copies of your sources. Set a primary destination, then select available sources in Source map and choose Back up selected. A copy counts as verified only after SHA-256 checks; Silo compares source path, size, and modification-time signatures to flag changes. This tour does not choose a destination or start a backup.",
+    body: "Fallout Shelter tracks verified copies of your sources. Set a primary destination, then select available sources in Source map and choose Back up selected. A copy counts as verified only after SHA-256 checks; Silo compares source path, size, and modification-time signatures to flag changes.",
     target: '[data-tour="fallout-shelter"]',
     section: "stats",
   },
   {
     id: "fallout-shelter-replica",
     title: "Replicate the verified shelter",
-    body: "After a complete primary shelter exists, use Replicate shelter to another volume to prepare a verified copy on a different physical volume. Review the destination and space preflight before copying; Silo verifies the replica by SHA-256. Replication is optional, and the tour never starts it.",
+    body: "After a complete primary shelter exists, use Replicate shelter to another volume to prepare a verified copy on a different physical volume. Review the destination and space preflight before copying; Silo verifies the replica by SHA-256. Replication is optional.",
     target: '[data-tour="shelter-replica"]',
     fallbackTarget: '[data-tour="fallout-shelter"]',
     section: "stats",
@@ -567,11 +567,7 @@ export default function GuidedTour({
           Show this tour at startup
         </label>
         <footer className="guided-tour-footer">
-          <button
-            type="button"
-            className="guided-tour-skip"
-            onClick={onClose}
-          >
+          <button type="button" className="guided-tour-skip" onClick={onClose}>
             Not now
           </button>
           <div>
@@ -579,7 +575,9 @@ export default function GuidedTour({
               <button
                 type="button"
                 className="guided-tour-back"
-                onClick={() => setStepIndex((current) => Math.max(0, current - 1))}
+                onClick={() =>
+                  setStepIndex((current) => Math.max(0, current - 1))
+                }
                 disabled={activeStepIndex === 0}
               >
                 <FiArrowLeft /> Back
