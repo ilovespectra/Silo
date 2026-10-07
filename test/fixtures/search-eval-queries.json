@@ -1,0 +1,656 @@
+[
+  {
+    "query": "dog on a beach",
+    "categories_all": [
+      "dog"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "beach",
+        "shore",
+        "sand",
+        "ocean",
+        "coast",
+        "water"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "birthday cake",
+    "categories_all": [
+      "cake"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "birthday",
+        "candles",
+        "candle",
+        "celebration",
+        "party"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "people on a boat",
+    "categories_all": [
+      "person",
+      "boat"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "city street at night",
+    "categories_all": [],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "street",
+        "road",
+        "intersection"
+      ],
+      [
+        "night",
+        "evening",
+        "dark",
+        "lights"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "two kids playing",
+    "categories_all": [
+      "person"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "child",
+        "children",
+        "kid",
+        "kids"
+      ],
+      [
+        "playing",
+        "play"
+      ]
+    ],
+    "category_min_counts": {
+      "person": 2
+    }
+  },
+  {
+    "query": "a dog",
+    "categories_all": [
+      "dog"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a cat",
+    "categories_all": [
+      "cat"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "person using a cell phone",
+    "categories_all": [
+      "person",
+      "cell phone"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "laptop on a desk",
+    "categories_all": [
+      "laptop"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "desk",
+        "keyboard",
+        "table"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "people at a dining table",
+    "categories_all": [
+      "person",
+      "dining table"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "pizza on a table",
+    "categories_all": [
+      "pizza"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "table",
+        "plate",
+        "dining"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "sandwich on a plate",
+    "categories_all": [
+      "sandwich"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "plate",
+        "table",
+        "holding"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "coffee cup on a table",
+    "categories_all": [
+      "cup"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "coffee",
+        "cafe",
+        "table"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a book",
+    "categories_all": [
+      "book"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "bus on a city street",
+    "categories_all": [
+      "bus"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "street",
+        "road",
+        "traffic"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "cars parked on a street",
+    "categories_all": [
+      "car"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "parked",
+        "parking",
+        "street",
+        "road"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "truck on the road",
+    "categories_all": [
+      "truck"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "road",
+        "street",
+        "driving"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "train at a station",
+    "categories_all": [
+      "train"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "station",
+        "track",
+        "rail",
+        "train"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "airplane in the sky",
+    "categories_all": [
+      "airplane"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "sky",
+        "flying",
+        "flight",
+        "air"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "boat on the water",
+    "categories_all": [
+      "boat"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "water",
+        "sea",
+        "ocean",
+        "sailing",
+        "river"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a bicycle",
+    "categories_all": [
+      "bicycle"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a motorcycle",
+    "categories_all": [
+      "motorcycle"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "tennis players in a match",
+    "categories_all": [
+      "person",
+      "tennis racket",
+      "sports ball"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "tennis",
+        "racket"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a sports ball",
+    "categories_all": [
+      "sports ball"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a baseball game",
+    "categories_all": [
+      "person"
+    ],
+    "categories_any": [
+      "baseball bat",
+      "baseball glove"
+    ],
+    "caption_groups": [
+      [
+        "baseball",
+        "pitcher",
+        "base"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "people skiing in snow",
+    "categories_all": [
+      "person",
+      "skis"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "snow",
+        "ski",
+        "mountain"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "surfer riding a wave",
+    "categories_all": [
+      "person",
+      "surfboard"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "wave",
+        "surf",
+        "water",
+        "ocean"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "kite flying in the sky",
+    "categories_all": [
+      "kite"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "sky",
+        "flying",
+        "fly"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "skateboarder in a park",
+    "categories_all": [
+      "person",
+      "skateboard"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "park",
+        "skate",
+        "riding"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "person riding a horse",
+    "categories_all": [
+      "person",
+      "horse"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a cow",
+    "categories_all": [
+      "cow"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "an elephant",
+    "categories_all": [
+      "elephant"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a zebra",
+    "categories_all": [
+      "zebra"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a giraffe",
+    "categories_all": [
+      "giraffe"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "birds perched in trees",
+    "categories_all": [
+      "bird"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "tree",
+        "branch",
+        "perched",
+        "sitting"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "an umbrella",
+    "categories_all": [
+      "umbrella"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a person with a backpack",
+    "categories_all": [
+      "person",
+      "backpack"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a person with a handbag",
+    "categories_all": [
+      "person",
+      "handbag"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "traffic light at an intersection",
+    "categories_all": [
+      "traffic light"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "street",
+        "road",
+        "intersection"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "stop sign on a street",
+    "categories_all": [
+      "stop sign"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "street",
+        "road",
+        "intersection"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "people sitting on a bench",
+    "categories_all": [
+      "person",
+      "bench"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "sitting",
+        "sit",
+        "seated"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a couch in a living room",
+    "categories_all": [
+      "couch"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "living room",
+        "room",
+        "sofa"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a bed in a bedroom",
+    "categories_all": [
+      "bed"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "bedroom",
+        "sleep",
+        "bed"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a bathroom sink",
+    "categories_all": [
+      "sink"
+    ],
+    "categories_any": [],
+    "caption_groups": [
+      [
+        "bathroom",
+        "washroom",
+        "sink"
+      ]
+    ],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a clock",
+    "categories_all": [
+      "clock"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a potted plant",
+    "categories_all": [
+      "potted plant"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "an oven",
+    "categories_all": [
+      "oven"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a bowl of fruit",
+    "categories_all": [
+      "bowl"
+    ],
+    "categories_any": [
+      "banana",
+      "apple",
+      "orange"
+    ],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "wine glasses on a dining table",
+    "categories_all": [
+      "wine glass",
+      "dining table"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  },
+  {
+    "query": "a teddy bear",
+    "categories_all": [
+      "teddy bear"
+    ],
+    "categories_any": [],
+    "caption_groups": [],
+    "category_min_counts": {}
+  }
+]

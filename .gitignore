@@ -132,3 +132,6 @@ runtime.jsonl
 *.ipsw
 *.mobilebackup
 *.icloud
+
+# Downloaded COCO search-evaluation fixture and isolated index
+/work/search-eval/

@@ -11,6 +11,8 @@
     "react-test": "react-scripts test",
     "test:auto-indexing": "node test/runAutoIndexingTests.cjs",
     "test:semantic-isolation": "node test/runSemanticIsolationTests.cjs",
+    "search-eval": "node scripts/search-eval.cjs",
+    "test:search-eval": "node test/search-eval-core.test.cjs",
     "test:face-clustering": "node test/runFaceClusteringTests.cjs",
     "test:message-coverage": "node test/runMessageCoverageTests.cjs",
     "test:beta-license": "node test/runBetaLicenseTests.cjs && node test/runBetaReleaseCheckTests.cjs && node --check scripts/beta-license.cjs && node --check scripts/check-beta-release.cjs",

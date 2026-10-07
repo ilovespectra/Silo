@@ -28,6 +28,7 @@ const path = __importStar(require("path"));
 const fsPromises = __importStar(require("fs/promises"));
 const fs = __importStar(require("fs"));
 const os = __importStar(require("os"));
+const searchSettings_1 = require("./searchSettings");
 const indexingPathPolicy_1 = require("./indexingPathPolicy");
 const demoLimits_1 = require("./demoLimits");
 const child_process_1 = require("child_process");
@@ -52,8 +53,8 @@ const INCREMENTAL_BATCH_SIZE = 250;
 function confidenceSettingToMinimumThreshold(confidence) {
     const setting = Number.isFinite(confidence)
         ? Math.max(0, Math.min(100, confidence))
-        : 25;
-    return 100 - setting;
+        : searchSettings_1.DEFAULT_SEMANTIC_SEARCH_CONFIDENCE;
+    return setting;
 }
 exports.confidenceSettingToMinimumThreshold = confidenceSettingToMinimumThreshold;
 const plainTextExtensions = new Set([
