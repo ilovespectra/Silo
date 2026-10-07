@@ -1,0 +1,152 @@
+name: macOS arm64 signing
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/macos-arm64-signing.yml'
+      - 'electron-builder.config.cjs'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'signing/**'
+      - 'src/**'
+      - 'electron-dist/**'
+      - 'public/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and assess Silo arm64 DMG
+    runs-on: macos-15
+    env:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Confirm Apple silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Select signing mode
+        id: signing
+        shell: bash
+        run: |
+          if [[ -n "$CSC_LINK" && -n "$CSC_KEY_PASSWORD" && -n "$APPLE_ID" && -n "$APPLE_APP_SPECIFIC_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
+            echo 'mode=developer-id' >> "$GITHUB_OUTPUT"
+            echo 'Developer ID signing and notarization are enabled.'
+          else
+            echo 'mode=adhoc' >> "$GITHUB_OUTPUT"
+            echo 'One or more Apple signing secrets are missing; building an ad hoc DMG.'
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app files
+        run: npm run build
+
+      - name: Package arm64 DMG
+        run: npx electron-builder --config electron-builder.config.cjs --mac dmg --arm64 --publish never
+
+      - name: Locate and notarize DMG
+        id: dmg
+        if: steps.signing.outputs.mode == 'developer-id'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg_path="$(find release -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          xcrun notarytool store-credentials silo-notarization \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD"
+          xcrun notarytool submit "$dmg_path" \
+            --keychain-profile silo-notarization \
+            --wait \
+            --output-format json
+          xcrun stapler staple "$dmg_path"
+          echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
+
+      - name: Locate ad hoc DMG
+        id: adhoc-dmg
+        if: steps.signing.outputs.mode == 'adhoc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg_path="$(find release -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
+
+      - name: Verify signature, Gatekeeper, and stapling
+        shell: bash
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+          SIGNED_DMG: ${{ steps.dmg.outputs.path }}
+          ADHOC_DMG: ${{ steps.adhoc-dmg.outputs.path }}
+        run: |
+          set -euo pipefail
+          if [[ "$SIGNING_MODE" == 'developer-id' ]]; then
+            dmg_path="$SIGNED_DMG"
+          else
+            dmg_path="$ADHOC_DMG"
+          fi
+          test -f "$dmg_path"
+          mount_point="$RUNNER_TEMP/silo-dmg"
+          mkdir -p "$mount_point"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg_path"
+          app_path="$mount_point/Silo.app"
+          test -d "$app_path"
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+
+          if spctl -a -t exec -vv "$app_path"; then
+            if [[ "$SIGNING_MODE" == 'adhoc' ]]; then
+              echo 'Gatekeeper accepted the ad hoc build; review the assessment above.'
+            fi
+          elif [[ "$SIGNING_MODE" == 'developer-id' ]]; then
+            echo 'Gatekeeper rejected the Developer ID build.' >&2
+            exit 1
+          else
+            echo 'Gatekeeper rejection is expected for an ad hoc build.'
+          fi
+
+          if xcrun stapler validate "$app_path"; then
+            :
+          elif [[ "$SIGNING_MODE" == 'developer-id' ]]; then
+            echo 'The app stapling ticket did not validate.' >&2
+            exit 1
+          else
+            echo 'Missing stapling ticket is expected for an ad hoc build.'
+          fi
+
+          if xcrun stapler validate "$dmg_path"; then
+            :
+          elif [[ "$SIGNING_MODE" == 'developer-id' ]]; then
+            echo 'The DMG stapling ticket did not validate.' >&2
+            exit 1
+          else
+            echo 'Missing DMG stapling ticket is expected for an ad hoc build.'
+          fi
+
+          hdiutil detach "$mount_point"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-macos-arm64-${{ steps.signing.outputs.mode }}
+          path: release/*.dmg
+          if-no-files-found: error
+          retention-days: 14
