@@ -60,6 +60,12 @@ jobs:
           set -euo pipefail
           dmg_path="$(find release -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           test -n "$dmg_path"
+          echo 'Gatekeeper assessment for opening the ad hoc DMG:'
+          if spctl -a -t open --context context:primary-signature -vv "$dmg_path"; then
+            echo 'Gatekeeper accepted opening this ad hoc DMG; review the assessment above.'
+          else
+            echo 'Gatekeeper rejected opening this ad hoc DMG; it is not warning-free for direct distribution.'
+          fi
           mount_point="$RUNNER_TEMP/silo-dmg"
           mkdir -p "$mount_point"
           hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg_path"
@@ -68,9 +74,9 @@ jobs:
           test -d "$app_path"
           codesign --verify --deep --strict --verbose=2 "$app_path"
           if spctl -a -t exec -vv "$app_path"; then
-            echo 'Gatekeeper accepted this ad hoc build; review the assessment above.'
+            echo 'Gatekeeper accepted launching this ad hoc app; review the assessment above.'
           else
-            echo 'Gatekeeper rejection is expected for an ad hoc build.'
+            echo 'Gatekeeper rejected launching this ad hoc app; it is not warning-free for direct distribution.'
           fi
           if xcrun stapler validate "$app_path"; then
             echo 'An ad hoc build unexpectedly has an app notarization ticket.' >&2
@@ -190,6 +196,8 @@ jobs:
           set -euo pipefail
           dmg_path="$DMG_PATH"
           test -f "$dmg_path"
+          echo 'Gatekeeper assessment for opening the Developer ID DMG:'
+          spctl -a -t open --context context:primary-signature -vv "$dmg_path"
           mount_point="$RUNNER_TEMP/silo-dmg"
           mkdir -p "$mount_point"
           hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg_path"
@@ -197,6 +205,7 @@ jobs:
           app_path="$mount_point/Silo.app"
           test -d "$app_path"
           codesign --verify --deep --strict --verbose=2 "$app_path"
+          echo 'Gatekeeper assessment for launching the Developer ID app:'
           spctl -a -t exec -vv "$app_path"
           xcrun stapler validate "$app_path"
           xcrun stapler validate "$dmg_path"
@@ -208,6 +217,12 @@ jobs:
           set -euo pipefail
           dmg_path="$(find release -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           test -n "$dmg_path"
+          echo 'Gatekeeper assessment for opening the ad hoc fallback DMG:'
+          if spctl -a -t open --context context:primary-signature -vv "$dmg_path"; then
+            echo 'Gatekeeper accepted opening the ad hoc fallback DMG; review the assessment above.'
+          else
+            echo 'Gatekeeper rejected opening the ad hoc fallback DMG; it is not warning-free for direct distribution.'
+          fi
           mount_point="$RUNNER_TEMP/silo-dmg"
           mkdir -p "$mount_point"
           hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg_path"
@@ -215,10 +230,11 @@ jobs:
           app_path="$mount_point/Silo.app"
           test -d "$app_path"
           codesign --verify --deep --strict --verbose=2 "$app_path"
+          echo 'Gatekeeper assessment for launching the ad hoc fallback app:'
           if spctl -a -t exec -vv "$app_path"; then
-            echo 'Gatekeeper accepted the ad hoc fallback; review the assessment above.'
+            echo 'Gatekeeper accepted launching the ad hoc fallback app; review the assessment above.'
           else
-            echo 'Gatekeeper rejection is expected for an ad hoc fallback.'
+            echo 'Gatekeeper rejected launching the ad hoc fallback app; it is not warning-free for direct distribution.'
           fi
           if xcrun stapler validate "$app_path"; then
             echo 'An ad hoc fallback unexpectedly has an app ticket.' >&2
