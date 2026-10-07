@@ -9,24 +9,29 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - 'signing/**'
+      - 'scripts/**'
       - 'src/**'
       - 'electron-dist/**'
       - 'public/**'
   workflow_dispatch:
+    inputs:
+      signing_mode:
+        description: Build an ad hoc DMG or request Developer ID signing
+        type: choice
+        options:
+          - adhoc
+          - developer-id
+        default: adhoc
+        required: true
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build and assess Silo arm64 DMG
+  build-adhoc:
+    name: Build and assess ad hoc Silo arm64 DMG
+    if: github.event_name == 'pull_request' || inputs.signing_mode == 'adhoc'
     runs-on: macos-15
-    env:
-      CSC_LINK: ${{ secrets.CSC_LINK }}
-      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -40,17 +45,72 @@ jobs:
       - name: Confirm Apple silicon runner
         run: test "$(uname -m)" = arm64
 
-      - name: Select signing mode
-        id: signing
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app files
+        run: npm run build
+
+      - name: Package arm64 ad hoc DMG
+        run: npx electron-builder --config electron-builder.config.cjs --mac dmg --arm64 --publish never
+
+      - name: Verify ad hoc signature and assess Gatekeeper
         shell: bash
         run: |
-          if [[ -n "$CSC_LINK" && -n "$CSC_KEY_PASSWORD" && -n "$APPLE_ID" && -n "$APPLE_APP_SPECIFIC_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
-            echo 'mode=developer-id' >> "$GITHUB_OUTPUT"
-            echo 'Developer ID signing and notarization are enabled.'
+          set -euo pipefail
+          dmg_path="$(find release -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          mount_point="$RUNNER_TEMP/silo-dmg"
+          mkdir -p "$mount_point"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg_path"
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
+          app_path="$mount_point/Silo.app"
+          test -d "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          if spctl -a -t exec -vv "$app_path"; then
+            echo 'Gatekeeper accepted this ad hoc build; review the assessment above.'
           else
-            echo 'mode=adhoc' >> "$GITHUB_OUTPUT"
-            echo 'One or more Apple signing secrets are missing; building an ad hoc DMG.'
+            echo 'Gatekeeper rejection is expected for an ad hoc build.'
           fi
+          if xcrun stapler validate "$app_path"; then
+            echo 'An ad hoc build unexpectedly has an app notarization ticket.' >&2
+            exit 1
+          else
+            echo 'No app ticket is expected for an ad hoc build.'
+          fi
+          if xcrun stapler validate "$dmg_path"; then
+            echo 'An ad hoc build unexpectedly has a DMG notarization ticket.' >&2
+            exit 1
+          else
+            echo 'No DMG ticket is expected for an ad hoc build.'
+          fi
+
+      - name: Upload ad hoc DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-macos-arm64-adhoc
+          path: release/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  build-developer-id:
+    name: Sign, notarize, and assess Silo arm64 DMG
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.signing_mode == 'developer-id'
+    runs-on: macos-15
+    environment:
+      name: macos-signing
+    steps:
+      - name: Check out trusted main branch
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Confirm Apple silicon runner
+        run: test "$(uname -m)" = arm64
 
       - name: Install dependencies
         run: npm ci
@@ -58,13 +118,56 @@ jobs:
       - name: Build app files
         run: npm run build
 
-      - name: Package arm64 DMG
-        run: npx electron-builder --config electron-builder.config.cjs --mac dmg --arm64 --publish never
+      - name: Select signing mode from protected environment secrets
+        id: signing
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ -n "$CSC_LINK" && -n "$CSC_KEY_PASSWORD" && -n "$APPLE_ID" && -n "$APPLE_APP_SPECIFIC_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
+            echo 'mode=developer-id' >> "$GITHUB_OUTPUT"
+            echo 'All protected signing secrets are present.'
+          else
+            echo 'mode=adhoc' >> "$GITHUB_OUTPUT"
+            echo 'Signing secrets are incomplete; this run will produce an ad hoc DMG.'
+          fi
 
-      - name: Locate and notarize DMG
-        id: dmg
+      - name: Import Developer ID certificate
         if: steps.signing.outputs.mode == 'developer-id'
         shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+        run: |
+          set -euo pipefail
+          certificate_path="$RUNNER_TEMP/silo-developer-id.p12"
+          printf '%s' "$CSC_LINK" | base64 --decode > "$certificate_path"
+          test -s "$certificate_path"
+          echo "CSC_LINK=$certificate_path" >> "$GITHUB_ENV"
+
+      - name: Package Developer ID arm64 DMG
+        if: steps.signing.outputs.mode == 'developer-id'
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx electron-builder --config electron-builder.config.cjs --mac dmg --arm64 --publish never
+
+      - name: Package ad hoc arm64 DMG fallback
+        if: steps.signing.outputs.mode == 'adhoc'
+        run: npx electron-builder --config electron-builder.config.cjs --mac dmg --arm64 --publish never
+
+      - name: Notarize and staple Developer ID DMG
+        if: steps.signing.outputs.mode == 'developer-id'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           dmg_path="$(find release -maxdepth 1 -type f -name '*.dmg' -print -quit)"
@@ -78,77 +181,57 @@ jobs:
             --wait \
             --output-format json
           xcrun stapler staple "$dmg_path"
-          echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
+          echo "DMG_PATH=$dmg_path" >> "$GITHUB_ENV"
 
-      - name: Locate ad hoc DMG
-        id: adhoc-dmg
+      - name: Verify Developer ID signature, Gatekeeper, and notarization
+        if: steps.signing.outputs.mode == 'developer-id'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg_path="$DMG_PATH"
+          test -f "$dmg_path"
+          mount_point="$RUNNER_TEMP/silo-dmg"
+          mkdir -p "$mount_point"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg_path"
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
+          app_path="$mount_point/Silo.app"
+          test -d "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl -a -t exec -vv "$app_path"
+          xcrun stapler validate "$app_path"
+          xcrun stapler validate "$dmg_path"
+
+      - name: Verify ad hoc fallback signature and Gatekeeper
         if: steps.signing.outputs.mode == 'adhoc'
         shell: bash
         run: |
           set -euo pipefail
           dmg_path="$(find release -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           test -n "$dmg_path"
-          echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
-
-      - name: Verify signature, Gatekeeper, and stapling
-        shell: bash
-        env:
-          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
-          SIGNED_DMG: ${{ steps.dmg.outputs.path }}
-          ADHOC_DMG: ${{ steps.adhoc-dmg.outputs.path }}
-        run: |
-          set -euo pipefail
-          if [[ "$SIGNING_MODE" == 'developer-id' ]]; then
-            dmg_path="$SIGNED_DMG"
-          else
-            dmg_path="$ADHOC_DMG"
-          fi
-          test -f "$dmg_path"
           mount_point="$RUNNER_TEMP/silo-dmg"
           mkdir -p "$mount_point"
           hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg_path"
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
           app_path="$mount_point/Silo.app"
           test -d "$app_path"
-
-          if codesign --verify --deep --strict --verbose=2 "$app_path"; then
-            :
-          elif [[ "$SIGNING_MODE" == 'developer-id' ]]; then
-            echo 'Strict code signature verification failed for the Developer ID build.' >&2
-            exit 1
-          else
-            echo 'Strict signature verification failed for this ad hoc build; continuing with diagnostics.' >&2
-          fi
-
+          codesign --verify --deep --strict --verbose=2 "$app_path"
           if spctl -a -t exec -vv "$app_path"; then
-            if [[ "$SIGNING_MODE" == 'adhoc' ]]; then
-              echo 'Gatekeeper accepted the ad hoc build; review the assessment above.'
-            fi
-          elif [[ "$SIGNING_MODE" == 'developer-id' ]]; then
-            echo 'Gatekeeper rejected the Developer ID build.' >&2
-            exit 1
+            echo 'Gatekeeper accepted the ad hoc fallback; review the assessment above.'
           else
-            echo 'Gatekeeper rejection is expected for an ad hoc build.'
+            echo 'Gatekeeper rejection is expected for an ad hoc fallback.'
           fi
-
           if xcrun stapler validate "$app_path"; then
-            :
-          elif [[ "$SIGNING_MODE" == 'developer-id' ]]; then
-            echo 'The app stapling ticket did not validate.' >&2
+            echo 'An ad hoc fallback unexpectedly has an app ticket.' >&2
             exit 1
           else
-            echo 'Missing stapling ticket is expected for an ad hoc build.'
+            echo 'No app ticket is expected for the ad hoc fallback.'
           fi
-
           if xcrun stapler validate "$dmg_path"; then
-            :
-          elif [[ "$SIGNING_MODE" == 'developer-id' ]]; then
-            echo 'The DMG stapling ticket did not validate.' >&2
+            echo 'An ad hoc fallback unexpectedly has a DMG ticket.' >&2
             exit 1
           else
-            echo 'Missing DMG stapling ticket is expected for an ad hoc build.'
+            echo 'No DMG ticket is expected for the ad hoc fallback.'
           fi
-
-          hdiutil detach "$mount_point"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4

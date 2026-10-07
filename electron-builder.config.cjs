@@ -13,9 +13,11 @@ const hasCompleteSigningSetup = signingSecrets.every((name) => {
 
 module.exports = {
   ...packageJson.build,
+  afterPack: require('./signing/after-pack.cjs'),
   mac: {
     ...packageJson.build.mac,
-    identity: hasCompleteSigningSetup ? undefined : '-',
+    identity: hasCompleteSigningSetup ? undefined : null,
+    forceCodeSigning: hasCompleteSigningSetup,
     hardenedRuntime: true,
     entitlements: 'signing/entitlements.mac.plist',
     entitlementsInherit: 'signing/entitlements.mac.inherit.plist',
