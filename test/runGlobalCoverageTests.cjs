@@ -220,6 +220,8 @@ async function run() {
 async function runGlobalIndexSummary() {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "silo-global-index-summary-"));
   try {
+    const userData = path.join(temp, "user-data");
+    fs.mkdirSync(userData);
     const roots = [path.join(temp, "photos"), path.join(temp, "documents")];
     roots.forEach((root) => fs.mkdirSync(root));
     const files = roots.map((root, sourceIndex) =>
@@ -238,7 +240,7 @@ async function runGlobalIndexSummary() {
       const index = roots.indexOf(root);
       for (const file of files[index]) onFile(file);
     };
-    const makeIndexer = () => new SemanticIndexer(temp, temp, scan, () => {});
+    const makeIndexer = () => new SemanticIndexer(userData, temp, scan, () => {});
     let indexer = makeIndexer();
     await indexer.initialize();
     await indexer.appendRecord(files[0][0], roots[0], new Float32Array(512));

@@ -3,13 +3,6 @@ import { createReadStream } from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
-export const DEFAULT_EXTERNAL_INDEX_STORAGE_ROOT = path.join(
-  "/Volumes",
-  "BIGGERDRIVE",
-  "LOOK",
-  "DOCS",
-  "SILOCACHE",
-);
 const INDEX_STORAGE_SETTINGS_FILE = "index-storage.json";
 
 interface IndexStorageSettings {

@@ -9,10 +9,13 @@ async function run() {
   );
   let indexer;
   try {
+    const userData = path.join(directory, "user-data");
+    const sourceRoots = [path.join(directory, "source-a"), path.join(directory, "source-b")];
+    await Promise.all(sourceRoots.map((root) => fs.mkdir(root)));
     const snapshots = [];
     let scanningObserved = false;
     indexer = new SemanticIndexer(
-      directory,
+      userData,
       directory,
       async (source, onFile) => {
         for (let i = 0; i < 1200; i++) {
@@ -40,7 +43,7 @@ async function run() {
       (progress) => snapshots.push({ ...progress }),
     );
     await indexer.initialize();
-    await indexer.start(["/source-a", "/source-b"]);
+    await indexer.start(sourceRoots);
     assert(scanningObserved);
     const finished = indexer.getReconciliationProgress();
     assert.equal(finished.running, false);

@@ -28,7 +28,9 @@
     "unbrand-dev": "node scripts/brand-dev-app.js --restore",
     "dist": "npm run react-build && tsc && npm run release:check && electron-builder",
     "test:clone-archive": "node test/runCloneArchiveTests.cjs && node test/runSourceCloneTests.cjs",
-    "test:access-branding": "node test/runAccessBrandingTests.cjs"
+    "test:access-branding": "node test/runAccessBrandingTests.cjs",
+    "test:phone-restore-target": "node test/runPhoneRestoreTargetTests.cjs",
+    "test:startup-smoke": "node test/runStartupSmokeTests.cjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

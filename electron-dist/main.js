@@ -3829,8 +3829,9 @@ electron_1.app.whenReady().then(async () => {
     if (!electron_1.app.isPackaged)
         electron_1.app.dock?.setIcon(appIconPath());
     installApplicationMenu();
+    const userDataPath = electron_1.app.getPath("userData");
+    let startupStorageNotice = null;
     try {
-        const userDataPath = electron_1.app.getPath("userData");
         const storage = await (0, indexingStorage_1.prepareConfiguredIndexStorage)(userDataPath, (filesVerified, bytesVerified) => runtimeLog("index-storage-migration-progress", {
             filesVerified,
             bytesVerified,
@@ -3847,16 +3848,13 @@ electron_1.app.whenReady().then(async () => {
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        runtimeLog("external-index-storage-unavailable", { message });
-        await electron_1.dialog.showMessageBox({
-            type: "error",
-            title: "External Index Storage Unavailable",
-            message: "Connect Silo’s selected external index drive.",
-            detail: `${indexStorageRoot}\n\n${message}\n\nLocal indexing is disabled; Silo will not fall back to filling the Mac's internal storage.`,
-            buttons: ["Quit"],
+        indexStorageRoot = path.resolve(userDataPath);
+        (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
+        startupStorageNotice = `${message} Silo opened with local index storage for this session. The configured external location and its data were left untouched.`;
+        runtimeLog("external-index-storage-unavailable", {
+            message,
+            fallback: indexStorageRoot,
         });
-        electron_1.app.quit();
-        return;
     }
     // A restored config is swapped in before any store opens its files.
     try {
@@ -3876,6 +3874,16 @@ electron_1.app.whenReady().then(async () => {
     await contentSettingsStore.initialize();
     registerMediaProtocols();
     await createWindow();
+    if (startupStorageNotice && mainWindow) {
+        void electron_1.dialog.showMessageBox(mainWindow, {
+            type: "warning",
+            title: "Using Local Index Storage",
+            message: "Silo could not open the selected external storage drive.",
+            detail: startupStorageNotice,
+            buttons: ["Continue"],
+            defaultId: 0,
+        });
+    }
     reportStartup("Loading content filters…");
     await loadSafetyCache();
     const modelCachePath = electron_1.app.isPackaged

@@ -23,12 +23,11 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.prepareConfiguredIndexStorage = exports.prepareExternalIndexStorage = exports.migrateIndexStorageEntries = exports.validateIndexStorageDestination = exports.INDEX_STORAGE_ENTRIES = exports.stageIndexStorageRoot = exports.writeIndexStorageRoot = exports.readIndexStorageRoot = exports.getActiveIndexStorageRoot = exports.setActiveIndexStorageRoot = exports.DEFAULT_EXTERNAL_INDEX_STORAGE_ROOT = void 0;
+exports.prepareConfiguredIndexStorage = exports.prepareExternalIndexStorage = exports.migrateIndexStorageEntries = exports.validateIndexStorageDestination = exports.INDEX_STORAGE_ENTRIES = exports.stageIndexStorageRoot = exports.writeIndexStorageRoot = exports.readIndexStorageRoot = exports.getActiveIndexStorageRoot = exports.setActiveIndexStorageRoot = void 0;
 const crypto_1 = require("crypto");
 const fs_1 = require("fs");
 const fsPromises = __importStar(require("fs/promises"));
 const path = __importStar(require("path"));
-exports.DEFAULT_EXTERNAL_INDEX_STORAGE_ROOT = path.join("/Volumes", "BIGGERDRIVE", "LOOK", "DOCS", "SILOCACHE");
 const INDEX_STORAGE_SETTINGS_FILE = "index-storage.json";
 let activeIndexStorageRoot = "";
 function setActiveIndexStorageRoot(storageRoot) {

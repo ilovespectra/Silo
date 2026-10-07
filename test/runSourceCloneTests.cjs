@@ -90,6 +90,7 @@ const context = vm.createContext({
   isSiloCloneDirectory,
   invalidateSiloCloneDirectoryCache,
   app: { getPath: (name) => { assert.equal(name, "userData"); return userData; }, getVersion: () => "test-version" },
+  indexStorageRoot: userData,
   exportConfig: async (_userData, target) => { await fsp.writeFile(target, "test silo config and indexes"); return { size: 28 }; },
   listSources: async () => [
     { id: sourceRoot, rootPath: sourceRoot, label: "Photos", kind: "local", enabled: true, available: true },

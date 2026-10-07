@@ -4537,8 +4537,9 @@ app.whenReady().then(async () => {
   // Packaged builds carry the .icns in the bundle; development runs from Electron.app.
   if (!app.isPackaged) app.dock?.setIcon(appIconPath());
   installApplicationMenu();
+  const userDataPath = app.getPath("userData");
+  let startupStorageNotice: string | null = null;
   try {
-    const userDataPath = app.getPath("userData");
     const storage = await prepareConfiguredIndexStorage(
       userDataPath,
       (filesVerified, bytesVerified) =>
@@ -4558,16 +4559,13 @@ app.whenReady().then(async () => {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    runtimeLog("external-index-storage-unavailable", { message });
-    await dialog.showMessageBox({
-      type: "error",
-      title: "External Index Storage Unavailable",
-      message: "Connect Silo’s selected external index drive.",
-      detail: `${indexStorageRoot}\n\n${message}\n\nLocal indexing is disabled; Silo will not fall back to filling the Mac's internal storage.`,
-      buttons: ["Quit"],
+    indexStorageRoot = path.resolve(userDataPath);
+    setActiveIndexStorageRoot(indexStorageRoot);
+    startupStorageNotice = `${message} Silo opened with local index storage for this session. The configured external location and its data were left untouched.`;
+    runtimeLog("external-index-storage-unavailable", {
+      message,
+      fallback: indexStorageRoot,
     });
-    app.quit();
-    return;
   }
   // A restored config is swapped in before any store opens its files.
   try {
@@ -4591,6 +4589,16 @@ app.whenReady().then(async () => {
   await contentSettingsStore.initialize();
   registerMediaProtocols();
   await createWindow();
+  if (startupStorageNotice && mainWindow) {
+    void dialog.showMessageBox(mainWindow, {
+      type: "warning",
+      title: "Using Local Index Storage",
+      message: "Silo could not open the selected external storage drive.",
+      detail: startupStorageNotice,
+      buttons: ["Continue"],
+      defaultId: 0,
+    });
+  }
   reportStartup("Loading content filters…");
   await loadSafetyCache();
   const modelCachePath = app.isPackaged

@@ -1,4 +1,3 @@
-export declare const DEFAULT_EXTERNAL_INDEX_STORAGE_ROOT: string;
 export declare function setActiveIndexStorageRoot(storageRoot: string): void;
 export declare function getActiveIndexStorageRoot(): string;
 export declare function readIndexStorageRoot(userDataPath: string): Promise<string>;
