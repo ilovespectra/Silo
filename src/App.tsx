@@ -4560,99 +4560,113 @@ function App() {
             </nav>
           </div>
           {appSection === "files" ? (
-            <div className="semantic-search" data-tour="semantic-search">
-              <FiSearch />
-              <input
-                value={searchQuery}
-                onChange={(event) => setSearchQuery(event.target.value)}
-                onFocus={() => {
-                  setSearchFocused(true);
-                  setHistoryLevel(0);
-                }}
-                onBlur={() => setSearchFocused(false)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") rememberSearch(searchQuery);
-                  if (event.key === "Escape")
-                    (event.target as HTMLInputElement).blur();
-                }}
-                placeholder="Search images and documents by meaning"
-                aria-label="Semantic search"
-                data-help="Describe what you remember in ordinary language to find matching indexed photos and documents locally."
-              />
-              <span className="semantic-search-status" role="status" aria-live="polite">
-                {searching ? "Searching…" : searchDone ? "Done!" : ""}
-              </span>
-              {searchQuery && (
-                <button onClick={() => setSearchQuery("")} title="Clear search" aria-label="Clear search"
-                  data-help="Remove the current semantic-search query and return to the unfiltered view.">
-                  <FiX />
-                </button>
-              )}
-              {searchFocused &&
-                (() => {
-                  const query = searchQuery.trim().toLowerCase();
-                  const matches = searchHistory.filter(
-                    (item) =>
-                      !query ||
-                      (item.toLowerCase().includes(query) &&
-                        item.toLowerCase() !== query),
-                  );
-                  if (matches.length === 0) return null;
-                  const limit =
-                    historyLevel === 0
-                      ? 3
-                      : historyLevel === 1
-                        ? 10
-                        : matches.length;
-                  return (
-                    // preventDefault keeps focus in the input while choosing an entry.
-                    <div
-                      className={`search-history ${historyLevel === 2 ? "expanded" : ""}`}
-                      onMouseDown={(event) => event.preventDefault()}
-                    >
-                      <span className="search-history-label">
-                        Recent searches
-                      </span>
-                      <div className="search-history-list">
-                        {matches.slice(0, limit).map((item) => (
-                          <div className="search-history-item" key={item}>
-                            <button
-                              onClick={() => {
-                                setSearchQuery(item);
-                                rememberSearch(item);
-                                setSearchFocused(false);
-                              }}
-                            >
-                              <span>{item}</span>
-                            </button>
-                            <button
-                              className="search-history-remove"
-                              onClick={() => forgetSearch(item)}
-                              title="Remove from history"
-                            >
-                              <FiX />
-                            </button>
-                          </div>
-                        ))}
+            <div className="header-search-group">
+              <div className="semantic-search" data-tour="semantic-search">
+                <FiSearch />
+                <input
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  onFocus={() => {
+                    setSearchFocused(true);
+                    setHistoryLevel(0);
+                  }}
+                  onBlur={() => setSearchFocused(false)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") rememberSearch(searchQuery);
+                    if (event.key === "Escape")
+                      (event.target as HTMLInputElement).blur();
+                  }}
+                  placeholder="Search images and documents by meaning"
+                  aria-label="Semantic search"
+                  data-help="Describe what you remember in ordinary language to find matching indexed photos and documents locally."
+                />
+                <span className="semantic-search-status" role="status" aria-live="polite">
+                  {searching ? "Searching…" : searchDone ? "Done!" : ""}
+                </span>
+                {searchQuery && (
+                  <button onClick={() => setSearchQuery("")} title="Clear search" aria-label="Clear search"
+                    data-help="Remove the current semantic-search query and return to the unfiltered view.">
+                    <FiX />
+                  </button>
+                )}
+                {searchFocused &&
+                  (() => {
+                    const query = searchQuery.trim().toLowerCase();
+                    const matches = searchHistory.filter(
+                      (item) =>
+                        !query ||
+                        (item.toLowerCase().includes(query) &&
+                          item.toLowerCase() !== query),
+                    );
+                    if (matches.length === 0) return null;
+                    const limit =
+                      historyLevel === 0
+                        ? 3
+                        : historyLevel === 1
+                          ? 10
+                          : matches.length;
+                    return (
+                      // preventDefault keeps focus in the input while choosing an entry.
+                      <div
+                        className={`search-history ${historyLevel === 2 ? "expanded" : ""}`}
+                        onMouseDown={(event) => event.preventDefault()}
+                      >
+                        <span className="search-history-label">
+                          Recent searches
+                        </span>
+                        <div className="search-history-list">
+                          {matches.slice(0, limit).map((item) => (
+                            <div className="search-history-item" key={item}>
+                              <button
+                                onClick={() => {
+                                  setSearchQuery(item);
+                                  rememberSearch(item);
+                                  setSearchFocused(false);
+                                }}
+                              >
+                                <span>{item}</span>
+                              </button>
+                              <button
+                                className="search-history-remove"
+                                onClick={() => forgetSearch(item)}
+                                title="Remove from history"
+                              >
+                                <FiX />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                        {matches.length > limit && (
+                          <button
+                            className="search-history-more"
+                            onClick={() =>
+                              setHistoryLevel((level) => (level === 0 ? 1 : 2))
+                            }
+                            title={
+                              historyLevel === 0
+                                ? "Show 10 recent searches"
+                                : "Show all recent searches"
+                            }
+                          >
+                            …
+                          </button>
+                        )}
                       </div>
-                      {matches.length > limit && (
-                        <button
-                          className="search-history-more"
-                          onClick={() =>
-                            setHistoryLevel((level) => (level === 0 ? 1 : 2))
-                          }
-                          title={
-                            historyLevel === 0
-                              ? "Show 10 recent searches"
-                              : "Show all recent searches"
-                          }
-                        >
-                          …
-                        </button>
-                      )}
-                    </div>
-                  );
-                })()}
+                    );
+                  })()}
+              </div>
+              <button
+                className={`btn explode-button header-tool-explode ${exploded ? "active" : ""}`}
+                onClick={() => changeExploded(!exploded)}
+                title={
+                  audioOnlySelected
+                    ? "Flatten audio into a single list"
+                    : "Flatten every nested file into one view"
+                }
+                data-help="Temporarily flatten nested folders into one list view; it does not move files."
+              >
+                <FiZap /> {exploded ? "Exploded" : "Explode"}
+              </button>
             </div>
           ) : appSection === "people" ? (
             <div className="face-header-progress">
@@ -4744,18 +4758,6 @@ function App() {
           >
             {appSection === "files" ? (
               <>
-                <button
-                  className={`btn explode-button header-tool-explode ${exploded ? "active" : ""}`}
-                  onClick={() => changeExploded(!exploded)}
-                  title={
-                    audioOnlySelected
-                      ? "Flatten audio into a single list"
-                      : "Flatten every nested file into one view"
-                  }
-                  data-help="Temporarily flatten nested folders into one list view; it does not move files."
-                >
-                  <FiZap /> {exploded ? "Exploded" : "Explode"}
-                </button>
                 <button
                   className="btn btn-icon header-tool-item"
                   onClick={createFolder}
