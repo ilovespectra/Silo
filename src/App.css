@@ -192,16 +192,43 @@ body {
   position: sticky;
   top: 0;
   z-index: 100;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(220px, min(34vw, 460px)) minmax(0, 1fr);
-  gap: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   min-width: 0;
-  align-items: center;
-  padding: 10px clamp(12px, 1.5vw, 24px);
+  padding: 8px clamp(12px, 1.5vw, 24px);
   background: var(--surface-header);
   color: var(--text);
   border-bottom: 1px solid var(--line);
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
+}
+
+.header-primary {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) minmax(280px, 1fr) max-content;
+  gap: 12px;
+  min-width: 0;
+  align-items: center;
+}
+
+.header-tools-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-directory,
+.header-navigation-buttons {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+}
+
+.header-navigation-buttons {
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
 }
 
 .search-policy-error {
@@ -433,16 +460,16 @@ body {
 .header-left {
   display: flex;
   min-width: 0;
-  gap: 12px;
+  gap: 10px;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .app-tabs {
   display: flex;
   min-width: 0;
-  gap: 3px;
-  flex-wrap: wrap;
+  gap: 2px;
+  flex-wrap: nowrap;
   padding: 3px;
   border: 1px solid var(--line);
   border-radius: 5px;
@@ -451,9 +478,10 @@ body {
 
 .app-tabs button {
   display: flex;
+  white-space: nowrap;
   align-items: center;
-  gap: 5px;
-  padding: 6px 9px;
+  gap: 4px;
+  padding: 6px 8px;
   border: 0;
   border-radius: 3px;
   background: transparent;
@@ -489,10 +517,57 @@ body {
 .header-right {
   display: flex;
   min-width: 0;
-  gap: 8px;
-  justify-content: flex-end;
+  gap: 4px;
+  justify-content: flex-start;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+}
+
+.header-right .header-tool-explode {
+  order: 1;
+}
+
+.header-right .header-tool-view {
+  order: 2;
+}
+
+.header-right .header-tool-filter {
+  order: 3;
+  margin-left: 4px;
+}
+
+.header-right .header-tool-item {
+  order: 4;
+}
+
+.header-right .header-tool-selection {
+  order: 5;
+}
+
+.header-navigation-buttons .btn-icon,
+.header-right .btn-icon:not([aria-label="Sort and filter files"]) {
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  min-height: 36px;
+  flex: 0 0 36px;
+  padding: 7px;
+}
+
+.header-right .header-tool-item[aria-label="New folder"],
+.header-right .header-tool-selection[aria-label="Select all files"] {
+  position: relative;
+  margin-left: 7px;
+}
+
+.header-right .header-tool-item[aria-label="New folder"]::before,
+.header-right .header-tool-selection[aria-label="Select all files"]::before {
+  position: absolute;
+  top: 7px;
+  left: -6px;
+  height: 22px;
+  border-left: 1px solid var(--line);
+  content: "";
 }
 
 .header-tools-toggle {
@@ -515,12 +590,8 @@ body {
   color: var(--orange-bright);
 }
 
-.header-tools-collapsed > :nth-child(2),
-.header-tools-collapsed > .header-right {
-  display: none;
-}
-
-.header-tools-collapsed .header-left > .btn {
+.header-tools-collapsed .semantic-search,
+.header-tools-collapsed .header-tools-row {
   display: none;
 }
 
@@ -7091,21 +7162,35 @@ input[type="range"]::-moz-range-progress {
 }
 
 @media (max-width: 1024px) {
-  .header {
-    grid-template-columns: minmax(0, 1fr);
-    padding: 10px 14px;
-  }
-
-  .header-left,
-  .header > :nth-child(2),
-  .header-right {
-    grid-column: 1;
-    grid-row: auto;
-    width: 100%;
+  .header-primary {
+    grid-template-columns: minmax(0, 1fr) max-content;
   }
 
   .header-left {
-    gap: 8px;
+    grid-column: 1 / -1;
+  }
+
+  .header-primary > .semantic-search,
+  .header-primary > .face-header-progress,
+  .header-primary > .header-primary-spacer {
+    grid-column: 1;
+    grid-row: 2;
+    width: 100%;
+  }
+
+  .header-primary > .header-tools-toggle {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .header-tools-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .header-directory,
+  .header-right {
+    width: 100%;
   }
 
   .semantic-search {
@@ -7114,12 +7199,24 @@ input[type="range"]::-moz-range-progress {
 
   .header-right {
     justify-content: flex-start;
+    flex-wrap: wrap;
   }
 }
 
 @media (max-width: 600px) {
   .header {
     padding: 9px 10px;
+  }
+
+  .header-primary {
+    grid-template-columns: minmax(0, 1fr) max-content;
+    gap: 8px;
+  }
+
+  .header-left {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 7px;
   }
 
   .header-left h1 {
@@ -7129,6 +7226,7 @@ input[type="range"]::-moz-range-progress {
   .app-tabs {
     width: 100%;
     justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .app-tabs button {
@@ -7142,6 +7240,10 @@ input[type="range"]::-moz-range-progress {
 
   .header-right {
     gap: 6px;
+  }
+
+  .header-directory {
+    flex-wrap: wrap;
   }
 
   .library-sidebar {
@@ -7210,14 +7312,21 @@ input[type="range"]::-moz-range-progress {
   }
 
   .header {
-    flex-direction: column;
     gap: 12px;
-    align-items: flex-start;
+  }
+
+  .header-primary {
+    grid-template-columns: minmax(0, 1fr) max-content;
+  }
+
+  .header-tools-row {
+    gap: 8px;
   }
 
   .header-right {
     width: 100%;
-    justify-content: flex-end;
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .file-grid {

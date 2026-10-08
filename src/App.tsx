@@ -4488,66 +4488,176 @@ function App() {
         </div>
       )}
       <header className={`header${headerToolsCollapsed ? " header-tools-collapsed" : ""}`}>
-        <div className="header-left" data-help="Use Back, Forward, and Parent to navigate folder history; Refresh reloads the current source view. These controls do not alter the underlying files.">
-          <h1>silo</h1>
-          <nav className="app-tabs" data-tour="app-tabs">
-            <button className={appSection === "memories" ? "active" : ""}
-                          onClick={() => setAppSection("memories")}
-                          data-tour="memories-tab"
-                          data-help="Open the story-video area. Browse suggestions and create or export a memory only when you choose."><FiPlay /> Memories</button>
-            <button
-              className={appSection === "files" ? "active" : ""}
-              onClick={() => setAppSection("files")}
-              data-help="Browse local folders, connected cloud accounts, and saved device sources; search and organize their files."
-            >
-              <FiGrid /> Files
-            </button>
-            <button
-              className={appSection === "people" ? "active" : ""}
-              onClick={() => setAppSection("people")}
-              data-help="Review offline face clusters, name people, and correct or merge their photo assignments."
-            >
-              <FiUsers /> People
-            </button>
-            <button
-              className={appSection === "map" ? "active" : ""}
-              onClick={() => setAppSection("map")}
-              data-help="Explore geotagged photos by place and update selected photos’ location metadata."
-            >
-              <FiMap /> Map
-            </button>
-            <button
-              className={appSection === "duplicates" ? "active" : ""}
-              onClick={() => setAppSection("duplicates")}
-              data-help="Compare exact duplicate files, review recoverable removals, and verify before permanent deletion."
-            >
-              <FiCopy /> Duplicates
-            </button>
-            <button
-              className={appSection === "mobile" ? "active" : ""}
-              onClick={() => setAppSection("mobile")}
-              data-help="Connect phones and tablets, browse saved copies, and review or export message histories."
-            >
-              <FiSmartphone /> Mobile
-            </button>
-            <button
-              onClick={() => setShowSettings(true)}
-              title="Settings"
-              aria-label="Settings"
-              data-help="Open appearance, content protection, memory storage, configuration backup, bug reporting, and full Library Statistics."
-            >
-              <FiSettings />
-            </button>
-            <button
-              onClick={() => setShowLocalHelp(true)}
-              title="Local help and replay the guided tour"
-              aria-label="Open Silo Help"
-              data-tour="help-button"
-              data-help="Search the built-in local help and replay the guided tour; no live AI or network call is used."
-            >
-              <FiHelpCircle /> Help
-            </button>
-          </nav>
+        <div className="header-primary">
+          <div className="header-left">
+            <h1>silo</h1>
+            <nav className="app-tabs" data-tour="app-tabs">
+              <button className={appSection === "memories" ? "active" : ""}
+                            onClick={() => setAppSection("memories")}
+                            data-tour="memories-tab"
+                            data-help="Open the story-video area. Browse suggestions and create or export a memory only when you choose."><FiPlay /> Memories</button>
+              <button
+                className={appSection === "files" ? "active" : ""}
+                onClick={() => setAppSection("files")}
+                data-help="Browse local folders, connected cloud accounts, and saved device sources; search and organize their files."
+              >
+                <FiGrid /> Files
+              </button>
+              <button
+                className={appSection === "people" ? "active" : ""}
+                onClick={() => setAppSection("people")}
+                data-help="Review offline face clusters, name people, and correct or merge their photo assignments."
+              >
+                <FiUsers /> People
+              </button>
+              <button
+                className={appSection === "map" ? "active" : ""}
+                onClick={() => setAppSection("map")}
+                data-help="Explore geotagged photos by place and update selected photos’ location metadata."
+              >
+                <FiMap /> Map
+              </button>
+              <button
+                className={appSection === "duplicates" ? "active" : ""}
+                onClick={() => setAppSection("duplicates")}
+                data-help="Compare exact duplicate files, review recoverable removals, and verify before permanent deletion."
+              >
+                <FiCopy /> Duplicates
+              </button>
+              <button
+                className={appSection === "mobile" ? "active" : ""}
+                onClick={() => setAppSection("mobile")}
+                data-help="Connect phones and tablets, browse saved copies, and review or export message histories."
+              >
+                <FiSmartphone /> Mobile
+              </button>
+              <button
+                onClick={() => setShowSettings(true)}
+                title="Settings"
+                aria-label="Settings"
+                data-help="Open appearance, content protection, memory storage, configuration backup, bug reporting, and full Library Statistics."
+              >
+                <FiSettings />
+              </button>
+              <button
+                onClick={() => setShowLocalHelp(true)}
+                title="Local help and replay the guided tour"
+                aria-label="Open Silo Help"
+                data-tour="help-button"
+                data-help="Search the built-in local help and replay the guided tour; no live AI or network call is used."
+              >
+                <FiHelpCircle /> Help
+              </button>
+            </nav>
+          </div>
+          {appSection === "files" ? (
+            <div className="semantic-search" data-tour="semantic-search">
+              <FiSearch />
+              <input
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                onFocus={() => {
+                  setSearchFocused(true);
+                  setHistoryLevel(0);
+                }}
+                onBlur={() => setSearchFocused(false)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") rememberSearch(searchQuery);
+                  if (event.key === "Escape")
+                    (event.target as HTMLInputElement).blur();
+                }}
+                placeholder="Search images and documents by meaning"
+                aria-label="Semantic search"
+                data-help="Describe what you remember in ordinary language to find matching indexed photos and documents locally."
+              />
+              <span className="semantic-search-status" role="status" aria-live="polite">
+                {searching ? "Searching…" : searchDone ? "Done!" : ""}
+              </span>
+              {searchQuery && (
+                <button onClick={() => setSearchQuery("")} title="Clear search" aria-label="Clear search"
+                  data-help="Remove the current semantic-search query and return to the unfiltered view.">
+                  <FiX />
+                </button>
+              )}
+              {searchFocused &&
+                (() => {
+                  const query = searchQuery.trim().toLowerCase();
+                  const matches = searchHistory.filter(
+                    (item) =>
+                      !query ||
+                      (item.toLowerCase().includes(query) &&
+                        item.toLowerCase() !== query),
+                  );
+                  if (matches.length === 0) return null;
+                  const limit =
+                    historyLevel === 0
+                      ? 3
+                      : historyLevel === 1
+                        ? 10
+                        : matches.length;
+                  return (
+                    // preventDefault keeps focus in the input while choosing an entry.
+                    <div
+                      className={`search-history ${historyLevel === 2 ? "expanded" : ""}`}
+                      onMouseDown={(event) => event.preventDefault()}
+                    >
+                      <span className="search-history-label">
+                        Recent searches
+                      </span>
+                      <div className="search-history-list">
+                        {matches.slice(0, limit).map((item) => (
+                          <div className="search-history-item" key={item}>
+                            <button
+                              onClick={() => {
+                                setSearchQuery(item);
+                                rememberSearch(item);
+                                setSearchFocused(false);
+                              }}
+                            >
+                              <span>{item}</span>
+                            </button>
+                            <button
+                              className="search-history-remove"
+                              onClick={() => forgetSearch(item)}
+                              title="Remove from history"
+                            >
+                              <FiX />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      {matches.length > limit && (
+                        <button
+                          className="search-history-more"
+                          onClick={() =>
+                            setHistoryLevel((level) => (level === 0 ? 1 : 2))
+                          }
+                          title={
+                            historyLevel === 0
+                              ? "Show 10 recent searches"
+                              : "Show all recent searches"
+                          }
+                        >
+                          …
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
+            </div>
+          ) : appSection === "people" ? (
+            <div className="face-header-progress">
+              <span>
+                {faceProgress.processed.toLocaleString()} photos scanned
+              </span>
+              <strong>
+                {faceProgress.faces.toLocaleString()} faces ·{" "}
+                {faceProgress.people.toLocaleString()} people
+              </strong>
+            </div>
+          ) : (
+            <div className="header-primary-spacer" />
+          )}
           <button
             className="header-tools-toggle"
             type="button"
@@ -4558,294 +4668,190 @@ function App() {
             <FiChevronDown aria-hidden="true" />
             {headerToolsCollapsed ? "Show tools" : "Hide tools"}
           </button>
-          {appSection === "files" && (
-            <button className="btn btn-primary" onClick={selectDirectory}
-              data-help="Choose a folder on this Mac and add it to Files as a source for browsing and indexing.">
-              <FiDownload /> Open Directory
-            </button>
-          )}
-          {appSection === "files" && (currentPath || activeDigitalFolderId) && (
-            <>
-              <button
-                className="btn btn-icon"
-                onClick={() => navigateHistory(historyIndex - 1)}
-                disabled={historyIndex <= 0}
-                title="Back"
-                aria-label="Back"
-                data-help="Return to the previous folder or library view in your navigation history."
-              >
-                <FiChevronLeft />
-              </button>
-              <button
-                className="btn btn-icon"
-                onClick={() => navigateHistory(historyIndex + 1)}
-                disabled={historyIndex >= navigationHistory.length - 1}
-                title="Forward"
-                aria-label="Forward"
-                data-help="Move forward to the next folder or library view in your navigation history."
-              >
-                <FiChevronRight />
-              </button>
-              {(currentPath || activeDigitalFolderId) && (
-                <button
-                  className="btn btn-icon"
-                  onClick={navigateUp}
-                  disabled={currentPath === allSourcesPath}
-                  title="Parent folder"
-                  aria-label="Parent folder"
-                  data-help="Go up one folder level in the current source."
-                >
-                  <FiArrowUp />
-                </button>
-              )}
-              <button
-                className="btn btn-icon"
-                onClick={() =>
-                  currentPath
-                    ? loadDirectory(currentPath)
-                    : activeDigitalFolderId &&
-                      navigateToDigitalFolder(activeDigitalFolderId, false)
-                }
-                title="Refresh"
-                aria-label="Refresh current folder"
-                data-help="Reload the current directory or digital-folder contents from its source."
-              >
-                <FiRefreshCw />
-              </button>
-            </>
-          )}
         </div>
-        {appSection === "files" ? (
-          <div className="semantic-search" data-tour="semantic-search">
-            <FiSearch />
-            <input
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
-              onFocus={() => {
-                setSearchFocused(true);
-                setHistoryLevel(0);
-              }}
-              onBlur={() => setSearchFocused(false)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") rememberSearch(searchQuery);
-                if (event.key === "Escape")
-                  (event.target as HTMLInputElement).blur();
-              }}
-              placeholder="Search images and documents by meaning"
-              aria-label="Semantic search"
-              data-help="Describe what you remember in ordinary language to find matching indexed photos and documents locally."
-            />
-            <span className="semantic-search-status" role="status" aria-live="polite">
-              {searching ? "Searching…" : searchDone ? "Done!" : ""}
-            </span>
-            {searchQuery && (
-              <button onClick={() => setSearchQuery("")} title="Clear search" aria-label="Clear search"
-                data-help="Remove the current semantic-search query and return to the unfiltered view.">
-                <FiX />
-              </button>
-            )}
-            {searchFocused &&
-              (() => {
-                const query = searchQuery.trim().toLowerCase();
-                const matches = searchHistory.filter(
-                  (item) =>
-                    !query ||
-                    (item.toLowerCase().includes(query) &&
-                      item.toLowerCase() !== query),
-                );
-                if (matches.length === 0) return null;
-                const limit =
-                  historyLevel === 0
-                    ? 3
-                    : historyLevel === 1
-                      ? 10
-                      : matches.length;
-                return (
-                  // preventDefault keeps focus in the input while choosing an entry.
-                  <div
-                    className={`search-history ${historyLevel === 2 ? "expanded" : ""}`}
-                    onMouseDown={(event) => event.preventDefault()}
-                  >
-                    <span className="search-history-label">
-                      Recent searches
-                    </span>
-                    <div className="search-history-list">
-                      {matches.slice(0, limit).map((item) => (
-                        <div className="search-history-item" key={item}>
-                          <button
-                            onClick={() => {
-                              setSearchQuery(item);
-                              rememberSearch(item);
-                              setSearchFocused(false);
-                            }}
-                          >
-                            <span>{item}</span>
-                          </button>
-                          <button
-                            className="search-history-remove"
-                            onClick={() => forgetSearch(item)}
-                            title="Remove from history"
-                          >
-                            <FiX />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                    {matches.length > limit && (
-                      <button
-                        className="search-history-more"
-                        onClick={() =>
-                          setHistoryLevel((level) => (level === 0 ? 1 : 2))
-                        }
-                        title={
-                          historyLevel === 0
-                            ? "Show 10 recent searches"
-                            : "Show all recent searches"
-                        }
-                      >
-                        …
-                      </button>
-                    )}
+        <div className="header-tools-row">
+          <div className="header-directory" data-help="Use Back, Forward, and Parent to navigate folder history; Refresh reloads the current source view. These controls do not alter the underlying files.">
+            {appSection === "files" && (
+              <>
+                <button className="btn btn-primary" onClick={selectDirectory}
+                  data-help="Choose a folder on this Mac and add it to Files as a source for browsing and indexing.">
+                  <FiDownload /> Open Directory
+                </button>
+                {(currentPath || activeDigitalFolderId) && (
+                  <div className="header-navigation-buttons">
+                    <button
+                      className="btn btn-icon"
+                      onClick={() => navigateHistory(historyIndex - 1)}
+                      disabled={historyIndex <= 0}
+                      title="Back"
+                      aria-label="Back"
+                      data-help="Return to the previous folder or library view in your navigation history."
+                    >
+                      <FiChevronLeft />
+                    </button>
+                    <button
+                      className="btn btn-icon"
+                      onClick={() => navigateHistory(historyIndex + 1)}
+                      disabled={historyIndex >= navigationHistory.length - 1}
+                      title="Forward"
+                      aria-label="Forward"
+                      data-help="Move forward to the next folder or library view in your navigation history."
+                    >
+                      <FiChevronRight />
+                    </button>
+                    <button
+                      className="btn btn-icon"
+                      onClick={navigateUp}
+                      disabled={currentPath === allSourcesPath}
+                      title="Parent folder"
+                      aria-label="Parent folder"
+                      data-help="Go up one folder level in the current source."
+                    >
+                      <FiArrowUp />
+                    </button>
+                    <button
+                      className="btn btn-icon"
+                      onClick={() =>
+                        currentPath
+                          ? loadDirectory(currentPath)
+                          : activeDigitalFolderId &&
+                            navigateToDigitalFolder(activeDigitalFolderId, false)
+                      }
+                      title="Refresh"
+                      aria-label="Refresh current folder"
+                      data-help="Reload the current directory or digital-folder contents from its source."
+                    >
+                      <FiRefreshCw />
+                    </button>
                   </div>
-                );
-              })()}
+                )}
+              </>
+            )}
           </div>
-        ) : appSection === "people" ? (
-          <div className="face-header-progress">
-            <span>
-              {faceProgress.processed.toLocaleString()} photos scanned
-            </span>
-            <strong>
-              {faceProgress.faces.toLocaleString()} faces ·{" "}
-              {faceProgress.people.toLocaleString()} people
-            </strong>
+          <div
+            className="header-right"
+            data-tour={appSection === "files" ? "file-actions" : undefined}
+            data-help={appSection === "files" ? "These actions change the current file view or apply to selected files. Move and New folder affect real files; Set virtual name only changes Silo’s label." : undefined}
+          >
+            {appSection === "files" ? (
+              <>
+                <button
+                  className={`btn explode-button header-tool-explode ${exploded ? "active" : ""}`}
+                  onClick={() => changeExploded(!exploded)}
+                  title={
+                    audioOnlySelected
+                      ? "Flatten audio into a single list"
+                      : "Flatten every nested file into one view"
+                  }
+                  data-help="Temporarily flatten nested folders into one list view; it does not move files."
+                >
+                  <FiZap /> {exploded ? "Exploded" : "Explode"}
+                </button>
+                <button
+                  className="btn btn-icon header-tool-item"
+                  onClick={createFolder}
+                  disabled={!currentPath}
+                  title="New folder"
+                  aria-label="New folder"
+                  data-help="Create a real folder inside the currently open source directory."
+                >
+                  <FiFolderPlus />
+                </button>
+                <button
+                  className="btn btn-icon header-tool-item"
+                  onClick={moveSelectedFile}
+                  disabled={!selectedFile || selectedFile.isDirectory}
+                  title="Move selected file"
+                  aria-label="Move selected file"
+                  data-help="Choose a destination and move the selected file on disk. Review the destination before confirming."
+                >
+                  <FiMove />
+                </button>
+                <button
+                  className="btn btn-icon header-tool-item"
+                  onClick={editVirtualName}
+                  disabled={metadataTargets.length !== 1}
+                  title="Set virtual name"
+                  aria-label="Set virtual name"
+                  data-help="Change the name Silo displays and searches for this file without renaming the file on disk."
+                >
+                  <FiEdit3 />
+                </button>
+                <button
+                  className="btn btn-icon header-tool-item"
+                  onClick={editKeywords}
+                  disabled={metadataTargets.length === 0}
+                  title="Edit search keywords"
+                  aria-label="Edit search keywords"
+                  data-help="Add or edit local keywords that help Silo find the selected files."
+                >
+                  <FiTag />
+                </button>
+                <button
+                  className={`btn btn-icon header-tool-view ${viewMode === "list" ? "active" : ""}`}
+                  onClick={() => setViewMode("list")}
+                  title="List view"
+                  aria-label="List view"
+                  data-help="Show files as rows with additional columns and details."
+                >
+                  <FiList />
+                </button>
+                <button
+                  className={`btn btn-icon header-tool-view ${viewMode === "grid" ? "active" : ""}`}
+                  onClick={() => setViewMode("grid")}
+                  title="Grid view"
+                  aria-label="Grid view"
+                  data-help="Show files as a visual thumbnail grid."
+                >
+                  <FiGrid />
+                </button>
+                <button
+                  className={`btn btn-icon header-tool-filter ${showFilters ? "active" : ""}`}
+                  onClick={() => setShowFilters(!showFilters)}
+                  title="Sort and filter files"
+                  aria-label="Sort and filter files"
+                  data-help="Choose a sort order and filter by type, year, people, or location. These controls work in both List and Grid views."
+                >
+                  <FiSliders /> Sort &amp; Filter
+                </button>
+                {(currentPath || activeDigitalFolderId) && (
+                  <>
+                    <button
+                      className="btn btn-icon header-tool-selection"
+                      onClick={selectAllFiles}
+                      disabled={
+                        filteredAndSortedFiles.filter((f) => !f.isDirectory)
+                        .length === 0
+                      }
+                      title="Select all files (Cmd+A)"
+                      aria-label="Select all files"
+                      data-help="Select every currently visible file in this view."
+                    >
+                      <FiCheck />
+                    </button>
+                    <button
+                      className="btn btn-icon header-tool-selection"
+                      onClick={clearAllFiles}
+                      disabled={selectedFilePaths.size === 0}
+                      title="Clear selection"
+                      aria-label="Clear selection"
+                      data-help="Clear the current file selection without changing any files."
+                    >
+                      <FiX />
+                    </button>
+                  </>
+                )}
+              </>
+            ) : appSection === "people" ? (
+              <button
+                className="btn btn-primary"
+                onClick={createPerson}
+                data-tour="new-person"
+              >
+                <FiUserPlus /> New Person
+              </button>
+            ) : null}
           </div>
-        ) : (
-          <div />
-        )}
-        <div
-          className="header-right"
-          data-tour={appSection === "files" ? "file-actions" : undefined}
-          data-help={appSection === "files" ? "These actions change the current file view or apply to selected files. Move and New folder affect real files; Set virtual name only changes Silo’s label." : undefined}
-        >
-          {appSection === "files" ? (
-            <>
-              <button
-                className={`btn explode-button ${exploded ? "active" : ""}`}
-                onClick={() => changeExploded(!exploded)}
-                title={
-                  audioOnlySelected
-                    ? "Flatten audio into a single list"
-                    : "Flatten every nested file into one view"
-                }
-                data-help="Temporarily flatten nested folders into one list view; it does not move files."
-              >
-                <FiZap /> {exploded ? "Exploded" : "Explode"}
-              </button>
-              <button
-                className="btn btn-icon"
-                onClick={createFolder}
-                disabled={!currentPath}
-                title="New folder"
-                aria-label="New folder"
-                data-help="Create a real folder inside the currently open source directory."
-              >
-                <FiFolderPlus />
-              </button>
-              <button
-                className="btn btn-icon"
-                onClick={moveSelectedFile}
-                disabled={!selectedFile || selectedFile.isDirectory}
-                title="Move selected file"
-                aria-label="Move selected file"
-                data-help="Choose a destination and move the selected file on disk. Review the destination before confirming."
-              >
-                <FiMove />
-              </button>
-              <button
-                className="btn btn-icon"
-                onClick={editVirtualName}
-                disabled={metadataTargets.length !== 1}
-                title="Set virtual name"
-                aria-label="Set virtual name"
-                data-help="Change the name Silo displays and searches for this file without renaming the file on disk."
-              >
-                <FiEdit3 />
-              </button>
-              <button
-                className="btn btn-icon"
-                onClick={editKeywords}
-                disabled={metadataTargets.length === 0}
-                title="Edit search keywords"
-                aria-label="Edit search keywords"
-                data-help="Add or edit local keywords that help Silo find the selected files."
-              >
-                <FiTag />
-              </button>
-              <button
-                className={`btn btn-icon ${viewMode === "list" ? "active" : ""}`}
-                onClick={() => setViewMode("list")}
-                title="List view"
-                aria-label="List view"
-                data-help="Show files as rows with additional columns and details."
-              >
-                <FiList />
-              </button>
-              <button
-                className={`btn btn-icon ${viewMode === "grid" ? "active" : ""}`}
-                onClick={() => setViewMode("grid")}
-                title="Grid view"
-                aria-label="Grid view"
-                data-help="Show files as a visual thumbnail grid."
-              >
-                <FiGrid />
-              </button>
-              <button
-                className={`btn btn-icon ${showFilters ? "active" : ""}`}
-                onClick={() => setShowFilters(!showFilters)}
-                title="Sort and filter files"
-                aria-label="Sort and filter files"
-                data-help="Choose a sort order and filter by type, year, people, or location. These controls work in both List and Grid views."
-              >
-                <FiSliders /> Sort &amp; Filter
-              </button>
-              {(currentPath || activeDigitalFolderId) && (
-                <>
-                  <button
-                    className="btn btn-icon"
-                    onClick={selectAllFiles}
-                    disabled={
-                      filteredAndSortedFiles.filter((f) => !f.isDirectory)
-                      .length === 0
-                    }
-                    title="Select all files (Cmd+A)"
-                    aria-label="Select all files"
-                    data-help="Select every currently visible file in this view."
-                  >
-                    <FiCheck />
-                  </button>
-                  <button
-                    className="btn btn-icon"
-                    onClick={clearAllFiles}
-                    disabled={selectedFilePaths.size === 0}
-                    title="Clear selection"
-                    aria-label="Clear selection"
-                    data-help="Clear the current file selection without changing any files."
-                  >
-                    <FiX />
-                  </button>
-                </>
-              )}
-            </>
-          ) : appSection === "people" ? (
-            <button
-              className="btn btn-primary"
-              onClick={createPerson}
-              data-tour="new-person"
-            >
-              <FiUserPlus /> New Person
-            </button>
-          ) : null}
         </div>
       </header>
 
