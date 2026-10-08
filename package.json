@@ -1,6 +1,6 @@
 {
   "name": "silo",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "A local-first media library with semantic search, people, maps, messages, and duplicate management.",
   "main": "electron-dist/main.js",
   "homepage": "./",

@@ -415,7 +415,7 @@ function FileThumbnail({
 }: {
   file: FileInfo;
   onOpen: () => void;
-  onThumbnailLoaded?: (filePath: string) => void;
+  onThumbnailLoaded?: (filePath: string, file: FileInfo) => void;
   onAddPeople?: () => void;
   thumbnailSize?: number;
 }) {
@@ -445,7 +445,7 @@ function FileThumbnail({
   }, [isPreviewable]);
 
   useEffect(() => {
-    if (thumbnail) onThumbnailLoaded?.(file.path);
+    if (thumbnail) onThumbnailLoaded?.(file.path, file);
   }, [file.path, onThumbnailLoaded, thumbnail]);
 
   return (
@@ -532,6 +532,7 @@ function App() {
   const [loadedThumbnailPaths, setLoadedThumbnailPaths] = useState<Set<string>>(
     new Set(),
   );
+  const loadedThumbnailFilesRef = useRef(new Map<string, FileInfo>());
   const pendingLoadedThumbnails = useRef(new Set<string>());
   const thumbnailCountTimer = useRef<number | null>(null);
   useEffect(
@@ -1309,7 +1310,8 @@ function App() {
     filtersRef.current = filters;
   }, [filters]);
 
-  const markThumbnailLoaded = useCallback((filePath: string) => {
+  const markThumbnailLoaded = useCallback((filePath: string, file: FileInfo) => {
+    loadedThumbnailFilesRef.current.set(filePath, file);
     pendingLoadedThumbnails.current.add(filePath);
     if (thumbnailCountTimer.current !== null) return;
     thumbnailCountTimer.current = window.setTimeout(() => {
@@ -4485,21 +4487,47 @@ function App() {
           </span>
         </div>
       )}
-      {(indexStorageStatus.message ||
+      {((indexStorageStatus.message ||
         indexStorageStatus.transfer?.state === "moving" ||
         indexStorageStatus.transfer?.state === "complete" ||
-        indexStorageStatus.transfer?.state === "error") && (
-        <div className="index-storage-banner" role="status" aria-live="polite">
-          {indexStorageStatus.message && <strong>{indexStorageStatus.message}</strong>}
-          {indexStorageStatus.usingLocalFallback && (
-            <span>
-              {indexStorageStatus.localFallbackEnabled
-                ? `Local cache fallback is enabled with a ${Math.round(indexStorageStatus.reserveBytes / 1024 / 1024 / 1024)} GB free-space reserve. Silo will verify and move the cache back when the destination reconnects.`
-                : "Local cache fallback is off. Indexing is paused until the selected destination reconnects."}
-            </span>
+        indexStorageStatus.transfer?.state === "error") ||
+        intensiveJobs.length > 0 ||
+        searchError) && (
+        <div className="app-notice-stack" aria-live="polite">
+          {(indexStorageStatus.message ||
+            indexStorageStatus.transfer?.state === "moving" ||
+            indexStorageStatus.transfer?.state === "complete" ||
+            indexStorageStatus.transfer?.state === "error") && (
+            <div className="index-storage-banner" role="status">
+              {indexStorageStatus.message && (
+                <strong>{indexStorageStatus.message}</strong>
+              )}
+              {indexStorageStatus.usingLocalFallback && (
+                <span>
+                  {indexStorageStatus.localFallbackEnabled
+                    ? `Local cache fallback is enabled with a ${Math.round(indexStorageStatus.reserveBytes / 1024 / 1024 / 1024)} GB free-space reserve. Silo will verify and move the cache back when the destination reconnects.`
+                    : "Local cache fallback is off. Indexing is paused until the selected destination reconnects."}
+                </span>
+              )}
+              {indexStorageStatus.transfer && (
+                <span>{indexStorageStatus.transfer.message}</span>
+              )}
+            </div>
           )}
-          {indexStorageStatus.transfer && (
-            <span>{indexStorageStatus.transfer.message}</span>
+          {intensiveJobs.length > 0 && (
+            <div className="indexing-performance-banner" role="status">
+              <FiZap aria-hidden="true" />
+              <span>
+                <strong>Background processing may reduce responsiveness.</strong>{" "}
+                Active: {intensiveJobs.join(", ")}. You can keep browsing; previews
+                load progressively.
+              </span>
+            </div>
+          )}
+          {searchError && (
+            <div className="search-policy-error" role="alert">
+              {searchError}
+            </div>
           )}
         </div>
       )}
@@ -4880,17 +4908,6 @@ function App() {
         </div>
       </header>
 
-      {intensiveJobs.length > 0 && (
-        <div className="indexing-performance-banner" role="status">
-          <FiZap aria-hidden="true" />
-          <span>
-            <strong>Background processing may reduce responsiveness.</strong>{" "}
-            Active: {intensiveJobs.join(", ")}. You can keep browsing; previews
-            load progressively.
-          </span>
-        </div>
-      )}
-      {searchError && <div className="search-policy-error">{searchError}</div>}
 
       {appSection === "files" && scanIssues && (
         <div className="permission-banner">

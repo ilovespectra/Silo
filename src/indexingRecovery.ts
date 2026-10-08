@@ -8,7 +8,7 @@ export interface RecoveryStage {
   ready: () => boolean;
   unresolvedWork?: () => string | null;
   needsInitialCheck?: boolean;
-  lane?: "analysis" | "disk" | "light";
+  lane?: "analysis" | "disk" | "light" | "background";
   blockedReason?: () => string;
   pause?: () => Promise<unknown> | unknown;
 }
@@ -211,6 +211,30 @@ export class IndexingRecovery {
     this.persist();
   }
 
+  request(id: string) {
+    const stage = this.stages.find((item) => item.id === id);
+    if (!stage) throw new Error("This index does not support recovery.");
+    if (this.stopped)
+      throw new Error("Silo is shutting down. Reopen it to resume indexing.");
+    const record = this.records.get(id) ?? {
+      attempts: 0,
+      error: "",
+      retryAt: 0,
+      running: false,
+      checked: false,
+      userPaused: false,
+    };
+    if (record.userPaused) return;
+    record.checked = false;
+    record.error = "";
+    record.retryAt = 0;
+    if (!record.running) record.attempts = 0;
+    this.records.set(id, record);
+    this.requested.add(id);
+    this.persist();
+    void this.tick();
+  }
+
   queue(id: string) {
     const stage = this.stages.find((item) => item.id === id);
     if (!stage) throw new Error("This index does not support recovery.");
@@ -248,7 +272,8 @@ export class IndexingRecovery {
       const ordered = [...this.stages].sort(
         (first, second) =>
           Number(this.requested.has(second.id)) -
-          Number(this.requested.has(first.id)),
+            Number(this.requested.has(first.id)) ||
+          Number(second.id === "search") - Number(first.id === "search"),
       );
       for (const stage of ordered) {
         if (this.stopped || this.externalBlockReason || !stage.ready()) continue;
@@ -333,6 +358,7 @@ export class IndexingRecovery {
       record.running = false;
       if (stage.lane) this.activeLanes.delete(stage.lane);
       this.persist();
+      setImmediate(() => void this.tick());
     }
   }
 }

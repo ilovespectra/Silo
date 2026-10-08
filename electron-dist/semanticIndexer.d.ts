@@ -40,6 +40,7 @@ export declare class SemanticIndexer {
     private readonly onDiagnostic;
     private readonly latestRecords;
     private readonly indexedRecordListeners;
+    private backgroundIndexWorkListener;
     private readonly searchEmbeddingCache;
     private indexedSearchSnapshotCache;
     private readonly processingPaths;
@@ -49,6 +50,8 @@ export declare class SemanticIndexer {
     private readonly workerFailures;
     private retryableErrorCountCache;
     private pendingCheckpoint;
+    private recoveryFileWriteChain;
+    private recoveryFileWriteSequence;
     private restoredSourcePaths;
     private progress;
     private clipRuntime;
@@ -60,6 +63,7 @@ export declare class SemanticIndexer {
     private readonly inferenceQueue;
     private inferenceSequence;
     private inferenceActive;
+    private activeSearchCount;
     private searchChain;
     private runPromise;
     private queuedSourcePaths;
@@ -106,9 +110,6 @@ export declare class SemanticIndexer {
     private revision;
     private loaded;
     private loadComplete;
-    private hasRestoredSearchableRecord;
-    private resolveFirstSearchableRecord;
-    private readonly firstSearchableRecord;
     private writeChain;
     private recordsBoundaryChecked;
     private dirtyWatchSources;
@@ -117,6 +118,7 @@ export declare class SemanticIndexer {
     private isWatching;
     private filesToIndex;
     constructor(userDataPath: string, modelCachePath: string, scanSource: ScanSource, onProgress: ProgressListener, onDiagnostic?: DiagnosticListener, indexStoragePath?: string);
+    setBackgroundIndexWorkListener(listener: ((changedFiles: Map<string, string>) => void) | null): void;
     initialize(onLoadProgress?: (fraction: number, records: number) => void): Promise<void>;
     /** False while the saved index is still being read; partial counts are shown meanwhile. */
     isLoaded(): boolean;
@@ -133,6 +135,9 @@ export declare class SemanticIndexer {
         discoveredTotal: number;
         remaining: number;
     };
+    getRetryableFiles(sourcePaths: string[]): Map<string, string>;
+    getSourceCoverageErrors(sourcePaths: string[]): string[];
+    hasPendingIndexWork(): boolean;
     getRetryableErrorCount(sourcePaths: string[]): number;
     private updateRecordCounts;
     private setLatestRecord;
@@ -240,6 +245,7 @@ export declare class SemanticIndexer {
         }>;
     }>>;
     private runSearch;
+    private preservePendingFiles;
     private run;
     private loadClipRuntime;
     private runInference;

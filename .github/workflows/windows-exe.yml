@@ -40,8 +40,69 @@ jobs:
       - name: Compile app
         run: npm run build
 
-      - name: Package NSIS installer
-        run: npx electron-builder --config electron-builder.windows.config.cjs --win nsis --x64 --publish never
+      - name: Smoke test bundled offline Windows semantic search
+        shell: pwsh
+        run: |
+          $env:SILO_REAL_SEMANTIC_SMOKE = '1'
+          node test/runSemanticIsolationTests.cjs
+
+      - name: Package and verify NSIS installer
+        shell: pwsh
+        run: |
+          $hook = Join-Path $env:RUNNER_TEMP 'silo-installer-progress.nsh'
+          @'
+          !macro customInstall
+            SetDetailsView show
+            SetDetailsPrint both
+            DetailPrint "Checking that the Silo desktop app is ready to launch..."
+            ${IfNot} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
+              MessageBox MB_ICONSTOP "Silo could not verify its desktop app. Setup will stop so you do not get an incomplete install."
+              Abort
+            ${EndIf}
+            DetailPrint "Tuning Silo's offline semantic search engine..."
+            ${IfNot} ${FileExists} "$INSTDIR\resources\clip-model-cache\Xenova\clip-vit-base-patch32\onnx\text_model_quantized.onnx"
+              MessageBox MB_ICONSTOP "Silo's offline text search model is missing. Setup will stop rather than install a broken search feature."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\clip-model-cache\Xenova\clip-vit-base-patch32\onnx\vision_model_quantized.onnx"
+              MessageBox MB_ICONSTOP "Silo's offline photo search model is missing. Setup will stop rather than install a broken search feature."
+              Abort
+            ${EndIf}
+            DetailPrint "Checking the local ONNX runtime that powers photo and text matching..."
+            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\onnxruntime-web\dist\ort-wasm-simd-threaded.asyncify.wasm"
+              MessageBox MB_ICONSTOP "Silo's local semantic runtime is missing. Setup will stop so search works after installation."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\onnxruntime-web\dist\ort-wasm-simd-threaded.asyncify.mjs"
+              MessageBox MB_ICONSTOP "Silo's local semantic runtime loader is missing. Setup will stop so search works after installation."
+              Abort
+            ${EndIf}
+            DetailPrint "Verifying the offline face and people analysis models..."
+            ${IfNot} ${FileExists} "$INSTDIR\resources\face-models\tiny_face_detector_model-weights_manifest.json"
+              MessageBox MB_ICONSTOP "Silo's bundled face analysis model is missing. Setup will stop rather than install an incomplete app."
+              Abort
+            ${EndIf}
+            DetailPrint "Silo's core offline features are in place; your library stays on this PC."
+            SetDetailsPrint none
+          !macroend
+          '@ | Set-Content -Path $hook -Encoding Ascii
+          $env:SILO_NSIS_INCLUDE = $hook
+          npx electron-builder --config electron-builder.windows.config.cjs --win nsis --x64 --publish never
+
+          $appExe = 'release/win-unpacked/Silo.exe'
+          $resources = 'release/win-unpacked/resources'
+          $required = @(
+            $appExe,
+            "$resources/clip-model-cache/Xenova/clip-vit-base-patch32/tokenizer.json",
+            "$resources/clip-model-cache/Xenova/clip-vit-base-patch32/onnx/text_model_quantized.onnx",
+            "$resources/clip-model-cache/Xenova/clip-vit-base-patch32/onnx/vision_model_quantized.onnx",
+            "$resources/face-models/tiny_face_detector_model-weights_manifest.json",
+            "$resources/app.asar.unpacked/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm",
+            "$resources/app.asar.unpacked/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs"
+          )
+          foreach ($asset in $required) {
+            if (-not (Test-Path $asset)) { throw "Missing packaged Silo asset: $asset" }
+          }
 
       - name: Verify installer output
         shell: pwsh

@@ -58,6 +58,10 @@ async function setup(): Promise<void> {
       progressUpdates.push({ ...progress });
     },
   );
+  semanticIndexer.setBackgroundIndexWorkListener((changedFiles) => {
+    const changedRoots = Array.from(new Set(changedFiles.values()));
+    void semanticIndexer.start(changedRoots, changedFiles);
+  });
 
   await semanticIndexer.initialize();
   (semanticIndexer as any).loadClipRuntime = async () => ({
@@ -188,6 +192,114 @@ async function testInitialIndexing(): Promise<void> {
 
   console.log(
     `  - Indexed ${lastProgress.indexed} files, ${lastProgress.errors} errors`,
+  );
+}
+
+async function testChronologicalIndexing(): Promise<void> {
+  console.log("\n✓ Test: Indexes oldest files first");
+  progressUpdates = [];
+
+  const oldest = await createTestFile("chronology-oldest.jpg");
+  const newest = await createTestFile("chronology-newest.jpg");
+  const middle = await createTestFile("chronology-middle.jpg");
+  await fsPromises.utimes(oldest, 1_700_000_000, 1_700_000_000);
+  await fsPromises.utimes(middle, 1_700_000_100, 1_700_000_100);
+  await fsPromises.utimes(newest, 1_700_000_200, 1_700_000_200);
+
+  await semanticIndexer.start([testSourceDir]);
+  const processingOrder = progressUpdates
+    .filter((progress) => progress.currentFile?.startsWith("chronology-"))
+    .map((progress) => progress.currentFile)
+    .filter((fileName, index, all) => index === 0 || all[index - 1] !== fileName);
+  assert.deepEqual(
+    processingOrder,
+    ["chronology-oldest.jpg", "chronology-middle.jpg", "chronology-newest.jpg"],
+    "full scans must embed files in modification-time order",
+  );
+}
+
+async function testBoundedDemoDiscovery(): Promise<void> {
+  console.log("\n✓ Test: Demo discovery stops at its sample limit");
+  progressUpdates = [];
+  (semanticIndexer as any).setDemoFileLimit(10);
+  for (let index = 0; index < 100; index += 1)
+    await createTestFile(`demo-sample-${index.toString().padStart(3, "0")}.jpg`);
+
+  await semanticIndexer.start([testSourceDir]);
+  const indexed = semanticIndexer.getIndexedImages([testSourceDir]);
+  assert.ok(indexed.length > 0, "demo mode should still create usable search results");
+  assert.ok(indexed.length <= 10, "demo mode must respect its file cap");
+  assert.ok(
+    (semanticIndexer as any).searchDiscovery.scanned < 100,
+    "demo discovery should stop after collecting a bounded sample",
+  );
+}
+
+async function testPausedFullScanRestoresSourceRoot(): Promise<void> {
+  console.log("\n✓ Test: Paused full scans resume from a saved source root");
+  progressUpdates = [];
+  for (let index = 0; index < 5; index += 1)
+    await createTestFile(`resume-${index}.jpg`);
+  imageReadDelayMs = 60;
+
+  const activeRun = semanticIndexer.start([testSourceDir]);
+  await waitForProgress("indexing", 10000);
+  await semanticIndexer.pause();
+  await activeRun;
+  imageReadDelayMs = 0;
+
+  const userDataPath = path.join(tempDir, "silo-user-data");
+  const checkpointPath = path.join(
+    userDataPath,
+    "semantic-index",
+    "pending-work.json",
+  );
+  const checkpoint = JSON.parse(await fsPromises.readFile(checkpointPath, "utf8"));
+  assert.ok(checkpoint.sources.includes(testSourceDir));
+  assert.equal(
+    checkpoint.entries.length,
+    0,
+    "unbounded full scans should persist roots instead of every candidate path",
+  );
+
+  semanticIndexer.stopWatching();
+  progressUpdates = [];
+  semanticIndexer = new SemanticIndexer(
+    userDataPath,
+    tempDir,
+    async (sourcePath, onFile, isCancelled) => {
+      for (const name of await fsPromises.readdir(sourcePath)) {
+        if (isCancelled()) return;
+        const fullPath = path.join(sourcePath, name);
+        const stats = await fsPromises.stat(fullPath);
+        onFile({
+          name,
+          path: fullPath,
+          relativePath: name,
+          size: stats.size,
+          modified: stats.mtimeMs,
+          isDirectory: false,
+          type: "image",
+          extension: path.extname(name),
+        });
+      }
+    },
+    (progress) => progressUpdates.push({ ...progress }),
+  );
+  await semanticIndexer.initialize();
+  (semanticIndexer as any).loadClipRuntime = async () => ({
+    RawImage: { read: async () => ({}) },
+    processor: async () => ({}),
+    visionModel: async () => ({
+      image_embeds: { data: new Float32Array(512).fill(1) },
+    }),
+  });
+
+  await semanticIndexer.start([testSourceDir]);
+  assert.equal(
+    semanticIndexer.getIndexedImages([testSourceDir]).length,
+    5,
+    "a restarted indexer should finish the saved source scan",
   );
 }
 
@@ -483,6 +595,9 @@ async function runAllTests(): Promise<void> {
 
   const tests = [
     testInitialIndexing,
+    testChronologicalIndexing,
+    testBoundedDemoDiscovery,
+    testPausedFullScanRestoresSourceRoot,
     testNewFilesDetection,
     testNewFilesDuringActiveScan,
     testModifiedFilesDetection,

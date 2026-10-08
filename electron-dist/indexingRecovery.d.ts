@@ -8,7 +8,7 @@ export interface RecoveryStage {
     ready: () => boolean;
     unresolvedWork?: () => string | null;
     needsInitialCheck?: boolean;
-    lane?: "analysis" | "disk" | "light";
+    lane?: "analysis" | "disk" | "light" | "background";
     blockedReason?: () => string;
     pause?: () => Promise<unknown> | unknown;
 }
@@ -41,6 +41,7 @@ export declare class IndexingRecovery {
     setBlocked(reason: string | null): Promise<void>;
     pause(id: string): void;
     clearUserPause(id: string): void;
+    request(id: string): void;
     queue(id: string): void;
     retry(id: string): Promise<void>;
     tick(): Promise<void>;

@@ -183,6 +183,7 @@ class SemanticIndexer {
         this.canonicalSourcePaths = new Map();
         this.latestRecords = new Map();
         this.indexedRecordListeners = new Set();
+        this.backgroundIndexWorkListener = null;
         this.searchEmbeddingCache = new Map();
         this.indexedSearchSnapshotCache = null;
         this.processingPaths = new Set();
@@ -192,6 +193,8 @@ class SemanticIndexer {
         this.workerFailures = new Map();
         this.retryableErrorCountCache = null;
         this.pendingCheckpoint = false;
+        this.recoveryFileWriteChain = Promise.resolve();
+        this.recoveryFileWriteSequence = 0;
         this.restoredSourcePaths = [];
         this.progress = { ...initialProgress };
         this.clipRuntime = null;
@@ -203,6 +206,7 @@ class SemanticIndexer {
         this.inferenceQueue = [];
         this.inferenceSequence = 0;
         this.inferenceActive = false;
+        this.activeSearchCount = 0;
         this.searchChain = Promise.resolve();
         this.runPromise = null;
         this.queuedSourcePaths = null;
@@ -245,8 +249,6 @@ class SemanticIndexer {
         this.revision = 0;
         this.loaded = Promise.resolve();
         this.loadComplete = true;
-        this.hasRestoredSearchableRecord = false;
-        this.resolveFirstSearchableRecord = null;
         this.writeChain = Promise.resolve();
         this.recordsBoundaryChecked = false;
         this.dirtyWatchSources = new Set();
@@ -257,9 +259,6 @@ class SemanticIndexer {
         this.holdReason = null;
         this.heldSourcePaths = [];
         this.activeSourcePaths = [];
-        this.firstSearchableRecord = new Promise((resolve) => {
-            this.resolveFirstSearchableRecord = resolve;
-        });
         this.userDataPath = path.resolve(userDataPath);
         this.canonicalUserDataPath = this.userDataPath;
         this.indexDirectory = path.join(indexStoragePath, "semantic-index");
@@ -271,13 +270,14 @@ class SemanticIndexer {
         this.onProgress = onProgress;
         this.onDiagnostic = onDiagnostic;
     }
+    setBackgroundIndexWorkListener(listener) {
+        this.backgroundIndexWorkListener = listener;
+    }
     async initialize(onLoadProgress) {
         this.loadComplete = false;
         const task = this.openIndex(onLoadProgress);
         this.loaded = task.then(() => undefined, () => undefined).then(() => {
             this.loadComplete = true;
-            this.resolveFirstSearchableRecord?.();
-            this.resolveFirstSearchableRecord = null;
         });
         // Searches and concept scans queue behind the load instead of seeing a partial index.
         this.searchChain = this.loaded;
@@ -422,6 +422,25 @@ class SemanticIndexer {
             remaining: Math.max(0, total - indexed - errors),
         };
     }
+    getRetryableFiles(sourcePaths) {
+        const roots = new Set(sourcePaths);
+        const demoPaths = this.demoFilePaths(sourcePaths);
+        const changedFiles = new Map();
+        for (const record of this.latestRecords.values())
+            if (roots.has(record.sourcePath) &&
+                (!demoPaths || demoPaths.has(record.path)) &&
+                this.shouldRetryFailure(record))
+                changedFiles.set(record.path, record.sourcePath);
+        return changedFiles;
+    }
+    getSourceCoverageErrors(sourcePaths) {
+        return this.getSourceCoverageProgress(sourcePaths).sources
+            .filter((source) => source.status === "error")
+            .map((source) => source.sourcePath);
+    }
+    hasPendingIndexWork() {
+        return Boolean(this.filesToIndex?.size || this.restoredSourcePaths.length);
+    }
     getRetryableErrorCount(sourcePaths) {
         const sourceKey = Array.from(new Set(sourcePaths)).sort().join("\0");
         const now = Date.now();
@@ -463,11 +482,6 @@ class SemanticIndexer {
         this.latestRecords.set(record.path, record);
         this.updateRecordCounts(record, 1);
         this.revision += 1;
-        if (record.vectorOffset >= 0 && !this.hasRestoredSearchableRecord) {
-            this.hasRestoredSearchableRecord = true;
-            this.resolveFirstSearchableRecord?.();
-            this.resolveFirstSearchableRecord = null;
-        }
         if (record.vectorOffset >= 0)
             for (const listener of this.indexedRecordListeners)
                 listener(record);
@@ -559,7 +573,8 @@ class SemanticIndexer {
             return this.updateProgress({ status: "paused", message: this.holdReason }, true);
         }
         this.pauseRequested = false;
-        const requestedSources = Array.from(new Set([...this.restoredSourcePaths, ...sourcePaths]));
+        const restoredSources = [...this.restoredSourcePaths];
+        const requestedSources = Array.from(new Set([...restoredSources, ...sourcePaths]));
         this.restoredSourcePaths = [];
         if (changedFiles) {
             if (!this.filesToIndex)
@@ -568,20 +583,40 @@ class SemanticIndexer {
                 this.filesToIndex.set(filePath, sourcePath);
             }
         }
+        let resumeFullScanAfterPendingQueue = Boolean(this.filesToIndex?.size) && restoredSources.length > 0;
         if (this.runPromise) {
             this.queuedSourcePaths = Array.from(new Set([...(this.queuedSourcePaths ?? []), ...requestedSources]));
             return this.runPromise;
         }
-        console.log("[SemanticIndexer] Starting indexing with sources:", sourcePaths);
-        const runPromise = (async () => {
+        console.log("[SemanticIndexer] Starting indexing with sources:", requestedSources);
+        // Defer the run body until after runPromise is registered. A checkpoint or
+        // progress callback may request another start synchronously during setup.
+        const runPromise = Promise.resolve().then(async () => {
             let nextSourcePaths = requestedSources;
             try {
+                await this.checkpointPendingWork(requestedSources, true);
                 while (nextSourcePaths !== null && !this.pauseRequested) {
                     this.queuedSourcePaths = null;
                     this.activeSourcePaths = nextSourcePaths;
                     await this.run(nextSourcePaths);
-                    nextSourcePaths =
-                        this.progress.status === "error" ? null : this.queuedSourcePaths;
+                    if (this.progress.status === "error") {
+                        nextSourcePaths = null;
+                    }
+                    else if (this.queuedSourcePaths !== null) {
+                        nextSourcePaths = this.queuedSourcePaths;
+                    }
+                    else if (this.filesToIndex?.size) {
+                        nextSourcePaths = this.activeSourcePaths.length
+                            ? this.activeSourcePaths
+                            : requestedSources;
+                    }
+                    else if (resumeFullScanAfterPendingQueue) {
+                        resumeFullScanAfterPendingQueue = false;
+                        nextSourcePaths = requestedSources;
+                    }
+                    else {
+                        nextSourcePaths = null;
+                    }
                 }
             }
             finally {
@@ -589,7 +624,7 @@ class SemanticIndexer {
                 this.queuedSourcePaths = null;
                 this.activeSourcePaths = [];
             }
-        })();
+        });
         this.runPromise = runPromise;
         return runPromise;
     }
@@ -602,8 +637,18 @@ class SemanticIndexer {
         await this.start(sourcePaths);
     }
     async pause() {
+        const interruptedSources = Array.from(new Set([
+            ...this.activeSourcePaths,
+            ...(this.queuedSourcePaths ?? []),
+            ...this.restoredSourcePaths,
+            ...Array.from(this.filesToIndex?.values() ?? []),
+        ]));
         this.pauseRequested = true;
         this.queuedSourcePaths = null;
+        if (this.runPromise)
+            await this.runPromise.catch(() => undefined);
+        if (interruptedSources.length || this.filesToIndex?.size)
+            await this.checkpointPendingWork(interruptedSources, true);
         if (!this.runPromise) {
             await this.updateProgress({ status: "paused", message: this.holdReason ?? "Indexing paused." }, true);
         }
@@ -927,8 +972,8 @@ class SemanticIndexer {
             console.log("[SemanticIndexer] Running debounced reconciliation for", sources.length, "changed source(s)");
             const changedFiles = await this.reconcileIndex(sources);
             if (changedFiles.size > 0) {
-                console.log(`[SemanticIndexer] Auto-starting incremental indexing for ${changedFiles.size} changed files`);
-                void this.start(Array.from(this.watchedSources), changedFiles);
+                console.log(`[SemanticIndexer] Queueing ${changedFiles.size} changed files for incremental indexing`);
+                this.backgroundIndexWorkListener?.(changedFiles);
             }
         }, RECONCILIATION_DEBOUNCE_MS);
     }
@@ -974,35 +1019,19 @@ class SemanticIndexer {
         // Pre-load the CLIP model to avoid delays on first search
         await this.loadClipRuntime();
     }
-    search(query, minimumConfidence, sourcePaths, isCancelled = () => false, onSearchProgress) {
+    async search(query, minimumConfidence, sourcePaths, isCancelled = () => false, onSearchProgress) {
         const confidenceThreshold = Number.isFinite(minimumConfidence)
             ? Math.max(0, Math.min(100, minimumConfidence))
             : 0;
-        return (async () => {
-            // Begin against the first usable restored records instead of waiting for a
-            // large saved index to finish opening. The embedding work below gives the
-            // restore stream time to add more records before its snapshot is taken.
-            if (!this.loadComplete && !this.hasRestoredSearchableRecord && !isCancelled()) {
-                await new Promise((resolve) => {
-                    let settled = false;
-                    const finish = () => {
-                        if (settled)
-                            return;
-                        settled = true;
-                        clearInterval(cancelCheck);
-                        resolve();
-                    };
-                    const cancelCheck = setInterval(() => {
-                        if (isCancelled())
-                            finish();
-                    }, 100);
-                    void Promise.race([this.firstSearchableRecord, this.loaded]).then(finish);
-                });
-            }
-            if (isCancelled())
-                return [];
-            return this.runSearch(query, confidenceThreshold, sourcePaths, isCancelled, onSearchProgress);
-        })();
+        // Searches use the saved index immediately and temporarily take priority
+        // between background embeddings while the results are being ranked.
+        this.activeSearchCount += 1;
+        try {
+            return await this.runSearch(query, confidenceThreshold, sourcePaths, isCancelled, onSearchProgress);
+        }
+        finally {
+            this.activeSearchCount = Math.max(0, this.activeSearchCount - 1);
+        }
     }
     classifyUnsafeImages(sourcePaths, unsafePrompt, safePrompt) {
         const result = this.searchChain.then(async () => {
@@ -1382,17 +1411,30 @@ class SemanticIndexer {
             await vectorHandle.close();
         }
     }
+    preservePendingFiles(pending, startIndex, preserveDiscoveredFiles) {
+        const queued = new Map();
+        if (preserveDiscoveredFiles)
+            for (const { file, sourcePath } of pending.slice(startIndex))
+                queued.set(file.path, sourcePath);
+        for (const [filePath, sourcePath] of this.filesToIndex ?? [])
+            if (!queued.has(filePath))
+                queued.set(filePath, sourcePath);
+        this.filesToIndex = queued.size ? queued : null;
+    }
     async run(sourcePaths) {
         const pending = [];
         const demoTypeCounts = new Map();
         const demoCandidatesByType = new Map();
         let demoSampleMessage = "";
         let nextPendingIndex = 0;
+        let isIncremental = false;
         try {
             // Check if we're doing incremental indexing (only specific files)
-            const isIncremental = this.filesToIndex !== null;
+            isIncremental = this.filesToIndex !== null;
             let filesToIndex = this.filesToIndex;
-            this.filesToIndex = null; // Clear for next run
+            // Keep an incremental batch durable while it is being processed. Newly
+            // changed files can still be appended by the watcher during this run.
+            this.filesToIndex = filesToIndex ? new Map(filesToIndex) : null;
             const demoPaths = this.demoFilePaths(sourcePaths);
             let demoSlotsRemaining = this.demoFileLimit === null
                 ? Number.POSITIVE_INFINITY
@@ -1409,12 +1451,41 @@ class SemanticIndexer {
                 demoSlotsRemaining -= 1;
                 return true;
             };
-            if (filesToIndex && filesToIndex.size > INCREMENTAL_BATCH_SIZE) {
-                const entries = Array.from(filesToIndex.entries());
-                filesToIndex = new Map(entries.slice(0, INCREMENTAL_BATCH_SIZE));
-                this.filesToIndex = new Map(entries.slice(INCREMENTAL_BATCH_SIZE));
-                this.queuedSourcePaths = sourcePaths;
-                console.log(`[SemanticIndexer] Processing ${filesToIndex.size} files now; ${this.filesToIndex.size} queued`);
+            if (filesToIndex) {
+                const originalEntries = Array.from(filesToIndex.entries());
+                const entries = await Promise.all(originalEntries.map(async ([filePath, sourcePath]) => {
+                    let modified = this.latestRecords.get(filePath)?.modified ?? 0;
+                    try {
+                        const stats = await fsPromises.stat(filePath);
+                        if (stats.isFile())
+                            modified = stats.mtime.getTime();
+                    }
+                    catch {
+                        // The normal incremental pass removes stale records for vanished files.
+                    }
+                    return { filePath, sourcePath, modified };
+                }));
+                entries.sort((first, second) => first.modified - second.modified ||
+                    (first.filePath < second.filePath
+                        ? -1
+                        : first.filePath > second.filePath
+                            ? 1
+                            : 0));
+                const orderedEntries = entries.map(({ filePath, sourcePath }) => [filePath, sourcePath]);
+                const originalPaths = new Set(originalEntries.map(([filePath]) => filePath));
+                const queuedDuringOrdering = Array.from(this.filesToIndex ?? []).filter(([filePath]) => !originalPaths.has(filePath));
+                const batchEntries = orderedEntries.slice(0, INCREMENTAL_BATCH_SIZE);
+                const remainingEntries = orderedEntries.slice(INCREMENTAL_BATCH_SIZE);
+                filesToIndex = new Map(batchEntries);
+                this.filesToIndex = new Map([
+                    ...batchEntries,
+                    ...remainingEntries,
+                    ...queuedDuringOrdering,
+                ]);
+                if (remainingEntries.length || queuedDuringOrdering.length) {
+                    this.queuedSourcePaths = sourcePaths;
+                    console.log(`[SemanticIndexer] Processing ${filesToIndex.size} files now; ${this.filesToIndex.size - filesToIndex.size} queued`);
+                }
             }
             const statusMsg = isIncremental
                 ? `Re-indexing ${filesToIndex.size} changed file${filesToIndex.size === 1 ? "" : "s"}...`
@@ -1432,6 +1503,36 @@ class SemanticIndexer {
             }, true);
             const seenPaths = new Set();
             const sourceFileStats = new Map();
+            // Reuse the existing bounded demo sample so repeat launches do not walk
+            // every directory just to rediscover files already represented in cache.
+            if (!isIncremental && this.demoFileLimit !== null && demoPaths) {
+                for (const record of this.latestRecords.values()) {
+                    if (!demoPaths.has(record.path) || !sourcePaths.includes(record.sourcePath))
+                        continue;
+                    const candidates = demoCandidatesByType.get(record.type) ?? [];
+                    candidates.push({
+                        file: {
+                            name: record.name,
+                            path: record.path,
+                            relativePath: record.relativePath,
+                            size: record.size,
+                            modified: record.modified,
+                            isDirectory: false,
+                            type: record.type,
+                            extension: record.extension,
+                        },
+                        sourcePath: record.sourcePath,
+                    });
+                    demoCandidatesByType.set(record.type, candidates);
+                    demoTypeCounts.set(record.type, (demoTypeCounts.get(record.type) ?? 0) + 1);
+                    seenPaths.add(record.path);
+                }
+                demoPaths.clear();
+                for (const candidates of demoCandidatesByType.values())
+                    for (const candidate of candidates)
+                        demoPaths.add(candidate.file.path);
+                demoSlotsRemaining = Math.max(0, this.demoFileLimit - demoPaths.size);
+            }
             let candidateCount = 0;
             let existingErrors = 0;
             let indexed = 0;
@@ -1447,8 +1548,10 @@ class SemanticIndexer {
                         break;
                     try {
                         const stats = await fsPromises.stat(filePath);
-                        if (stats.isDirectory())
+                        if (stats.isDirectory()) {
+                            this.filesToIndex?.delete(filePath);
                             continue;
+                        }
                         const file = {
                             name: path.basename(filePath),
                             path: filePath,
@@ -1459,22 +1562,24 @@ class SemanticIndexer {
                             type: this.inferType(filePath),
                             extension: path.extname(filePath).toLowerCase(),
                         };
-                        if (!this.isIndexable(file, sourcePath))
+                        if (!this.isIndexable(file, sourcePath) || !allowDemoFile(filePath)) {
+                            this.filesToIndex?.delete(filePath);
                             continue;
-                        if (!allowDemoFile(filePath))
-                            continue;
+                        }
                         seenPaths.add(filePath);
                         candidateCount += 1;
                         const failure = this.workerFailures.get(file.path);
                         if (failure?.signature === this.signature(file) &&
                             failure.attempts >= 3) {
                             existingErrors += 1;
+                            this.filesToIndex?.delete(filePath);
                             continue;
                         }
                         // Always re-index in incremental mode
                         pending.push({ file, sourcePath });
                     }
                     catch (error) {
+                        this.filesToIndex?.delete(filePath);
                         console.log(`[SemanticIndexer] Error accessing changed file ${filePath}:`, error instanceof Error ? error.message : "");
                         // File was deleted or inaccessible
                         this.deleteLatestRecord(filePath);
@@ -1507,7 +1612,17 @@ class SemanticIndexer {
                         if (this.pauseRequested)
                             break;
                         this.searchDiscovery.sourcePath = sourcePath;
-                        let sourceFileCount = 0;
+                        let sourceFileCount = this.demoFileLimit === null
+                            ? 0
+                            : Array.from(demoCandidatesByType.values())
+                                .flat()
+                                .filter((candidate) => candidate.sourcePath === sourcePath).length;
+                        const demoSourcesRemaining = sourcePaths.length - this.searchDiscovery.sourceIndex;
+                        const demoSourceTarget = this.demoFileLimit === null
+                            ? Number.POSITIVE_INFINITY
+                            : Math.ceil(demoSlotsRemaining / Math.max(1, demoSourcesRemaining));
+                        let demoSourceCandidates = 0;
+                        let demoSourceSampleReached = demoSourceTarget <= 0;
                         const previousDiscoveredTotal = this.discoveredTotalsBySource.get(sourcePath);
                         this.searchDiscovery.sourceIndex += 1;
                         this.searchDiscovery.source = path.basename(sourcePath) || "Source";
@@ -1521,63 +1636,76 @@ class SemanticIndexer {
                         if (!this.isRemotePath(sourcePath))
                             this.canonicalSourcePaths.set(sourcePath, await fsPromises.realpath(sourcePath).catch(() => path.resolve(sourcePath)));
                         await this.setSourceCoverage(sourcePath, "scanning");
-                        this.discoveredTotalsBySource.set(sourcePath, 0);
+                        this.discoveredTotalsBySource.set(sourcePath, sourceFileCount);
                         try {
-                            await this.scanSource(sourcePath, (file) => {
-                                this.searchDiscovery.scanned += 1;
-                                if (Date.now() - lastDiscoveryUpdate >= 500) {
-                                    lastDiscoveryUpdate = Date.now();
-                                    this.progress.total = candidateCount;
-                                    this.progress.indexed = indexed;
-                                    this.progress.errors = existingErrors;
-                                    this.progress.remaining = pending.length;
-                                    const observedIndexable = Array.from(demoTypeCounts.values()).reduce((sum, count) => sum + count, 0);
-                                    this.progress.message =
-                                        this.demoFileLimit === null
-                                            ? `${this.searchDiscovery.message} · ${this.searchDiscovery.scanned.toLocaleString()} entries inspected · ${candidateCount.toLocaleString()} indexable · ${pending.length.toLocaleString()} pending`
-                                            : `${this.searchDiscovery.message} · ${this.searchDiscovery.scanned.toLocaleString()} entries inspected · ${observedIndexable.toLocaleString()} indexable files counted by type`;
-                                    this.emitProgress();
-                                }
-                                if (!this.isIndexable(file, sourcePath))
-                                    return;
-                                if (seenPaths.has(file.path))
-                                    return;
-                                seenPaths.add(file.path);
-                                sourceFileCount += 1;
-                                this.discoveredTotalsBySource.set(sourcePath, sourceFileCount);
-                                if (this.demoFileLimit !== null) {
-                                    demoTypeCounts.set(file.type, (demoTypeCounts.get(file.type) ?? 0) + 1);
-                                    const candidates = demoCandidatesByType.get(file.type) ?? [];
-                                    if (candidates.length < this.demoFileLimit)
+                            if (!demoSourceSampleReached)
+                                await this.scanSource(sourcePath, (file) => {
+                                    this.searchDiscovery.scanned += 1;
+                                    if (Date.now() - lastDiscoveryUpdate >= 500) {
+                                        lastDiscoveryUpdate = Date.now();
+                                        this.progress.total = candidateCount;
+                                        this.progress.indexed = indexed;
+                                        this.progress.errors = existingErrors;
+                                        this.progress.remaining = pending.length;
+                                        const observedIndexable = Array.from(demoTypeCounts.values()).reduce((sum, count) => sum + count, 0);
+                                        this.progress.message =
+                                            this.demoFileLimit === null
+                                                ? `${this.searchDiscovery.message} · ${this.searchDiscovery.scanned.toLocaleString()} entries inspected · ${candidateCount.toLocaleString()} indexable · ${pending.length.toLocaleString()} pending`
+                                                : `${this.searchDiscovery.message} · ${this.searchDiscovery.scanned.toLocaleString()} entries inspected · ${observedIndexable.toLocaleString()} indexable files counted by type`;
+                                        this.emitProgress();
+                                    }
+                                    if (!this.isIndexable(file, sourcePath))
+                                        return;
+                                    if (seenPaths.has(file.path))
+                                        return;
+                                    seenPaths.add(file.path);
+                                    if (this.demoFileLimit !== null) {
+                                        if (!allowDemoFile(file.path)) {
+                                            demoLimitReached = true;
+                                            demoSourceSampleReached = true;
+                                            return;
+                                        }
+                                        sourceFileCount += 1;
+                                        demoSourceCandidates += 1;
+                                        demoTypeCounts.set(file.type, (demoTypeCounts.get(file.type) ?? 0) + 1);
+                                        const candidates = demoCandidatesByType.get(file.type) ?? [];
                                         candidates.push({ file, sourcePath });
-                                    demoCandidatesByType.set(file.type, candidates);
-                                    return;
-                                }
-                                if (!allowDemoFile(file.path))
-                                    return;
-                                candidateCount += 1;
-                                const stored = this.latestRecords.get(file.path);
-                                if (!stored ||
-                                    stored.signature !== this.signature(file) ||
-                                    this.shouldRetryFailure(stored)) {
-                                    pending.push({ file, sourcePath });
-                                    this.searchDiscovery.changed = pending.length;
-                                }
-                                else if (stored.error) {
-                                    existingErrors += 1;
-                                }
-                                else {
-                                    indexed += 1;
-                                }
-                                if (candidateCount % 1000 === 0) {
-                                    this.progress.total = candidateCount;
-                                    this.progress.indexed = indexed;
-                                    this.progress.errors = existingErrors;
-                                    this.progress.remaining = pending.length;
-                                    this.progress.message = `Discovered ${candidateCount.toLocaleString()} indexable files in ${path.basename(sourcePath)}...`;
-                                    this.emitProgress();
-                                }
-                            }, () => this.pauseRequested);
+                                        demoCandidatesByType.set(file.type, candidates);
+                                        this.discoveredTotalsBySource.set(sourcePath, sourceFileCount);
+                                        if (demoSourceCandidates >= demoSourceTarget) {
+                                            demoSourceSampleReached = true;
+                                            if (demoSlotsRemaining <= 0)
+                                                demoLimitReached = true;
+                                        }
+                                        return;
+                                    }
+                                    sourceFileCount += 1;
+                                    this.discoveredTotalsBySource.set(sourcePath, sourceFileCount);
+                                    if (!allowDemoFile(file.path))
+                                        return;
+                                    candidateCount += 1;
+                                    const stored = this.latestRecords.get(file.path);
+                                    if (!stored ||
+                                        stored.signature !== this.signature(file) ||
+                                        this.shouldRetryFailure(stored)) {
+                                        pending.push({ file, sourcePath });
+                                        this.searchDiscovery.changed = pending.length;
+                                    }
+                                    else if (stored.error) {
+                                        existingErrors += 1;
+                                    }
+                                    else {
+                                        indexed += 1;
+                                    }
+                                    if (candidateCount % 1000 === 0) {
+                                        this.progress.total = candidateCount;
+                                        this.progress.indexed = indexed;
+                                        this.progress.errors = existingErrors;
+                                        this.progress.remaining = pending.length;
+                                        this.progress.message = `Discovered ${candidateCount.toLocaleString()} indexable files in ${path.basename(sourcePath)}...`;
+                                        this.emitProgress();
+                                    }
+                                }, () => this.pauseRequested || demoSourceSampleReached);
                         }
                         catch (error) {
                             this.searchDiscovery.error =
@@ -1658,6 +1786,19 @@ class SemanticIndexer {
                 this.auditErrors = existingErrors;
                 this.searchDiscovery.changed = pending.length;
             }
+            pending.sort((first, second) => first.file.modified - second.file.modified ||
+                (first.file.path < second.file.path
+                    ? -1
+                    : first.file.path > second.file.path
+                        ? 1
+                        : 0));
+            if (isIncremental) {
+                const activeBatch = pending.map(({ file, sourcePath }) => [file.path, sourcePath]);
+                const activePaths = new Set(activeBatch.map(([filePath]) => filePath));
+                const laterWork = Array.from(this.filesToIndex ?? []).filter(([filePath]) => !activePaths.has(filePath));
+                this.filesToIndex = new Map([...activeBatch, ...laterWork]);
+                await this.checkpointPendingWork(sourcePaths, true);
+            }
             await this.updateProgress({
                 total: isIncremental && this.auditTotal > 0
                     ? this.auditTotal
@@ -1679,6 +1820,8 @@ class SemanticIndexer {
                         : {}),
             }, true);
             if (this.pauseRequested) {
+                this.preservePendingFiles(pending, 0, isIncremental || this.demoFileLimit !== null);
+                await this.checkpointPendingWork(sourcePaths, true);
                 await this.updateProgress({ status: "paused", message: "Indexing paused." }, true);
                 return;
             }
@@ -1697,8 +1840,18 @@ class SemanticIndexer {
                     message = `${demoSampleMessage} ${message}`;
                 console.log("[SemanticIndexer] No pending files to index. Message:", message);
                 console.log("[SemanticIndexer] Source stats:", Object.fromEntries(sourceFileStats));
-                await this.updateProgress({ status: "complete", message }, true);
-                await this.checkpointPendingWork([]);
+                if (this.filesToIndex?.size) {
+                    this.queuedSourcePaths = sourcePaths;
+                    await this.updateProgress({
+                        status: "scanning",
+                        message: `${this.filesToIndex.size.toLocaleString()} saved files remain in the chronological queue.`,
+                    }, true);
+                    await this.checkpointPendingWork(sourcePaths, true);
+                }
+                else {
+                    await this.updateProgress({ status: "complete", message }, true);
+                    await this.checkpointPendingWork([], true);
+                }
                 return;
             }
             await this.updateProgress({
@@ -1727,10 +1880,12 @@ class SemanticIndexer {
             for (let index = 0; index < pending.length; index += 1) {
                 nextPendingIndex = index;
                 if (this.pauseRequested) {
+                    this.preservePendingFiles(pending, index, isIncremental || this.demoFileLimit !== null);
+                    await this.checkpointPendingWork(sourcePaths, true);
                     await this.updateProgress({
                         status: "paused",
                         currentFile: null,
-                        message: "Indexing paused.",
+                        message: "Indexing paused with the remaining chronological queue saved.",
                     }, true);
                     return;
                 }
@@ -1791,6 +1946,7 @@ class SemanticIndexer {
                 nextPendingIndex = index + 1;
                 if (succeeded && this.workerFailures.delete(file.path))
                     await this.persistWorkerFailures();
+                this.filesToIndex?.delete(file.path);
                 if (succeeded) {
                     this.auditIndexed += 1;
                     this.progress.indexed =
@@ -1805,11 +1961,20 @@ class SemanticIndexer {
                         ? Math.max(0, this.auditTotal - this.auditIndexed - this.auditErrors)
                         : Math.max(0, this.progress.remaining - 1);
                 this.emitProgress();
-                if (index % 10 === 9)
+                if (index % 10 === 9) {
                     await this.persistProgress();
+                    if (isIncremental)
+                        await this.checkpointPendingWork(sourcePaths, true);
+                }
+                await new Promise((resolve) => setImmediate(resolve));
+                // An active search gets the next inference slot; don't add a fixed delay
+                // to every file when nobody is searching.
+                while (this.activeSearchCount > 0 && !this.pauseRequested)
+                    await new Promise((resolve) => setTimeout(resolve, 40));
             }
-            await this.checkpointPendingWork([]);
             if (this.filesToIndex && this.filesToIndex.size > 0) {
+                this.queuedSourcePaths = sourcePaths;
+                await this.checkpointPendingWork(sourcePaths, true);
                 await this.updateProgress({
                     status: "scanning",
                     currentFile: null,
@@ -1823,32 +1988,27 @@ class SemanticIndexer {
                     remaining: 0,
                     message: `${this.auditIndexed.toLocaleString()} of ${this.auditTotal.toLocaleString()} original files have CLIP embeddings.${demoSampleMessage ? ` ${demoSampleMessage}` : ""}`,
                 }, true);
+                await this.checkpointPendingWork([], true);
             }
         }
         catch (error) {
-            if (error instanceof EmbeddingProcessError) {
-                // Keep interrupted work for a later explicit start, but do not let
-                // already queued batches cause an unbounded crash/restart loop.
-                const interruptedSources = [
-                    ...sourcePaths,
-                    ...(this.queuedSourcePaths ?? []),
-                ];
-                this.queuedSourcePaths = null;
-                if (!this.filesToIndex)
-                    this.filesToIndex = new Map();
-                for (const { file, sourcePath } of pending.slice(nextPendingIndex)) {
-                    this.filesToIndex.set(file.path, sourcePath);
-                }
-                this.progress.remaining = this.filesToIndex.size;
-                try {
-                    await this.checkpointPendingWork(interruptedSources, true);
-                }
-                catch (checkpointError) {
-                    this.onDiagnostic("semantic-worker-checkpoint-error", {
-                        message: "Interrupted work could not be saved.",
-                    });
-                    console.error("[SemanticIndexer] Pending checkpoint failed", checkpointError);
-                }
+            // Keep the unfinished chronological queue and source scan roots so the
+            // recovery manager can retry in this session or resume after a restart.
+            const interruptedSources = [
+                ...sourcePaths,
+                ...(this.queuedSourcePaths ?? []),
+            ];
+            this.queuedSourcePaths = null;
+            this.preservePendingFiles(pending, nextPendingIndex, isIncremental || this.demoFileLimit !== null);
+            this.progress.remaining = this.filesToIndex?.size ?? 0;
+            try {
+                await this.checkpointPendingWork(interruptedSources, true);
+            }
+            catch (checkpointError) {
+                this.onDiagnostic("semantic-worker-checkpoint-error", {
+                    message: "Interrupted work could not be saved.",
+                });
+                console.error("[SemanticIndexer] Pending checkpoint failed", checkpointError);
             }
             await this.updateProgress({
                 status: "error",
@@ -2229,10 +2389,22 @@ class SemanticIndexer {
         }
     }
     async writeRecoveryFile(name, value) {
-        await fsPromises.mkdir(this.indexDirectory, { recursive: true });
-        const target = path.join(this.indexDirectory, name);
-        await fsPromises.writeFile(`${target}.tmp`, JSON.stringify(value), "utf8");
-        await fsPromises.rename(`${target}.tmp`, target);
+        const snapshot = JSON.stringify(value);
+        const task = this.recoveryFileWriteChain.then(async () => {
+            await fsPromises.mkdir(this.indexDirectory, { recursive: true });
+            const target = path.join(this.indexDirectory, name);
+            const temporaryPath = `${target}.${process.pid}.${++this.recoveryFileWriteSequence}.tmp`;
+            try {
+                await fsPromises.writeFile(temporaryPath, snapshot, "utf8");
+                await fsPromises.rename(temporaryPath, target);
+            }
+            catch (error) {
+                await fsPromises.unlink(temporaryPath).catch(() => undefined);
+                throw error;
+            }
+        });
+        this.recoveryFileWriteChain = task.catch(() => undefined);
+        await task;
     }
     persistWorkerFailures() {
         return this.writeRecoveryFile("worker-failures.json", Array.from(this.workerFailures));

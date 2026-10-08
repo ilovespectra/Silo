@@ -26,7 +26,7 @@ let taskChain = Promise.resolve();
 const MAX_INPUT_PIXELS = 40_000_000;
 class RuntimeInitializationError extends Error {}
 
-function loadIntelWasmRuntime() {
+function loadPortableWasmRuntime() {
   const onnxruntime = require("onnxruntime-web/wasm") as any;
   const moduleLoader = require("module") as any;
   const originalLoad = moduleLoader._load;
@@ -60,7 +60,7 @@ function loadIntelWasmRuntime() {
       "ort-wasm-simd-threaded.asyncify.mjs",
     );
     if (!fs.existsSync(wasmPath) || !fs.existsSync(wasmModulePath))
-      throw new Error("The local Intel semantic runtime files are missing.");
+      throw new Error("The local portable semantic runtime files are missing.");
     onnxruntime.env.wasm.numThreads = 1;
     onnxruntime.env.wasm.proxy = false;
     onnxruntime.env.wasm.wasmPaths = {
@@ -113,17 +113,20 @@ process.env.MKL_NUM_THREADS = "2";
 async function loadRuntime(): Promise<Runtime> {
   if (!runtimePromise) {
     runtimePromise = (async () => {
-      const intelRuntime =
-        process.platform === "darwin" && process.arch === "x64"
-          ? loadIntelWasmRuntime()
+      const usePortableWasmRuntime =
+        process.arch === "x64" &&
+        (process.platform === "win32" || process.platform === "darwin");
+      const portableRuntime =
+        usePortableWasmRuntime
+          ? loadPortableWasmRuntime()
           : null;
       const transformers =
-        intelRuntime?.transformers ??
+        portableRuntime?.transformers ??
         (require("@huggingface/transformers") as any);
       transformers.env.cacheDir =
         workerData?.modelCachePath ?? process.env.SEMANTIC_MODEL_CACHE_PATH;
       transformers.env.allowRemoteModels = false;
-      if (intelRuntime) transformers.env.useWasmCache = false;
+      if (portableRuntime) transformers.env.useWasmCache = false;
       const session_options = {
         intraOpNumThreads: 1,
         interOpNumThreads: 1,
@@ -134,18 +137,18 @@ async function loadRuntime(): Promise<Runtime> {
         await transformers.AutoTokenizer.from_pretrained(modelId);
       const processor =
         await transformers.AutoProcessor.from_pretrained(modelId);
-      if (intelRuntime) {
+      if (portableRuntime) {
         const modelDirectory = path.join(
           transformers.env.cacheDir,
           modelId,
           "onnx",
         );
         const textSession = await createWasmSession(
-          intelRuntime.onnxruntime,
+          portableRuntime.onnxruntime,
           path.join(modelDirectory, "text_model_quantized.onnx"),
         );
         const visionSession = await createWasmSession(
-          intelRuntime.onnxruntime,
+          portableRuntime.onnxruntime,
           path.join(modelDirectory, "vision_model_quantized.onnx"),
         );
         return {
@@ -153,7 +156,7 @@ async function loadRuntime(): Promise<Runtime> {
           processor,
           textSession,
           visionSession,
-          onnxruntime: intelRuntime.onnxruntime,
+          onnxruntime: portableRuntime.onnxruntime,
           RawImage: transformers.RawImage,
         };
       }

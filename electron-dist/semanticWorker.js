@@ -32,7 +32,7 @@ let taskChain = Promise.resolve();
 const MAX_INPUT_PIXELS = 40000000;
 class RuntimeInitializationError extends Error {
 }
-function loadIntelWasmRuntime() {
+function loadPortableWasmRuntime() {
     const onnxruntime = require("onnxruntime-web/wasm");
     const moduleLoader = require("module");
     const originalLoad = moduleLoader._load;
@@ -53,7 +53,7 @@ function loadIntelWasmRuntime() {
         const wasmPath = path.join(runtimeDirectory, "ort-wasm-simd-threaded.asyncify.wasm");
         const wasmModulePath = path.join(runtimeDirectory, "ort-wasm-simd-threaded.asyncify.mjs");
         if (!fs.existsSync(wasmPath) || !fs.existsSync(wasmModulePath))
-            throw new Error("The local Intel semantic runtime files are missing.");
+            throw new Error("The local portable semantic runtime files are missing.");
         onnxruntime.env.wasm.numThreads = 1;
         onnxruntime.env.wasm.proxy = false;
         onnxruntime.env.wasm.wasmPaths = {
@@ -96,15 +96,17 @@ process.env.MKL_NUM_THREADS = "2";
 async function loadRuntime() {
     if (!runtimePromise) {
         runtimePromise = (async () => {
-            const intelRuntime = process.platform === "darwin" && process.arch === "x64"
-                ? loadIntelWasmRuntime()
+            const usePortableWasmRuntime = process.arch === "x64" &&
+                (process.platform === "win32" || process.platform === "darwin");
+            const portableRuntime = usePortableWasmRuntime
+                ? loadPortableWasmRuntime()
                 : null;
-            const transformers = intelRuntime?.transformers ??
+            const transformers = portableRuntime?.transformers ??
                 require("@huggingface/transformers");
             transformers.env.cacheDir =
                 worker_threads_1.workerData?.modelCachePath ?? process.env.SEMANTIC_MODEL_CACHE_PATH;
             transformers.env.allowRemoteModels = false;
-            if (intelRuntime)
+            if (portableRuntime)
                 transformers.env.useWasmCache = false;
             const session_options = {
                 intraOpNumThreads: 1,
@@ -114,16 +116,16 @@ async function loadRuntime() {
             const modelId = "Xenova/clip-vit-base-patch32";
             const tokenizer = await transformers.AutoTokenizer.from_pretrained(modelId);
             const processor = await transformers.AutoProcessor.from_pretrained(modelId);
-            if (intelRuntime) {
+            if (portableRuntime) {
                 const modelDirectory = path.join(transformers.env.cacheDir, modelId, "onnx");
-                const textSession = await createWasmSession(intelRuntime.onnxruntime, path.join(modelDirectory, "text_model_quantized.onnx"));
-                const visionSession = await createWasmSession(intelRuntime.onnxruntime, path.join(modelDirectory, "vision_model_quantized.onnx"));
+                const textSession = await createWasmSession(portableRuntime.onnxruntime, path.join(modelDirectory, "text_model_quantized.onnx"));
+                const visionSession = await createWasmSession(portableRuntime.onnxruntime, path.join(modelDirectory, "vision_model_quantized.onnx"));
                 return {
                     tokenizer,
                     processor,
                     textSession,
                     visionSession,
-                    onnxruntime: intelRuntime.onnxruntime,
+                    onnxruntime: portableRuntime.onnxruntime,
                     RawImage: transformers.RawImage,
                 };
             }

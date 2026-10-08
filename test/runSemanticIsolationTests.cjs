@@ -136,6 +136,84 @@ function makeIndexer(
   };
 }
 
+if (process.env.SILO_REAL_SEMANTIC_SMOKE === "1") {
+  test("bundled Windows x64 offline model returns a finite text embedding", async (t) => {
+    assert.equal(process.platform, "win32");
+    assert.equal(process.arch, "x64");
+    const modelCachePath = path.join(root, ".model-test-cache");
+    const requiredModels = [
+      path.join(
+        modelCachePath,
+        "Xenova",
+        "clip-vit-base-patch32",
+        "onnx",
+        "text_model_quantized.onnx",
+      ),
+      path.join(
+        modelCachePath,
+        "Xenova",
+        "clip-vit-base-patch32",
+        "onnx",
+        "vision_model_quantized.onnx",
+      ),
+      path.join(
+        modelCachePath,
+        "Xenova",
+        "clip-vit-base-patch32",
+        "tokenizer.json",
+      ),
+    ];
+    for (const modelPath of requiredModels)
+      assert.ok(fs.existsSync(modelPath), `Missing bundled model: ${modelPath}`);
+
+    const child = fork(path.join(root, "electron-dist", "semanticWorker.js"), [], {
+      cwd: root,
+      env: {
+        ...process.env,
+        SEMANTIC_MODEL_CACHE_PATH: modelCachePath,
+        OMP_NUM_THREADS: "2",
+        OPENBLAS_NUM_THREADS: "2",
+        MKL_NUM_THREADS: "2",
+      },
+      execArgv: [],
+      silent: true,
+    });
+    t.after(() => {
+      if (child.exitCode === null) child.kill();
+    });
+
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("Windows semantic worker smoke timed out.")),
+        120_000,
+      );
+      child.on("message", (message) => {
+        if (message?.id !== 1) return;
+        clearTimeout(timer);
+        resolve(message);
+      });
+      child.once("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      child.once("exit", (code, signal) => {
+        clearTimeout(timer);
+        reject(
+          new Error(
+            `Windows semantic worker exited before responding (code ${code}, signal ${signal}).`,
+          ),
+        );
+      });
+    });
+    child.send({ id: 1, type: "text", text: "a sailboat on calm water" });
+    const result = await response;
+    assert.equal(result.error, undefined, result.error);
+    assert.ok(Array.isArray(result.values));
+    assert.equal(result.values.length, 512);
+    assert.ok(result.values.every(Number.isFinite));
+  });
+}
+
 test("real child IPC preserves embedding APIs; native-style death rejects all pending and allows explicit retry", async (t) => {
   const { indexer, children, diagnostics } = makeIndexer(t);
   const runtime = await indexer.loadClipRuntime();
@@ -346,6 +424,8 @@ test("three native image crashes persist across restarts, quarantine only unchan
   const good = path.join(sourcePath, "good.jpg");
   fs.writeFileSync(trap, "original trap image");
   fs.writeFileSync(good, "original good image");
+  const trapMtime = new Date(Date.now() - 10_000);
+  fs.utimesSync(trap, trapMtime, trapMtime);
   const original = fs.readFileSync(trap);
   const originalStats = fs.statSync(trap);
   let indexer;
@@ -491,6 +571,8 @@ test("failed recovery writes retain work and late queued starts cannot restart a
   const queuedRoot = path.join(sourcePath, "queued-root");
   fs.writeFileSync(trap, "unchanged");
   fs.writeFileSync(good, "unchanged");
+  const trapMtime = new Date(Date.now() - 10_000);
+  fs.utimesSync(trap, trapMtime, trapMtime);
   indexer.persistWorkerFailures = async () => {
     throw new Error("disk unavailable");
   };

@@ -15,6 +15,9 @@ module.exports = {
     allowToChangeInstallationDirectory: true,
     createDesktopShortcut: true,
     createStartMenuShortcut: true,
+    ...(process.env.SILO_NSIS_INCLUDE
+      ? { include: process.env.SILO_NSIS_INCLUDE }
+      : {}),
   },
   publish: [{
     provider: 'github',

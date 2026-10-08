@@ -206,6 +206,32 @@ class IndexingRecovery {
         this.requested.delete(id);
         this.persist();
     }
+    request(id) {
+        const stage = this.stages.find((item) => item.id === id);
+        if (!stage)
+            throw new Error("This index does not support recovery.");
+        if (this.stopped)
+            throw new Error("Silo is shutting down. Reopen it to resume indexing.");
+        const record = this.records.get(id) ?? {
+            attempts: 0,
+            error: "",
+            retryAt: 0,
+            running: false,
+            checked: false,
+            userPaused: false,
+        };
+        if (record.userPaused)
+            return;
+        record.checked = false;
+        record.error = "";
+        record.retryAt = 0;
+        if (!record.running)
+            record.attempts = 0;
+        this.records.set(id, record);
+        this.requested.add(id);
+        this.persist();
+        void this.tick();
+    }
     queue(id) {
         const stage = this.stages.find((item) => item.id === id);
         if (!stage)
@@ -242,7 +268,8 @@ class IndexingRecovery {
         this.tickRunning = true;
         try {
             const ordered = [...this.stages].sort((first, second) => Number(this.requested.has(second.id)) -
-                Number(this.requested.has(first.id)));
+                Number(this.requested.has(first.id)) ||
+                Number(second.id === "search") - Number(first.id === "search"));
             for (const stage of ordered) {
                 if (this.stopped || this.externalBlockReason || !stage.ready())
                     continue;
@@ -332,6 +359,7 @@ class IndexingRecovery {
             if (stage.lane)
                 this.activeLanes.delete(stage.lane);
             this.persist();
+            setImmediate(() => void this.tick());
         }
     }
 }
