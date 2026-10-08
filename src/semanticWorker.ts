@@ -1,4 +1,7 @@
+import * as fs from "fs";
+import * as path from "path";
 import { parentPort, workerData } from "worker_threads";
+import { pathToFileURL } from "url";
 
 interface WorkerRequest {
   id: number;
@@ -10,8 +13,11 @@ interface WorkerRequest {
 interface Runtime {
   tokenizer: any;
   processor: any;
-  textModel: any;
-  visionModel: any;
+  textModel?: any;
+  visionModel?: any;
+  textSession?: any;
+  visionSession?: any;
+  onnxruntime?: any;
   RawImage: any;
 }
 
@@ -19,6 +25,85 @@ let runtimePromise: Promise<Runtime> | null = null;
 let taskChain = Promise.resolve();
 const MAX_INPUT_PIXELS = 40_000_000;
 class RuntimeInitializationError extends Error {}
+
+function loadIntelWasmRuntime() {
+  const onnxruntime = require("onnxruntime-web/wasm") as any;
+  const moduleLoader = require("module") as any;
+  const originalLoad = moduleLoader._load;
+  moduleLoader._load = function (
+    request: string,
+    parent: unknown,
+    isMain: boolean,
+  ) {
+    if (request === "onnxruntime-node") return {};
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    (globalThis as any)[Symbol.for("onnxruntime")] = onnxruntime;
+    let runtimeDirectory = path.dirname(
+      require.resolve("onnxruntime-web/wasm"),
+    );
+    const asarSegment = `${path.sep}app.asar${path.sep}`;
+    if (runtimeDirectory.includes(asarSegment)) {
+      const unpackedDirectory = runtimeDirectory.replace(
+        asarSegment,
+        `${path.sep}app.asar.unpacked${path.sep}`,
+      );
+      if (fs.existsSync(unpackedDirectory)) runtimeDirectory = unpackedDirectory;
+    }
+    const wasmPath = path.join(
+      runtimeDirectory,
+      "ort-wasm-simd-threaded.asyncify.wasm",
+    );
+    const wasmModulePath = path.join(
+      runtimeDirectory,
+      "ort-wasm-simd-threaded.asyncify.mjs",
+    );
+    if (!fs.existsSync(wasmPath) || !fs.existsSync(wasmModulePath))
+      throw new Error("The local Intel semantic runtime files are missing.");
+    onnxruntime.env.wasm.numThreads = 1;
+    onnxruntime.env.wasm.proxy = false;
+    onnxruntime.env.wasm.wasmPaths = {
+      mjs: pathToFileURL(wasmModulePath).href,
+      wasm: pathToFileURL(wasmPath).href,
+    };
+    return {
+      onnxruntime,
+      transformers: require("@huggingface/transformers") as any,
+    };
+  } finally {
+    moduleLoader._load = originalLoad;
+  }
+}
+
+async function createWasmSession(onnxruntime: any, modelPath: string) {
+  const modelBuffer = fs.readFileSync(modelPath);
+  const modelData = new Uint8Array(
+    modelBuffer.buffer,
+    modelBuffer.byteOffset,
+    modelBuffer.byteLength,
+  );
+  return onnxruntime.InferenceSession.create(modelData, {
+    executionProviders: ["wasm"],
+  });
+}
+
+async function runWasmSession(
+  onnxruntime: any,
+  session: any,
+  inputs: Record<string, any>,
+) {
+  const feeds: Record<string, any> = {};
+  for (const name of session.inputNames) {
+    const input = inputs[name];
+    if (!input) throw new Error(`Missing CLIP model input: ${name}`);
+    feeds[name] =
+      input instanceof onnxruntime.Tensor
+        ? input
+        : new onnxruntime.Tensor(input.type, input.data, input.dims);
+  }
+  return session.run(feeds);
+}
 
 // Set before loading either native runtime, including in worker-thread mode.
 process.env.OMP_NUM_THREADS = "2";
@@ -28,10 +113,17 @@ process.env.MKL_NUM_THREADS = "2";
 async function loadRuntime(): Promise<Runtime> {
   if (!runtimePromise) {
     runtimePromise = (async () => {
-      const transformers = require("@huggingface/transformers") as any;
+      const intelRuntime =
+        process.platform === "darwin" && process.arch === "x64"
+          ? loadIntelWasmRuntime()
+          : null;
+      const transformers =
+        intelRuntime?.transformers ??
+        (require("@huggingface/transformers") as any);
       transformers.env.cacheDir =
         workerData?.modelCachePath ?? process.env.SEMANTIC_MODEL_CACHE_PATH;
       transformers.env.allowRemoteModels = false;
+      if (intelRuntime) transformers.env.useWasmCache = false;
       const session_options = {
         intraOpNumThreads: 1,
         interOpNumThreads: 1,
@@ -42,22 +134,37 @@ async function loadRuntime(): Promise<Runtime> {
         await transformers.AutoTokenizer.from_pretrained(modelId);
       const processor =
         await transformers.AutoProcessor.from_pretrained(modelId);
-      const textModel =
-        await transformers.CLIPTextModelWithProjection.from_pretrained(
+      if (intelRuntime) {
+        const modelDirectory = path.join(
+          transformers.env.cacheDir,
           modelId,
-          {
-            dtype: "q8",
-            session_options,
-          },
+          "onnx",
         );
-      const visionModel =
-        await transformers.CLIPVisionModelWithProjection.from_pretrained(
-          modelId,
-          {
-            dtype: "q8",
-            session_options,
-          },
+        const textSession = await createWasmSession(
+          intelRuntime.onnxruntime,
+          path.join(modelDirectory, "text_model_quantized.onnx"),
         );
+        const visionSession = await createWasmSession(
+          intelRuntime.onnxruntime,
+          path.join(modelDirectory, "vision_model_quantized.onnx"),
+        );
+        return {
+          tokenizer,
+          processor,
+          textSession,
+          visionSession,
+          onnxruntime: intelRuntime.onnxruntime,
+          RawImage: transformers.RawImage,
+        };
+      }
+      const textModel = await transformers.CLIPTextModelWithProjection.from_pretrained(
+        modelId,
+        { dtype: "q8", session_options },
+      );
+      const visionModel = await transformers.CLIPVisionModelWithProjection.from_pretrained(
+        modelId,
+        { dtype: "q8", session_options },
+      );
       return {
         tokenizer,
         processor,
@@ -85,7 +192,9 @@ async function handleRequest(request: WorkerRequest) {
       padding: true,
       truncation: true,
     });
-    const output = await runtime.textModel(inputs);
+    const output = runtime.textSession
+      ? await runWasmSession(runtime.onnxruntime, runtime.textSession, inputs)
+      : await runtime.textModel!(inputs);
     return Array.from(output.text_embeds.data as Iterable<number>);
   }
   // Never hand an unbounded encoded file to RawImage.read. All metadata and
@@ -118,7 +227,9 @@ async function handleRequest(request: WorkerRequest) {
     info.channels,
   );
   const inputs = await runtime.processor(image);
-  const output = await runtime.visionModel(inputs);
+  const output = runtime.visionSession
+    ? await runWasmSession(runtime.onnxruntime, runtime.visionSession, inputs)
+    : await runtime.visionModel!(inputs);
   return Array.from(output.image_embeds.data as Iterable<number>);
 }
 

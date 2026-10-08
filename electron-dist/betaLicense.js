@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.verifyBetaActivationCode = exports.createBetaActivationCode = exports.createBetaActivationRequestMailto = exports.BETA_ACTIVATION_REQUEST_EMAIL = exports.parseBetaRequestCode = exports.createBetaRequestCode = void 0;
+exports.verifyBetaActivationCode = exports.createBetaActivationCode = exports.BETA_ACTIVATION_REQUEST_EMAIL = exports.parseBetaRequestCode = exports.createBetaActivationRequestPayload = exports.createBetaRequestCode = void 0;
 const crypto_1 = require("crypto");
 const REQUEST_CODE_PREFIX = "SILO-BETA-REQUEST-1";
 const ACTIVATION_CODE_PREFIX = "SILO-BETA-LIFETIME-1";
@@ -11,30 +11,23 @@ function createBetaRequestCode(installationId) {
     return `${REQUEST_CODE_PREFIX}.${installationId}`;
 }
 exports.createBetaRequestCode = createBetaRequestCode;
+function createBetaActivationRequestPayload(installationId, appVersion, platform, createdAt = new Date().toISOString()) {
+    if (!Number.isFinite(Date.parse(createdAt)))
+        throw new Error("Invalid beta request timestamp.");
+    return {
+        requestCode: createBetaRequestCode(installationId),
+        appVersion: appVersion.slice(0, 64),
+        platform: platform.slice(0, 32),
+        createdAt: new Date(createdAt).toISOString(),
+    };
+}
+exports.createBetaActivationRequestPayload = createBetaActivationRequestPayload;
 function parseBetaRequestCode(requestCode) {
     const match = new RegExp(`^${REQUEST_CODE_PREFIX}\\.([a-f0-9]{32})$`).exec(requestCode.trim());
     return match?.[1] ?? null;
 }
 exports.parseBetaRequestCode = parseBetaRequestCode;
-exports.BETA_ACTIVATION_REQUEST_EMAIL = "info@balkanbiskits.si";
-function createBetaActivationRequestMailto(requestCode) {
-    if (!parseBetaRequestCode(requestCode))
-        throw new Error("Invalid Silo beta request code.");
-    const parameters = new URLSearchParams({
-        subject: "Silo lifetime beta activation request",
-        body: [
-            "Hello,",
-            "",
-            "I would like to request a free lifetime beta activation for this Silo installation.",
-            "",
-            `Silo beta request code: ${requestCode}`,
-            "",
-            "Thank you.",
-        ].join("\n"),
-    });
-    return `mailto:${exports.BETA_ACTIVATION_REQUEST_EMAIL}?${parameters.toString()}`;
-}
-exports.createBetaActivationRequestMailto = createBetaActivationRequestMailto;
+exports.BETA_ACTIVATION_REQUEST_EMAIL = "tani@kolektivkrog.si";
 function createBetaActivationCode(requestCode, privateKeyPem, issuedAt = Date.now()) {
     const installationId = parseBetaRequestCode(requestCode);
     if (!installationId)

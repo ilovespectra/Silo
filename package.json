@@ -1,6 +1,6 @@
 {
   "name": "silo",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "A local-first media library with semantic search, people, maps, messages, and duplicate management.",
   "main": "electron-dist/main.js",
   "homepage": "./",
@@ -29,7 +29,12 @@
     "brand-dev": "node scripts/brand-dev-app.js",
     "unbrand-dev": "node scripts/brand-dev-app.js --restore",
     "dist": "npm run react-build && tsc && npm run release:check && electron-builder --config electron-builder.config.cjs",
-    "test:clone-archive": "node test/runCloneArchiveTests.cjs && node test/runSourceCloneTests.cjs",
+    "dist:mac:x64": "node scripts/dist-mac.cjs x64",
+    "dist:mac:arm64": "node scripts/dist-mac.cjs arm64",
+    "release:merge-mac-updates": "node scripts/merge-mac-update-manifests.cjs",
+    "test:mac-update-manifest": "node test/runMacUpdateManifestTests.cjs",
+    "test:clone-archive": "node test/runCloneArchiveTests.cjs && node test/runSourceCloneTests.cjs && node test/runShelterVerificationTests.cjs",
+    "test:ffmpeg-packaging": "node test/runFfmpegPackagingTests.cjs",
     "test:access-branding": "node test/runAccessBrandingTests.cjs",
     "test:phone-restore-target": "node test/runPhoneRestoreTargetTests.cjs",
     "test:startup-smoke": "node test/runStartupSmokeTests.cjs",
@@ -43,6 +48,7 @@
     "@vladmandic/face-api": "^1.7.15",
     "archiver": "^7.0.1",
     "electron-is-dev": "^2.0.0",
+    "electron-updater": "^6.8.9",
     "exifr": "^7.1.3",
     "fflate": "^0.8.3",
     "ffmpeg-static": "^5.3.0",
@@ -50,6 +56,7 @@
     "highlight.js": "^11.12.0",
     "mammoth": "^1.13.0",
     "mime": "^3.0.0",
+    "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
     "pdf-parse": "^2.4.5",
     "pdfkit": "^0.13.0",
     "qrcode.react": "^4.2.0",
@@ -72,6 +79,7 @@
     "concurrently": "^8.2.0",
     "electron": "^43.4.0",
     "electron-builder": "^24.6.0",
+    "js-yaml": "^4.1.0",
     "react-scripts": "5.0.1",
     "typescript": "^4.9.5",
     "wait-on": "^7.0.0"
@@ -93,6 +101,7 @@
     "appId": "com.solosilo.app",
     "productName": "Silo",
     "mac": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
       "category": "public.app-category.utilities",
       "extendInfo": {
         "CFBundleName": "Silo",
@@ -131,6 +140,7 @@
     ],
     "asarUnpack": [
       "node_modules/onnxruntime-node/**/*",
+      "node_modules/onnxruntime-web/**/*",
       "node_modules/sharp/**/*",
       "node_modules/@img/**/*",
       "node_modules/ffmpeg-static/**/*"

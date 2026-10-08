@@ -389,6 +389,7 @@ function selectedTypes(value: string): string[] {
 
 const sourceKindLabels: Record<string, string> = {
   local: "Disk",
+  machine: "This Mac",
   ios: "iOS",
   android: "Android",
   gdrive: "Drive",
@@ -2880,6 +2881,24 @@ function App() {
   const addIndexSource = useCallback(async () => {
     if (!electronAPI) return;
     const state = await electronAPI.selectIndexSource();
+    if (state) {
+      applyPersistedState(state);
+      await refreshSources();
+      if (currentPath === allSourcesPath)
+        void loadDirectory(allSourcesPath, explodedRef.current, true, true);
+    }
+  }, [
+    allSourcesPath,
+    applyPersistedState,
+    currentPath,
+    electronAPI,
+    loadDirectory,
+    refreshSources,
+  ]);
+
+  const addMachineSource = useCallback(async () => {
+    if (!electronAPI) return;
+    const state = await electronAPI.addMachineSource();
     if (state) {
       applyPersistedState(state);
       await refreshSources();
@@ -6047,6 +6066,14 @@ function App() {
                   <FiPlus />
                 </button>
                 <button
+                  onClick={addMachineSource}
+                  title="Add this Mac’s internal drive as a source"
+                  aria-label="Add This Mac as a source"
+                  data-help="Browse, organize, index, search, and map files on this Mac’s internal data volume. Mounted external volumes are excluded."
+                >
+                  <FiHardDrive />
+                </button>
+                <button
                   onClick={() => setShowSourceClone(true)}
                   disabled={cloneableSources.length === 0}
                   title="Clone all enabled sources without modifying originals"
@@ -7257,6 +7284,7 @@ function App() {
             setAppSection("stats");
             setShowSettings(false);
           }}
+          hideSettingsForScreenshot={selectingBugReportScreenshot}
           lifetimePromptRequest={lifetimePromptRequest}
         />
       )}

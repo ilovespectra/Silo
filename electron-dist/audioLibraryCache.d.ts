@@ -33,6 +33,7 @@ export interface AudioLibraryScanProgress {
     sourceCount: number;
     phase: "scanning" | "retrying" | "cooldown" | "source-complete";
     message: string;
+    files?: CachedAudioFile[];
 }
 export declare class AudioLibraryCache {
     private cachePath;

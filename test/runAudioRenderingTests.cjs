@@ -174,6 +174,15 @@ test("CSS geometry matches production constants and prevents scroll anchoring", 
     css,
     /\.audio-track-list\s*\{[^}]*max-height: 3600px;[^}]*overflow-anchor: none;/,
   );
+  assert.match(
+    css,
+    /\.audio-visualizer\s*\{[^}]*max-height: min\(140px, 25vh\);/,
+  );
+  assert.match(
+    css,
+    /\.audio-visualizer i\s*\{[^}]*max-height: 100%;/,
+  );
+  assert.match(css, /@media \(max-height: 620px\)/);
   assert.match(text, /const orderedFiles = useMemo/);
   assert.match(text, /const activeFile = useMemo/);
   assert.match(text, /const activeIndex = useMemo/);
@@ -244,7 +253,7 @@ async function mountedTests() {
     this.dispatchEvent(new dom.window.Event("play"));
     return Promise.resolve();
   };
-  const inventory = Array.from({ length: 284097 }, (_, i) => ({
+  let inventory = Array.from({ length: 284097 }, (_, i) => ({
     path: `/music/${i}.mp3`,
     name: `Track ${i}.mp3`,
     extension: ".mp3",
@@ -305,8 +314,14 @@ async function mountedTests() {
   const Component = context.exports.default;
   const previewPaths = [];
   const favoritePaths = [];
+  let scanProgressCallback;
   const api = {
-    onAudioLibraryScanProgress: () => () => {},
+    onAudioLibraryScanProgress: (callback) => {
+      scanProgressCallback = callback;
+      return () => {
+        if (scanProgressCallback === callback) scanProgressCallback = null;
+      };
+    },
     onAudioLibraryCacheChanged: () => () => {},
     getFilePreview: async (filePath) => {
       previewPaths.push(filePath);
@@ -448,9 +463,78 @@ async function mountedTests() {
       document.querySelector(".audio-empty").textContent,
       /No tracks match/,
     );
+    inventory = [];
+    const scanningRootNode = document.createElement("div");
+    document.body.appendChild(scanningRootNode);
+    const scanningRoot = createRoot(scanningRootNode);
+    await act(async () => {
+      scanningRoot.render(
+        React.createElement(Component, {
+          ...props,
+          visible: true,
+          yearFilter: "all",
+        }),
+      );
+    });
+    await act(async () => {
+      scanProgressCallback({
+        requestId: -1,
+        phase: "scanning",
+        scanned: 10,
+        audioFound: 0,
+        source: "Scanning Music",
+        sourceIndex: 1,
+        sourceCount: 1,
+        message: "Scanning Music",
+      });
+    });
+    assert.ok(
+      scanningRootNode.querySelector(".audio-track-list .audio-scan-empty"),
+    );
+    assert.equal(
+      scanningRootNode.querySelector(".audio-visualizer .audio-orbit-loader"),
+      null,
+      "scan loader stays out of the EQ panel",
+    );
+    await act(async () => {
+      scanProgressCallback({
+        requestId: -1,
+        phase: "scanning",
+        scanned: 11,
+        audioFound: 1,
+        source: "Scanning Music",
+        sourceIndex: 1,
+        sourceCount: 1,
+        message: "Scanning Music",
+        files: [
+          {
+            path: "/music/new-track.mp3",
+            name: "New Track.mp3",
+            extension: ".mp3",
+            size: 10,
+            modified: Date.UTC(2024, 0, 1),
+            type: "audio",
+            isDirectory: false,
+          },
+        ],
+      });
+    });
+    assert.equal(
+      scanningRootNode.querySelector(".audio-track-list .audio-scan-empty"),
+      null,
+      "loader disappears as soon as the first matching track renders",
+    );
+    assert.equal(
+      scanningRootNode.querySelector(".audio-track-copy strong").textContent,
+      "New Track.mp3",
+    );
+    await act(async () => {
+      scanningRoot.unmount();
+    });
+    scanningRootNode.remove();
     passed++;
     console.log(
-      "PASS mounted scroll bottom, ResizeObserver, group expand/collapse, year and format filters",
+      "PASS mounted scroll, grouped filters, streamed audio results and loader placement",
     );
   } finally {
     await act(async () => {

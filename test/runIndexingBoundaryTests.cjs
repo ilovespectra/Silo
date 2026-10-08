@@ -159,17 +159,48 @@ async function run() {
     await audioCache.initialize();
     await fsp.mkdir(path.join(root, "Music"), { recursive: true });
     await fsp.writeFile(path.join(root, "Music", "song.mp3"), "audio");
+    await fsp.mkdir(path.join(root, "Music", "Live"), { recursive: true });
+    await fsp.writeFile(
+      path.join(root, "Music", "Live", "nested-song.mp3"),
+      "nested audio",
+    );
     await fsp.writeFile(path.join(cloneRoot, "backup-track.mp3"), "clone audio");
     await fsp.writeFile(path.join(userData, "phone-cache", "internal.mp3"), "cache audio");
+    const audioProgressBatches = [];
+    let audioScanReturned = false;
     const audioSnapshot = await audioCache.scan(
       [{ id: "drive", rootPath: root, kind: "local", label: "Drive" }],
       () => false,
       (name) => name.endsWith(".mp3"),
       async () => [],
-      () => undefined,
+      (progress) => {
+        if (progress.files?.length)
+          audioProgressBatches.push({
+            files: progress.files,
+            scanReturned: audioScanReturned,
+          });
+      },
       true,
     );
-    assert.deepEqual(audioSnapshot.files.map((file) => file.path), [path.join(root, "Music", "song.mp3")], "audio inventory prunes the same internal subtree");
+    audioScanReturned = true;
+    assert.deepEqual(
+      audioSnapshot.files.map((file) => file.path).sort(),
+      [
+        path.join(root, "Music", "Live", "nested-song.mp3"),
+        path.join(root, "Music", "song.mp3"),
+      ].sort(),
+      "audio inventory recursively finds tracks while pruning the same internal subtree",
+    );
+    assert(
+      audioProgressBatches.some(({ files }) =>
+        files.some((file) => file.path.endsWith("nested-song.mp3")),
+      ),
+      "recursively discovered tracks stream in progress batches",
+    );
+    assert(
+      audioProgressBatches.every(({ scanReturned }) => !scanReturned),
+      "track batches arrive before the complete scan resolves",
+    );
 
     const originalWatch = fs.watch;
     const watchCallbacks = [];

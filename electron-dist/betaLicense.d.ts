@@ -10,6 +10,12 @@ export interface BetaActivationInfo {
     requestEmail: string;
     available: boolean;
 }
+export interface BetaActivationRequestPayload {
+    requestCode: string;
+    appVersion: string;
+    platform: string;
+    createdAt: string;
+}
 export interface BetaActivationResult {
     status: "activated" | "invalid" | "unavailable" | "already-licensed" | "error";
     message: string;
@@ -21,8 +27,8 @@ export interface BetaActivationResult {
     };
 }
 export declare function createBetaRequestCode(installationId: string): string;
+export declare function createBetaActivationRequestPayload(installationId: string, appVersion: string, platform: string, createdAt?: string): BetaActivationRequestPayload;
 export declare function parseBetaRequestCode(requestCode: string): string | null;
-export declare const BETA_ACTIVATION_REQUEST_EMAIL = "info@balkanbiskits.si";
-export declare function createBetaActivationRequestMailto(requestCode: string): string;
+export declare const BETA_ACTIVATION_REQUEST_EMAIL = "tani@kolektivkrog.si";
 export declare function createBetaActivationCode(requestCode: string, privateKeyPem: string, issuedAt?: number): string;
 export declare function verifyBetaActivationCode(activationCode: string, publicKeyPem: string, expectedInstallationId: string): BetaActivationPayload | null;

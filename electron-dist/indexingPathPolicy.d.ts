@@ -1,5 +1,9 @@
+export declare const MAC_DATA_VOLUME_ROOT: string;
 /** Phone-generated thumbnails and caches: never indexed, browsed for memories, or backed up. */
 export declare function isPhoneDerivativePath(candidatePath: string): boolean;
+export declare function isMacDataVolumeSourceRoot(sourceRoot: string): boolean;
+export declare function getMacDataVolumeDeviceId(sourceRoot: string): Promise<number | null>;
+export declare function isMacDataVolumePathExcluded(candidatePath: string, sourceRoot: string): boolean;
 /** True for paths inside software trees that are never indexed or scanned for search. */
 export declare function isNonLibraryPath(candidatePath: string): boolean;
 /** True when candidate is root itself or is below it at a path boundary. */

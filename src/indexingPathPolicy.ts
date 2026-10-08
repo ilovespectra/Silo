@@ -12,10 +12,50 @@ const CLONE_MARKER_CACHE_LIMIT = 4096;
 const NEGATIVE_MARKER_CACHE_MS = 2000;
 // iOS-generated derivatives (thumbnail strips, caches) duplicate every real photo.
 const PHONE_DERIVATIVE_PATTERN = /(^|[\\/])PhotoData[\\/](Thumbnails|Caches|MISC|Metadata|CPLAssets[\\/]\.thumbnails)([\\/]|$)/i;
+export const MAC_DATA_VOLUME_ROOT = path.resolve("/System/Volumes/Data");
+const MAC_DATA_VOLUME_EXCLUDED_ROOTS = new Set([
+  "System",
+  "Volumes",
+  "home",
+  "dev",
+  "cores",
+  ".Spotlight-V100",
+  ".fseventsd",
+  ".Trashes",
+  ".TemporaryItems",
+  ".DocumentRevisions-V100",
+]);
 
 /** Phone-generated thumbnails and caches: never indexed, browsed for memories, or backed up. */
 export function isPhoneDerivativePath(candidatePath: string): boolean {
   return PHONE_DERIVATIVE_PATTERN.test(candidatePath);
+}
+
+export function isMacDataVolumeSourceRoot(sourceRoot: string): boolean {
+  return path.resolve(sourceRoot) === MAC_DATA_VOLUME_ROOT;
+}
+
+export async function getMacDataVolumeDeviceId(sourceRoot: string): Promise<number | null> {
+  if (!isMacDataVolumeSourceRoot(sourceRoot)) return null;
+  try {
+    const stats = await fsPromises.stat(MAC_DATA_VOLUME_ROOT);
+    return stats.isDirectory() ? stats.dev : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isMacDataVolumePathExcluded(candidatePath: string, sourceRoot: string): boolean {
+  if (!isMacDataVolumeSourceRoot(sourceRoot)) return false;
+  const relative = path.relative(MAC_DATA_VOLUME_ROOT, path.resolve(candidatePath));
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+    return false;
+  const segments = relative.split(path.sep);
+  if (MAC_DATA_VOLUME_EXCLUDED_ROOTS.has(segments[0])) return true;
+  if (segments[0] === "private" && ["var", "tmp"].includes(segments[1])) return true;
+  return segments.some((segment, index) =>
+    (segment === "Caches" || segment === "Logs") && segments[index - 1] === "Library",
+  );
 }
 
 // Software trees (dependencies, app bundles, VCS internals) hold thousands of files and no memories.

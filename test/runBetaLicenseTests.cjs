@@ -19,8 +19,9 @@ betaModule.paths = Module._nodeModulePaths(path.dirname(sourcePath));
 betaModule._compile(compiled, sourcePath);
 
 const {
+  BETA_ACTIVATION_REQUEST_EMAIL,
   createBetaActivationCode,
-  createBetaActivationRequestMailto,
+  createBetaActivationRequestPayload,
   createBetaRequestCode,
   parseBetaRequestCode,
   verifyBetaActivationCode,
@@ -32,20 +33,31 @@ const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519", {
 const installationId = "a1".repeat(16);
 const otherInstallationId = "b2".repeat(16);
 const requestCode = createBetaRequestCode(installationId);
-const requestMailto = new URL(createBetaActivationRequestMailto(requestCode));
+const requestPayload = createBetaActivationRequestPayload(
+  installationId,
+  "2.0.0",
+  "darwin",
+  "2026-10-07T08:00:00.000Z",
+);
 const activationCode = createBetaActivationCode(requestCode, privateKey, 123456);
 const tamperedActivationCode = activationCode.replace(/.$/, (lastCharacter) =>
   lastCharacter === "A" ? "B" : "A",
 );
 
 assert.strictEqual(parseBetaRequestCode(requestCode), installationId);
-assert.strictEqual(requestMailto.protocol, "mailto:");
-assert.strictEqual(requestMailto.pathname, "info@balkanbiskits.si");
-assert.match(requestMailto.searchParams.get("subject"), /beta activation request/i);
-assert.ok(requestMailto.searchParams.get("body").includes(requestCode));
+assert.strictEqual(BETA_ACTIVATION_REQUEST_EMAIL, "tani@kolektivkrog.si");
+assert.deepStrictEqual(requestPayload, {
+  requestCode,
+  appVersion: "2.0.0",
+  platform: "darwin",
+  createdAt: "2026-10-07T08:00:00.000Z",
+});
 assert.strictEqual(parseBetaRequestCode(`${requestCode}x`), null);
 assert.throws(() => createBetaRequestCode("not-an-installation-id"));
-assert.throws(() => createBetaActivationRequestMailto("invalid-request-code"));
+assert.throws(() => createBetaActivationRequestPayload("invalid-id", "2.0.0", "darwin"));
+assert.throws(() =>
+  createBetaActivationRequestPayload(installationId, "2.0.0", "darwin", "invalid-date"),
+);
 assert.deepStrictEqual(
   verifyBetaActivationCode(activationCode, publicKey, installationId),
   {

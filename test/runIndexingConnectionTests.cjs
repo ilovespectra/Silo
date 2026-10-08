@@ -42,6 +42,11 @@ const source = fs.readFileSync(
   path.join(__dirname, "../src/components/IndexingPanel.tsx"),
   "utf8",
 );
+assert(
+  source.includes('stage.id === "quality"') &&
+    source.includes('"Refresh photo quality index"'),
+  "completed Photo Quality rows keep a working manual rescan control",
+);
 const ast = ts.createSourceFile(
   "IndexingPanel.tsx",
   source,

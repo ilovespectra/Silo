@@ -37,6 +37,7 @@ const os = __importStar(require("os"));
 const fs = __importStar(require("fs"));
 const fsPromises = __importStar(require("fs/promises"));
 const electron_is_dev_1 = __importDefault(require("electron-is-dev"));
+const electron_updater_1 = require("electron-updater");
 const semanticIndexer_1 = require("./semanticIndexer");
 const stateStore_1 = require("./stateStore");
 const faceIndexer_1 = require("./faceIndexer");
@@ -69,7 +70,9 @@ const geocoder_1 = require("./geocoder");
 const duplicateManager_1 = require("./duplicateManager");
 const indexingStorage_1 = require("./indexingStorage");
 const cloneArchive_1 = require("./cloneArchive");
+const shelterVerification_1 = require("./shelterVerification");
 const heapGuard_1 = require("./heapGuard");
+const timeMachineBackup_1 = require("./timeMachineBackup");
 const indexingPathPolicy_1 = require("./indexingPathPolicy");
 const aestheticScorer_1 = require("./aestheticScorer");
 const configBundle_1 = require("./configBundle");
@@ -380,6 +383,7 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"])
 const diagnosticsPath = path.join(diagnosticsDirectory, "runtime.jsonl");
 const maxBugReportScreenshotBytes = 3 * 1024 * 1024;
 const defaultBugReportEndpoint = "https://silo-bug-report-relay.vercel.app/api/bug-report";
+const defaultBetaRequestEndpoint = "https://silo-bug-report-relay.vercel.app/api/beta-request";
 fs.mkdirSync(diagnosticsDirectory, { recursive: true });
 electron_1.crashReporter.start({
     productName: "silo",
@@ -479,6 +483,8 @@ function respondIndexingOverview(compute) {
 }
 // These only touch stateStore/contentSettings, which exist before the window is created.
 const EARLY_IPC_CHANNELS = new Set([
+    "get-app-update-state",
+    "check-app-updates",
     "get-startup-state",
     "get-content-settings",
     "get-lifetime-license",
@@ -546,6 +552,287 @@ function sendToRenderer(channel, payload) {
         // Frame may be mid-navigation; the renderer re-fetches state on mount.
     }
 }
+function compareAppVersions(candidate, current) {
+    const parse = (value) => {
+        const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value.trim());
+        if (!match)
+            return null;
+        return {
+            core: [Number(match[1]), Number(match[2]), Number(match[3])],
+            prerelease: match[4]?.split(".") ?? [],
+        };
+    };
+    const candidateVersion = parse(candidate);
+    const currentVersion = parse(current);
+    if (!candidateVersion || !currentVersion)
+        return null;
+    for (let index = 0; index < candidateVersion.core.length; index += 1) {
+        if (candidateVersion.core[index] !== currentVersion.core[index])
+            return candidateVersion.core[index] > currentVersion.core[index] ? 1 : -1;
+    }
+    if (!candidateVersion.prerelease.length && !currentVersion.prerelease.length)
+        return 0;
+    if (!candidateVersion.prerelease.length)
+        return 1;
+    if (!currentVersion.prerelease.length)
+        return -1;
+    const partCount = Math.max(candidateVersion.prerelease.length, currentVersion.prerelease.length);
+    for (let index = 0; index < partCount; index += 1) {
+        const candidatePart = candidateVersion.prerelease[index];
+        const currentPart = currentVersion.prerelease[index];
+        if (candidatePart === undefined)
+            return -1;
+        if (currentPart === undefined)
+            return 1;
+        if (candidatePart === currentPart)
+            continue;
+        const candidateNumeric = /^\d+$/.test(candidatePart);
+        const currentNumeric = /^\d+$/.test(currentPart);
+        if (candidateNumeric && currentNumeric)
+            return Number(candidatePart) > Number(currentPart) ? 1 : -1;
+        if (candidateNumeric !== currentNumeric)
+            return candidateNumeric ? -1 : 1;
+        return candidatePart > currentPart ? 1 : -1;
+    }
+    return 0;
+}
+function publishAppUpdateState(nextState) {
+    appUpdateState = nextState;
+    sendToRenderer("app-update-state", appUpdateState);
+}
+function isTrustedReleaseUrl(value, tag) {
+    if (typeof value !== "string")
+        return false;
+    try {
+        const url = new URL(value);
+        return (url.protocol === "https:" &&
+            url.hostname === "github.com" &&
+            url.pathname.startsWith(`/ilovespectra/silo-downloads/releases/download/${encodeURIComponent(tag)}/`));
+    }
+    catch {
+        return false;
+    }
+}
+async function getLatestDmgRelease() {
+    const currentVersion = electron_1.app.getVersion();
+    const response = await electron_1.net.fetch("https://api.github.com/repos/ilovespectra/silo-downloads/releases?per_page=30", {
+        headers: {
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "Silo",
+        },
+    });
+    if (!response.ok)
+        throw new Error(`Release check returned HTTP ${response.status}`);
+    const releases = (await response.json());
+    const candidates = releases
+        .filter((release) => release.draft !== true && typeof release.tag_name === "string")
+        .map((release) => ({
+        release,
+        version: release.tag_name.replace(/^v/, ""),
+        order: compareAppVersions(release.tag_name.replace(/^v/, ""), currentVersion),
+    }))
+        .filter((candidate) => candidate.order !== null && candidate.order > 0)
+        .sort((left, right) => compareAppVersions(right.version, left.version) ?? 0);
+    const latest = candidates[0];
+    if (!latest)
+        return { status: "not-available", currentVersion };
+    const tag = latest.release.tag_name;
+    const releaseUrl = typeof latest.release.html_url === "string" &&
+        latest.release.html_url.startsWith("https://github.com/ilovespectra/silo-downloads/releases/tag/")
+        ? latest.release.html_url
+        : `https://github.com/ilovespectra/silo-downloads/releases/tag/${encodeURIComponent(tag)}`;
+    const expectedArchitecture = process.arch === "arm64" ? "arm64" : "x64";
+    const assets = Array.isArray(latest.release.assets)
+        ? latest.release.assets
+        : [];
+    const matchingAsset = assets.find((asset) => asset.name === `Silo-${latest.version}-${expectedArchitecture}.dmg` &&
+        isTrustedReleaseUrl(asset.browser_download_url, tag));
+    const candidateDownloadUrl = matchingAsset?.browser_download_url;
+    const downloadUrl = isTrustedReleaseUrl(candidateDownloadUrl, tag)
+        ? candidateDownloadUrl
+        : undefined;
+    return {
+        status: "available",
+        currentVersion,
+        version: latest.version,
+        downloadUrl,
+        releaseUrl,
+        message: downloadUrl
+            ? undefined
+            : `Version ${latest.version} is available, but this release has no ${expectedArchitecture} DMG yet.`,
+    };
+}
+async function checkForAppUpdates() {
+    if (!electron_1.app.isPackaged || electron_is_dev_1.default) {
+        const state = {
+            status: "unsupported",
+            currentVersion: electron_1.app.getVersion(),
+            message: "Automatic update checks are available in installed builds.",
+        };
+        publishAppUpdateState(state);
+        return state;
+    }
+    if (appUpdateCheck)
+        return appUpdateCheck;
+    appUpdateCheck = (async () => {
+        publishAppUpdateState({
+            status: "checking",
+            currentVersion: electron_1.app.getVersion(),
+        });
+        try {
+            try {
+                await electron_updater_1.autoUpdater.checkForUpdates();
+            }
+            catch (error) {
+                runtimeLog("updater-metadata-unavailable", {
+                    message: error instanceof Error ? error.message : String(error),
+                });
+            }
+            const state = await getLatestDmgRelease();
+            publishAppUpdateState(state);
+            return state;
+        }
+        catch (error) {
+            const state = {
+                status: "error",
+                currentVersion: electron_1.app.getVersion(),
+                message: "Could not check for updates. Try again when you are online.",
+            };
+            runtimeLog("app-update-check-failed", {
+                message: error instanceof Error ? error.message : String(error),
+            });
+            publishAppUpdateState(state);
+            return state;
+        }
+        finally {
+            appUpdateCheck = null;
+        }
+    })();
+    return appUpdateCheck;
+}
+async function downloadAndInstallAppUpdate() {
+    if (!electron_1.app.isPackaged || electron_is_dev_1.default) {
+        const state = {
+            status: "unsupported",
+            currentVersion: electron_1.app.getVersion(),
+            message: "Install an official Silo build to use automatic updates.",
+        };
+        publishAppUpdateState(state);
+        return state;
+    }
+    if (appUpdateInstall)
+        return appUpdateInstall;
+    const announcedUpdate = appUpdateState;
+    if (announcedUpdate.status !== "available" ||
+        !announcedUpdate.version ||
+        !announcedUpdate.downloadUrl) {
+        const state = {
+            status: "error",
+            currentVersion: electron_1.app.getVersion(),
+            message: "No compatible update is ready to install. Check again online.",
+        };
+        publishAppUpdateState(state);
+        return state;
+    }
+    appUpdateInstall = (async () => {
+        const currentVersion = electron_1.app.getVersion();
+        const version = announcedUpdate.version;
+        publishAppUpdateState({
+            ...announcedUpdate,
+            status: "checking",
+            currentVersion,
+            message: `Verifying Silo ${version} before download…`,
+        });
+        try {
+            const updateCheck = await electron_updater_1.autoUpdater.checkForUpdates();
+            if (!updateCheck?.isUpdateAvailable ||
+                compareAppVersions(updateCheck.updateInfo.version, version) !== 0) {
+                throw new Error("The release metadata does not match the announced update.");
+            }
+            publishAppUpdateState({
+                ...announcedUpdate,
+                status: "downloading",
+                currentVersion,
+                downloadPercent: 0,
+                message: `Downloading Silo ${version}…`,
+            });
+            await electron_updater_1.autoUpdater.downloadUpdate();
+            const state = {
+                ...announcedUpdate,
+                status: "installing",
+                currentVersion,
+                message: `Silo ${version} is installing. The app will restart automatically.`,
+            };
+            publishAppUpdateState(state);
+            setTimeout(() => {
+                try {
+                    electron_updater_1.autoUpdater.quitAndInstall(false, true);
+                }
+                catch (error) {
+                    runtimeLog("app-update-restart-failed", {
+                        version,
+                        message: error instanceof Error ? error.message : String(error),
+                    });
+                    publishAppUpdateState({
+                        ...state,
+                        status: "error",
+                        downloadUrl: announcedUpdate.downloadUrl,
+                        message: "The update downloaded, but Silo could not restart to install it.",
+                    });
+                }
+            }, 500);
+            return state;
+        }
+        catch (error) {
+            runtimeLog("app-update-install-failed", {
+                version,
+                message: error instanceof Error ? error.message : String(error),
+            });
+            const state = {
+                status: "error",
+                currentVersion,
+                version,
+                downloadUrl: announcedUpdate.downloadUrl,
+                releaseUrl: announcedUpdate.releaseUrl,
+                message: "Automatic installation failed. Download the DMG instead or try again later.",
+            };
+            publishAppUpdateState(state);
+            return state;
+        }
+    })();
+    try {
+        return await appUpdateInstall;
+    }
+    finally {
+        appUpdateInstall = null;
+    }
+}
+function configureAppUpdater() {
+    electron_updater_1.autoUpdater.autoDownload = false;
+    electron_updater_1.autoUpdater.autoInstallOnAppQuit = false;
+    electron_updater_1.autoUpdater.allowPrerelease = true;
+    electron_updater_1.autoUpdater.on("error", (error) => {
+        runtimeLog("electron-updater-discovery-error", {
+            message: error instanceof Error ? error.message : String(error),
+        });
+    });
+    electron_updater_1.autoUpdater.on("download-progress", (progress) => {
+        if (appUpdateState.status !== "downloading")
+            return;
+        publishAppUpdateState({
+            ...appUpdateState,
+            downloadPercent: Math.max(0, Math.min(100, Math.round(progress.percent))),
+        });
+    });
+    if (electron_1.app.isPackaged && !electron_is_dev_1.default) {
+        electron_updater_1.autoUpdater.setFeedURL({
+            provider: "github",
+            owner: "ilovespectra",
+            repo: "silo-downloads",
+        });
+    }
+}
 function reportStartup(label, ready = false) {
     startupState = {
         ready,
@@ -572,6 +859,13 @@ function reportStartupDetail(label) {
 let mainWindow = null;
 let rendererReady = false;
 let shuttingDown = false;
+let appUpdateState = {
+    status: "unsupported",
+    currentVersion: electron_1.app.getVersion(),
+    message: "Automatic update checks are available in installed builds.",
+};
+let appUpdateCheck = null;
+let appUpdateInstall = null;
 const rendererRecovery = new rendererRecovery_1.RendererRecovery();
 let rendererRecoveryTimer = null;
 let stateStore;
@@ -2061,7 +2355,8 @@ async function setShelterDestination(destination) {
         : null;
     if (resolved) {
         await fsPromises.access(resolved, fs.constants.R_OK | fs.constants.W_OK);
-        if (!(await fsPromises.stat(resolved)).isDirectory())
+        const stats = await fsPromises.stat(resolved);
+        if (!stats.isDirectory())
             throw new Error("The shelter destination must be a folder.");
     }
     const temporaryPath = `${shelterDestinationPath}.tmp`;
@@ -2070,6 +2365,25 @@ async function setShelterDestination(destination) {
     await fsPromises.rename(temporaryPath, shelterDestinationPath);
     shelterDestinationCache = resolved;
     return resolved;
+}
+async function getShelterDestinationState() {
+    const destination = await getShelterDestination();
+    if (!destination)
+        return { destination: null, available: false };
+    try {
+        await fsPromises.access(destination, fs.constants.R_OK);
+        const [resolved, stats] = await Promise.all([
+            fsPromises.realpath(destination),
+            fsPromises.stat(destination),
+        ]);
+        return {
+            destination,
+            available: stats.isDirectory() && resolved === destination,
+        };
+    }
+    catch {
+        return { destination, available: false };
+    }
 }
 async function getSourceCloneStatus() {
     if (!sourceCloneStatusCache) {
@@ -2188,7 +2502,7 @@ function isPermissionError(error) {
     const code = error?.code;
     return code === "EPERM" || code === "EACCES";
 }
-async function readFiles(rootPath, exploded, diagnostics, onProgress) {
+async function readFiles(rootPath, exploded, diagnostics, onProgress, sourceRootPath) {
     const results = [];
     const appDataPath = path.resolve(electron_1.app.getPath("userData"));
     const canonicalAppDataPath = await fsPromises
@@ -2198,7 +2512,13 @@ async function readFiles(rootPath, exploded, diagnostics, onProgress) {
         .realpath(rootPath)
         .catch(() => path.resolve(rootPath));
     const isSiloAppData = (candidatePath) => (0, indexingPathPolicy_1.isAppDataPath)(candidatePath, rootPath, canonicalRootPath, appDataPath, canonicalAppDataPath);
-    if (isSiloAppData(rootPath) || (0, indexingPathPolicy_1.isNonLibraryPath)(rootPath)) {
+    const machineRoot = sourceRootPath && (0, indexingPathPolicy_1.isMacDataVolumeSourceRoot)(sourceRootPath);
+    const machineDevice = machineRoot
+        ? await (0, indexingPathPolicy_1.getMacDataVolumeDeviceId)(sourceRootPath)
+        : null;
+    if ((machineRoot && machineDevice === null) ||
+        isSiloAppData(rootPath) || (0, indexingPathPolicy_1.isNonLibraryPath)(rootPath) ||
+        (sourceRootPath && (0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(rootPath, sourceRootPath))) {
         if (onProgress)
             onProgress(results);
         return results;
@@ -2213,8 +2533,14 @@ async function readFiles(rootPath, exploded, diagnostics, onProgress) {
     const PROGRESS_INTERVAL_MS = 250;
     while (pendingDirectories.length > 0) {
         const directoryPath = pendingDirectories.shift();
-        if (isSiloAppData(directoryPath) || (0, indexingPathPolicy_1.isNonLibraryPath)(directoryPath))
+        if (isSiloAppData(directoryPath) || (0, indexingPathPolicy_1.isNonLibraryPath)(directoryPath) ||
+            (sourceRootPath && (0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(directoryPath, sourceRootPath)))
             continue;
+        if (machineDevice !== null) {
+            const directoryStats = await fsPromises.stat(directoryPath).catch(() => null);
+            if (!directoryStats || directoryStats.dev !== machineDevice)
+                continue;
+        }
         let entries;
         try {
             entries = await fsPromises.readdir(directoryPath, {
@@ -2239,7 +2565,8 @@ async function readFiles(rootPath, exploded, diagnostics, onProgress) {
                 if (entry.isSymbolicLink())
                     return null;
                 const fullPath = path.join(directoryPath, entry.name);
-                if (isSiloAppData(fullPath) || (0, indexingPathPolicy_1.isNonLibraryPath)(fullPath))
+                if (isSiloAppData(fullPath) || (0, indexingPathPolicy_1.isNonLibraryPath)(fullPath) ||
+                    (sourceRootPath && (0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(fullPath, sourceRootPath)))
                     return null;
                 try {
                     let stats;
@@ -2251,6 +2578,8 @@ async function readFiles(rootPath, exploded, diagnostics, onProgress) {
                             throw statError;
                         stats = await fsPromises.lstat(fullPath);
                     }
+                    if (machineDevice !== null && stats.dev !== machineDevice)
+                        return null;
                     const isDirectory = entry.isDirectory() || stats.isDirectory();
                     const extension = isDirectory
                         ? ""
@@ -2409,11 +2738,12 @@ async function buildSourceList() {
     }));
     for (const { source, available, includesSiloData } of localSources) {
         const cloned = cloneStatus[source.path];
+        const machine = source.kind === "machine";
         sources.push({
             id: source.path,
-            kind: "local",
-            label: source.path.split(path.sep).filter(Boolean).pop() || source.path,
-            detail: source.path,
+            kind: machine ? "machine" : "local",
+            label: machine ? "This Mac" : source.path.split(path.sep).filter(Boolean).pop() || source.path,
+            detail: machine ? "Internal data volume; mounted external volumes are excluded." : source.path,
             rootPath: source.path,
             enabled: !disabled.has(source.path),
             available,
@@ -2552,7 +2882,7 @@ async function readSourceFiles(source, exploded, onProgress) {
     else if (googleManager.isCloudPath(source.rootPath))
         files = (await googleManager.listFiles(source.rootPath, exploded));
     else
-        files = await readFiles(source.rootPath, exploded, undefined, (progressFiles) => reportNewFiles(progressFiles, progressFiles.length));
+        files = await readFiles(source.rootPath, exploded, undefined, (progressFiles) => reportNewFiles(progressFiles, progressFiles.length), source.rootPath);
     reportNewFiles(files, files.length);
     return files.map(annotate);
 }
@@ -2674,6 +3004,10 @@ async function listLocalCloneEntries(root, operationId, onEntry, options = {}) {
         .realpath(root)
         .catch(() => path.resolve(root));
     const isSiloAppData = (candidatePath) => (0, indexingPathPolicy_1.isAppDataPath)(candidatePath, root, canonicalRootPath, appDataPath, canonicalAppDataPath);
+    const machineRoot = (0, indexingPathPolicy_1.isMacDataVolumeSourceRoot)(root);
+    const machineDevice = machineRoot ? await (0, indexingPathPolicy_1.getMacDataVolumeDeviceId)(root) : null;
+    if (machineRoot && machineDevice === null)
+        throw new Error("Could not verify the internal data-volume boundary; this machine source was not cloned.");
     if (isSiloAppData(root))
         return;
     if (!options.allowMarkedRoot && await (0, indexingPathPolicy_1.isSiloCloneDirectory)(root))
@@ -2682,6 +3016,13 @@ async function listLocalCloneEntries(root, operationId, onEntry, options = {}) {
     while (stack.length > 0) {
         ensureCloneActive(operationId);
         const current = stack.pop();
+        if ((0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(current.directory, root))
+            continue;
+        if (machineDevice !== null) {
+            const directoryStats = await fsPromises.stat(current.directory).catch(() => null);
+            if (!directoryStats || directoryStats.dev !== machineDevice)
+                continue;
+        }
         if (isSiloAppData(current.directory))
             continue;
         if (!(options.allowMarkedRoot && current.directory === root) &&
@@ -2695,12 +3036,16 @@ async function listLocalCloneEntries(root, operationId, onEntry, options = {}) {
             const absolutePath = path.join(current.directory, entry.name);
             if (options.skipRootManifest && current.directory === root && entry.name === "silo-clone-manifest.json")
                 continue;
+            if ((0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(absolutePath, root))
+                continue;
             if (isSiloAppData(absolutePath))
                 continue;
             if (entry.isDirectory() && await (0, indexingPathPolicy_1.isSiloCloneDirectory)(absolutePath))
                 continue;
             const relativePath = path.join(current.relativePath, entry.name);
             const stats = await fsPromises.stat(absolutePath);
+            if (machineDevice !== null && stats.dev !== machineDevice)
+                continue;
             if (stats.isDirectory()) {
                 onEntry({
                     sourcePath: absolutePath,
@@ -2741,7 +3086,7 @@ async function prepareSourceClone(sourceIds, destinations, operationId, sourceOv
         await fsPromises.access(destination, fs.constants.R_OK | fs.constants.W_OK);
         const resolved = await fsPromises.realpath(destination);
         for (const source of selected) {
-            if (source.kind !== "local")
+            if (source.kind !== "local" && source.kind !== "machine")
                 continue;
             const sourceResolved = await fsPromises.realpath(source.rootPath);
             const relative = path.relative(sourceResolved, resolved);
@@ -2789,7 +3134,7 @@ async function prepareSourceClone(sourceIds, destinations, operationId, sourceOv
                 modified: 0,
                 isDirectory: true,
             });
-        if (source.kind === "local") {
+        if (source.kind === "local" || source.kind === "machine") {
             await listLocalCloneEntries(source.rootPath, operationId, (entry) => {
                 entry.sourceId = source.id;
                 entry.sourceRelativePath = entry.destinationRelativePath;
@@ -3027,9 +3372,11 @@ async function runSourceClone(planId, runOptions = {}) {
         throw new Error("One or more selected destinations do not have enough free space.");
     const successfulDestinations = [];
     const fingerprints = new Map();
+    const sourceFileCounts = new Map();
     for (const entry of plan.entries) {
         if (entry.isDirectory || !entry.sourceId)
             continue;
+        sourceFileCounts.set(entry.sourceId, (sourceFileCounts.get(entry.sourceId) ?? 0) + 1);
         let fingerprint = fingerprints.get(entry.sourceId);
         if (!fingerprint) {
             fingerprint = new inventoryFingerprint_1.InventoryFingerprint();
@@ -3046,12 +3393,31 @@ async function runSourceClone(planId, runOptions = {}) {
         const history = (await getSourceCloneStatus());
         const update = {};
         for (const sourceId of plan.sourceIds) {
-            const previous = history[sourceId]?.destinations ?? [];
+            const previousRecord = history[sourceId];
+            const previous = previousRecord?.destinations ?? [];
+            const sourceFingerprint = fingerprints.get(sourceId)?.finish() ?? new inventoryFingerprint_1.InventoryFingerprint().finish();
+            const verifiedFiles = sourceFileCounts.get(sourceId) ?? 0;
+            const shelterAudits = { ...(previousRecord?.shelterAudits ?? {}) };
+            if (verifiedFiles > 0) {
+                for (const clonePath of successfulDestinations) {
+                    shelterAudits[path.resolve(path.dirname(clonePath))] = {
+                        clonePath,
+                        lastFullyVerifiedAt: lastClonedAt,
+                        lastAttemptAt: lastClonedAt,
+                        lastResult: "verified",
+                        verifiedFiles,
+                        totalFiles: verifiedFiles,
+                        sourceFingerprint,
+                    };
+                }
+            }
             update[sourceId] = {
+                ...previousRecord,
                 lastClonedAt,
                 destinations: Array.from(new Set([...previous, ...successfulDestinations])).slice(-32),
-                sourceFingerprint: fingerprints.get(sourceId)?.finish() ?? new inventoryFingerprint_1.InventoryFingerprint().finish(),
+                sourceFingerprint,
                 sourceFingerprintVersion: 2,
+                shelterAudits,
             };
         }
         await persistSourceCloneStatus(update);
@@ -3390,6 +3756,12 @@ async function createWindow() {
         },
     });
     const inventoryOwner = mainWindow.webContents.id;
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        if (url.startsWith("https://github.com/ilovespectra/silo-downloads/releases/download/") ||
+            url.startsWith("https://github.com/ilovespectra/silo-downloads/releases/tag/"))
+            void electron_1.shell.openExternal(url);
+        return { action: "deny" };
+    });
     mainWindow.webContents.on("destroyed", () => inventoryTransfers.releaseOwner(inventoryOwner));
     mainWindow.webContents.on("did-start-navigation", (_event, _url, _inPlace, isMainFrame) => {
         if (isMainFrame)
@@ -3634,6 +4006,12 @@ async function createUnifiedScanSource() {
         const canonicalSourcePath = await fsPromises
             .realpath(sourcePath)
             .catch(() => path.resolve(sourcePath));
+        const machineRoot = (0, indexingPathPolicy_1.isMacDataVolumeSourceRoot)(sourcePath);
+        const machineDevice = machineRoot
+            ? await (0, indexingPathPolicy_1.getMacDataVolumeDeviceId)(sourcePath)
+            : null;
+        if (machineRoot && machineDevice === null)
+            return;
         const isSiloAppData = (candidatePath) => (0, indexingPathPolicy_1.isAppDataPath)(candidatePath, sourcePath, canonicalSourcePath, appDataPath, canonicalAppDataPath);
         // A user may add a broad parent such as Home or an external volume. Never
         // treat Silo's private storage as source material; phone snapshots remain
@@ -3647,6 +4025,13 @@ async function createUnifiedScanSource() {
         const timeMachine = await (0, timeMachine_1.isTimeMachineDirectory)(sourcePath);
         while (pendingDirectories.length > 0 && !isCancelled()) {
             const directoryPath = pendingDirectories.shift();
+            if ((0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(directoryPath, sourcePath))
+                continue;
+            if (machineDevice !== null) {
+                const directoryStats = await fsPromises.stat(directoryPath).catch(() => null);
+                if (!directoryStats || directoryStats.dev !== machineDevice)
+                    continue;
+            }
             if (isSiloAppData(directoryPath))
                 continue;
             if (await (0, indexingPathPolicy_1.isSiloCloneDirectory)(directoryPath))
@@ -3669,6 +4054,8 @@ async function createUnifiedScanSource() {
                     if (entry.isSymbolicLink())
                         return null;
                     const fullPath = path.join(directoryPath, entry.name);
+                    if ((0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(fullPath, sourcePath))
+                        return null;
                     if (isSiloAppData(fullPath))
                         return null;
                     try {
@@ -3681,6 +4068,8 @@ async function createUnifiedScanSource() {
                                 throw new Error("stat failed");
                             stats = await fsPromises.lstat(fullPath);
                         }
+                        if (machineDevice !== null && stats.dev !== machineDevice)
+                            return null;
                         const isDirectory = entry.isDirectory() || stats.isDirectory();
                         if (isDirectory && await (0, indexingPathPolicy_1.isSiloCloneDirectory)(fullPath))
                             return null;
@@ -3878,6 +4267,7 @@ electron_1.app.whenReady().then(async () => {
     installApplicationMenu();
     const userDataPath = electron_1.app.getPath("userData");
     let startupStorageNotice = null;
+    configureAppUpdater();
     try {
         const storage = await (0, indexingStorage_1.prepareConfiguredIndexStorage)(userDataPath, (filesVerified, bytesVerified) => runtimeLog("index-storage-migration-progress", {
             filesVerified,
@@ -3939,6 +4329,8 @@ electron_1.app.whenReady().then(async () => {
             defaultId: 0,
         });
     }
+    if (electron_1.app.isPackaged && !electron_is_dev_1.default)
+        void checkForAppUpdates();
     reportStartup("Loading content filters…");
     await loadSafetyCache();
     const modelCachePath = electron_1.app.isPackaged
@@ -4840,15 +5232,46 @@ electron_1.ipcMain.handle("start-source-clone", async (_event, planId, options) 
         return { ok: false, error: "Invalid clone plan." };
     const compress = Boolean(options && typeof options === "object" &&
         options.compress === true);
+    const createAppleCompatibleBackup = Boolean(options && typeof options === "object" &&
+        options.createAppleCompatibleBackup === true);
+    const plan = sourceClonePlans.get(planId);
+    if (createAppleCompatibleBackup &&
+        (!plan || plan.sourceIds.length !== 1 || plan.sourceIds[0] !== indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT ||
+            !stateStore.getState().indexSources.some((source) => source.path === indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT && source.kind === "machine")))
+        return { ok: false, error: "Time Machine can only be added to a clone of the registered This Mac source." };
     try {
         await runSourceClone(planId, { compress });
-        return { ok: true };
+        if (!createAppleCompatibleBackup)
+            return { ok: true };
+        try {
+            await (0, timeMachineBackup_1.startConfiguredTimeMachineBackup)(indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT, stateStore.getState().indexSources.some((source) => source.path === indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT && source.kind === "machine"));
+            return { ok: true, timeMachineStarted: true };
+        }
+        catch (error) {
+            return {
+                ok: true,
+                timeMachineError: error instanceof Error ? error.message : String(error),
+            };
+        }
     }
     catch (error) {
         return {
             ok: false,
             error: error instanceof Error ? error.message : String(error),
         };
+    }
+});
+electron_1.ipcMain.handle("start-machine-time-machine-backup", async (_event, sourceId) => {
+    if (typeof sourceId !== "string" || sourceId !== indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT)
+        return { ok: false, error: "Time Machine can only be requested for This Mac." };
+    const sourceRegistered = process.platform === "darwin" &&
+        stateStore.getState().indexSources.some((source) => source.path === indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT && source.kind === "machine");
+    try {
+        await (0, timeMachineBackup_1.startConfiguredTimeMachineBackup)(sourceId, sourceRegistered);
+        return { ok: true, timeMachineStarted: true };
+    }
+    catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
 });
 electron_1.ipcMain.handle("extract-source-clone-archive", async (_event, operationId) => {
@@ -5089,7 +5512,7 @@ electron_1.ipcMain.handle("get-files", async (_event, dirPath, exploded = false,
                 errors: diagnostics.denied + diagnostics.unreadable,
             });
         }
-    });
+    }, owningSource?.kind === "machine" ? owningSource.rootPath : undefined);
     const annotatedFiles = filterForContentSafety(files.map((file) => ({
         ...file,
         sourceId: owningSource?.id,
@@ -5578,6 +6001,22 @@ electron_1.ipcMain.handle("select-index-source", async () => {
     void indexNewSources([newSourcePath], "local-source-added");
     return stateStore.getState();
 });
+electron_1.ipcMain.handle("add-machine-source", async () => {
+    if (process.platform !== "darwin")
+        return null;
+    if (!(await fsPromises.access(indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT, fs.constants.R_OK).then(() => true, () => false)))
+        return null;
+    const existing = stateStore.getState().indexSources.some((source) => source.path === indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT);
+    if (!fullAccessEnabled() && !existing &&
+        (await getDemoSourceCount()) >= demoLimits_1.DEMO_LIMITS.sources) {
+        notifyDemoLimitReached("sources");
+        return null;
+    }
+    await stateStore.addMachineSource(indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT);
+    sourceListCacheAt = 0;
+    void indexNewSources([indexingPathPolicy_1.MAC_DATA_VOLUME_ROOT], "machine-source-added");
+    return stateStore.getState();
+});
 electron_1.ipcMain.handle("remove-index-source", async (_event, sourcePath) => {
     await stateStore.removeIndexSource(sourcePath);
     sourceListCacheAt = 0;
@@ -5918,6 +6357,154 @@ electron_1.ipcMain.handle("retry-indexing-stage", async (_event, id) => {
     await indexRecovery.retry(id);
     return { ok: true };
 });
+async function collectShelterSourceFiles(source, operationId) {
+    const files = [];
+    const fingerprint = new inventoryFingerprint_1.InventoryFingerprint();
+    const add = (relativePath, localPath, size, modified) => {
+        files.push({ relativePath, localPath, size, modified });
+        fingerprint.add(relativePath, size, modified);
+    };
+    if (source.kind === "local" || source.kind === "machine") {
+        await listLocalCloneEntries(source.rootPath, operationId, (entry) => {
+            if (!entry.isDirectory && entry.localPath)
+                add(entry.destinationRelativePath, entry.localPath, entry.size, entry.modified);
+        });
+    }
+    else {
+        const remoteEntries = phoneManager.isPhonePath(source.rootPath)
+            ? await phoneManager.listPhoneFilesRecursively(source.rootPath)
+            : await googleManager.listFilesRecursively(source.rootPath);
+        for (const remote of remoteEntries) {
+            ensureCloneActive(operationId);
+            if (remote.isDirectory)
+                continue;
+            const localPath = await resolveLocalPath(remote.path);
+            const stats = await fsPromises.stat(localPath);
+            const size = Number.isFinite(remote.size) && remote.size >= 0 ? remote.size : stats.size;
+            const modified = Number.isFinite(remote.modified) ? remote.modified : stats.mtimeMs;
+            add(remote.relativePath || remote.name, localPath, size, modified);
+        }
+    }
+    return { files, fingerprint: fingerprint.finish() };
+}
+async function findLatestCompleteShelterClone(sourceId, destination, clonePaths) {
+    const candidates = [];
+    for (const clonePath of new Set(clonePaths)) {
+        if (path.resolve(path.dirname(clonePath)) !== path.resolve(destination))
+            continue;
+        try {
+            const [stats, linkStats, resolved] = await Promise.all([
+                fsPromises.stat(clonePath),
+                fsPromises.lstat(clonePath),
+                fsPromises.realpath(clonePath),
+            ]);
+            const isArchive = path.extname(clonePath).toLowerCase() === cloneArchive_1.CLONE_ARCHIVE_EXTENSION;
+            if (linkStats.isSymbolicLink() || (isArchive ? !stats.isFile() : !stats.isDirectory()) ||
+                path.dirname(resolved) !== path.resolve(destination))
+                continue;
+            candidates.push({ path: clonePath, modified: stats.mtimeMs });
+        }
+        catch {
+            continue;
+        }
+    }
+    candidates.sort((left, right) => right.modified - left.modified);
+    for (const candidate of candidates) {
+        try {
+            const manifest = await (0, shelterVerification_1.readShelterCloneManifest)(candidate.path);
+            const containsSource = [...manifest.files,
+                ...manifest.aliases]
+                .some((entry) => entry.sourceId === sourceId);
+            if (containsSource)
+                return candidate.path;
+        }
+        catch {
+            continue;
+        }
+    }
+    return null;
+}
+async function verifyShelterSources(sourceIds) {
+    const destinationState = await getShelterDestinationState();
+    if (!destinationState.destination)
+        throw new Error("Choose a Fallout Shelter destination before verifying backups.");
+    if (!destinationState.available)
+        throw new Error("The selected Fallout Shelter destination is not connected and readable.");
+    const destination = destinationState.destination;
+    const registeredSources = await listSources();
+    const selected = registeredSources.filter((source) => sourceIds.includes(source.id));
+    if (!sourceIds.length || selected.length !== new Set(sourceIds).size || selected.some((source) => !source.available))
+        throw new Error("Select only connected, available sources before verifying backups.");
+    const operationId = `shelter-audit-${Date.now()}-${(0, crypto_1.randomBytes)(4).toString("hex")}`;
+    sourceCloneOperations.set(operationId, { cancelled: false });
+    try {
+        for (const source of selected) {
+            ensureCloneActive(operationId);
+            const previous = (await getSourceCloneStatus())?.[source.id];
+            const previousAudit = previous?.shelterAudits?.[destination];
+            let audit;
+            try {
+                const { files, fingerprint } = await collectShelterSourceFiles(source, operationId);
+                const clonePath = await findLatestCompleteShelterClone(source.id, destination, previous?.destinations ?? []);
+                if (!clonePath) {
+                    audit = {
+                        clonePath: null,
+                        lastFullyVerifiedAt: previousAudit?.lastFullyVerifiedAt ?? null,
+                        lastAttemptAt: Date.now(),
+                        lastResult: "missing",
+                        verifiedFiles: 0,
+                        totalFiles: files.length,
+                        sourceFingerprint: fingerprint,
+                        message: "No complete source clone was found in the selected shelter destination.",
+                    };
+                }
+                else {
+                    const result = await (0, shelterVerification_1.verifyShelterCloneSource)(clonePath, source.id, files);
+                    const verifiedAt = result.verified ? Date.now() : previousAudit?.lastFullyVerifiedAt ?? null;
+                    audit = {
+                        clonePath,
+                        lastFullyVerifiedAt: verifiedAt,
+                        lastAttemptAt: Date.now(),
+                        lastResult: result.verified ? "verified" : "mismatch",
+                        verifiedFiles: result.verifiedFiles,
+                        totalFiles: result.totalFiles,
+                        sourceFingerprint: result.verified ? fingerprint : previousAudit?.sourceFingerprint,
+                        message: result.error ?? (result.verified
+                            ? undefined
+                            : `${result.missingFiles} missing · ${result.changedFiles} changed · ${result.extraFiles} extra`),
+                    };
+                }
+            }
+            catch (error) {
+                audit = {
+                    clonePath: previousAudit?.clonePath ?? null,
+                    lastFullyVerifiedAt: previousAudit?.lastFullyVerifiedAt ?? null,
+                    lastAttemptAt: Date.now(),
+                    lastResult: "error",
+                    verifiedFiles: 0,
+                    totalFiles: previousAudit?.totalFiles ?? 0,
+                    sourceFingerprint: previousAudit?.sourceFingerprint,
+                    message: error instanceof Error ? error.message : "The shelter verification failed.",
+                };
+            }
+            await persistSourceCloneStatus({
+                [source.id]: {
+                    ...previous,
+                    lastClonedAt: previous?.lastClonedAt ?? 0,
+                    destinations: previous?.destinations ?? [],
+                    shelterAudits: {
+                        ...(previous?.shelterAudits ?? {}),
+                        [destination]: audit,
+                    },
+                },
+            });
+        }
+    }
+    finally {
+        sourceCloneOperations.delete(operationId);
+    }
+    return getLibraryDashboardSnapshot();
+}
 async function getLibraryDashboardSnapshot() {
     const registeredSources = await listSources();
     const sourceInputs = registeredSources.map(({ id, label, kind, rootPath, available, offlineBackup, snapshotAt, message }) => ({
@@ -5925,37 +6512,67 @@ async function getLibraryDashboardSnapshot() {
     }));
     const inventory = libraryStatsManager?.getSnapshot(sourceInputs);
     const cloneStatus = await getSourceCloneStatus();
+    const destinationState = await getShelterDestinationState();
+    const destination = destinationState.destination;
+    const destinationKey = destination ? path.resolve(destination) : null;
     const sources = (inventory?.sources ?? []).map((source) => {
         const clone = cloneStatus?.[source.id];
         const sourceIndex = semanticIndexer?.getIndexSummary([source.rootPath]);
-        const hasVerifiedCopy = Number(clone?.lastClonedAt) > 0;
+        const audit = destinationKey ? clone?.shelterAudits?.[destinationKey] : undefined;
+        const hasCloneInDestination = Boolean(destinationKey && clone?.destinations?.some((clonePath) => path.resolve(path.dirname(clonePath)) === destinationKey));
+        const hasVerifiedCopy = Number(audit?.lastFullyVerifiedAt) > 0;
         let shelterState;
-        if (!hasVerifiedCopy)
-            shelterState = "unprotected";
-        else if (!clone?.sourceFingerprint || clone.sourceFingerprintVersion !== 2)
-            shelterState = "unknown";
+        if (audit && audit.lastResult !== "verified")
+            shelterState = audit.lastResult === "missing" && !hasVerifiedCopy ? "unprotected" : "changed";
+        else if (destination && !destinationState.available)
+            shelterState = hasVerifiedCopy || hasCloneInDestination ? "offline" : "unprotected";
+        else if (!hasVerifiedCopy)
+            shelterState = hasCloneInDestination ? "unknown" : "unprotected";
         else if (source.status === "offline")
             shelterState = "offline";
         else if (source.status === "scanning" || source.status === "pending" || source.status === "error")
             shelterState = "checking";
         else
-            shelterState = source.fingerprint === clone.sourceFingerprint ? "verified" : "changed";
+            shelterState = audit?.sourceFingerprint === source.fingerprint ? "verified" : "changed";
         return {
             ...source,
             hasVerifiedCopy,
-            lastVerifiedAt: clone?.lastClonedAt ?? null,
-            cloneDestination: clone?.destinations?.at(-1) ?? null,
+            lastVerifiedAt: audit?.lastFullyVerifiedAt ?? null,
+            cloneDestination: audit?.clonePath ?? null,
+            shelterFreshness: (0, shelterVerification_1.getShelterFreshness)(audit?.lastFullyVerifiedAt),
+            shelterBackups: Object.entries(clone?.shelterAudits ?? {})
+                .map(([backupDestination, backupAudit]) => ({
+                destination: backupDestination,
+                clonePath: backupAudit.clonePath,
+                lastVerifiedAt: backupAudit.lastFullyVerifiedAt,
+                lastResult: backupAudit.lastResult,
+                verifiedFiles: backupAudit.verifiedFiles,
+                totalFiles: backupAudit.totalFiles,
+            }))
+                .sort((left, right) => left.destination.localeCompare(right.destination)),
+            shelterAuditResult: audit?.lastResult ?? null,
+            shelterAuditMessage: audit?.message ?? "",
+            shelterVerifiedFiles: audit?.verifiedFiles ?? 0,
+            shelterTotalFiles: audit?.totalFiles ?? 0,
             shelterState,
             indexedFiles: sourceIndex?.indexed ?? 0,
             indexingErrors: sourceIndex?.errors ?? 0,
         };
     });
     const verifiedSources = sources.filter((source) => source.shelterState === "verified" ||
-        (source.shelterState === "offline" && source.hasVerifiedCopy &&
-            Boolean(source.fingerprint) &&
-            cloneStatus?.[source.id]?.sourceFingerprintVersion === 2 &&
-            source.fingerprint === cloneStatus?.[source.id]?.sourceFingerprint)).length;
-    const destination = await getShelterDestination();
+        (source.shelterState === "offline" && source.hasVerifiedCopy && source.shelterAuditResult === "verified")).length;
+    const freshnessOrder = {
+        unknown: 0,
+        green: 1,
+        yellow: 2,
+        orange: 3,
+        red: 4,
+        "blinking-red": 5,
+    };
+    const freshness = sources
+        .filter((source) => source.hasVerifiedCopy)
+        .map((source) => source.shelterFreshness)
+        .sort((left, right) => freshnessOrder[right] - freshnessOrder[left])[0] ?? "unknown";
     const latestShelterSnapshot = destination ? await findLatestShelterSnapshot() : null;
     const eligibleRoots = [];
     for (const source of registeredSources) {
@@ -5976,6 +6593,7 @@ async function getLibraryDashboardSnapshot() {
         indexingErrors: globalIndex?.errors ?? 0,
         shelter: {
             destination,
+            destinationAvailable: destinationState.available,
             snapshotAvailable: Boolean(latestShelterSnapshot),
             replicas: Object.entries(cloneStatus ?? {})
                 .filter(([id]) => id.startsWith("shelter-replica:"))
@@ -5987,10 +6605,17 @@ async function getLibraryDashboardSnapshot() {
             verifiedSources,
             totalSources: sources.length,
             percentage: sources.length ? Math.round((verifiedSources / sources.length) * 100) : 0,
+            freshness,
         },
     };
 }
 electron_1.ipcMain.handle("get-library-dashboard", () => getLibraryDashboardSnapshot());
+electron_1.ipcMain.handle("verify-shelter-sources", async (_event, sourceIds) => {
+    const cleanIds = Array.isArray(sourceIds)
+        ? Array.from(new Set(sourceIds.filter((id) => typeof id === "string")))
+        : [];
+    return verifyShelterSources(cleanIds);
+});
 electron_1.ipcMain.handle("refresh-library-stats", async () => {
     if (!libraryStatsManager)
         throw new Error("Library inventory is not ready.");
@@ -6067,7 +6692,7 @@ electron_1.ipcMain.handle("get-indexing-overview", async () => {
         .filter((source) => source.rootPath.trim())
         .map((source) => [source.rootPath, source])).values());
     const eligibleRoots = await getIndexableRootsFromSources(registeredSources);
-    const unavailableSources = registeredSources.filter((source) => source.kind !== "local" && !source.available);
+    const unavailableSources = registeredSources.filter((source) => source.kind !== "local" && source.kind !== "machine" && !source.available);
     const coverage = typeof semanticIndexer.getSourceCoverageProgress === "function"
         ? semanticIndexer.getSourceCoverageProgress(eligibleRoots)
         : {
@@ -6794,9 +7419,48 @@ electron_1.ipcMain.handle("get-beta-activation-info", async () => ({
     requestEmail: betaLicense_1.BETA_ACTIVATION_REQUEST_EMAIL,
     available: Boolean(betaLicensePublicKey_1.BETA_LICENSE_PUBLIC_KEY.trim()),
 }));
-electron_1.ipcMain.handle("open-beta-activation-request-email", async () => {
-    const requestCode = (0, betaLicense_1.createBetaRequestCode)(await getBetaInstallationId());
-    await electron_1.shell.openExternal((0, betaLicense_1.createBetaActivationRequestMailto)(requestCode));
+electron_1.ipcMain.handle("submit-beta-activation-request", async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents)
+        return {
+            ok: false,
+            error: "The Silo window is not available to send the request.",
+        };
+    const configuredEndpoint = process.env.SILO_BETA_REQUEST_ENDPOINT?.trim() || defaultBetaRequestEndpoint;
+    let endpoint;
+    try {
+        endpoint = new URL(configuredEndpoint);
+    }
+    catch {
+        return { ok: false, error: "The beta request relay endpoint is invalid." };
+    }
+    if (endpoint.protocol !== "https:")
+        return { ok: false, error: "The beta request relay must use HTTPS." };
+    const payload = (0, betaLicense_1.createBetaActivationRequestPayload)(await getBetaInstallationId(), electron_1.app.getVersion(), process.platform);
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 15000);
+    try {
+        const response = await electron_1.net.fetch(endpoint.href, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: abortController.signal,
+        });
+        if (!response.ok)
+            return {
+                ok: false,
+                error: `The beta request relay returned HTTP ${response.status}.`,
+            };
+        return { ok: true };
+    }
+    catch {
+        return {
+            ok: false,
+            error: "Silo could not reach the beta request relay. Try again when online.",
+        };
+    }
+    finally {
+        clearTimeout(timeout);
+    }
 });
 electron_1.ipcMain.handle("activate-beta-license", async (_event, activationCodeValue) => {
     if (typeof activationCodeValue !== "string")
@@ -6983,6 +7647,9 @@ electron_1.ipcMain.handle("check-lifetime-payment-reference", async (_event, ref
     }
 });
 electron_1.ipcMain.handle("is-dev", () => electron_is_dev_1.default);
+electron_1.ipcMain.handle("get-app-update-state", () => appUpdateState);
+electron_1.ipcMain.handle("check-app-updates", () => checkForAppUpdates());
+electron_1.ipcMain.handle("download-and-install-app-update", () => downloadAndInstallAppUpdate());
 electron_1.ipcMain.handle("open-full-disk-access", async () => {
     await electron_1.shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles");
 });

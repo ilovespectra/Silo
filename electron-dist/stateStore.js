@@ -135,6 +135,20 @@ class StateStore {
         }
         return this.getState();
     }
+    async addMachineSource(sourcePath) {
+        const existing = this.state.indexSources.find((source) => source.path === sourcePath);
+        if (existing) {
+            if (existing.kind !== "machine") {
+                existing.kind = "machine";
+                await this.write();
+            }
+        }
+        else {
+            this.state.indexSources.push({ path: sourcePath, addedAt: Date.now(), kind: "machine" });
+            await this.write();
+        }
+        return this.getState();
+    }
     async removeIndexSource(sourcePath) {
         this.state.indexSources = this.state.indexSources.filter((source) => source.path !== sourcePath);
         this.state.disabledSourceIds = this.state.disabledSourceIds.filter((sourceId) => sourceId !== sourcePath);

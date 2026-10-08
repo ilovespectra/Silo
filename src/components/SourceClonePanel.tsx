@@ -37,9 +37,15 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
   const [acknowledged, setAcknowledged] = useState(false);
   const [destinations, setDestinations] = useState<string[]>(initialDestinations);
   const [compress, setCompress] = useState(false);
+  const [createAppleCompatibleBackup, setCreateAppleCompatibleBackup] = useState(false);
+  const [timeMachineMode, setTimeMachineMode] = useState<"instead" | "as-well">("as-well");
+  const [timeMachineMessage, setTimeMachineMessage] = useState("");
+  const [timeMachineError, setTimeMachineError] = useState("");
   const [extracting, setExtracting] = useState(false);
   const operationIdRef = useRef("");
   const busy = preparing || running || extracting;
+  const supportsTimeMachine = mode === "sources" && sources.length === 1 && sources[0].kind === "machine";
+  const timeMachineOnly = supportsTimeMachine && createAppleCompatibleBackup && timeMachineMode === "instead";
 
   useEffect(() => {
     return electronAPI.onSourceCloneProgress((state) => {
@@ -102,10 +108,35 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
     setRunning(true);
     setError("");
     try {
-      const result = await electronAPI.startSourceClone(plan.planId, { compress });
+      const result = await electronAPI.startSourceClone(plan.planId, {
+        compress,
+        createAppleCompatibleBackup: supportsTimeMachine && createAppleCompatibleBackup && timeMachineMode === "as-well",
+      });
       if (!result.ok) throw new Error(result.error || "Clone did not complete.");
+      if (result.timeMachineStarted)
+        setTimeMachineMessage("macOS accepted the Time Machine backup request. Check Time Machine for progress and completion.");
+      if (result.timeMachineError)
+        setTimeMachineError(`The Silo clone completed, but Time Machine could not be confirmed: ${result.timeMachineError}`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Clone did not complete.");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const startTimeMachineOnly = async () => {
+    if (!supportsTimeMachine || !acknowledged || busy) return;
+    setRunning(true);
+    setError("");
+    setTimeMachineMessage("");
+    setTimeMachineError("");
+    try {
+      const result = await electronAPI.startMachineTimeMachineBackup(sources[0].id);
+      if (!result.ok) throw new Error(result.error || "Time Machine did not start.");
+      if (result.timeMachineStarted)
+        setTimeMachineMessage("macOS accepted the Time Machine backup request. Check Time Machine for progress and completion.");
+    } catch (cause) {
+      setTimeMachineError(cause instanceof Error ? cause.message : "Time Machine could not be started or confirmed.");
     } finally {
       setRunning(false);
     }
@@ -172,9 +203,43 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             : "Silo reads selected sources and writes one physical copy per unique SHA-256; duplicate source paths become hard links where supported, or manifest aliases. Originals are not changed."}</p>
         </div>
 
+        {supportsTimeMachine && !plan && (
+          <div className="source-clone-time-machine-choice">
+            <label className="source-clone-acknowledge">
+              <input
+                type="checkbox"
+                checked={createAppleCompatibleBackup}
+                disabled={busy}
+                onChange={(event) => {
+                  setCreateAppleCompatibleBackup(event.target.checked);
+                  if (event.target.checked) setCompress(false);
+                  setAcknowledged(false);
+                  setTimeMachineMessage("");
+                  setTimeMachineError("");
+                }}
+              />
+              <span><strong>Create Apple Compatible Backup File for Device Restoration.</strong> Uses macOS’s currently configured Time Machine destination and inclusion settings. Silo does not choose a destination folder or change those settings. This is not a bootable system image or a guaranteed full-migration copy; macOS Recovery or Migration Assistant may be needed.</span>
+            </label>
+            {createAppleCompatibleBackup && (
+              <div role="radiogroup" aria-label="Time Machine backup mode">
+                <label className="source-clone-acknowledge">
+                  <input type="radio" name="time-machine-mode" checked={timeMachineMode === "instead"} disabled={busy}
+                    onChange={() => { setTimeMachineMode("instead"); setAcknowledged(false); setTimeMachineMessage(""); setTimeMachineError(""); }} />
+                  <span><strong>Instead</strong> — run Time Machine only; do not make a Silo clone.</span>
+                </label>
+                <label className="source-clone-acknowledge">
+                  <input type="radio" name="time-machine-mode" checked={timeMachineMode === "as-well"} disabled={busy}
+                    onChange={() => { setTimeMachineMode("as-well"); setCompress(false); setAcknowledged(false); setTimeMachineMessage(""); setTimeMachineError(""); }} />
+                  <span><strong>As Well</strong> — make and verify the human-readable Silo clone in the selected folder, then request Time Machine separately.</span>
+                </label>
+              </div>
+            )}
+          </div>
+        )}
+
         {!plan && (
           <div className="source-clone-prepare">
-            {destinations.map((destination) => <div className="source-clone-destination" key={destination}>
+            {!timeMachineOnly && destinations.map((destination) => <div className="source-clone-destination" key={destination}>
               <strong title={destination}>{destination}</strong>
               <button disabled={preparing} onClick={() => setDestinations((current) => current.filter((item) => item !== destination))} aria-label={`Remove destination ${destination}`}>Remove</button>
             </div>)}
@@ -205,6 +270,21 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 </div>
                 {preparing && <button className="source-clone-cancel" onClick={() => void cancel()}>Cancel scan</button>}
               </div>
+            ) : timeMachineOnly ? (
+              <>
+                <label className="source-clone-acknowledge">
+                  <input type="checkbox" checked={acknowledged} disabled={busy}
+                    onChange={(event) => setAcknowledged(event.target.checked)} />
+                  <span>I understand this starts macOS Time Machine using its current destination and settings, without creating a Silo clone.</span>
+                </label>
+                {timeMachineMessage && <div className="source-clone-success"><FiCheckCircle /> {timeMachineMessage}</div>}
+                {timeMachineError && <div className="source-clone-warning insufficient">{timeMachineError}</div>}
+                <div className="source-clone-actions">
+                  {timeMachineMessage
+                    ? <button className="source-clone-primary" onClick={onClose}>Done</button>
+                    : <button className="source-clone-primary" onClick={() => void startTimeMachineOnly()} disabled={!acknowledged || busy}>Start Time Machine backup</button>}
+                </div>
+              </>
             ) : (
               <div className="source-clone-actions">
                 <button onClick={() => void addDestination()}><FiHardDrive /> Add destination</button>
@@ -230,13 +310,20 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               {destination.destination}: {destination.shortfallBytes > 0 ? <>short by <strong>{formatBytes(destination.shortfallBytes)}</strong></> : <>free space {formatBytes(destination.freeBytes)} is sufficient</>}
             </div>)}
             <label className="source-clone-acknowledge source-clone-compress">
-              <input type="checkbox" checked={compress} disabled={busy || progress?.phase === "complete"}
+              <input type="checkbox" checked={compress} disabled={busy || progress?.phase === "complete" || (createAppleCompatibleBackup && timeMachineMode === "as-well")}
                 onChange={(event) => setCompress(event.target.checked)} />
-              <span><strong>Compress</strong> into a single .zip archive for easier storage. Photos, video and other already-compressed media are stored as-is; documents and text are deflated. The archive is re-read and SHA-256 verified before it is kept, and can be restored with “Extract a .zip clone…”.</span>
+              <span><strong>Compress</strong> into a single .zip archive for easier storage. Photos, video and other already-compressed media are stored as-is; documents and text are deflated. The archive is re-read and SHA-256 verified before it is kept, and can be restored with “Extract a .zip clone…”. Compression is disabled for “As Well” so the Silo copy remains directly browseable.</span>
             </label>
+            {mode === "sources" && sources.length === 1 && sources[0].kind === "machine" && (
+              createAppleCompatibleBackup && timeMachineMode === "as-well" && (
+                <small className="source-clone-preflight-note">Time Machine starts only after this Silo clone finishes SHA-256 verification. macOS Recovery or Migration Assistant may be needed to set up a replacement Mac.</small>
+              )
+            )}
             <label className="source-clone-acknowledge">
               <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />
-              <span>I understand this makes a separate copy and does not alter the originals.</span>
+              <span>{createAppleCompatibleBackup && timeMachineMode === "as-well"
+                ? "I understand this makes a separate readable Silo copy in the selected folder and also requests a separate Time Machine backup at macOS’s configured destination; originals and settings are not changed."
+                : "I understand this makes a separate copy and does not alter the originals."}</span>
             </label>
             {running && progress && (
               <div className={`source-clone-progress ${progress.phase}`}>
@@ -253,6 +340,8 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             {!running && progress?.phase === "complete" && (
               <div className="source-clone-success"><FiCheckCircle /> {progress.message}</div>
             )}
+            {timeMachineMessage && <div className="source-clone-success">{timeMachineMessage}</div>}
+            {timeMachineError && <div className="source-clone-warning insufficient">{timeMachineError}</div>}
             {!running && progress && ["error", "cancelled"].includes(progress.phase) && (
               <div className="source-clone-warning insufficient">{progress.message}</div>
             )}
@@ -264,7 +353,9 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 <button className="source-clone-primary" onClick={onClose}>Done</button>
               ) : (
                 <button className="source-clone-primary" onClick={() => void startClone()} disabled={!acknowledged || hasShortfall}>
-                  {compress ? <><FiArchive /> Compress &amp; verify</> : <><FiCopy /> Clone &amp; verify</>}
+                  {createAppleCompatibleBackup && timeMachineMode === "as-well"
+                    ? <><FiCopy /> Clone, verify &amp; start Time Machine</>
+                    : compress ? <><FiArchive /> Compress &amp; verify</> : <><FiCopy /> Clone &amp; verify</>}
                 </button>
               )}
             </div>

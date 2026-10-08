@@ -24,6 +24,7 @@ interface SettingsPanelProps {
   onClose: () => void;
   onOpenStatistics: () => void;
   onOpenBugReport: () => void;
+  hideSettingsForScreenshot?: boolean;
   lifetimePromptRequest?: number;
 }
 
@@ -482,6 +483,7 @@ export default function SettingsPanel({
   onClose,
   onOpenStatistics,
   onOpenBugReport,
+  hideSettingsForScreenshot = false,
   lifetimePromptRequest = 0,
 }: SettingsPanelProps) {
   const electronAPI = window.electron;
@@ -505,6 +507,10 @@ export default function SettingsPanel({
     enabled: false,
   });
   const [demoModeBusy, setDemoModeBusy] = useState(false);
+  const [appUpdate, setAppUpdate] = useState<AppUpdateState>({
+    status: "checking",
+    currentVersion: "",
+  });
 
   useEffect(() => {
     if (lifetimePromptRequest > 0) setShowLifetimeUnlock(true);
@@ -563,6 +569,28 @@ export default function SettingsPanel({
       disposed = true;
     };
   }, [electronAPI, lifetimeLicense.isLicensed]);
+
+  useEffect(() => {
+    if (!electronAPI?.getAppUpdateState || !electronAPI.checkForAppUpdates)
+      return;
+    let disposed = false;
+    const receiveUpdateState = (state: AppUpdateState) => {
+      if (!disposed) setAppUpdate(state);
+    };
+    const removeListener = electronAPI.onAppUpdateState(receiveUpdateState);
+    void electronAPI
+      .getAppUpdateState()
+      .then(receiveUpdateState)
+      .catch(() => undefined);
+    void electronAPI
+      .checkForAppUpdates()
+      .then(receiveUpdateState)
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      removeListener();
+    };
+  }, [electronAPI]);
 
   const toggleDemoTestingMode = async () => {
     if (!electronAPI?.setDemoTestingMode) return;
@@ -832,6 +860,79 @@ export default function SettingsPanel({
               )}
             </div>
           )}
+        </section>
+
+        <section className="settings-update-section" aria-live="polite">
+          <div className="settings-section-title">
+            <FiDownload />
+            <div>
+              <h3>
+                {appUpdate.status === "available"
+                  ? "Update Available!"
+                  : "Software updates"}
+              </h3>
+              <p>
+                {appUpdate.status === "checking"
+                  ? appUpdate.message ?? "Checking for a newer Silo version…"
+                  : appUpdate.status === "available"
+                  ? appUpdate.message ??
+                    `Silo ${appUpdate.version} is available to download and install.`
+                  : appUpdate.status === "downloading"
+                  ? `Downloading Silo ${appUpdate.version ?? "update"}… ${appUpdate.downloadPercent ?? 0}%`
+                  : appUpdate.status === "installing"
+                  ? appUpdate.message ??
+                    "Silo is installing the update and will restart automatically."
+                  : appUpdate.status === "not-available"
+                  ? `Silo ${appUpdate.currentVersion} is up to date.`
+                  : appUpdate.status === "unsupported"
+                  ? appUpdate.message
+                  : appUpdate.message ?? "Could not check for updates."}
+              </p>
+            </div>
+          </div>
+          {appUpdate.status === "available" && appUpdate.downloadUrl && (
+            <button
+              type="button"
+              className="settings-save settings-update-download"
+              onClick={() => void electronAPI?.downloadAndInstallAppUpdate()}
+            >
+              Download and install Silo {appUpdate.version}
+            </button>
+          )}
+          {(appUpdate.status === "downloading" ||
+            appUpdate.status === "installing") && (
+            <button
+              type="button"
+              className="settings-save settings-update-download"
+              disabled
+            >
+              {appUpdate.status === "downloading"
+                ? `Downloading… ${appUpdate.downloadPercent ?? 0}%`
+                : "Installing and restarting…"}
+            </button>
+          )}
+          {appUpdate.status === "error" && appUpdate.downloadUrl && (
+            <a
+              className="settings-secondary settings-update-download"
+              href={appUpdate.downloadUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Download DMG instead
+            </a>
+          )}
+          {appUpdate.status === "available" &&
+            !appUpdate.downloadUrl &&
+            appUpdate.releaseUrl && (
+              <a
+                className="settings-secondary settings-update-download"
+                href={appUpdate.releaseUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                View release and available builds
+              </a>
+            )}
         </section>
 
         <section className="settings-bug-report">

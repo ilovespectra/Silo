@@ -36,6 +36,7 @@ export interface AudioLibraryScanProgress {
   sourceCount: number;
   phase: "scanning" | "retrying" | "cooldown" | "source-complete";
   message: string;
+  files?: CachedAudioFile[];
 }
 
 export class AudioLibraryCache {
@@ -223,6 +224,20 @@ export class AudioLibraryCache {
         scanned = 0;
         audioFound = 0;
         const sourceFiles = new Map<string, CachedAudioFile>();
+        const pendingFiles: CachedAudioFile[] = [];
+        const emitScanProgress = (message: string) => {
+          const files = pendingFiles.splice(0);
+          onProgress({
+            source: source.label,
+            scanned,
+            audioFound,
+            sourceIndex: sourceIndex + 1,
+            sourceCount: sources.length,
+            phase: "scanning",
+            message,
+            ...(files.length > 0 ? { files } : {}),
+          });
+        };
         try {
           if (isRemotePath(source.rootPath)) {
             const remoteFiles = await listRemoteFiles(source);
@@ -241,8 +256,17 @@ export class AudioLibraryCache {
                   sourceLabel: source.label,
                 });
                 audioFound += 1;
+                pendingFiles.push(sourceFiles.get(file.path)!);
+                if (audioFound === 1 || pendingFiles.length >= 24)
+                  emitScanProgress(
+                    `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
+                  );
               }
             }
+            if (pendingFiles.length > 0)
+              emitScanProgress(
+                `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
+              );
           } else {
             const appDataPath = path.resolve(path.dirname(this.cachePath));
             const canonicalAppDataPath = await fsPromises
@@ -273,34 +297,67 @@ export class AudioLibraryCache {
                 if (file.sourceId === source.id) next.delete(filePath);
               break;
             }
-            const stack = [{ directory: source.rootPath, relativePath: "" }];
+            const directoryQueue = [
+              { directory: source.rootPath, relativePath: "" },
+            ];
+            let pendingDirectories = 1;
+            const waitingWorkers: Array<() => void> = [];
             const visitedDirectories = new Set<string>();
             let unreadableEntries = 0;
             let rootOpened = false;
-            while (stack.length > 0) {
-              if (this.cancelled) return this.getSnapshot();
-              const current = stack.pop()!;
-              if (isSiloAppData(current.directory)) continue;
-              if (await isSiloCloneDirectory(current.directory)) continue;
+            let traversalError: unknown;
+            let stopTraversal = false;
+            const wakeWorkers = () => {
+              waitingWorkers.splice(0).forEach((wake) => wake());
+            };
+            const enqueueDirectory = (item: {
+              directory: string;
+              relativePath: string;
+            }) => {
+              pendingDirectories += 1;
+              directoryQueue.push(item);
+              wakeWorkers();
+            };
+            const takeDirectory = async () => {
+              while (true) {
+                if (this.cancelled || stopTraversal) return undefined;
+                const item = directoryQueue.shift();
+                if (item) return item;
+                if (pendingDirectories === 0) return undefined;
+                await new Promise<void>((resolve) =>
+                  waitingWorkers.push(resolve),
+                );
+              }
+            };
+            const scanDirectory = async (current: {
+              directory: string;
+              relativePath: string;
+            }) => {
+              if (isSiloAppData(current.directory)) return;
+              if (await isSiloCloneDirectory(current.directory)) return;
               let directory;
               try {
                 const realDirectory = await fsPromises.realpath(
                   current.directory,
                 );
-                if (visitedDirectories.has(realDirectory)) continue;
+                if (visitedDirectories.has(realDirectory)) return;
                 visitedDirectories.add(realDirectory);
                 directory = await fsPromises.opendir(current.directory);
                 if (current.directory === source.rootPath) rootOpened = true;
               } catch (error) {
                 if (current.directory === source.rootPath) throw error;
                 unreadableEntries += 1;
-                continue;
+                return;
               }
               for await (const entry of directory) {
-                if (this.cancelled) return this.getSnapshot();
+                if (this.cancelled || stopTraversal) return;
                 const fullPath = path.join(current.directory, entry.name);
                 if (isSiloAppData(fullPath)) continue;
-                if (entry.isDirectory() && await isSiloCloneDirectory(fullPath)) continue;
+                if (
+                  entry.isDirectory() &&
+                  (await isSiloCloneDirectory(fullPath))
+                )
+                  continue;
                 const relativePath = path.join(
                   current.relativePath,
                   entry.name,
@@ -314,9 +371,9 @@ export class AudioLibraryCache {
                 }
                 scanned += 1;
                 if (stats.isDirectory()) {
-                  stack.push({ directory: fullPath, relativePath });
+                  enqueueDirectory({ directory: fullPath, relativePath });
                 } else if (stats.isFile() && isAudio(entry.name)) {
-                  sourceFiles.set(fullPath, {
+                  const file: CachedAudioFile = {
                     name: entry.name,
                     path: fullPath,
                     relativePath,
@@ -327,21 +384,47 @@ export class AudioLibraryCache {
                     extension: path.extname(entry.name).toLowerCase(),
                     sourceId: source.id,
                     sourceLabel: source.label,
-                  });
+                  };
+                  sourceFiles.set(fullPath, file);
+                  pendingFiles.push(file);
                   audioFound += 1;
+                  if (audioFound === 1 || pendingFiles.length >= 24)
+                    emitScanProgress(
+                      `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
+                    );
                 }
                 if (scanned % 500 === 0)
-                  onProgress({
-                    source: source.label,
-                    scanned,
-                    audioFound,
-                    sourceIndex: sourceIndex + 1,
-                    sourceCount: sources.length,
-                    phase: "scanning",
-                    message: `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
-                  });
+                  emitScanProgress(
+                    `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
+                  );
               }
-            }
+            };
+            const worker = async () => {
+              while (!this.cancelled && !stopTraversal) {
+                const current = await takeDirectory();
+                if (!current) return;
+                try {
+                  await scanDirectory(current);
+                } catch (error) {
+                  if (current.directory === source.rootPath) {
+                    traversalError = error;
+                    stopTraversal = true;
+                  } else unreadableEntries += 1;
+                } finally {
+                  pendingDirectories -= 1;
+                  wakeWorkers();
+                }
+              }
+            };
+            await Promise.all(
+              Array.from({ length: 4 }, () => worker()),
+            );
+            if (this.cancelled) return this.getSnapshot();
+            if (traversalError) throw traversalError;
+            if (pendingFiles.length > 0)
+              emitScanProgress(
+                `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
+              );
             if (!rootOpened)
               throw new Error(`Source unavailable: ${source.rootPath}`);
             if (unreadableEntries > 0) {

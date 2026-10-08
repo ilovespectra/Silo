@@ -68,7 +68,7 @@ export default function LifetimeUnlockPanel({
     "idle" | "copied" | "error"
   >("idle");
   const [betaEmailState, setBetaEmailState] = useState<
-    "idle" | "opening" | "opened" | "error"
+    "idle" | "sending" | "sent" | "error"
   >("idle");
   const [betaEmailNotice, setBetaEmailNotice] = useState("");
   const [activationCode, setActivationCode] = useState("");
@@ -257,25 +257,28 @@ export default function LifetimeUnlockPanel({
     }
   };
 
-  const openBetaActivationRequestEmail = async () => {
-    if (!window.electron?.openBetaActivationRequestEmail) {
+  const sendBetaActivationRequest = async () => {
+    if (!window.electron?.submitBetaActivationRequest) {
       setBetaEmailState("error");
-      setBetaEmailNotice("Email requests are unavailable in this session.");
+      setBetaEmailNotice("Beta requests are unavailable in this session.");
       return;
     }
-    setBetaEmailState("opening");
+    setBetaEmailState("sending");
     setBetaEmailNotice("");
     try {
-      await window.electron.openBetaActivationRequestEmail();
-      setBetaEmailState("opened");
+      const result = await window.electron.submitBetaActivationRequest();
+      if (!result.ok) {
+        setBetaEmailState("error");
+        setBetaEmailNotice(result.error || "Silo could not send the beta request.");
+        return;
+      }
+      setBetaEmailState("sent");
       setBetaEmailNotice(
-        "Your email app opened with a draft. Review it and press Send when ready.",
+        `Beta request sent to ${betaActivationInfo?.requestEmail ?? "the beta team"}.`,
       );
     } catch {
       setBetaEmailState("error");
-      setBetaEmailNotice(
-        `Could not open an email app. Copy the request code and email it to ${betaActivationInfo?.requestEmail ?? "the beta team"}.`,
-      );
+      setBetaEmailNotice("Silo could not send the beta request. Try again when online.");
     }
   };
 
@@ -617,9 +620,9 @@ export default function LifetimeUnlockPanel({
               <div className="lifetime-beta-heading">
                 <strong>Beta tester access</strong>
                   <p>
-                    Copy this installation-specific request code or open a
-                  prefilled email to {betaActivationInfo?.requestEmail ?? "the beta team"}
-                  to request a full lifetime beta license.
+                    Send a beta-access request for this Silo installation. Its
+                    installation-specific request code will be emailed to{" "}
+                    {betaActivationInfo?.requestEmail ?? "the beta team"}.
                   </p>
               </div>
               {betaActivationInfo ? (
@@ -646,15 +649,15 @@ export default function LifetimeUnlockPanel({
                   <button
                     className="lifetime-beta-email-request"
                     type="button"
-                    onClick={() => void openBetaActivationRequestEmail()}
-                    disabled={betaEmailState === "opening"}
+                    onClick={() => void sendBetaActivationRequest()}
+                    disabled={betaEmailState === "sending"}
                   >
                     <FiMail />
-                    {betaEmailState === "opening"
-                      ? "Opening email…"
-                      : betaEmailState === "opened"
-                        ? "Open email again"
-                        : "Email beta request"}
+                    {betaEmailState === "sending"
+                      ? "Sending request…"
+                      : betaEmailState === "sent"
+                        ? "Request sent"
+                        : "Send beta access request"}
                   </button>
                   {betaEmailNotice && (
                     <p className="lifetime-unlock-inline-note" role="status">

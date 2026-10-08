@@ -432,6 +432,7 @@ export class AestheticScorer {
     if (this.running) return;
     this.running = true;
     try {
+      this.emitProgress();
       this.promptVectors ??= await this.deps
         .embedPrompts(PROMPTS)
         .catch(() => null);

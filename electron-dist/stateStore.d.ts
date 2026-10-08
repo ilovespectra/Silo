@@ -12,6 +12,7 @@ export interface PersistedUiState {
 export interface IndexSource {
     path: string;
     addedAt: number;
+    kind?: "machine";
 }
 export interface DigitalFolder {
     id: string;
@@ -78,6 +79,7 @@ export declare class StateStore {
     getSearchState(): Pick<PersistedAppState, "digitalFolders" | "nameIndex" | "fileMetadata">;
     updateUi(update: Partial<PersistedUiState>): Promise<PersistedAppState>;
     addIndexSource(sourcePath: string): Promise<PersistedAppState>;
+    addMachineSource(sourcePath: string): Promise<PersistedAppState>;
     removeIndexSource(sourcePath: string): Promise<PersistedAppState>;
     setSourceEnabled(sourceId: string, enabled: boolean): Promise<PersistedAppState>;
     setAllSourcesEnabled(sourceIds: string[], enabled: boolean): Promise<PersistedAppState>;

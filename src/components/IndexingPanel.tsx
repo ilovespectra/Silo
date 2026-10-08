@@ -232,7 +232,8 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
               </small>
             )}
             {stage.canRetry &&
-              (stage.status === "paused" ||
+              (stage.id === "quality" ||
+                stage.status === "paused" ||
                 stage.status === "error" ||
                 stage.status === "waiting" ||
                 stage.status === "idle" ||
@@ -245,7 +246,9 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
                     stage.recoveryRunning
                   }
                   title={
-                    stage.resumeQueued
+                    stage.id === "quality"
+                      ? "Refresh photo quality index"
+                      : stage.resumeQueued
                       ? "Resume queued"
                       : stage.recoveryRunning
                         ? "Resuming…"
@@ -253,7 +256,11 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
                           ? "Resume indexing"
                           : "Retry indexing"
                   }
-                  aria-label={`Retry or resume ${stage.label}`}
+                  aria-label={
+                    stage.id === "quality"
+                      ? "Refresh photo quality index"
+                      : `Retry or resume ${stage.label}`
+                  }
                   onClick={() => void retryStage(stage.id)}
                 >
                   <FiRefreshCw aria-hidden="true" />

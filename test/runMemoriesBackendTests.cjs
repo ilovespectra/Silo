@@ -214,6 +214,29 @@ async function run() {
     assert.deepEqual(await magic.filterSimilar(["a", "b", "c", "d"], 0.85), ["a", "c", "d"]);
   });
 
+  await test("Photo quality reports background analysis as running before prompt embedding finishes", async () => {
+    const progress = [];
+    let releasePrompts;
+    const magic = new AestheticScorer({
+      cachePath: path.join(root, "aesthetic-progress-test.jsonl"),
+      thumbnailFile: async () => null,
+      temporaryPreview: async () => null,
+      faceBoxes: () => [],
+      imageVectors: async () => new Map(),
+      embedPrompts: () => new Promise((resolve) => { releasePrompts = resolve; }),
+      onProgress: (next) => progress.push(next),
+    });
+    await magic.analyzeInBackground([
+      { path: path.join(library, "pending.jpg"), size: 10, modified: 1, name: "pending.jpg" },
+    ]);
+    assert.equal(progress.at(-1).running, true);
+    assert.equal(progress.at(-1).libraryAnalyzed, 0);
+    assert.equal(progress.at(-1).libraryTotal, 1);
+    releasePrompts([]);
+    await new Promise(setImmediate);
+    await new Promise(setImmediate);
+  });
+
   await test("IPC registration waits for servicesReady and services exist first", () => {
     const wrapper = text.indexOf("ipcMain.handle = ((");
     assert(wrapper > 0);

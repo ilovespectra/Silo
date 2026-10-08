@@ -55,6 +55,7 @@ interface AudioScanProgress {
   source: string;
   sourceIndex: number;
   sourceCount: number;
+  files?: AudioFile[];
 }
 
 interface AudioOutputDevice {
@@ -218,6 +219,14 @@ function audioRecoveryMessage(snapshot: AudioLibraryCacheSnapshot) {
   return snapshot.failedSources?.length
     ? `${snapshot.failedSources.length} source(s) awaiting automatic recovery. Discovered tracks remain available.`
     : "";
+}
+
+function mergeAudioFiles(current: AudioFile[], discovered: AudioFile[]) {
+  const filesByPath = new Map(current.map((file) => [file.path, file]));
+  for (const file of discovered)
+    if (!file.isDirectory && file.type === "audio")
+      filesByPath.set(file.path, file);
+  return Array.from(filesByPath.values());
 }
 
 function yearOf(file: AudioFile) {
@@ -548,6 +557,8 @@ export default function AudioLibrary({
           sourceIndex: progress.sourceIndex,
           sourceCount: progress.sourceCount,
         });
+        if (progress.files?.length)
+          setFiles((current) => mergeAudioFiles(current, progress.files!));
       },
     );
     setError("");
@@ -1023,7 +1034,7 @@ export default function AudioLibrary({
               )}
             </div>
           </div>
-          {loading && (
+          {loading && files.length === 0 && (
             <div className="audio-scan-empty" aria-hidden="true">
               <div className="audio-orbit-loader">
                 {Array.from({ length: 12 }, (_, index) => (
@@ -1079,21 +1090,6 @@ export default function AudioLibrary({
                 }}
               />
             ))}
-            {loading && (
-              <div className="audio-orbit-loader">
-                {Array.from({ length: 12 }, (_, index) => (
-                  <i
-                    key={index}
-                    style={
-                      {
-                        "--loader-index": index,
-                        opacity: 0.22 + index * 0.065,
-                      } as React.CSSProperties
-                    }
-                  />
-                ))}
-              </div>
-            )}
           </div>
           <div className="audio-track-metadata">
             <span className="audio-disc">♫</span>

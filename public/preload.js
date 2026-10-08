@@ -92,6 +92,8 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("prepare-shelter-replica", destinations, operationId),
   startSourceClone: (planId, options) =>
     ipcRenderer.invoke("start-source-clone", planId, options),
+  startMachineTimeMachineBackup: (sourceId) =>
+    ipcRenderer.invoke("start-machine-time-machine-backup", sourceId),
   extractSourceCloneArchive: (operationId) =>
     ipcRenderer.invoke("extract-source-clone-archive", operationId),
   cancelSourceClone: (operationId) =>
@@ -118,6 +120,8 @@ contextBridge.exposeInMainWorld("electron", {
   getIndexingOverview: () => ipcRenderer.invoke("get-indexing-overview"),
   getLibraryDashboard: () => ipcRenderer.invoke("get-library-dashboard"),
   refreshLibraryStats: () => ipcRenderer.invoke("refresh-library-stats"),
+  verifyShelterSources: (sourceIds) =>
+    ipcRenderer.invoke("verify-shelter-sources", sourceIds),
   selectShelterDestination: () =>
     ipcRenderer.invoke("select-shelter-destination"),
   getRuntimeDiagnostics: (cursor) =>
@@ -143,13 +147,22 @@ contextBridge.exposeInMainWorld("electron", {
   saveFileToDevice: (sourcePath, suggestedFileName) =>
     ipcRenderer.invoke("save-file-to-device", sourcePath, suggestedFileName),
   getAppState: () => ipcRenderer.invoke("get-app-state"),
+  getAppUpdateState: () => ipcRenderer.invoke("get-app-update-state"),
+  checkForAppUpdates: () => ipcRenderer.invoke("check-app-updates"),
+  downloadAndInstallAppUpdate: () =>
+    ipcRenderer.invoke("download-and-install-app-update"),
+  onAppUpdateState: (callback) => {
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on("app-update-state", listener);
+    return () => ipcRenderer.removeListener("app-update-state", listener);
+  },
   getLifetimeLicense: () => ipcRenderer.invoke("get-lifetime-license"),
   getDemoTestingMode: () => ipcRenderer.invoke("get-demo-testing-mode"),
   setDemoTestingMode: (enabled) =>
     ipcRenderer.invoke("set-demo-testing-mode", enabled),
   getBetaActivationInfo: () => ipcRenderer.invoke("get-beta-activation-info"),
-  openBetaActivationRequestEmail: () =>
-    ipcRenderer.invoke("open-beta-activation-request-email"),
+  submitBetaActivationRequest: () =>
+    ipcRenderer.invoke("submit-beta-activation-request"),
   activateBetaLicense: (activationCode) =>
     ipcRenderer.invoke("activate-beta-license", activationCode),
   verifyLifetimePayment: (signature) =>
@@ -174,6 +187,7 @@ contextBridge.exposeInMainWorld("electron", {
   },
   updateUiState: (update) => ipcRenderer.invoke("update-ui-state", update),
   selectIndexSource: () => ipcRenderer.invoke("select-index-source"),
+  addMachineSource: () => ipcRenderer.invoke("add-machine-source"),
   removeIndexSource: (sourcePath) =>
     ipcRenderer.invoke("remove-index-source", sourcePath),
   startIndexing: () => ipcRenderer.invoke("start-indexing"),

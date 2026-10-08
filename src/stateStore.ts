@@ -25,6 +25,7 @@ export interface PersistedUiState {
 export interface IndexSource {
   path: string;
   addedAt: number;
+  kind?: "machine";
 }
 
 export interface DigitalFolder {
@@ -205,6 +206,20 @@ export class StateStore {
   async addIndexSource(sourcePath: string) {
     if (!this.state.indexSources.some((source) => source.path === sourcePath)) {
       this.state.indexSources.push({ path: sourcePath, addedAt: Date.now() });
+      await this.write();
+    }
+    return this.getState();
+  }
+
+  async addMachineSource(sourcePath: string) {
+    const existing = this.state.indexSources.find((source) => source.path === sourcePath);
+    if (existing) {
+      if (existing.kind !== "machine") {
+        existing.kind = "machine";
+        await this.write();
+      }
+    } else {
+      this.state.indexSources.push({ path: sourcePath, addedAt: Date.now(), kind: "machine" });
       await this.write();
     }
     return this.getState();

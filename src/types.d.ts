@@ -171,7 +171,7 @@ interface ScanIssues {
   isTimeMachine: boolean;
 }
 
-type SourceKind = "local" | "ios" | "android" | "gdrive" | "gphotos";
+type SourceKind = "local" | "machine" | "ios" | "android" | "gdrive" | "gphotos";
 
 interface BrowseSource {
   id: string;
@@ -226,6 +226,7 @@ interface PersistedUiState {
 interface IndexSource {
   path: string;
   addedAt: number;
+  kind?: "machine";
 }
 
 interface DigitalFolder {
@@ -364,6 +365,19 @@ interface LibraryDashboardSource extends BrowseSource {
   stale: boolean;
   hasVerifiedCopy: boolean;
   lastVerifiedAt: number | null;
+  shelterFreshness: "unknown" | "green" | "yellow" | "orange" | "red" | "blinking-red";
+  shelterBackups: Array<{
+    destination: string;
+    clonePath: string | null;
+    lastVerifiedAt: number | null;
+    lastResult: "verified" | "mismatch" | "missing" | "error";
+    verifiedFiles: number;
+    totalFiles: number;
+  }>;
+  shelterAuditResult: "verified" | "mismatch" | "missing" | "error" | null;
+  shelterAuditMessage: string;
+  shelterVerifiedFiles: number;
+  shelterTotalFiles: number;
   cloneDestination: string | null;
   shelterState: "unprotected" | "verified" | "changed" | "checking" | "offline" | "unknown";
   indexedFiles: number;
@@ -396,11 +410,13 @@ interface LibraryDashboardSnapshot {
   indexingErrors: number;
   shelter: {
     destination: string | null;
+    destinationAvailable: boolean;
     snapshotAvailable: boolean;
     replicas: Array<{ path: string; verifiedAt: number; replicaOf: string }>;
     verifiedSources: number;
     totalSources: number;
     percentage: number;
+    freshness: "unknown" | "green" | "yellow" | "orange" | "red" | "blinking-red";
   };
 }
 
@@ -474,6 +490,7 @@ interface AudioLibraryScanProgress {
   sourceCount: number;
   phase: "scanning" | "retrying" | "cooldown" | "source-complete";
   message: string;
+  files?: FileInfo[];
 }
 
 interface SourceCloneProgress {
@@ -648,8 +665,29 @@ interface BannedFace {
   addedAt: number;
 }
 
+interface AppUpdateState {
+  status:
+    | "checking"
+    | "available"
+    | "downloading"
+    | "installing"
+    | "not-available"
+    | "error"
+    | "unsupported";
+  currentVersion: string;
+  version?: string;
+  downloadUrl?: string;
+  releaseUrl?: string;
+  downloadPercent?: number;
+  message?: string;
+}
+
 interface Window {
   electron?: {
+    getAppUpdateState(): Promise<AppUpdateState>;
+    checkForAppUpdates(): Promise<AppUpdateState>;
+    downloadAndInstallAppUpdate(): Promise<AppUpdateState>;
+    onAppUpdateState(callback: (state: AppUpdateState) => void): () => void;
     isDemoMode(): Promise<boolean>;
     getBugReportStatus(): Promise<{ available: boolean; message: string }>;
     captureBugReportScreenshot(): Promise<string>;
@@ -666,7 +704,7 @@ interface Window {
       restarting: boolean;
     }>;
     getBetaActivationInfo(): Promise<import("./betaLicense").BetaActivationInfo>;
-    openBetaActivationRequestEmail(): Promise<void>;
+    submitBetaActivationRequest(): Promise<{ ok: boolean; error?: string }>;
     activateBetaLicense(
       activationCode: string,
     ): Promise<import("./betaLicense").BetaActivationResult>;
@@ -744,8 +782,13 @@ interface Window {
     ): Promise<{ ok: boolean; plan?: SourceClonePreflight; error?: string }>;
     startSourceClone(
       planId: string,
-      options?: { compress?: boolean },
-    ): Promise<{ ok: boolean; error?: string }>;
+      options?: { compress?: boolean; createAppleCompatibleBackup?: boolean },
+    ): Promise<{ ok: boolean; timeMachineStarted?: boolean; timeMachineError?: string; error?: string }>;
+    startMachineTimeMachineBackup(sourceId: string): Promise<{
+      ok: boolean;
+      timeMachineStarted?: boolean;
+      error?: string;
+    }>;
     extractSourceCloneArchive(operationId: string): Promise<{
       ok: boolean;
       cancelled?: boolean;
@@ -765,8 +808,13 @@ interface Window {
     ): Promise<{ ok: boolean; plan?: SourceClonePreflight; error?: string }>;
     startSourceClone(
       planId: string,
-      options?: { compress?: boolean },
-    ): Promise<{ ok: boolean; error?: string }>;
+      options?: { compress?: boolean; createAppleCompatibleBackup?: boolean },
+    ): Promise<{ ok: boolean; timeMachineStarted?: boolean; timeMachineError?: string; error?: string }>;
+    startMachineTimeMachineBackup(sourceId: string): Promise<{
+      ok: boolean;
+      timeMachineStarted?: boolean;
+      error?: string;
+    }>;
     extractSourceCloneArchive(operationId: string): Promise<{
       ok: boolean;
       cancelled?: boolean;
@@ -802,6 +850,7 @@ interface Window {
     getIndexingOverview(): Promise<IndexingStageProgress[]>;
     getLibraryDashboard(): Promise<LibraryDashboardSnapshot>;
     refreshLibraryStats(): Promise<LibraryDashboardSnapshot>;
+    verifyShelterSources(sourceIds: string[]): Promise<LibraryDashboardSnapshot>;
     selectShelterDestination(): Promise<string | null>;
     getRuntimeDiagnostics(cursor: number): Promise<RuntimeDiagnosticRead>;
     retryIndexingStage(id: string): Promise<{ ok: boolean }>;
@@ -845,6 +894,8 @@ interface Window {
       update: Partial<PersistedUiState>,
     ): Promise<PersistedAppState>;
     selectIndexSource(): Promise<PersistedAppState | null>;
+    addMachineSource(): Promise<PersistedAppState | null>;
+    addMachineSource(): Promise<PersistedAppState | null>;
     removeIndexSource(sourcePath: string): Promise<PersistedAppState>;
     startIndexing(): Promise<IndexProgress>;
     pauseIndexing(): Promise<IndexProgress>;

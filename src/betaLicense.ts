@@ -18,6 +18,13 @@ export interface BetaActivationInfo {
   available: boolean;
 }
 
+export interface BetaActivationRequestPayload {
+  requestCode: string;
+  appVersion: string;
+  platform: string;
+  createdAt: string;
+}
+
 export interface BetaActivationResult {
   status:
     | "activated"
@@ -40,6 +47,22 @@ export function createBetaRequestCode(installationId: string): string {
   return `${REQUEST_CODE_PREFIX}.${installationId}`;
 }
 
+export function createBetaActivationRequestPayload(
+  installationId: string,
+  appVersion: string,
+  platform: string,
+  createdAt = new Date().toISOString(),
+): BetaActivationRequestPayload {
+  if (!Number.isFinite(Date.parse(createdAt)))
+    throw new Error("Invalid beta request timestamp.");
+  return {
+    requestCode: createBetaRequestCode(installationId),
+    appVersion: appVersion.slice(0, 64),
+    platform: platform.slice(0, 32),
+    createdAt: new Date(createdAt).toISOString(),
+  };
+}
+
 export function parseBetaRequestCode(requestCode: string): string | null {
   const match = new RegExp(`^${REQUEST_CODE_PREFIX}\\.([a-f0-9]{32})$`).exec(
     requestCode.trim(),
@@ -47,25 +70,7 @@ export function parseBetaRequestCode(requestCode: string): string | null {
   return match?.[1] ?? null;
 }
 
-export const BETA_ACTIVATION_REQUEST_EMAIL = "info@balkanbiskits.si";
-
-export function createBetaActivationRequestMailto(requestCode: string): string {
-  if (!parseBetaRequestCode(requestCode))
-    throw new Error("Invalid Silo beta request code.");
-  const parameters = new URLSearchParams({
-    subject: "Silo lifetime beta activation request",
-    body: [
-      "Hello,",
-      "",
-      "I would like to request a free lifetime beta activation for this Silo installation.",
-      "",
-      `Silo beta request code: ${requestCode}`,
-      "",
-      "Thank you.",
-    ].join("\n"),
-  });
-  return `mailto:${BETA_ACTIVATION_REQUEST_EMAIL}?${parameters.toString()}`;
-}
+export const BETA_ACTIVATION_REQUEST_EMAIL = "tani@kolektivkrog.si";
 
 export function createBetaActivationCode(
   requestCode: string,

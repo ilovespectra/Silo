@@ -23,7 +23,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.isWithinSiloClone = exports.invalidateSiloCloneDirectoryCache = exports.isSiloCloneDirectory = exports.isAppDataPath = exports.canonicalPathFromSource = exports.isPathWithin = exports.isNonLibraryPath = exports.isPhoneDerivativePath = void 0;
+exports.isWithinSiloClone = exports.invalidateSiloCloneDirectoryCache = exports.isSiloCloneDirectory = exports.isAppDataPath = exports.canonicalPathFromSource = exports.isPathWithin = exports.isNonLibraryPath = exports.isMacDataVolumePathExcluded = exports.getMacDataVolumeDeviceId = exports.isMacDataVolumeSourceRoot = exports.isPhoneDerivativePath = exports.MAC_DATA_VOLUME_ROOT = void 0;
 const path = __importStar(require("path"));
 const fsPromises = __importStar(require("fs/promises"));
 const indexingStorage_1 = require("./indexingStorage");
@@ -37,11 +37,54 @@ const CLONE_MARKER_CACHE_LIMIT = 4096;
 const NEGATIVE_MARKER_CACHE_MS = 2000;
 // iOS-generated derivatives (thumbnail strips, caches) duplicate every real photo.
 const PHONE_DERIVATIVE_PATTERN = /(^|[\\/])PhotoData[\\/](Thumbnails|Caches|MISC|Metadata|CPLAssets[\\/]\.thumbnails)([\\/]|$)/i;
+exports.MAC_DATA_VOLUME_ROOT = path.resolve("/System/Volumes/Data");
+const MAC_DATA_VOLUME_EXCLUDED_ROOTS = new Set([
+    "System",
+    "Volumes",
+    "home",
+    "dev",
+    "cores",
+    ".Spotlight-V100",
+    ".fseventsd",
+    ".Trashes",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+]);
 /** Phone-generated thumbnails and caches: never indexed, browsed for memories, or backed up. */
 function isPhoneDerivativePath(candidatePath) {
     return PHONE_DERIVATIVE_PATTERN.test(candidatePath);
 }
 exports.isPhoneDerivativePath = isPhoneDerivativePath;
+function isMacDataVolumeSourceRoot(sourceRoot) {
+    return path.resolve(sourceRoot) === exports.MAC_DATA_VOLUME_ROOT;
+}
+exports.isMacDataVolumeSourceRoot = isMacDataVolumeSourceRoot;
+async function getMacDataVolumeDeviceId(sourceRoot) {
+    if (!isMacDataVolumeSourceRoot(sourceRoot))
+        return null;
+    try {
+        const stats = await fsPromises.stat(exports.MAC_DATA_VOLUME_ROOT);
+        return stats.isDirectory() ? stats.dev : null;
+    }
+    catch {
+        return null;
+    }
+}
+exports.getMacDataVolumeDeviceId = getMacDataVolumeDeviceId;
+function isMacDataVolumePathExcluded(candidatePath, sourceRoot) {
+    if (!isMacDataVolumeSourceRoot(sourceRoot))
+        return false;
+    const relative = path.relative(exports.MAC_DATA_VOLUME_ROOT, path.resolve(candidatePath));
+    if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+        return false;
+    const segments = relative.split(path.sep);
+    if (MAC_DATA_VOLUME_EXCLUDED_ROOTS.has(segments[0]))
+        return true;
+    if (segments[0] === "private" && ["var", "tmp"].includes(segments[1]))
+        return true;
+    return segments.some((segment, index) => (segment === "Caches" || segment === "Logs") && segments[index - 1] === "Library");
+}
+exports.isMacDataVolumePathExcluded = isMacDataVolumePathExcluded;
 // Software trees (dependencies, app bundles, VCS internals) hold thousands of files and no memories.
 const NON_LIBRARY_SEGMENT = /(^|[\\/])(node_modules|bower_components|\.git|\.svn|\.hg|__pycache__|\.Trashes|\.cache|\.silo-phone-restores|[^\\/]+\.(app|asar|framework|bundle|plugin|kext|xpc|appex|xcodeproj|xcassets))([\\/]|$)/i;
 /** True for paths inside software trees that are never indexed or scanned for search. */

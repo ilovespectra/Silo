@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
-const { fork } = require("node:child_process");
+const { fork, spawnSync } = require("node:child_process");
 const { EventEmitter, once } = require("node:events");
 const { createRequire } = require("node:module");
 const { test } = require("node:test");
@@ -13,15 +13,24 @@ const root = path.resolve(__dirname, "..");
 function loadSource(name, overrides = {}, globals = {}) {
   const filename = path.join(root, "src", name);
   const sourceRequire = createRequire(filename);
+  const mockedRequire = (moduleName) => {
+    overrides.beforeRequire?.(moduleName);
+    return (
+      overrides[moduleName] ??
+      (moduleName.startsWith("./") &&
+      fs.existsSync(path.join(root, "src", `${moduleName.slice(2)}.ts`))
+        ? loadSource(`${moduleName.slice(2)}.ts`)
+        : sourceRequire(moduleName))
+    );
+  };
+  mockedRequire.resolve = (moduleName) =>
+    overrides.resolve?.(moduleName) ?? sourceRequire.resolve(moduleName);
   const exports = {};
   const context = vm.createContext({
     exports,
     module: { exports },
     __dirname: path.join(root, "electron-dist"),
-    require: (name) => overrides[name] ??
-      (name.startsWith("./") && fs.existsSync(path.join(root, "src", `${name.slice(2)}.ts`))
-        ? loadSource(`${name.slice(2)}.ts`)
-        : sourceRequire(name)),
+    require: mockedRequire,
     process,
     console,
     Buffer,
@@ -682,6 +691,224 @@ test("worker supports both transports, bounded raw decoding, and existing tokeni
     );
     assert.equal(fakeProcess.env.OMP_NUM_THREADS, "2");
   }
+});
+
+test("x64 macOS loads Transformers through WASM without the unavailable native binding", (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("The missing native binding is specific to the macOS x64 package.");
+    return;
+  }
+
+  const script = `
+    const assert = require("node:assert/strict");
+    const Module = require("node:module");
+    const runtime = require("onnxruntime-web/wasm");
+    const originalLoad = Module._load;
+    let interceptedNativeRuntime = false;
+    Module._load = function (request, parent, isMain) {
+      if (request === "onnxruntime-node") {
+        interceptedNativeRuntime = true;
+        return {};
+      }
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    try {
+      globalThis[Symbol.for("onnxruntime")] = runtime;
+      const transformers = require("@huggingface/transformers");
+      assert.equal(process.arch, "x64");
+      assert.equal(interceptedNativeRuntime, true);
+      assert.equal(typeof transformers.AutoTokenizer.from_pretrained, "function");
+      assert.equal(typeof transformers.RawImage, "function");
+      assert.equal(typeof runtime.InferenceSession.create, "function");
+      console.log("x64-wasm-runtime-ready");
+    } finally {
+      Module._load = originalLoad;
+    }
+  `;
+  const args = process.arch === "x64"
+    ? ["-e", script]
+    : ["-x86_64", process.execPath, "-e", script];
+  const command = process.arch === "x64" ? process.execPath : "/usr/bin/arch";
+  const result = spawnSync(command, args, { encoding: "utf8", timeout: 30_000 });
+
+  if (
+    process.arch !== "x64" &&
+    (result.error?.code === "ENOEXEC" || /Bad CPU type/i.test(result.stderr ?? ""))
+  ) {
+    t.skip("Rosetta is unavailable for the x64 runtime smoke test.");
+    return;
+  }
+
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.match(result.stdout, /x64-wasm-runtime-ready/);
+});
+
+test("Intel macOS uses local WASM sessions for compatible CLIP embeddings", async () => {
+  const port = new EventEmitter();
+  const fakeProcess = new EventEmitter();
+  fakeProcess.arch = "x64";
+  fakeProcess.platform = "darwin";
+  fakeProcess.env = { SEMANTIC_MODEL_CACHE_PATH: "offline-cache" };
+  fakeProcess.connected = true;
+  fakeProcess.exit = () => {};
+  const responses = new EventEmitter();
+  fakeProcess.send = (response, callback) => {
+    responses.emit("response", response);
+    callback?.(null);
+  };
+  port.postMessage = (response) => responses.emit("response", response);
+
+  const moduleLoader = { _load: () => assert.fail("loader was not patched") };
+  const onnxruntime = {
+    env: { wasm: {} },
+    Tensor: class {
+      constructor(type, data, dims) {
+        Object.assign(this, { type, data, dims });
+      }
+    },
+    InferenceSession: {
+      create: async (modelData, options) => {
+        const modelPath = Buffer.from(modelData).toString();
+        assert.equal(options.executionProviders.length, 1);
+        assert.equal(options.executionProviders[0], "wasm");
+        const isText = modelPath.endsWith("text_model_quantized.onnx");
+        return {
+          inputNames: [isText ? "input_ids" : "pixel_values"],
+          run: async (feeds) => {
+            assert.deepEqual(Object.keys(feeds), [
+              isText ? "input_ids" : "pixel_values",
+            ]);
+            assert.ok(feeds[Object.keys(feeds)[0]] instanceof onnxruntime.Tensor);
+            return {
+              [isText ? "text_embeds" : "image_embeds"]: {
+                data: isText ? [1, 2] : [3, 4],
+              },
+            };
+          },
+        };
+      },
+    },
+  };
+  const transformers = {
+    env: {},
+    AutoTokenizer: {
+      from_pretrained: async () => () => ({
+        input_ids: {
+          type: "int64",
+          data: new BigInt64Array([1n, 2n]),
+          dims: [1, 2],
+        },
+        attention_mask: {
+          type: "int64",
+          data: new BigInt64Array([1n, 1n]),
+          dims: [1, 2],
+        },
+      }),
+    },
+    AutoProcessor: {
+      from_pretrained: async () => async () => ({
+        pixel_values: {
+          type: "float32",
+          data: new Float32Array([0.25]),
+          dims: [1, 3, 1, 1],
+        },
+      }),
+    },
+    RawImage: class {},
+  };
+  const sharp = () => ({
+    metadata: async () => ({ width: 1, height: 1 }),
+    rotate() {
+      return this;
+    },
+    toColourspace() {
+      return this;
+    },
+    removeAlpha() {
+      return this;
+    },
+    raw() {
+      return this;
+    },
+    toBuffer: async () => ({
+      data: Buffer.from([1, 2, 3]),
+      info: { width: 1, height: 1, channels: 3 },
+    }),
+  });
+  sharp.concurrency = (threads) => assert.equal(threads, 2);
+  const fsMock = {
+    existsSync: () => true,
+    readFileSync: (filePath) => Buffer.from(filePath),
+  };
+  const asarRuntimePath = path.join(
+    path.sep,
+    "Applications",
+    "Silo.app",
+    "Contents",
+    "Resources",
+    "app.asar",
+    "node_modules",
+    "onnxruntime-web",
+    "dist",
+    "ort.wasm.min.js",
+  );
+  loadSource(
+    "semanticWorker.ts",
+    {
+      worker_threads: { parentPort: port, workerData: { modelCachePath: "offline-cache" } },
+      fs: fsMock,
+      module: moduleLoader,
+      "onnxruntime-web/wasm": onnxruntime,
+      "@huggingface/transformers": transformers,
+      sharp,
+      beforeRequire: (moduleName) => {
+        if (moduleName === "@huggingface/transformers") {
+          const nativeRuntimeStub = moduleLoader._load("onnxruntime-node");
+          assert.equal(typeof nativeRuntimeStub, "object");
+          assert.equal(Object.keys(nativeRuntimeStub).length, 0);
+        }
+      },
+      resolve: (moduleName) => {
+        assert.equal(moduleName, "onnxruntime-web/wasm");
+        return asarRuntimePath;
+      },
+    },
+    { process: fakeProcess, Error },
+  );
+  const send = async (request) => {
+    const response = once(responses, "response");
+    port.emit("message", request);
+    return (await response)[0];
+  };
+
+  const preload = await send({ id: 1, type: "preload" });
+  assert.equal(preload.id, 1);
+  assert.equal(preload.error, undefined);
+  assert.deepEqual(Array.from(preload.values), []);
+  assert.equal(transformers.env.allowRemoteModels, false);
+  assert.equal(transformers.env.cacheDir, "offline-cache");
+  assert.equal(transformers.env.useWasmCache, false);
+  assert.equal(onnxruntime.env.wasm.numThreads, 1);
+  assert.equal(onnxruntime.env.wasm.proxy, false);
+  for (const fileName of [
+    "ort-wasm-simd-threaded.asyncify.mjs",
+    "ort-wasm-simd-threaded.asyncify.wasm",
+  ]) {
+    const assetUrl = onnxruntime.env.wasm.wasmPaths[
+      fileName.endsWith(".mjs") ? "mjs" : "wasm"
+    ];
+    assert.match(assetUrl, /app\.asar\.unpacked/);
+    assert.ok(assetUrl.endsWith(fileName));
+  }
+  assert.deepEqual(
+    Array.from((await send({ id: 2, type: "text", text: "search" })).values),
+    [1, 2],
+  );
+  assert.deepEqual(
+    Array.from((await send({ id: 3, type: "image", filePath: "/test.jpg" })).values),
+    [3, 4],
+  );
+  assert.equal(fakeProcess.env.OMP_NUM_THREADS, "2");
 });
 
 test("confidence slider maps higher settings to stricter match thresholds", (t) => {

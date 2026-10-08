@@ -206,7 +206,7 @@ export class LibraryStatsManager {
         overlapsAnotherSource: false,
         stale: status !== "ready" || Date.now() - (inventory?.scannedAt ?? 0) > 15 * 60 * 1000,
         canonicalPath: inventory?.canonicalPath ?? source.rootPath,
-        isLocal: source.kind === "local",
+        isLocal: source.kind === "local" || source.kind === "machine",
       };
     });
 
@@ -304,7 +304,7 @@ export class LibraryStatsManager {
       let totalBytes = 0;
       let unknownSizeFiles = 0;
       try {
-        const canonicalPath = source.kind === "local"
+        const canonicalPath = source.kind === "local" || source.kind === "machine"
           ? await fsPromises.realpath(source.rootPath).catch(() => path.resolve(source.rootPath))
           : source.rootPath;
         await this.scanSource(source.rootPath, (file) => {
