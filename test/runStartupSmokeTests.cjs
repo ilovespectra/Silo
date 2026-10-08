@@ -6,7 +6,10 @@ const crypto = require("crypto");
 
 const repoRoot = path.resolve(__dirname, "..");
 const workspaceRoot = path.resolve(__dirname, "../../..");
-const runRoot = path.join(workspaceRoot, "tmp", `silo-startup-smoke-${process.pid}`);
+const testTempRoot = process.env.SILO_STARTUP_SMOKE_ROOT
+  ? path.resolve(process.env.SILO_STARTUP_SMOKE_ROOT)
+  : path.join(workspaceRoot, "tmp");
+const runRoot = path.join(testTempRoot, `silo-startup-smoke-${process.pid}`);
 const fixture = path.join(repoRoot, "startupSmokeMain.cjs");
 const electronBinary = require("electron");
 
@@ -83,10 +86,10 @@ async function runScenario(scenario, configureMissingExternal) {
   const evidence = JSON.parse(fs.readFileSync(marker, "utf8"));
   assert.deepStrictEqual(evidence, { scenario, windowCreated: true });
   if (configureMissingExternal) {
-    const notice = JSON.parse(fs.readFileSync(noticeMarker, "utf8"));
-    assert.equal(notice.type, "warning");
-    assert.equal(notice.title, "Using Local Index Storage");
-    assert.match(notice.message, /could not open the selected external storage drive/i);
+    const status = JSON.parse(fs.readFileSync(noticeMarker, "utf8"));
+    assert.equal(status.destinationAvailable, false);
+    assert.equal(status.localFallbackEnabled, true);
+    assert.match(status.message, /selected destination/i);
   } else {
     assert.equal(fs.existsSync(noticeMarker), false, "no warning is shown when no external drive was selected");
   }
@@ -100,7 +103,7 @@ async function main() {
   try {
     await runScenario("no-external-setting", false);
     await runScenario("configured-drive-absent", true);
-    console.log("Electron startup smoke tests passed: both storage settings created a window.");
+    console.log("Electron startup smoke tests passed: both storage settings created a window and a missing destination reports its status.");
   } finally {
     fs.rmSync(runRoot, { recursive: true, force: true });
   }

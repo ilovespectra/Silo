@@ -1659,6 +1659,15 @@ function App() {
     return electronAPI.onFileScanProgress((progress) => {
       if (progress.requestId !== scanRequestRef.current) return;
       setFileScanProgress(progress);
+      // The initial library scan can continue for a long time. Let the Files
+      // view become usable as soon as it has its first results instead of
+      // keeping the startup overlay up until the complete inventory arrives.
+      if (
+        progress.done ||
+        Boolean(progress.files?.length) ||
+        Boolean(progress.fileDeltas?.length)
+      )
+        setHydrated(true);
       if (
         progress.files &&
         progress.files.length > 0 &&
