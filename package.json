@@ -26,7 +26,7 @@
     "beta:grant": "node scripts/beta-license.cjs grant",
     "brand-dev": "node scripts/brand-dev-app.js",
     "unbrand-dev": "node scripts/brand-dev-app.js --restore",
-    "dist": "npm run react-build && tsc && npm run release:check && electron-builder",
+    "dist": "npm run react-build && tsc && npm run release:check && electron-builder --config electron-builder.config.cjs",
     "test:clone-archive": "node test/runCloneArchiveTests.cjs && node test/runSourceCloneTests.cjs",
     "test:access-branding": "node test/runAccessBrandingTests.cjs"
   },
