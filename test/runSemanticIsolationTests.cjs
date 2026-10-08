@@ -59,11 +59,11 @@ function makeIndexer(
     setImmediateImpl = setImmediate,
   } = {},
 ) {
+  const ownsUserDataPath = !userDataPath;
   if (!userDataPath) {
     userDataPath = fs.mkdtempSync(
       path.join(os.tmpdir(), "semantic-worker-test-"),
     );
-    t.after(() => fs.rmSync(userDataPath, { recursive: true, force: true }));
   }
   const children = [],
     diagnostics = [],
@@ -116,15 +116,19 @@ function makeIndexer(
     () => {},
     (event, details) => diagnostics.push({ event, details }),
   );
-  t.after(() => {
-    if (indexer.embeddingWorker)
-      indexer.failEmbeddingWorker(
-        indexer.embeddingWorker,
-        new Error("Test cleanup"),
-      );
-    for (const child of children)
-      if (child.exitCode === null && child.signalCode === null)
-        child.kill("SIGKILL");
+  t.after(async () => {
+    const activeChildren = children.filter(
+      (child) => child.exitCode === null && child.signalCode === null,
+    );
+    const exits = activeChildren.map(
+      (child) => new Promise((resolve) => child.once("exit", resolve)),
+    );
+    for (const child of activeChildren) child.kill("SIGKILL");
+    await Promise.all(exits);
+    await indexer.runPromise?.catch(() => undefined);
+    await indexer.flushWrites();
+    if (ownsUserDataPath)
+      fs.rmSync(userDataPath, { recursive: true, force: true });
   });
   return {
     indexer,
@@ -136,10 +140,15 @@ function makeIndexer(
   };
 }
 
-if (process.env.SILO_REAL_SEMANTIC_SMOKE === "1") {
-  test("bundled Windows x64 offline model returns a finite text embedding", async (t) => {
-    assert.equal(process.platform, "win32");
-    assert.equal(process.arch, "x64");
+if (
+  process.env.SILO_REAL_SEMANTIC_SMOKE === "1" ||
+  process.env.SILO_REAL_SEMANTIC_SMOKE_LOCAL === "1"
+) {
+  test("bundled offline model indexes a batch and finds the known document", async (t) => {
+    if (process.env.SILO_REAL_SEMANTIC_SMOKE === "1") {
+      assert.equal(process.platform, "win32");
+      assert.equal(process.arch, "x64");
+    }
     const modelCachePath = path.join(root, ".model-test-cache");
     const requiredModels = [
       path.join(
@@ -166,51 +175,104 @@ if (process.env.SILO_REAL_SEMANTIC_SMOKE === "1") {
     for (const modelPath of requiredModels)
       assert.ok(fs.existsSync(modelPath), `Missing bundled model: ${modelPath}`);
 
-    const child = fork(path.join(root, "electron-dist", "semanticWorker.js"), [], {
-      cwd: root,
-      env: {
-        ...process.env,
-        SEMANTIC_MODEL_CACHE_PATH: modelCachePath,
-        OMP_NUM_THREADS: "2",
-        OPENBLAS_NUM_THREADS: "2",
-        MKL_NUM_THREADS: "2",
-      },
-      execArgv: [],
-      silent: true,
-    });
-    t.after(() => {
-      if (child.exitCode === null) child.kill();
+    const userDataPath = fs.mkdtempSync(
+      path.join(os.tmpdir(), "semantic-real-search-index-"),
+    );
+    const sourcePath = fs.mkdtempSync(
+      path.join(os.tmpdir(), "semantic-real-search-source-"),
+    );
+    let indexer;
+    t.after(async () => {
+      if (indexer?.embeddingWorker) {
+        const child = indexer.embeddingWorker;
+        const exited =
+          child.exitCode === null && child.signalCode === null
+            ? new Promise((resolve) => child.once("exit", resolve))
+            : Promise.resolve();
+        indexer.failEmbeddingWorker(child, new Error("Test cleanup"));
+        await exited;
+      }
+      await indexer?.runPromise?.catch(() => undefined);
+      await indexer?.flushWrites();
+      fs.rmSync(sourcePath, { recursive: true, force: true });
+      fs.rmSync(userDataPath, { recursive: true, force: true });
     });
 
-    const response = new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("Windows semantic worker smoke timed out.")),
-        120_000,
-      );
-      child.on("message", (message) => {
-        if (message?.id !== 1) return;
-        clearTimeout(timer);
-        resolve(message);
-      });
-      child.once("error", (error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
-      child.once("exit", (code, signal) => {
-        clearTimeout(timer);
-        reject(
-          new Error(
-            `Windows semantic worker exited before responding (code ${code}, signal ${signal}).`,
-          ),
-        );
-      });
-    });
-    child.send({ id: 1, type: "text", text: "a sailboat on calm water" });
-    const result = await response;
-    assert.equal(result.error, undefined, result.error);
-    assert.ok(Array.isArray(result.values));
-    assert.equal(result.values.length, 512);
-    assert.ok(result.values.every(Number.isFinite));
+    const svg = Buffer.from(`
+      <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+        <rect width="256" height="256" fill="#91d8f2"/>
+        <circle cx="205" cy="48" r="23" fill="#ffd66b"/>
+        <path d="M0 173 Q44 157 86 173 T172 173 T256 173 V256 H0Z" fill="#358cc4"/>
+        <path d="M0 204 Q44 188 86 204 T172 204 T256 204 V256 H0Z" fill="#17699f"/>
+        <path d="M127 48 L127 174 L54 174Z" fill="#fffdf1"/>
+        <path d="M137 78 L137 174 L204 174Z" fill="#f7f1da"/>
+        <path d="M43 178 Q128 195 215 178 L199 198 H60Z" fill="#8b4f34"/>
+        <path d="M128 39 V179" stroke="#65452e" stroke-width="5"/>
+      </svg>
+    `);
+    const imagePath = path.join(sourcePath, "sailboat.png");
+    await require("sharp")(svg).png().toFile(imagePath);
+
+    const targetPath = path.join(sourcePath, "sailboat-notes.txt");
+    const controlPaths = [
+      path.join(sourcePath, "garden-notes.txt"),
+      path.join(sourcePath, "winter-dog-notes.txt"),
+    ];
+    fs.writeFileSync(
+      targetPath,
+      "A sailboat on calm blue water, with its white sail visible beneath a clear sky.",
+    );
+    fs.writeFileSync(
+      controlPaths[0],
+      "A bowl of fresh apples and oranges on a kitchen table.",
+    );
+    fs.writeFileSync(
+      controlPaths[1],
+      "A dog running through deep snow during a winter storm.",
+    );
+
+    const { SemanticIndexer } = loadSource("semanticIndexer.ts");
+    indexer = new SemanticIndexer(
+      userDataPath,
+      modelCachePath,
+      async () => {},
+      () => {},
+    );
+    await indexer.initialize();
+    const batch = [imagePath, targetPath, ...controlPaths];
+    await indexer.start(
+      [sourcePath],
+      new Map(batch.map((filePath) => [filePath, sourcePath])),
+    );
+    assert.equal(
+      indexer.getProgress().status,
+      "complete",
+      indexer.getProgress().message,
+    );
+    assert.equal(indexer.latestRecords.size, batch.length);
+
+    const imageVectors = await indexer.getImageVectors([imagePath]);
+    assert.ok(imageVectors.has(imagePath), "the image received a stored embedding");
+    assert.ok(
+      Array.from(imageVectors.get(imagePath)).every(Number.isFinite),
+      "the stored image embedding is finite",
+    );
+
+    const results = await indexer.search(
+      "a sailboat on calm blue water",
+      23,
+      [sourcePath],
+    );
+    assert.ok(results.length > 0, "semantic search returned a match");
+    assert.equal(
+      results[0].path,
+      targetPath,
+      `Expected the sailboat note first; got ${results
+        .slice(0, 3)
+        .map((result) => `${path.basename(result.path)} (${result.confidence.toFixed(1)})`)
+        .join(", ")}`,
+    );
+    assert.ok(results[0].confidence >= 23);
   });
 }
 
