@@ -1035,3 +1035,82 @@ test("semantic search discards results when cancelled during its yield", async (
   );
   assert.equal(results.length, 0);
 });
+
+test("semantic search streams its first record when indexing starts from an empty index", async (t) => {
+  const { indexer, userDataPath } = makeIndexer(t);
+  const vectorPath = path.join(userDataPath, "progressive-search-vectors.bin");
+  fs.mkdirSync(path.dirname(vectorPath), { recursive: true });
+  indexer.vectorsPath = vectorPath;
+  indexer.demoFilePaths = () => null;
+  indexer.loadClipRuntime = async () => ({});
+  indexer.embedText = async () => {
+    const queryVector = new Float32Array(512);
+    queryVector[0] = 1;
+    return queryVector;
+  };
+  indexer.loadComplete = false;
+  let finishIndexing;
+  indexer.runPromise = new Promise((resolve) => {
+    finishIndexing = resolve;
+  });
+
+  let resolveStreamed;
+  const streamed = new Promise((resolve) => {
+    resolveStreamed = resolve;
+  });
+  let searchResults;
+  const searchPromise = indexer.runSearch(
+    "progressive-first-record",
+    0,
+    ["/photos"],
+    () => false,
+    (results) => {
+      if (results.length > 0) resolveStreamed(results);
+    },
+  ).then((results) => {
+    searchResults = results;
+    return results;
+  });
+
+  try {
+    for (let attempt = 0; attempt < 50 && indexer.indexedRecordListeners.size === 0; attempt++)
+      await new Promise(setImmediate);
+    assert.equal(indexer.indexedRecordListeners.size, 1);
+
+    const vector = Buffer.alloc(512 * Float32Array.BYTES_PER_ELEMENT);
+    vector.writeFloatLE(1, 0);
+    fs.writeFileSync(vectorPath, vector);
+    indexer.setLatestRecord({
+      path: "/photos/first.jpg",
+      name: "first.jpg",
+      sourcePath: "/photos",
+      relativePath: "first.jpg",
+      size: 1,
+      modified: 1,
+      type: "image",
+      extension: "jpg",
+      signature: "fixture",
+      vectorOffset: 0,
+    });
+
+    const streamedResults = await Promise.race([
+      streamed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("The first indexed result was not streamed.")), 2000),
+      ),
+    ]);
+    assert.deepEqual(
+      Array.from(streamedResults, (result) => result.path),
+      ["/photos/first.jpg"],
+    );
+  } finally {
+    finishIndexing();
+    indexer.runPromise = null;
+    indexer.loadComplete = true;
+    await searchPromise;
+  }
+  assert.deepEqual(
+    Array.from(searchResults, (result) => result.path),
+    ["/photos/first.jpg"],
+  );
+});

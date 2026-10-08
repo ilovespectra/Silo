@@ -733,6 +733,7 @@ function App() {
     [],
   );
   const [searchProgress, setSearchProgress] = useState({ scanned: 0, total: 0 });
+  const searchDebounceTimerRef = useRef<number | null>(null);
   const [searching, setSearching] = useState(false);
   const [searchDone, setSearchDone] = useState(false);
   const [confidence, setConfidence] = useState(DEFAULT_SEMANTIC_SEARCH_CONFIDENCE);
@@ -3810,9 +3811,15 @@ function App() {
       setSearchError("");
       return;
     }
-    const timer = window.setTimeout(() => void runSemanticSearch(true), 120);
+    const timer = window.setTimeout(() => {
+      searchDebounceTimerRef.current = null;
+      void runSemanticSearch(true);
+    }, 120);
+    searchDebounceTimerRef.current = timer;
     return () => {
       window.clearTimeout(timer);
+      if (searchDebounceTimerRef.current === timer)
+        searchDebounceTimerRef.current = null;
       if (electronAPI)
         void electronAPI.cancelSemanticSearch().catch(() => undefined);
     };
@@ -4572,7 +4579,14 @@ function App() {
                   }}
                   onBlur={() => setSearchFocused(false)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter") rememberSearch(searchQuery);
+                    if (event.key === "Enter") {
+                      rememberSearch(searchQuery);
+                      if (searchDebounceTimerRef.current !== null) {
+                        window.clearTimeout(searchDebounceTimerRef.current);
+                        searchDebounceTimerRef.current = null;
+                      }
+                      void runSemanticSearch(true);
+                    }
                     if (event.key === "Escape")
                       (event.target as HTMLInputElement).blur();
                   }}

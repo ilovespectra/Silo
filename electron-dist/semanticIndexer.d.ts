@@ -39,6 +39,8 @@ export declare class SemanticIndexer {
     private readonly onProgress;
     private readonly onDiagnostic;
     private readonly latestRecords;
+    private readonly indexedRecordListeners;
+    private readonly searchEmbeddingCache;
     private indexedSearchSnapshotCache;
     private readonly processingPaths;
     private demoFileLimit;
