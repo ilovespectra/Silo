@@ -1926,12 +1926,16 @@ function App() {
   );
 
   const restorePhoneFromArchive = useCallback(
-    async (archive: PhoneRestoreArchive, password: string): Promise<boolean> => {
+    async (
+      targetDeviceId: string,
+      archive: PhoneRestoreArchive,
+      password: string,
+    ): Promise<boolean> => {
       if (!electronAPI) return false;
       setPhoneNotice(`Preparing to restore ${archive.deviceName}…`);
       try {
         const restored = await electronAPI.restorePhoneFromArchive(
-          archive.deviceId,
+          targetDeviceId,
           "ios",
           archive.id,
           password,

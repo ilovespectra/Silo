@@ -102,6 +102,7 @@ const context = vm.createContext({
   notifyDemoLimitReached() {},
   requestSourceProcessingStages() {},
   requestIndexRecoveryStages() {},
+  indexRecovery: null,
   path,
   Set,
   Map,
@@ -254,7 +255,7 @@ const context = vm.createContext({
   },
   safetyScanPromise: null,
   semanticUnsafePaths: new Set(),
-  safetyCachePath: "/cache",
+  safetyCachePath: () => "/cache",
   NSFW_VISUAL_PROMPT: "",
   SAFE_VISUAL_PROMPT: "",
   fsPromises: {

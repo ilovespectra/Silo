@@ -24,6 +24,7 @@ interface PhoneManagerPanelProps {
     password: string,
   ) => Promise<boolean>;
   onRestoreFromArchive: (
+    targetDeviceId: string,
     archive: PhoneRestoreArchive,
     password: string,
   ) => Promise<boolean>;
@@ -78,6 +79,7 @@ function PhoneManagerPanel({
   const restoreFromArchive = async (
     archive: PhoneRestoreArchive,
     deviceKey: string,
+    targetDeviceId: string,
   ) => {
     const password = restorePasswords[deviceKey] || "";
     if (!password) {
@@ -87,7 +89,7 @@ function PhoneManagerPanel({
     setRestoreBusyKey(deviceKey);
     setRestoreFormNotice("");
     try {
-      const restored = await onRestoreFromArchive(archive, password);
+      const restored = await onRestoreFromArchive(targetDeviceId, archive, password);
       if (restored)
         setRestorePasswords((current) => ({ ...current, [deviceKey]: "" }));
     } finally {
@@ -343,7 +345,7 @@ function PhoneManagerPanel({
                               archive.deviceModel !== device.model
                             }
                             onClick={() =>
-                              void restoreFromArchive(archive, deviceKey)
+                              void restoreFromArchive(archive, deviceKey, device.id)
                             }
                           >
                             Restore this archive

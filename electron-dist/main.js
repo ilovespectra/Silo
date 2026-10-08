@@ -102,7 +102,7 @@ electron_1.app.setPath("userData", process.env.FILE_BROWSER_USER_DATA_DIR ||
     path.join(electron_1.app.getPath("appData"), "file-browser-electron"));
 let indexStorageRoot = electron_1.app.getPath("userData");
 (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
-const indexStoragePath = (...segments) => path.join(indexStorageRoot, ...segments);
+const indexStoragePath = (0, indexingStorage_1.createIndexStoragePathResolver)(() => indexStorageRoot);
 const diagnosticsDirectory = path.join(electron_1.app.getPath("userData"), "diagnostics");
 const lifetimeLicensePath = path.join(electron_1.app.getPath("userData"), "lifetime-license.json");
 const betaLicensePath = path.join(electron_1.app.getPath("userData"), "beta-license.json");
@@ -3833,8 +3833,9 @@ electron_1.app.whenReady().then(async () => {
     if (!electron_1.app.isPackaged)
         electron_1.app.dock?.setIcon(appIconPath());
     installApplicationMenu();
+    const userDataPath = electron_1.app.getPath("userData");
+    let startupStorageNotice = null;
     try {
-        const userDataPath = electron_1.app.getPath("userData");
         const storage = await (0, indexingStorage_1.prepareConfiguredIndexStorage)(userDataPath, (filesVerified, bytesVerified) => runtimeLog("index-storage-migration-progress", {
             filesVerified,
             bytesVerified,
@@ -3851,16 +3852,21 @@ electron_1.app.whenReady().then(async () => {
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        runtimeLog("external-index-storage-unavailable", { message });
-        await electron_1.dialog.showMessageBox({
-            type: "error",
-            title: "External Index Storage Unavailable",
-            message: "Connect Silo’s selected external index drive.",
-            detail: `${indexStorageRoot}\n\n${message}\n\nLocal indexing is disabled; Silo will not fall back to filling the Mac's internal storage.`,
-            buttons: ["Quit"],
+        if (!(error instanceof indexingStorage_1.ExternalIndexStorageUnavailableError)) {
+            runtimeLog("index-storage-initialization-failed", { message });
+            electron_1.dialog.showErrorBox("Silo could not safely prepare its index", `${message}\n\nSilo stopped before opening the library. Existing index files were preserved. Resolve the storage issue and reopen Silo.`);
+            electron_1.app.quit();
+            return;
+        }
+        indexStorageRoot = (0, indexingStorage_1.getLocalFallbackIndexStorageRoot)(userDataPath);
+        await fsPromises.mkdir(indexStorageRoot, { recursive: true });
+        (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
+        (0, indexingStorage_1.setIndexStorageExclusionRoots)([error.storageRoot, indexStorageRoot]);
+        startupStorageNotice = `${message} Silo opened with separate local fallback index storage for this session. The configured external location and its data were left untouched.`;
+        runtimeLog("external-index-storage-unavailable", {
+            message,
+            fallback: indexStorageRoot,
         });
-        electron_1.app.quit();
-        return;
     }
     // A restored config is swapped in before any store opens its files.
     try {
@@ -3880,6 +3886,16 @@ electron_1.app.whenReady().then(async () => {
     await contentSettingsStore.initialize();
     registerMediaProtocols();
     await createWindow();
+    if (startupStorageNotice && mainWindow) {
+        void electron_1.dialog.showMessageBox(mainWindow, {
+            type: "warning",
+            title: "Using Local Index Storage",
+            message: "Silo could not open the selected external storage drive.",
+            detail: startupStorageNotice,
+            buttons: ["Continue"],
+            defaultId: 0,
+        });
+    }
     reportStartup("Loading content filters…");
     await loadSafetyCache();
     const modelCachePath = electron_1.app.isPackaged

@@ -1,15 +1,8 @@
 import { createHash, randomBytes } from "crypto";
-import { createReadStream } from "fs";
+import { createReadStream, realpathSync } from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
-export const DEFAULT_EXTERNAL_INDEX_STORAGE_ROOT = path.join(
-  "/Volumes",
-  "BIGGERDRIVE",
-  "LOOK",
-  "DOCS",
-  "SILOCACHE",
-);
 const INDEX_STORAGE_SETTINGS_FILE = "index-storage.json";
 
 interface IndexStorageSettings {
@@ -20,13 +13,50 @@ interface IndexStorageSettings {
 }
 
 let activeIndexStorageRoot = "";
+let indexStorageExclusionRoots: string[] = [];
+
+function canonicalizeStoragePath(storageRoot: string) {
+  const resolved = path.resolve(storageRoot);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
 
 export function setActiveIndexStorageRoot(storageRoot: string) {
-  activeIndexStorageRoot = path.resolve(storageRoot);
+  const resolved = path.resolve(storageRoot);
+  activeIndexStorageRoot = canonicalizeStoragePath(resolved);
+  indexStorageExclusionRoots = [resolved];
+}
+
+export function setIndexStorageExclusionRoots(storageRoots: readonly string[]) {
+  indexStorageExclusionRoots = Array.from(
+    new Set(storageRoots.map((storageRoot) => path.resolve(storageRoot))),
+  );
+}
+
+export function getIndexStorageExclusionRoots() {
+  return Array.from(
+    new Set(
+      indexStorageExclusionRoots.flatMap((storageRoot) => [
+        storageRoot,
+        canonicalizeStoragePath(storageRoot),
+      ]),
+    ),
+  );
+}
+
+export function getLocalFallbackIndexStorageRoot(userDataPath: string) {
+  return path.join(path.resolve(userDataPath), ".silo-local-fallback-index");
 }
 
 export function getActiveIndexStorageRoot() {
   return activeIndexStorageRoot;
+}
+
+export function createIndexStoragePathResolver(getStorageRoot: () => string) {
+  return (...segments: string[]) => path.join(getStorageRoot(), ...segments);
 }
 
 export async function readIndexStorageRoot(userDataPath: string) {
@@ -201,6 +231,13 @@ function isPathWithin(candidatePath: string, rootPath: string) {
   );
 }
 
+export class ExternalIndexStorageUnavailableError extends Error {
+  constructor(readonly storageRoot: string) {
+    super(`Could not open the selected external storage drive at ${storageRoot}. Indexing is paused for that drive.`);
+    this.name = "ExternalIndexStorageUnavailableError";
+  }
+}
+
 async function validateExternalVolume(userDataPath: string, storageRoot: string) {
   if (
     isPathWithin(storageRoot, userDataPath) ||
@@ -213,10 +250,13 @@ async function validateExternalVolume(userDataPath: string, storageRoot: string)
     fsPromises.stat(userDataPath),
   ]);
   const volume = await fsPromises.stat(existingAncestor);
-  if (volume.dev === userData.dev)
+  if (volume.dev === userData.dev) {
+    if (!(await exists(storageRoot)))
+      throw new ExternalIndexStorageUnavailableError(storageRoot);
     throw new Error(
-      `The selected index storage drive is unavailable or is not external: ${storageRoot}. Indexing is paused and local storage will not be used as a fallback.`,
+      `The selected index storage must be on a separate external volume: ${storageRoot}.`,
     );
+  }
 }
 
 export async function validateIndexStorageDestination(
@@ -272,74 +312,194 @@ async function summarizeTree(target: string): Promise<StorageTreeSummary> {
   return total;
 }
 
-async function migrateEntry(
+interface MigrationNode {
+  source: string;
+  target: string;
+  staged: string;
+  kind: "directory" | "file";
+  size: number;
+  hash?: string;
+}
+
+async function collectMigrationNodes(
   source: string,
-  destination: string,
-  progress: { filesVerified: number; bytesVerified: number },
-  onProgress?: ProgressListener,
+  target: string,
+  staged: string,
+  nodes: MigrationNode[],
 ): Promise<void> {
-  const sourceStats = await fsPromises.lstat(source);
-  if (sourceStats.isSymbolicLink())
+  const stats = await fsPromises.lstat(source);
+  if (stats.isSymbolicLink())
     throw new Error(`Index storage migration refuses symbolic links: ${source}`);
-
-  if (sourceStats.isDirectory()) {
-    const destinationExists = await exists(destination);
-    if (destinationExists) {
-      const destinationStats = await fsPromises.lstat(destination);
-      if (!destinationStats.isDirectory() || destinationStats.isSymbolicLink())
-        throw new Error(`Index storage destination conflicts with ${source}`);
-    } else {
-      await fsPromises.mkdir(destination, { recursive: true });
-    }
-
-    for (const name of await fsPromises.readdir(source))
-      await migrateEntry(
+  if (stats.isDirectory()) {
+    nodes.push({ source, target, staged, kind: "directory", size: 0 });
+    const names = (await fsPromises.readdir(source)).sort();
+    for (const name of names)
+      await collectMigrationNodes(
         path.join(source, name),
-        path.join(destination, name),
-        progress,
-        onProgress,
+        path.join(target, name),
+        path.join(staged, name),
+        nodes,
       );
-    await fsPromises.rmdir(source);
     return;
   }
-
-  if (!sourceStats.isFile())
+  if (!stats.isFile())
     throw new Error(`Unsupported item in index storage: ${source}`);
+  nodes.push({ source, target, staged, kind: "file", size: stats.size });
+}
 
-  if (await exists(destination)) {
-    const destinationStats = await fsPromises.lstat(destination);
-    if (!destinationStats.isFile() || destinationStats.isSymbolicLink())
-      throw new Error(`Index storage destination conflicts with ${source}`);
-    const [sourceHash, destinationHash] = await Promise.all([
-      hashFile(source),
-      hashFile(destination),
-    ]);
-    if (sourceStats.size !== destinationStats.size || sourceHash !== destinationHash)
-      throw new Error(
-        `Index storage contains different files at ${destination}; the local original was preserved.`,
-      );
-  } else {
-    await fsPromises.mkdir(path.dirname(destination), { recursive: true });
-    const temporary = `${destination}.silo-migrating-${randomBytes(8).toString("hex")}`;
-    try {
-      await fsPromises.copyFile(source, temporary);
-      const [sourceHash, copiedHash] = await Promise.all([
-        hashFile(source),
-        hashFile(temporary),
-      ]);
-      if (sourceStats.size !== (await fsPromises.stat(temporary)).size || sourceHash !== copiedHash)
-        throw new Error(`Checksum verification failed for ${source}; the local original was preserved.`);
-      await fsPromises.rename(temporary, destination);
-    } catch (error) {
-      await fsPromises.rm(temporary, { force: true });
-      throw error;
-    }
+function migrationNodeKey(node: Pick<MigrationNode, "source" | "kind">) {
+  return `${path.resolve(node.source)}\u0000${node.kind}`;
+}
+
+async function assertTargetMatches(node: MigrationNode): Promise<boolean> {
+  if (!(await exists(node.target))) return false;
+  const stats = await fsPromises.lstat(node.target);
+  if (stats.isSymbolicLink())
+    throw new Error(`Index storage destination refuses symbolic links: ${node.target}`);
+  if (node.kind === "directory") {
+    if (!stats.isDirectory())
+      throw new Error(`Index storage destination conflicts with ${node.source}`);
+    return true;
+  }
+  if (!stats.isFile())
+    throw new Error(`Index storage destination conflicts with ${node.source}`);
+  const destinationHash = await hashFile(node.target);
+  if (stats.size !== node.size || destinationHash !== node.hash)
+    throw new Error(
+      `Index storage contains different files at ${node.target}; the local original was preserved.`,
+    );
+  return true;
+}
+
+export async function migrateIndexStorageRoots(
+  sourceRoots: readonly string[],
+  storageRoot: string,
+  entries: readonly string[] = INDEX_STORAGE_ENTRIES,
+  onProgress?: ProgressListener,
+  beforeSourceRemoval?: () => Promise<void>,
+): Promise<IndexStorageMigrationResult> {
+  const destinationRoot = path.resolve(storageRoot);
+  const sources = Array.from(new Set(sourceRoots.map((source) => path.resolve(source))))
+    .filter((source) => source !== destinationRoot);
+  for (const source of sources) {
+    if (isPathWithin(source, destinationRoot) || isPathWithin(destinationRoot, source))
+      throw new Error("Index storage migration source and destination must be separate.");
   }
 
-  await fsPromises.unlink(source);
-  progress.filesVerified += 1;
-  progress.bytesVerified += sourceStats.size;
-  if (progress.filesVerified % 500 === 0) onProgress?.(progress.filesVerified, progress.bytesVerified);
+  await fsPromises.mkdir(destinationRoot, { recursive: true });
+  const sourceEntries: string[] = [];
+  const nodes: MigrationNode[] = [];
+  let requiredBytes = 0;
+  for (let rootIndex = 0; rootIndex < sources.length; rootIndex += 1) {
+    const sourceRoot = sources[rootIndex];
+    for (const name of entries) {
+      const source = path.join(sourceRoot, name);
+      if (!(await exists(source))) continue;
+      const staged = path.join(destinationRoot, `.silo-index-migration-${process.pid}`, String(rootIndex), name);
+      const before = nodes.length;
+      await collectMigrationNodes(source, path.join(destinationRoot, name), staged, nodes);
+      sourceEntries.push(source);
+      for (const node of nodes.slice(before))
+        if (node.kind === "file") requiredBytes += node.size;
+    }
+  }
+  await assertEnoughSpace(destinationRoot, requiredBytes);
+  if (nodes.length === 0) {
+    await beforeSourceRemoval?.();
+    return { filesVerified: 0, bytesVerified: 0 };
+  }
+
+  const stagingRoot = path.join(destinationRoot, `.silo-index-migration-${process.pid}-${randomBytes(8).toString("hex")}`);
+  const stagedNodes = nodes.map((node) => ({
+    ...node,
+    staged: node.staged.replace(
+      path.join(destinationRoot, `.silo-index-migration-${process.pid}`),
+      stagingRoot,
+    ),
+  }));
+  const progress = { filesVerified: 0, bytesVerified: 0 };
+  try {
+    for (const node of stagedNodes) {
+      if (node.kind === "directory") {
+        await fsPromises.mkdir(node.staged, { recursive: true });
+        continue;
+      }
+      await fsPromises.mkdir(path.dirname(node.staged), { recursive: true });
+      await fsPromises.copyFile(node.source, node.staged);
+      const [sourceHash, stagedHash, stagedStats] = await Promise.all([
+        hashFile(node.source),
+        hashFile(node.staged),
+        fsPromises.stat(node.staged),
+      ]);
+      if (node.size !== stagedStats.size || sourceHash !== stagedHash)
+        throw new Error(`Checksum verification failed for ${node.source}; the local original was preserved.`);
+      node.hash = sourceHash;
+      progress.filesVerified += 1;
+      progress.bytesVerified += node.size;
+      if (progress.filesVerified % 500 === 0)
+        onProgress?.(progress.filesVerified, progress.bytesVerified);
+    }
+
+    const byTarget = new Map<string, MigrationNode>();
+    for (const node of stagedNodes) {
+      const key = path.resolve(node.target);
+      const previous = byTarget.get(key);
+      if (previous) {
+        if (previous.kind !== node.kind ||
+            (node.kind === "file" && (previous.size !== node.size || previous.hash !== node.hash)))
+          throw new Error(`Index storage sources contain conflicting data at ${node.target}; all originals were preserved.`);
+      } else {
+        byTarget.set(key, node);
+      }
+      await assertTargetMatches(node);
+    }
+
+    for (const node of Array.from(byTarget.values())
+      .filter((entry) => entry.kind === "directory")
+      .sort((first, second) => first.target.length - second.target.length)) {
+      if (!(await assertTargetMatches(node)))
+        await fsPromises.mkdir(node.target, { recursive: true });
+    }
+    for (const node of byTarget.values()) {
+      if (node.kind !== "file" || await assertTargetMatches(node)) continue;
+      await fsPromises.mkdir(path.dirname(node.target), { recursive: true });
+      await fsPromises.rename(node.staged, node.target);
+    }
+
+    for (const node of stagedNodes)
+      if (node.kind === "file" && !(await assertTargetMatches(node)))
+        throw new Error(`Index storage commit verification failed for ${node.target}; all originals were preserved.`);
+
+    const originalKeys = new Set(nodes.map(migrationNodeKey));
+    const currentNodes: MigrationNode[] = [];
+    for (const source of sourceEntries) {
+      const sourceRoot = sources.find((candidate) => isPathWithin(source, candidate))!;
+      const entryName = path.relative(sourceRoot, source);
+      await collectMigrationNodes(
+        source,
+        path.join(destinationRoot, entryName),
+        "",
+        currentNodes,
+      );
+    }
+    if (currentNodes.length !== nodes.length ||
+        currentNodes.some((node) => !originalKeys.has(migrationNodeKey(node))))
+      throw new Error("Index storage sources changed during migration; all originals were preserved.");
+    for (const node of nodes) {
+      if (node.kind !== "file") continue;
+      const stats = await fsPromises.stat(node.source);
+      if (stats.size !== node.size || await hashFile(node.source) !== node.hash)
+        throw new Error(`Index storage source changed during migration: ${node.source}; all originals were preserved.`);
+    }
+
+    await beforeSourceRemoval?.();
+    for (const source of sourceEntries)
+      await fsPromises.rm(source, { recursive: true, force: true });
+    onProgress?.(progress.filesVerified, progress.bytesVerified);
+    return progress;
+  } finally {
+    await fsPromises.rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 export async function migrateIndexStorageEntries(
@@ -348,37 +508,7 @@ export async function migrateIndexStorageEntries(
   entries: readonly string[] = INDEX_STORAGE_ENTRIES,
   onProgress?: ProgressListener,
 ): Promise<IndexStorageMigrationResult> {
-  let requiredBytes = 0;
-  let expectedFiles = 0;
-  const sources: string[] = [];
-  for (const name of entries) {
-    const source = path.join(userDataPath, name);
-    if (!(await exists(source))) continue;
-    const summary = await summarizeTree(source);
-    requiredBytes += summary.bytes;
-    expectedFiles += summary.files;
-    sources.push(name);
-  }
-  await assertEnoughSpace(storageRoot, requiredBytes);
-
-  const progress = { filesVerified: 0, bytesVerified: 0 };
-  for (const name of sources) {
-    await migrateEntry(
-      path.join(userDataPath, name),
-      path.join(storageRoot, name),
-      progress,
-      onProgress,
-    );
-  }
-  onProgress?.(progress.filesVerified, progress.bytesVerified);
-  if (
-    progress.filesVerified !== expectedFiles ||
-    progress.bytesVerified !== requiredBytes
-  )
-    throw new Error(
-      "Index storage verification totals did not match the local source manifest; Silo was not started.",
-  );
-  return progress;
+  return migrateIndexStorageRoots([userDataPath], storageRoot, entries, onProgress);
 }
 
 export async function prepareExternalIndexStorage(
@@ -421,20 +551,18 @@ export async function prepareConfiguredIndexStorage(
     await validateExternalVolume(userDataPath, storageRoot);
     await fsPromises.mkdir(storageRoot, { recursive: true });
     const sourceRoots = new Set([settings.path, path.resolve(userDataPath)]);
-    for (const sourceRoot of sourceRoots) {
-      if (sourceRoot === storageRoot) continue;
-      if (sourceRoot !== path.resolve(userDataPath))
+    for (const sourceRoot of sourceRoots)
+      if (sourceRoot !== path.resolve(userDataPath) && sourceRoot !== storageRoot)
         await fsPromises.stat(sourceRoot);
-      const result = await migrateIndexStorageEntries(
-        sourceRoot,
-        storageRoot,
-        INDEX_STORAGE_ENTRIES,
-        onProgress,
-      );
-      filesVerified += result.filesVerified;
-      bytesVerified += result.bytesVerified;
-    }
-    await writeIndexStorageRoot(userDataPath, storageRoot);
+    const result = await migrateIndexStorageRoots(
+      Array.from(sourceRoots).filter((sourceRoot) => sourceRoot !== storageRoot),
+      storageRoot,
+      INDEX_STORAGE_ENTRIES,
+      onProgress,
+      () => writeIndexStorageRoot(userDataPath, storageRoot),
+    );
+    filesVerified = result.filesVerified;
+    bytesVerified = result.bytesVerified;
   } else {
     await validateExternalVolume(userDataPath, storageRoot);
     await fsPromises.mkdir(storageRoot, { recursive: true });

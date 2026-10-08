@@ -15,5 +15,4 @@ export declare function exportConfig(userData: string, target: string, appVersio
 export declare function stageConfigImport(userData: string, archive: string): Promise<ConfigManifest>;
 export declare function commitStagedImport(userData: string): Promise<void>;
 export declare function cancelStagedImport(userData: string): Promise<void>;
-/** Runs at startup before any store opens its files: swaps the staged config into place. */
 export declare function applyPendingImport(userData: string, indexStoragePath?: string): Promise<boolean>;
