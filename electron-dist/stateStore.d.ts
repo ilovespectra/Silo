@@ -74,6 +74,8 @@ export declare class StateStore {
     constructor(userDataPath: string);
     initialize(): Promise<void>;
     getState(): PersistedAppState;
+    /** Search reads this small live view instead of cloning the full library state. */
+    getSearchState(): Pick<PersistedAppState, "digitalFolders" | "nameIndex" | "fileMetadata">;
     updateUi(update: Partial<PersistedUiState>): Promise<PersistedAppState>;
     addIndexSource(sourcePath: string): Promise<PersistedAppState>;
     removeIndexSource(sourcePath: string): Promise<PersistedAppState>;

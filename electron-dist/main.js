@@ -2517,6 +2517,33 @@ async function buildSourceList() {
     return sources;
 }
 async function readSourceFiles(source, exploded, onProgress) {
+    const reportedFiles = new Map();
+    const annotate = (file) => ({
+        ...file,
+        sourceId: source.id,
+        sourceLabel: source.label,
+        ...(source.snapshotAt ? { sourceSnapshotAt: source.snapshotAt } : {}),
+    });
+    const reportNewFiles = (files, scanned) => {
+        if (!onProgress)
+            return;
+        const delta = [];
+        for (const file of files) {
+            const previous = reportedFiles.get(file.path);
+            if (previous?.file === file)
+                continue;
+            const annotated = annotate(file);
+            const signature = JSON.stringify(annotated);
+            if (previous?.signature === signature) {
+                reportedFiles.set(file.path, { file, signature });
+                continue;
+            }
+            reportedFiles.set(file.path, { file, signature });
+            delta.push(annotated);
+        }
+        if (delta.length)
+            onProgress(delta, scanned, files.filter((file) => file.type === "audio").length);
+    };
     let files;
     if (phoneManager.isPhonePath(source.rootPath))
         files = (await (exploded
@@ -2525,24 +2552,11 @@ async function readSourceFiles(source, exploded, onProgress) {
     else if (googleManager.isCloudPath(source.rootPath))
         files = (await googleManager.listFiles(source.rootPath, exploded));
     else
-        files = await readFiles(source.rootPath, exploded, undefined, onProgress
-            ? (progressFiles) => onProgress(progressFiles.slice(0, 500).map((file) => ({
-                ...file,
-                sourceId: source.id,
-                sourceLabel: source.label,
-                ...(source.snapshotAt ? { sourceSnapshotAt: source.snapshotAt } : {}),
-            })), progressFiles.length, progressFiles.filter((file) => file.type === "audio").length)
-            : undefined);
-    const annotated = files.map((file) => ({
-        ...file,
-        sourceId: source.id,
-        sourceLabel: source.label,
-        ...(source.snapshotAt ? { sourceSnapshotAt: source.snapshotAt } : {}),
-    }));
-    onProgress?.(annotated.slice(0, 500), annotated.length, annotated.filter((file) => file.type === "audio").length);
-    return annotated;
+        files = await readFiles(source.rootPath, exploded, undefined, (progressFiles) => reportNewFiles(progressFiles, progressFiles.length));
+    reportNewFiles(files, files.length);
+    return files.map(annotate);
 }
-/** The aggregate root lists enabled sources as folders, or every file when exploded. */
+/** The aggregate root lists enabled sources as folders, or discovers each recursive source in parallel. */
 async function readAllSources(exploded, onProgress) {
     const enabled = (await listSources()).filter((source) => source.enabled && source.available);
     if (!exploded) {
@@ -2560,28 +2574,57 @@ async function readAllSources(exploded, onProgress) {
             ...(source.snapshotAt ? { sourceSnapshotAt: source.snapshotAt } : {}),
         }));
     }
-    const collected = [];
-    let completedAudio = 0;
-    for (const source of enabled) {
-        let sourceFiles = [];
-        try {
-            sourceFiles = await readSourceFiles(source, true, (progressFiles, sourceScanned, sourceAudio) => {
-                const preview = [...collected, ...progressFiles].slice(0, 500);
-                onProgress?.(preview, collected.length + sourceScanned, 0, completedAudio + sourceAudio);
-            });
+    const results = new Array(enabled.length);
+    const scannedBySource = new Array(enabled.length).fill(0);
+    const audioBySource = new Array(enabled.length).fill(0);
+    const reportedFiles = new Map();
+    let nextSource = 0;
+    let scanErrors = 0;
+    const report = (delta = []) => {
+        onProgress?.(delta, scannedBySource.reduce((sum, count) => sum + count, 0), 0, // A recursive scan cannot know the final total until each source completes.
+        audioBySource.reduce((sum, count) => sum + count, 0), scanErrors);
+    };
+    const scanWorker = async () => {
+        while (nextSource < enabled.length) {
+            const sourceIndex = nextSource++;
+            const source = enabled[sourceIndex];
+            try {
+                results[sourceIndex] = await readSourceFiles(source, true, (sourceDeltas, sourceScanned, sourceAudio) => {
+                    scannedBySource[sourceIndex] = sourceScanned;
+                    audioBySource[sourceIndex] = sourceAudio;
+                    const fresh = sourceDeltas.filter((file) => {
+                        const signature = JSON.stringify(file);
+                        if (reportedFiles.get(file.path) === signature)
+                            return false;
+                        reportedFiles.set(file.path, signature);
+                        return true;
+                    });
+                    report(fresh);
+                });
+                scannedBySource[sourceIndex] = results[sourceIndex].length;
+                audioBySource[sourceIndex] = results[sourceIndex].filter((file) => file.type === "audio").length;
+                const finalDeltas = results[sourceIndex].filter((file) => {
+                    const signature = JSON.stringify(file);
+                    if (reportedFiles.get(file.path) === signature)
+                        return false;
+                    reportedFiles.set(file.path, signature);
+                    return true;
+                });
+                report(finalDeltas);
+            }
+            catch (error) {
+                results[sourceIndex] = [];
+                scanErrors += 1;
+                runtimeLog("source-scan-error", {
+                    sourceId: source.id,
+                    message: String(error),
+                });
+                report();
+            }
         }
-        catch (error) {
-            runtimeLog("source-scan-error", {
-                sourceId: source.id,
-                message: String(error),
-            });
-        }
-        completedAudio += sourceFiles.filter((file) => file.type === "audio").length;
-        for (const file of sourceFiles)
-            collected.push(file);
-        onProgress?.(collected.slice(0, 500), collected.length, 0, completedAudio);
-    }
-    return collected;
+    };
+    await Promise.all(Array.from({ length: Math.min(3, enabled.length) }, () => scanWorker()));
+    return results.flat();
 }
 function isRemotePath(candidate) {
     return ((phoneManager?.isPhonePath(candidate) ?? false) ||
@@ -4945,19 +4988,21 @@ electron_1.ipcMain.handle("get-files", async (_event, dirPath, exploded = false,
     };
     await emitIndexedPreview();
     if (dirPath === ALL_SOURCES_PATH) {
+        let browseScanErrors = 0;
         const progressCallback = typeof requestId === "number"
-            ? (partialFiles, scanned, total, audioFound) => {
-                const visible = filterForContentSafety(partialFiles);
+            ? (fileDeltas, scanned, total, audioFound, errors) => {
+                browseScanErrors = errors;
+                const visible = filterForContentSafety(fileDeltas);
                 sendToRenderer("file-scan-progress", {
                     requestId,
                     directoryPath: dirPath,
-                    files: visible.slice(0, 500),
+                    fileDeltas: visible,
                     scanned,
                     total,
                     audioFound,
                     done: false,
                     isTimeMachine: false,
-                    errors: 0,
+                    errors,
                 });
             }
             : undefined;
@@ -4972,7 +5017,7 @@ electron_1.ipcMain.handle("get-files", async (_event, dirPath, exploded = false,
                 audioFound: files.filter((file) => file.type === "audio").length,
                 done: true,
                 isTimeMachine: false,
-                errors: 0,
+                errors: browseScanErrors,
             });
         return files;
     }
@@ -5584,10 +5629,11 @@ const supersedeSemanticSearch = (sender) => {
 electron_1.ipcMain.handle("cancel-semantic-search", (event) => {
     supersedeSemanticSearch(event.sender);
 });
-electron_1.ipcMain.handle("semantic-search", async (event, query, confidence) => {
+electron_1.ipcMain.handle("semantic-search", async (event, query, confidence, requestId) => {
     const sender = event.sender;
     const generation = supersedeSemanticSearch(sender);
     const isCancelled = () => sender.isDestroyed() || semanticSearchGenerations.get(sender) !== generation;
+    const progressRequestId = Number.isSafeInteger(requestId) ? requestId : generation;
     const minimumConfidence = (0, semanticIndexer_1.confidenceSettingToMinimumThreshold)(confidence);
     const contentSettings = contentSettingsStore.getPublicSettings();
     if (contentSettings.safeSearch && (0, contentPolicy_1.containsExplicitTerms)(query))
@@ -5595,124 +5641,134 @@ electron_1.ipcMain.handle("semantic-search", async (event, query, confidence) =>
     const sources = await getEnabledIndexSources();
     if (isCancelled())
         return [];
-    const semanticResults = await semanticIndexer.search(query, minimumConfidence, sources, isCancelled);
-    if (isCancelled())
-        return [];
-    const state = stateStore.getState();
-    const allResults = new Map();
-    // Start with PRIORITY 3: Semantic search results (normal results) - add all first
-    for (const result of semanticResults) {
-        allResults.set(result.path, {
-            ...result,
-            _priority: 3,
-            _source: undefined,
-        });
-    }
-    // PRIORITY 2: Digital folder name matches - override if better match
-    const folderMatches = state.digitalFolders.filter((folder) => folder.name.toLowerCase().includes(query.toLowerCase()));
-    for (const folderMatch of folderMatches) {
-        for (const folderFilePath of folderMatch.filePaths) {
-            const existing = allResults.get(folderFilePath);
-            if (!existing || existing._priority > 2) {
-                // Get full file info from semantic results if available, otherwise create minimal
-                const semanticResult = semanticResults.find((r) => r.path === folderFilePath);
-                const conf = semanticResult?.confidence ?? 50;
-                const result = {
-                    ...(semanticResult || {
-                        name: folderFilePath.split("/").pop() || folderFilePath,
-                        path: folderFilePath,
-                        relativePath: folderFilePath,
-                        size: 0,
-                        modified: Date.now(),
-                        isDirectory: false,
-                        type: "image",
-                        extension: folderFilePath.includes(".")
-                            ? folderFilePath.split(".").pop() || ""
-                            : "",
-                        confidence: conf,
-                    }),
-                    _priority: 2,
-                    _source: `In folder: ${folderMatch.name}`,
-                };
-                allResults.set(folderFilePath, result);
-            }
-        }
-    }
-    // PRIORITY 1: Name-based search results (people and animals) - highest priority
-    const nameMatches = state.nameIndex.filter((entry) => entry.name.toLowerCase().includes(query.toLowerCase()));
-    for (const nameEntry of nameMatches) {
-        for (const fileEntry of nameEntry.filePaths) {
-            const existing = allResults.get(fileEntry.path);
-            if (!existing || existing._priority > 1) {
-                // Get full file info from semantic results if available
-                const semanticResult = semanticResults.find((r) => r.path === fileEntry.path);
-                const conf = semanticResult?.confidence ?? 50;
-                const result = {
-                    ...(semanticResult || {
-                        name: fileEntry.path.split("/").pop() || fileEntry.path,
-                        path: fileEntry.path,
-                        relativePath: fileEntry.path,
-                        size: 0,
-                        modified: Date.now(),
-                        isDirectory: false,
-                        type: "image",
-                        extension: fileEntry.path.includes(".")
-                            ? fileEntry.path.split(".").pop() || ""
-                            : "",
-                        confidence: conf,
-                    }),
-                    _priority: 1,
-                    _source: `Named as: ${nameEntry.name}`,
-                };
-                allResults.set(fileEntry.path, result);
-            }
-        }
-    }
-    // PRIORITY 0: user-authored aliases and keywords outrank inferred matches.
+    // Read only the search fields here. getState() structured-clones the entire
+    // persisted library, which made every keystroke copy hundreds of thousands
+    // of metadata records before a result could be shown.
+    const state = stateStore.getSearchState();
     const normalizedQuery = query.trim().toLowerCase();
-    for (const [filePath, metadata] of Object.entries(state.fileMetadata)) {
-        const aliasMatches = metadata.displayName
-            ?.toLowerCase()
-            .includes(normalizedQuery);
-        const keywordMatches = metadata.keywords.some((keyword) => keyword.toLowerCase().includes(normalizedQuery));
-        if (!aliasMatches && !keywordMatches)
-            continue;
-        const semanticResult = semanticResults.find((result) => result.path === filePath);
-        const extension = path.extname(filePath).slice(1);
-        allResults.set(filePath, {
-            ...(semanticResult || {
-                name: path.basename(filePath),
-                path: filePath,
-                relativePath: filePath,
-                size: 0,
-                modified: metadata.updatedAt,
-                isDirectory: false,
-                type: "image",
-                extension,
-                confidence: 100,
-            }),
-            name: metadata.displayName ||
-                semanticResult?.name ||
-                path.basename(filePath),
-            confidence: 100,
-            _priority: 0,
-            _source: aliasMatches
-                ? `Virtual name: ${metadata.displayName}`
-                : `Keywords: ${metadata.keywords.join(", ")}`,
-        });
+    const priorityMatches = new Map();
+    const addPriorityMatch = (filePath, priority, source, name) => {
+        const previous = priorityMatches.get(filePath);
+        if (!previous || priority < previous.priority)
+            priorityMatches.set(filePath, { priority, source, name });
+    };
+    if (normalizedQuery) {
+        for (const folder of state.digitalFolders) {
+            if (!folder.name.toLowerCase().includes(normalizedQuery))
+                continue;
+            for (const filePath of folder.filePaths)
+                addPriorityMatch(filePath, 2, `In folder: ${folder.name}`);
+        }
+        // User-confirmed people photos outrank inferred visual similarity.
+        for (const person of faceIndexer.getPeople()) {
+            if (!person.name.toLowerCase().includes(normalizedQuery))
+                continue;
+            const detail = faceIndexer.getPerson(person.id);
+            for (const filePath of detail?.confirmedPhotoPaths ?? [])
+                addPriorityMatch(filePath, 1, `Named as: ${person.name}`);
+        }
+        // Pet names and other explicit name assignments remain searchable. Person
+        // cluster suggestions are excluded here; only confirmed cluster photos win.
+        const matchingPetPaths = new Set();
+        for (const entry of state.nameIndex) {
+            if (entry.sourceType === "person" ||
+                !entry.name.toLowerCase().includes(normalizedQuery))
+                continue;
+            for (const fileEntry of entry.filePaths) {
+                addPriorityMatch(fileEntry.path, 1, `Named as: ${entry.name}`);
+                if (entry.sourceType === "pet")
+                    matchingPetPaths.add(fileEntry.path);
+            }
+        }
+        if (matchingPetPaths.size) {
+            for (const folder of state.digitalFolders) {
+                if (!folder.filePaths.some((filePath) => matchingPetPaths.has(filePath)))
+                    continue;
+                for (const filePath of folder.filePaths)
+                    addPriorityMatch(filePath, 1, `In folder: ${folder.name}`);
+            }
+        }
+        // User-authored aliases and keywords are the strongest exact matches.
+        for (const [filePath, metadata] of Object.entries(state.fileMetadata)) {
+            const aliasMatches = metadata.displayName
+                ?.toLowerCase()
+                .includes(normalizedQuery);
+            const keywordMatches = metadata.keywords.some((keyword) => keyword.toLowerCase().includes(normalizedQuery));
+            if (aliasMatches || keywordMatches)
+                addPriorityMatch(filePath, 0, aliasMatches
+                    ? `Virtual name: ${metadata.displayName}`
+                    : `Keywords: ${metadata.keywords.join(", ")}`, metadata.displayName);
+        }
     }
-    const activeResults = filterForEnabledSources(Array.from(allResults.values()), new Set(sources)).filter((result) => Number.isFinite(result.confidence) &&
-        result.confidence >= minimumConfidence);
+    const rankResults = (semanticResults) => {
+        const semanticResultsByPath = new Map(semanticResults.map((result) => [result.path, result]));
+        const allResults = new Map();
+        for (const result of semanticResults)
+            allResults.set(result.path, {
+                ...result,
+                _priority: 3,
+                _source: undefined,
+            });
+        for (const [filePath, match] of priorityMatches) {
+            const semanticResult = semanticResultsByPath.get(filePath);
+            allResults.set(filePath, {
+                ...(semanticResult || {
+                    name: path.basename(filePath),
+                    path: filePath,
+                    relativePath: filePath,
+                    size: 0,
+                    modified: Date.now(),
+                    isDirectory: false,
+                    type: "image",
+                    extension: path.extname(filePath).slice(1),
+                    confidence: 100,
+                }),
+                ...(match.name ? { name: match.name } : {}),
+                confidence: 100,
+                _priority: match.priority,
+                _source: match.source,
+            });
+        }
+        const activeResults = filterForEnabledSources(Array.from(allResults.values()), new Set(sources)).filter((result) => Number.isFinite(result.confidence) &&
+            result.confidence >= minimumConfidence);
+        if (isCancelled())
+            return [];
+        return filterForContentSafety(activeResults).sort((first, second) => {
+            const priorityDifference = (first._priority ?? 3) - (second._priority ?? 3);
+            return priorityDifference || second.confidence - first.confidence;
+        });
+    };
+    const publishProgress = (status, semanticResults, scanned = 0, total = 0) => {
+        if (isCancelled())
+            return;
+        sender.send("semantic-search-progress", {
+            requestId: progressRequestId,
+            status,
+            results: rankResults(semanticResults),
+            scanned,
+            total,
+        });
+    };
+    // Exact metadata and confirmed-name hits appear before CLIP loads/scans.
+    publishProgress("searching", []);
+    let scannedRecords = 0;
+    let totalRecords = 0;
+    const semanticResults = await semanticIndexer.search(query, minimumConfidence, sources, isCancelled, (partialResults, scanned, total) => {
+        scannedRecords = scanned;
+        totalRecords = total;
+        publishProgress("searching", partialResults, scanned, total);
+    });
     if (isCancelled())
         return [];
-    return filterForContentSafety(activeResults).sort((a, b) => {
-        const priorityA = a._priority ?? 3;
-        const priorityB = b._priority ?? 3;
-        if (priorityA !== priorityB) {
-            return priorityA - priorityB;
-        }
-        return b.confidence - a.confidence;
+    const results = rankResults(semanticResults);
+    sender.send("semantic-search-progress", {
+        requestId: progressRequestId,
+        status: "done",
+        results,
+        scanned: scannedRecords,
+        total: totalRecords,
     });
+    return results;
 });
 electron_1.ipcMain.handle("create-digital-folder", async (_event, name) => {
     const folderCount = stateStore
@@ -6026,6 +6082,7 @@ electron_1.ipcMain.handle("get-indexing-overview", async () => {
         ? { ...semanticIndexer.getProgress(), status: "loading-model", message: "Opening the saved search index…" }
         : semanticIndexer.getProgress();
     const globalSearch = semanticIndexer.getIndexSummary();
+    const retryableSearchErrors = semanticIndexer.getRetryableErrorCount(eligibleRoots);
     const discovery = semanticIndexer.getReconciliationProgress();
     const currentSource = registeredSources.find((source) => source.rootPath === discovery.sourcePath);
     const batchRoot = currentSource?.label ||
@@ -6072,7 +6129,7 @@ electron_1.ipcMain.handle("get-indexing-overview", async () => {
             unit: "sources",
             errors: coverage.errors,
             message: discoveryMessage,
-            detail: `${registeredSources.length} registered sources (distinct roots in this snapshot) · ${eligibleRoots.length} eligible for indexing · ${coverage.completed} discovered · ${coverage.pending} pending · ${coverage.scanning} scanning · ${coverage.errors} errors · ${coverage.unavailable} unavailable${unavailableSources.length ? ` · ${unavailableSources.length} disconnected / unauthorized sources excluded from eligible total` : ""}. Current / last discovery batch: source ${discovery.sourceIndex} of ${discovery.sourceCount} · ${batchRoot} (not global coverage) · ${discovery.scanned.toLocaleString()} entries inspected · ${discovery.changed.toLocaleString()} new / changed files${discovery.running ? ` · ${Math.floor((Date.now() - discovery.startedAt) / 1000)}s elapsed` : ""}`,
+            detail: `${registeredSources.length} registered roots · ${eligibleRoots.length} eligible · ${coverage.completed} index scans complete · ${coverage.scanning} index scans active · ${coverage.pending} awaiting discovery · ${coverage.errors} discovery errors · ${coverage.unavailable} unavailable · ${discovery.running ? "1 source discovery job active" : "0 source discovery jobs active"}${unavailableSources.length ? ` · ${unavailableSources.length} disconnected / unauthorized sources excluded from eligible total` : ""}. Current / last discovery batch: source ${discovery.sourceIndex} of ${discovery.sourceCount} · ${batchRoot} · ${discovery.scanned.toLocaleString()} entries inspected · ${discovery.changed.toLocaleString()} new / changed files${discovery.running ? ` · ${Math.floor((Date.now() - discovery.startedAt) / 1000)}s elapsed` : ""}`,
         },
         {
             id: "search",
@@ -6082,8 +6139,9 @@ electron_1.ipcMain.handle("get-indexing-overview", async () => {
             total: globalSearch.total,
             unit: "files",
             errors: globalSearch.errors,
+            retryable: retryableSearchErrors,
             message: search.message,
-            detail: `${globalSearch.indexed.toLocaleString()} indexed · ${globalSearch.remaining.toLocaleString()} awaiting embeddings · ${globalSearch.errors.toLocaleString()} errors · recursive totals across saved and current source indexes`,
+            detail: `${globalSearch.indexed.toLocaleString()} indexed · ${globalSearch.remaining.toLocaleString()} awaiting embeddings · ${globalSearch.errors.toLocaleString()} failed records · ${retryableSearchErrors.toLocaleString()} retryable failures with persistent retry state · recursive totals across saved and current source indexes`,
         },
         {
             id: "faces",

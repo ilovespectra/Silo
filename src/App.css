@@ -454,7 +454,7 @@ body {
 
 .semantic-search {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) 30px;
+  grid-template-columns: 20px minmax(0, 1fr) auto 30px;
   align-items: center;
   height: 38px;
   padding: 0 6px 0 12px;
@@ -577,6 +577,14 @@ body {
   background: transparent;
   color: var(--text);
   font: inherit;
+}
+
+.semantic-search-status {
+  min-width: 42px;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .semantic-search button {

@@ -447,7 +447,7 @@ function FileThumbnail({
       (entries) => {
         if (!entries[0].isIntersecting) return;
         observer.disconnect();
-        void loadThumbnail(file.path, false, thumbnailSize).then((url) => {
+        void loadThumbnail(file.path, true, thumbnailSize).then((url) => {
           if (cancelled || !url) return;
           setThumbnail(url);
           onThumbnailLoaded?.(file.path);
@@ -730,6 +730,7 @@ function App() {
     [],
   );
   const [searching, setSearching] = useState(false);
+  const [searchDone, setSearchDone] = useState(false);
   const [confidence, setConfidence] = useState(DEFAULT_SEMANTIC_SEARCH_CONFIDENCE);
   const [appSection, setAppSection] = useState<
     "files" | "people" | "map" | "duplicates" | "pets" | "mobile" | "memories" | "stats"
@@ -1598,7 +1599,6 @@ function App() {
     return electronAPI.onFileScanProgress((progress) => {
       if (progress.requestId !== scanRequestRef.current) return;
       setFileScanProgress(progress);
-      // Progress events carry a capped preview; never let a late one replace the complete list.
       if (
         progress.files &&
         progress.files.length > 0 &&
@@ -1606,7 +1606,6 @@ function App() {
         settledScanRef.current !== progress.requestId &&
         preserveScanRequestRef.current !== progress.requestId
       ) {
-        // Keep the first usable preview mounted until the final result arrives.
         previewedScanRef.current = progress.requestId;
         setFiles(progress.files);
         if (progress.inventory) {
@@ -1624,12 +1623,27 @@ function App() {
                 settledScanRef.current !== requestId &&
                 cached.length
               )
-                setFiles(cached);
+                setFiles((current) => {
+                  const merged = new Map(cached.map((file) => [file.path, file]));
+                  for (const file of current) merged.set(file.path, file);
+                  return Array.from(merged.values());
+                });
             })
             .catch((cause) =>
               console.error("Cached inventory transfer failed", cause),
             );
         }
+      }
+      if (
+        progress.fileDeltas?.length &&
+        settledScanRef.current !== progress.requestId &&
+        preserveScanRequestRef.current !== progress.requestId
+      ) {
+        setFiles((current) => {
+          const merged = new Map(current.map((file) => [file.path, file]));
+          for (const file of progress.fileDeltas!) merged.set(file.path, file);
+          return Array.from(merged.values());
+        });
       }
     });
   }, [electronAPI]);
@@ -3640,15 +3654,18 @@ function App() {
   }, [rememberSearch, searchQuery]);
 
   const runSemanticSearch = useCallback(
-    async (showLoading: boolean) => {
+    async (_showLoading: boolean) => {
       if (!electronAPI || !searchQuery.trim()) return;
       const requestId = ++searchRequestRef.current;
-      if (showLoading) setSearching(true);
+      setSearching(true);
+      setSearchDone(false);
       setSearchError("");
+      let succeeded = false;
       try {
         const results = await electronAPI.semanticSearch(
           searchQuery,
           confidence,
+          requestId,
         );
         if (requestId === searchRequestRef.current) {
           const hidden = bannedHiddenPathsRef.current;
@@ -3657,6 +3674,7 @@ function App() {
               ? results.filter((result) => !hidden.has(result.path))
               : results,
           );
+          succeeded = true;
         }
       } catch (cause) {
         if (requestId === searchRequestRef.current) {
@@ -3668,21 +3686,41 @@ function App() {
           );
         }
       } finally {
-        if (requestId === searchRequestRef.current) setSearching(false);
+        if (requestId === searchRequestRef.current) {
+          setSearching(false);
+          setSearchDone(succeeded);
+        }
       }
     },
     [confidence, electronAPI, searchQuery],
   );
 
   useEffect(() => {
+    if (!electronAPI) return;
+    return electronAPI.onSemanticSearchProgress((progress) => {
+      if (progress.requestId !== searchRequestRef.current) return;
+      const hidden = bannedHiddenPathsRef.current;
+      setSearchResults(
+        hidden.size > 0
+          ? progress.results.filter((result) => !hidden.has(result.path))
+          : progress.results,
+      );
+      const done = progress.status === "done";
+      setSearching(!done);
+      setSearchDone(done);
+    });
+  }, [electronAPI]);
+
+  useEffect(() => {
     if (!searchQuery.trim()) {
       searchRequestRef.current += 1;
       setSearchResults([]);
       setSearching(false);
+      setSearchDone(false);
       setSearchError("");
       return;
     }
-    const timer = window.setTimeout(() => void runSemanticSearch(true), 200);
+    const timer = window.setTimeout(() => void runSemanticSearch(true), 120);
     return () => {
       window.clearTimeout(timer);
       if (electronAPI)
@@ -4487,6 +4525,9 @@ function App() {
               aria-label="Semantic search"
               data-help="Describe what you remember in ordinary language to find matching indexed photos and documents locally."
             />
+            <span className="semantic-search-status" role="status" aria-live="polite">
+              {searching ? "Searching…" : searchDone ? "Done!" : ""}
+            </span>
             {searchQuery && (
               <button onClick={() => setSearchQuery("")} title="Clear search" aria-label="Clear search"
                 data-help="Remove the current semantic-search query and return to the unfiltered view.">

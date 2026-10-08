@@ -115,6 +115,14 @@ class StateStore {
     getState() {
         return structuredClone(this.state);
     }
+    /** Search reads this small live view instead of cloning the full library state. */
+    getSearchState() {
+        return {
+            digitalFolders: this.state.digitalFolders,
+            nameIndex: this.state.nameIndex,
+            fileMetadata: this.state.fileMetadata,
+        };
+    }
     async updateUi(update) {
         this.state.ui = { ...this.state.ui, ...update };
         await this.write();

@@ -191,7 +191,12 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
             {stage.detail && <small>{stage.detail}</small>}
             {Boolean(stage.errors) && (
               <small className="indexing-stage-errors">
-                {stage.errors!.toLocaleString()} errors / unresolved
+                {stage.errors!.toLocaleString()} {stage.id === "search" ? "failed files" : "errors / unresolved"}
+              </small>
+            )}
+            {stage.id === "search" && stage.retryable !== undefined && (
+              <small>
+                {stage.retryable.toLocaleString()} retryable files; retry state is saved across restarts
               </small>
             )}
             <small className="indexing-stage-message" title={stage.message}>

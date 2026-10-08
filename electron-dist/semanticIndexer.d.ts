@@ -23,6 +23,7 @@ export interface IndexProgress {
 }
 type ScanSource = (sourcePath: string, onFile: (file: IndexableFile) => void, isCancelled: () => boolean) => Promise<void>;
 type ProgressListener = (progress: IndexProgress) => void;
+type SearchProgressListener = (results: SearchResult[], scanned: number, total: number) => void;
 type SourceCoverageStatus = "pending" | "scanning" | "completed" | "error" | "unavailable";
 type DiagnosticListener = (event: string, details?: Record<string, unknown>) => void;
 export declare class SemanticIndexer {
@@ -38,11 +39,13 @@ export declare class SemanticIndexer {
     private readonly onProgress;
     private readonly onDiagnostic;
     private readonly latestRecords;
+    private indexedSearchSnapshotCache;
     private readonly processingPaths;
     private demoFileLimit;
     private readonly recordCountsBySource;
     private readonly discoveredTotalsBySource;
     private readonly workerFailures;
+    private retryableErrorCountCache;
     private pendingCheckpoint;
     private restoredSourcePaths;
     private progress;
@@ -52,7 +55,9 @@ export declare class SemanticIndexer {
     private readonly embeddingExitDetails;
     private embeddingRequestId;
     private readonly embeddingRequests;
-    private inferenceChain;
+    private readonly inferenceQueue;
+    private inferenceSequence;
+    private inferenceActive;
     private searchChain;
     private runPromise;
     private queuedSourcePaths;
@@ -202,7 +207,7 @@ export declare class SemanticIndexer {
         watchedSourceCount: number;
     };
     preloadClipModel(): Promise<void>;
-    search(query: string, minimumConfidence: number, sourcePaths: string[], isCancelled?: () => boolean): Promise<SearchResult[]>;
+    search(query: string, minimumConfidence: number, sourcePaths: string[], isCancelled?: () => boolean, onSearchProgress?: SearchProgressListener): Promise<SearchResult[]>;
     classifyUnsafeImages(sourcePaths: string[], unsafePrompt: string, safePrompt: string): Promise<string[]>;
     /** CLIP text embeddings for prompts, computed locally. */
     embedPreviewImage(filePath: string): Promise<Float32Array>;
@@ -233,6 +238,7 @@ export declare class SemanticIndexer {
     private run;
     private loadClipRuntime;
     private runInference;
+    private finishInference;
     private embedText;
     private embedImage;
     private embedImageFile;

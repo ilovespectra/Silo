@@ -192,9 +192,14 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.on("duplicate-progress", listener);
     return () => ipcRenderer.removeListener("duplicate-progress", listener);
   },
-  semanticSearch: (query, confidence) =>
-    ipcRenderer.invoke("semantic-search", query, confidence),
+  semanticSearch: (query, confidence, requestId) =>
+    ipcRenderer.invoke("semantic-search", query, confidence, requestId),
   cancelSemanticSearch: () => ipcRenderer.invoke("cancel-semantic-search"),
+  onSemanticSearchProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("semantic-search-progress", listener);
+    return () => ipcRenderer.removeListener("semantic-search-progress", listener);
+  },
   onIndexProgress: (callback) => {
     const listener = (_event, progress) => callback(progress);
     ipcRenderer.on("index-progress", listener);

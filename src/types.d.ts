@@ -333,6 +333,7 @@ interface IndexingStageProgress {
   unit: string;
   message: string;
   errors?: number;
+  retryable?: number;
   detail?: string;
   canRetry?: boolean;
   attempts?: number;
@@ -440,6 +441,7 @@ interface FileScanProgress {
   requestId: number;
   directoryPath: string;
   files?: FileInfo[];
+  fileDeltas?: FileInfo[];
   scanned: number;
   total: number;
   audioFound?: number;
@@ -525,6 +527,14 @@ interface SemanticSearchResult extends FileInfo {
   confidence: number;
   _priority?: 0 | 1 | 2 | 3; // 0=user metadata, 1=name, 2=folder, 3=semantic
   _source?: string; // Human-readable source: "Named as: John", "In folder: yoshimi"
+}
+
+interface SemanticSearchProgress {
+  requestId: number;
+  status: "searching" | "done";
+  results: SemanticSearchResult[];
+  scanned: number;
+  total: number;
 }
 
 interface FaceIndexProgress {
@@ -848,8 +858,12 @@ interface Window {
     semanticSearch(
       query: string,
       confidence: number,
+      requestId: number,
     ): Promise<SemanticSearchResult[]>;
     cancelSemanticSearch(): Promise<void>;
+    onSemanticSearchProgress(
+      callback: (progress: SemanticSearchProgress) => void,
+    ): () => void;
     onIndexProgress(callback: (progress: IndexProgress) => void): () => void;
     getGeoState(): Promise<GeoIndexState>;
     refreshGeoState(): Promise<GeoIndexState>;

@@ -164,6 +164,11 @@ type ScanSource = (
   isCancelled: () => boolean,
 ) => Promise<void>;
 type ProgressListener = (progress: IndexProgress) => void;
+type SearchProgressListener = (
+  results: SearchResult[],
+  scanned: number,
+  total: number,
+) => void;
 type SourceCoverageStatus =
   | "pending"
   | "scanning"
@@ -203,6 +208,11 @@ export class SemanticIndexer {
   private readonly onProgress: ProgressListener;
   private readonly onDiagnostic: DiagnosticListener;
   private readonly latestRecords = new Map<string, IndexRecord>();
+  private indexedSearchSnapshotCache: {
+    revision: number;
+    sourceKey: string;
+    records: IndexRecord[];
+  } | null = null;
   private readonly processingPaths = new Set<string>();
   private demoFileLimit: number | null = null;
   private readonly recordCountsBySource = new Map<
@@ -211,6 +221,11 @@ export class SemanticIndexer {
   >();
   private readonly discoveredTotalsBySource = new Map<string, number>();
   private readonly workerFailures = new Map<string, WorkerFailure>();
+  private retryableErrorCountCache: {
+    sourceKey: string;
+    calculatedAt: number;
+    count: number;
+  } | null = null;
   private pendingCheckpoint = false;
   private restoredSourcePaths: string[] = [];
   private progress: IndexProgress = { ...initialProgress };
@@ -234,7 +249,13 @@ export class SemanticIndexer {
       reject: (error: Error) => void;
     }
   >();
-  private inferenceChain: Promise<void> = Promise.resolve();
+  private readonly inferenceQueue: Array<{
+    priority: number;
+    sequence: number;
+    task: () => void;
+  }> = [];
+  private inferenceSequence = 0;
+  private inferenceActive = false;
   private searchChain: Promise<void> = Promise.resolve();
   private runPromise: Promise<void> | null = null;
   private queuedSourcePaths: string[] | null = null;
@@ -552,6 +573,12 @@ export class SemanticIndexer {
   }
 
   getRetryableErrorCount(sourcePaths: string[]) {
+    const sourceKey = Array.from(new Set(sourcePaths)).sort().join("\0");
+    const now = Date.now();
+    if (
+      this.retryableErrorCountCache?.sourceKey === sourceKey &&
+      now - this.retryableErrorCountCache.calculatedAt < 1000
+    ) return this.retryableErrorCountCache.count;
     const roots = new Set(sourcePaths);
     const demoPaths = this.demoFilePaths(sourcePaths);
     let count = 0;
@@ -562,6 +589,7 @@ export class SemanticIndexer {
         this.shouldRetryFailure(record)
       )
         count += 1;
+    this.retryableErrorCountCache = { sourceKey, calculatedAt: now, count };
     return count;
   }
 
@@ -1209,18 +1237,23 @@ export class SemanticIndexer {
     minimumConfidence: number,
     sourcePaths: string[],
     isCancelled: () => boolean = () => false,
+    onSearchProgress?: SearchProgressListener,
   ): Promise<SearchResult[]> {
     const confidenceThreshold = Number.isFinite(minimumConfidence)
       ? Math.max(0, Math.min(100, minimumConfidence))
       : 0;
-    const result = this.searchChain.then(() =>
-      this.runSearch(query, confidenceThreshold, sourcePaths, isCancelled),
-    );
-    this.searchChain = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+    return (async () => {
+      // Search the records already restored while the remaining saved index loads.
+      if (!this.latestRecords.size && !this.loadComplete) await this.loaded;
+      if (isCancelled()) return [];
+      return this.runSearch(
+        query,
+        confidenceThreshold,
+        sourcePaths,
+        isCancelled,
+        onSearchProgress,
+      );
+    })();
   }
 
   classifyUnsafeImages(
@@ -1426,133 +1459,147 @@ export class SemanticIndexer {
     minimumConfidence: number,
     sourcePaths: string[],
     isCancelled: () => boolean,
+    onSearchProgress?: SearchProgressListener,
   ): Promise<SearchResult[]> {
     const cleanQuery = query.trim();
-    if (
-      isCancelled() ||
-      !cleanQuery ||
-      sourcePaths.length === 0 ||
-      this.latestRecords.size === 0
-    ) return [];
+    if (isCancelled() || !cleanQuery || sourcePaths.length === 0 || !this.latestRecords.size)
+      return [];
 
     const runtime = await this.loadClipRuntime();
     if (isCancelled()) return [];
-    const documentQuery = await this.embedText(cleanQuery, runtime);
+    // Interactive queries jump ahead of queued indexing/classification embeddings.
+    const documentQuery = await this.embedText(cleanQuery, runtime, 10);
     if (isCancelled()) return [];
-    const imageQuery = await this.embedText(
-      `a photo of ${cleanQuery}`,
-      runtime,
-    );
+    const imageQuery = await this.embedText(`a photo of ${cleanQuery}`, runtime, 10);
     if (isCancelled()) return [];
-    const activeSources = new Set(sourcePaths);
-    const demoPaths = this.demoFilePaths(sourcePaths);
-    const indexedSnapshot = Array.from(this.latestRecords.values())
-      .filter(
-        (record) =>
-          record.vectorOffset >= 0 &&
-          activeSources.has(record.sourcePath) &&
-          !this.processingPaths.has(record.path) &&
-          (!demoPaths || demoPaths.has(record.path)),
-      )
-      .sort((first, second) => first.vectorOffset - second.vectorOffset);
-    if (isCancelled() || indexedSnapshot.length === 0) return [];
 
-    const vectorHandle = await fsPromises
-      .open(this.vectorsPath, "r")
-      .catch(() => null);
-    if (!vectorHandle) return [];
-    const imageResults: SearchResult[] = [];
-    const documentResults: SearchResult[] = [];
-    const trimResults = (results: SearchResult[]) => {
-      if (results.length <= SEARCH_RESULT_PRUNE_THRESHOLD) return;
-      results.sort((first, second) => second.confidence - first.confidence);
-      results.length = SEARCH_RESULTS_PER_TYPE;
+    const activeSources = new Set(sourcePaths);
+    const sourceKey = Array.from(activeSources).sort().join("\0");
+    const demoPaths = this.demoFilePaths(sourcePaths);
+    if (
+      !this.indexedSearchSnapshotCache ||
+      this.indexedSearchSnapshotCache.revision !== this.revision ||
+      this.indexedSearchSnapshotCache.sourceKey !== sourceKey
+    ) {
+      this.indexedSearchSnapshotCache = {
+        revision: this.revision,
+        sourceKey,
+        records: Array.from(this.latestRecords.values())
+          .filter((record) => record.vectorOffset >= 0 && activeSources.has(record.sourcePath))
+          .sort((first, second) => first.vectorOffset - second.vectorOffset),
+      };
+    }
+    const indexedSnapshot = this.indexedSearchSnapshotCache.records.filter(
+      (record) =>
+        !this.processingPaths.has(record.path) &&
+        (!demoPaths || demoPaths.has(record.path)),
+    );
+    const total = indexedSnapshot.length;
+    if (isCancelled() || total === 0) {
+      onSearchProgress?.([], 0, total);
+      return [];
+    }
+
+    const vectorHandle = await fsPromises.open(this.vectorsPath, "r").catch(() => null);
+    if (!vectorHandle) {
+      onSearchProgress?.([], 0, total);
+      return [];
+    }
+    const imageResults = new Map<string, SearchResult>();
+    const documentResults = new Map<string, SearchResult>();
+    const trimResults = (results: Map<string, SearchResult>) => {
+      if (results.size <= SEARCH_RESULT_PRUNE_THRESHOLD) return;
+      const top = Array.from(results.values())
+        .sort((first, second) => second.confidence - first.confidence)
+        .slice(0, SEARCH_RESULTS_PER_TYPE);
+      results.clear();
+      for (const result of top) results.set(result.path, result);
+    };
+    const currentResults = () => [
+      ...Array.from(imageResults.values()),
+      ...Array.from(documentResults.values()),
+    ].sort((first, second) => second.confidence - first.confidence);
+    let scanned = 0;
+    let lastProgressAt = 0;
+    const publishProgress = (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastProgressAt < 250) return;
+      lastProgressAt = now;
+      if (!isCancelled()) onSearchProgress?.(currentResults(), scanned, total);
     };
 
     try {
       const vectorFileSize = (await vectorHandle.stat()).size;
       let snapshotIndex = 0;
-      while (snapshotIndex < indexedSnapshot.length) {
+      while (snapshotIndex < total) {
         if (isCancelled()) return [];
+        const firstBatch = snapshotIndex === 0;
         const startOffset = indexedSnapshot[snapshotIndex].vectorOffset;
         if (startOffset + VECTOR_BYTES > vectorFileSize) break;
 
         let batchEnd = snapshotIndex + 1;
         while (
-          batchEnd < indexedSnapshot.length &&
+          batchEnd < total &&
           batchEnd - snapshotIndex < SEARCH_MAX_RECORDS_PER_WINDOW &&
-          indexedSnapshot[batchEnd].vectorOffset + VECTOR_BYTES - startOffset <=
-            SEARCH_VECTOR_WINDOW_BYTES
-        ) {
-          batchEnd += 1;
-        }
+          indexedSnapshot[batchEnd].vectorOffset + VECTOR_BYTES - startOffset <= SEARCH_VECTOR_WINDOW_BYTES
+        ) batchEnd += 1;
 
         const lastRecord = indexedSnapshot[batchEnd - 1];
-        const bytesToRead = Math.min(
-          lastRecord.vectorOffset + VECTOR_BYTES,
-          vectorFileSize,
-        ) - startOffset;
+        const bytesToRead = Math.min(lastRecord.vectorOffset + VECTOR_BYTES, vectorFileSize) - startOffset;
         if (bytesToRead >= VECTOR_BYTES) {
           const vectorBuffer = Buffer.allocUnsafeSlow(bytesToRead);
-          const { bytesRead } = await vectorHandle.read(
-            vectorBuffer,
-            0,
-            bytesToRead,
-            startOffset,
-          );
+          const { bytesRead } = await vectorHandle.read(vectorBuffer, 0, bytesToRead, startOffset);
           if (isCancelled()) return [];
           const vectors = new Float32Array(
             vectorBuffer.buffer,
             vectorBuffer.byteOffset,
             Math.floor(bytesRead / Float32Array.BYTES_PER_ELEMENT),
           );
-
           for (let index = snapshotIndex; index < batchEnd; index += 1) {
             const record = indexedSnapshot[index];
             const localByteOffset = record.vectorOffset - startOffset;
-            if (localByteOffset + VECTOR_BYTES > bytesRead) continue;
-            const queryVector = record.type === "image" ? imageQuery : documentQuery;
-            const vectorStart = localByteOffset / Float32Array.BYTES_PER_ELEMENT;
-            let similarity = 0;
-            for (let dimension = 0; dimension < VECTOR_SIZE; dimension += 1)
-              similarity += queryVector[dimension] * vectors[vectorStart + dimension];
-            if (!Number.isFinite(similarity)) continue;
-            const confidence = Math.max(0, Math.min(100, similarity * 100));
-            if (confidence < minimumConfidence) continue;
-            const result = {
-              name: record.name,
-              path: record.path,
-              relativePath: record.relativePath,
-              size: record.size,
-              modified: record.modified,
-              isDirectory: false,
-              type: record.type,
-              extension: record.extension,
-              confidence,
-            };
-            if (record.type === "image") imageResults.push(result);
-            else documentResults.push(result);
+            if (localByteOffset + VECTOR_BYTES <= bytesRead) {
+              const queryVector = record.type === "image" ? imageQuery : documentQuery;
+              const vectorStart = localByteOffset / Float32Array.BYTES_PER_ELEMENT;
+              let similarity = 0;
+              for (let dimension = 0; dimension < VECTOR_SIZE; dimension += 1)
+                similarity += queryVector[dimension] * vectors[vectorStart + dimension];
+              if (Number.isFinite(similarity)) {
+                const confidence = Math.max(0, Math.min(100, similarity * 100));
+                if (confidence >= minimumConfidence) {
+                  const result: SearchResult = {
+                    name: record.name,
+                    path: record.path,
+                    relativePath: record.relativePath,
+                    size: record.size,
+                    modified: record.modified,
+                    isDirectory: false,
+                    type: record.type,
+                    extension: record.extension,
+                    confidence,
+                  };
+                  (record.type === "image" ? imageResults : documentResults).set(record.path, result);
+                }
+              }
+            }
+            scanned += 1;
           }
           trimResults(imageResults);
           trimResults(documentResults);
+          snapshotIndex = batchEnd;
+          publishProgress(firstBatch);
+        } else {
+          scanned = batchEnd;
+          snapshotIndex = batchEnd;
+          publishProgress(firstBatch);
         }
-
-        snapshotIndex = batchEnd;
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
+      publishProgress(true);
+      return isCancelled() ? [] : currentResults();
     } finally {
       await vectorHandle.close();
     }
-
-    if (isCancelled()) return [];
-    return [
-      ...imageResults
-        .sort((first, second) => second.confidence - first.confidence)
-        .slice(0, SEARCH_RESULTS_PER_TYPE),
-      ...documentResults
-        .sort((first, second) => second.confidence - first.confidence)
-        .slice(0, SEARCH_RESULTS_PER_TYPE),
-    ].sort((first, second) => second.confidence - first.confidence);
   }
 
   private async run(sourcePaths: string[]) {
@@ -2174,16 +2221,38 @@ export class SemanticIndexer {
     return this.clipRuntimePromise;
   }
 
-  private runInference<T>(task: () => Promise<T>): Promise<T> {
-    const result = this.inferenceChain.then(task);
-    this.inferenceChain = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+  private runInference<T>(task: () => Promise<T>, priority = 0): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.inferenceQueue.push({
+        priority,
+        sequence: this.inferenceSequence++,
+        task: () => {
+          this.inferenceActive = true;
+          void task().then(
+            (value) => {
+              resolve(value);
+              this.finishInference();
+            },
+            (error) => {
+              reject(error);
+              this.finishInference();
+            },
+          );
+        },
+      });
+      this.inferenceQueue.sort(
+        (first, second) => second.priority - first.priority || first.sequence - second.sequence,
+      );
+      if (!this.inferenceActive) this.inferenceQueue.shift()?.task();
+    });
   }
 
-  private async embedText(text: string, runtime: ClipRuntime) {
+  private finishInference(): void {
+    this.inferenceActive = false;
+    this.inferenceQueue.shift()?.task();
+  }
+
+  private async embedText(text: string, runtime: ClipRuntime, priority = 0) {
     return this.runInference(async () => {
       if (runtime.worker)
         return this.normalize(
@@ -2199,7 +2268,7 @@ export class SemanticIndexer {
       });
       const output = await runtime.textModel!(inputs);
       return this.normalize(output.text_embeds.data);
-    });
+    }, priority);
   }
 
   private async embedImage(filePath: string, runtime: ClipRuntime) {
