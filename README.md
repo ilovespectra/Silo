@@ -41,6 +41,18 @@ cd file-browser-electron
 npm install
 ```
 
+### Opening Silo the first time
+
+Preview builds are not Developer ID signed or notarized, so macOS may say it cannot verify Silo. Continue only if you downloaded Silo from the official release page and its published SHA-256 checksum matches.
+
+On **macOS 14 Sonoma** or **macOS 15 Sequoia**:
+
+1. Drag `Silo.app` into **Applications**, then try opening it once. If macOS blocks it, choose **Done**.
+2. Open **System Settings → Privacy & Security** and choose **Open Anyway** beside Silo under Security.
+3. Confirm **Open** (enter your Mac password if asked). This exception applies only to Silo.
+
+If macOS says Silo **is damaged** or **will damage your computer**, stop and do not bypass that alert. Re-download from the official release page, verify the checksum, and contact Silo support if it persists.
+
 ## Development
 
 ```bash
