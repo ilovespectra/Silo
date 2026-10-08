@@ -89,6 +89,7 @@ import {
   readPreviewBytes,
 } from "./documentPreview";
 import { IndexingRecovery } from "./indexingRecovery";
+import { resolveAppAssetRequest } from "./appAssets";
 import { InventoryTransfers } from "./inventoryTransfer";
 import { RendererRecovery } from "./rendererRecovery";
 import { createProgressThrottle } from "./progressThrottle";
@@ -623,6 +624,15 @@ app.on("child-process-gone", (_event, details) =>
   runtimeLog("child-process-gone", { ...details }),
 );
 protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "silo-asset",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+    },
+  },
   {
     scheme: "face-crop",
     privileges: { standard: true, secure: true, supportFetchAPI: true },
@@ -2062,6 +2072,28 @@ function kickGeoCheck(explicit = false): Promise<void> {
 }
 
 function registerMediaProtocols() {
+  protocol.handle("silo-asset", async (request) => {
+    const asset = resolveAppAssetRequest(
+      request.url,
+      app.getAppPath(),
+      app.isPackaged,
+    );
+    if (!asset) return new Response("Not found", { status: 404 });
+    try {
+      const data = await fsPromises.readFile(asset.filePath);
+      return new Response(data, {
+        headers: {
+          "access-control-allow-origin": "*",
+          "cache-control": app.isPackaged
+            ? "public, max-age=31536000, immutable"
+            : "no-cache",
+          "content-type": asset.contentType,
+        },
+      });
+    } catch {
+      return new Response("Not found", { status: 404 });
+    }
+  });
   protocol.handle("face-crop", async (request) => {
     // Accept legacy absolute-path URLs too, but only ever serve from the active crops directory.
     const fileName = path.basename(
