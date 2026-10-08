@@ -6,6 +6,7 @@ import React, {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { DEFAULT_SEMANTIC_SEARCH_CONFIDENCE } from "./searchSettings";
 import {
   FiArrowUp,
   FiCheck,
@@ -729,7 +730,7 @@ function App() {
     [],
   );
   const [searching, setSearching] = useState(false);
-  const [confidence, setConfidence] = useState(25);
+  const [confidence, setConfidence] = useState(DEFAULT_SEMANTIC_SEARCH_CONFIDENCE);
   const [appSection, setAppSection] = useState<
     "files" | "people" | "map" | "duplicates" | "pets" | "mobile" | "memories" | "stats"
   >("files");

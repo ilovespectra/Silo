@@ -26,6 +26,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.StateStore = exports.REFUSE_FOLDER_ID = exports.FAVORITES_FOLDER_ID = void 0;
 const path = __importStar(require("path"));
 const fsPromises = __importStar(require("fs/promises"));
+const searchSettings_1 = require("./searchSettings");
 exports.FAVORITES_FOLDER_ID = "__favorites__";
 exports.REFUSE_FOLDER_ID = "__refuse__";
 function favoritesFolder() {
@@ -55,7 +56,7 @@ const defaultState = {
         includedType: "all",
         viewMode: "grid",
         showFilters: false,
-        confidence: 25,
+        confidence: searchSettings_1.DEFAULT_SEMANTIC_SEARCH_CONFIDENCE,
     },
     indexSources: [],
     digitalFolders: [favoritesFolder(), refuseFolder()],

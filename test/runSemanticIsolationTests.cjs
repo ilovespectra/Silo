@@ -684,12 +684,12 @@ test("worker supports both transports, bounded raw decoding, and existing tokeni
   }
 });
 
-test("confidence slider maps lower settings to stricter match thresholds", (t) => {
+test("confidence slider maps higher settings to stricter match thresholds", (t) => {
   const { confidenceSettingToMinimumThreshold } = makeIndexer(t);
-  assert.equal(confidenceSettingToMinimumThreshold(0), 100);
-  assert.equal(confidenceSettingToMinimumThreshold(25), 75);
-  assert.equal(confidenceSettingToMinimumThreshold(100), 0);
-  assert.equal(confidenceSettingToMinimumThreshold(Number.NaN), 75);
+  assert.equal(confidenceSettingToMinimumThreshold(0), 0);
+  assert.equal(confidenceSettingToMinimumThreshold(25), 25);
+  assert.equal(confidenceSettingToMinimumThreshold(100), 100);
+  assert.equal(confidenceSettingToMinimumThreshold(Number.NaN), 23);
 });
 
 test("semantic search applies confidence and excludes unfinished or inactive records", async (t) => {

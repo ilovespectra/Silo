@@ -2,6 +2,7 @@ import * as path from "path";
 import * as fsPromises from "fs/promises";
 import * as fs from "fs";
 import * as os from "os";
+import { DEFAULT_SEMANTIC_SEARCH_CONFIDENCE } from "./searchSettings";
 import {
   isAppDataPath,
   isNonLibraryPath,
@@ -46,8 +47,8 @@ const INCREMENTAL_BATCH_SIZE = 250;
 export function confidenceSettingToMinimumThreshold(confidence: number): number {
   const setting = Number.isFinite(confidence)
     ? Math.max(0, Math.min(100, confidence))
-    : 25;
-  return 100 - setting;
+    : DEFAULT_SEMANTIC_SEARCH_CONFIDENCE;
+  return setting;
 }
 
 const plainTextExtensions = new Set([

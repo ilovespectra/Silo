@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as fsPromises from "fs/promises";
 import type { GeocodedLocation } from "./geocoder";
+import { DEFAULT_SEMANTIC_SEARCH_CONFIDENCE } from "./searchSettings";
 
 export interface PersistedUiState {
   currentPath: string | null;
@@ -113,7 +114,7 @@ const defaultState: PersistedAppState = {
     includedType: "all",
     viewMode: "grid",
     showFilters: false,
-    confidence: 25,
+    confidence: DEFAULT_SEMANTIC_SEARCH_CONFIDENCE,
   },
   indexSources: [],
   digitalFolders: [favoritesFolder(), refuseFolder()],
