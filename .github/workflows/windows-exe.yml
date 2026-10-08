@@ -1,0 +1,63 @@
+name: Windows x64 installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-exe.yml'
+      - 'electron-builder.windows.config.cjs'
+      - 'electron-builder.config.cjs'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/**'
+      - 'src/**'
+      - 'electron-dist/**'
+      - 'public/**'
+      - 'signing/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    name: Build unsigned Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Windows dependencies
+        run: npm ci
+
+      - name: Compile app
+        run: npm run build
+
+      - name: Package NSIS installer
+        run: npx electron-builder --config electron-builder.windows.config.cjs --win nsis --x64 --publish never
+
+      - name: Verify installer output
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem release -Filter '*-Setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No Windows x64 setup executable was produced.' }
+          Get-FileHash $installer.FullName -Algorithm SHA256
+          Get-ChildItem release | Select-Object Name, Length
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-windows-x64
+          path: |
+            release/*-Setup.exe
+            release/*.blockmap
+            release/latest.yml
+          if-no-files-found: error
+          retention-days: 14
