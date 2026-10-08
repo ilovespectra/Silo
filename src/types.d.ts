@@ -68,7 +68,7 @@ interface GeoAssignmentResult {
 }
 
 interface GeoIndexState {
-  status: "idle" | "scanning" | "complete" | "error";
+  status: "idle" | "scanning" | "paused" | "complete" | "error";
   scanned: number;
   total: number;
   geotagged: number;
@@ -84,6 +84,22 @@ interface StartupState {
   step: number;
   total: number;
   label: string;
+}
+
+interface IndexStorageStatus {
+  message: string | null;
+  usingLocalFallback: boolean;
+  localFallbackEnabled: boolean;
+  destinationAvailable: boolean;
+  selectedDestination: string;
+  localFreeBytes: number | null;
+  reserveBytes: number;
+  transfer: {
+    state: "idle" | "moving" | "complete" | "error";
+    message: string;
+    filesVerified: number;
+    bytesVerified: number;
+  } | null;
 }
 
 type PhonePlatform = "ios" | "android";
@@ -249,6 +265,7 @@ interface ContentPreferences {
   safeSearch: boolean;
   theme: "system" | "dark" | "light";
   autoplayGlobe: boolean;
+  preloadMapTextures: boolean;
   showBannedPeople: boolean;
 }
 
@@ -276,7 +293,7 @@ interface DuplicateTrashEntry {
 }
 
 interface DuplicateState {
-  status: "idle" | "scanning" | "complete" | "error";
+  status: "idle" | "scanning" | "paused" | "complete" | "error";
   scanned: number;
   total: number;
   duplicateFiles: number;
@@ -1169,6 +1186,15 @@ interface Window {
     ): Promise<string | null>;
     getPhoneBackupDestination(): Promise<string | null>;
     getIndexStorageRoot(): Promise<string>;
+    getIndexStorageStatus(): Promise<IndexStorageStatus>;
+    getLocalIndexFallbackEnabled(): Promise<boolean>;
+    setLocalIndexFallbackEnabled(enabled: boolean): Promise<{
+      enabled: boolean;
+      restarting?: boolean;
+    }>;
+    onIndexStorageStatus(
+      callback: (status: IndexStorageStatus) => void,
+    ): () => void;
     selectIndexStorageRoot(): Promise<{
       canceled: boolean;
       restarting?: boolean;

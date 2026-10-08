@@ -10,6 +10,7 @@ export interface RecoveryStage {
   needsInitialCheck?: boolean;
   lane?: "analysis" | "disk" | "light";
   blockedReason?: () => string;
+  pause?: () => Promise<unknown> | unknown;
 }
 
 interface RecoveryRecord {
@@ -28,6 +29,7 @@ export class IndexingRecovery {
   private activeLanes = new Set<string>();
   private requested = new Set<string>();
   private persistenceError = "";
+  private externalBlockReason = "";
   constructor(
     private stages: RecoveryStage[],
     private now = Date.now,
@@ -111,12 +113,13 @@ export class IndexingRecovery {
     const record = this.records.get(id);
     const stage = this.stages.find((item) => item.id === id);
     const blocker =
-      stage && !stage.ready()
+      this.externalBlockReason ||
+      (stage && !stage.ready()
         ? stage.blockedReason?.() ||
           "Waiting for another active index to release resources."
         : stage?.lane && this.activeLanes.has(stage.lane) && !record?.running
           ? `Waiting for the ${stage.lane} processing lane.`
-          : "";
+          : "");
     return {
       attempts: record?.attempts ?? 0,
       recoveryError: record?.error ?? "",
@@ -132,6 +135,48 @@ export class IndexingRecovery {
 
   stop() {
     this.stopped = true;
+  }
+
+  async setBlocked(reason: string | null) {
+    this.externalBlockReason = reason ?? "";
+    if (this.externalBlockReason) {
+      const busyStatuses = new Set([
+        "scanning",
+        "indexing",
+        "loading-model",
+        "clustering",
+        "generating",
+      ]);
+      const activeStages = this.stages.filter((stage) =>
+        busyStatuses.has(stage.progress().status),
+      );
+      for (const stage of activeStages) {
+        const record = this.records.get(stage.id) ?? {
+          attempts: 0,
+          error: "",
+          retryAt: 0,
+          running: false,
+          checked: false,
+          userPaused: false,
+        };
+        if (!record.userPaused) {
+          record.checked = false;
+          record.error = "";
+          record.retryAt = 0;
+          this.records.set(stage.id, record);
+          this.requested.add(stage.id);
+        }
+        if (!stage.pause) continue;
+        try {
+          await stage.pause();
+        } catch (error) {
+          console.error(`[IndexingRecovery] Could not pause ${stage.id}`, error);
+        }
+      }
+      this.persist();
+      return;
+    }
+    await this.tick();
   }
 
   pause(id: string) {
@@ -197,7 +242,7 @@ export class IndexingRecovery {
   }
 
   async tick() {
-    if (this.stopped || this.tickRunning) return;
+    if (this.stopped || this.externalBlockReason || this.tickRunning) return;
     this.tickRunning = true;
     try {
       const ordered = [...this.stages].sort(
@@ -206,7 +251,7 @@ export class IndexingRecovery {
           Number(this.requested.has(first.id)),
       );
       for (const stage of ordered) {
-        if (this.stopped || !stage.ready()) continue;
+        if (this.stopped || this.externalBlockReason || !stage.ready()) continue;
         const progress = stage.progress();
         const record = this.records.get(stage.id);
         const interrupted =
@@ -258,7 +303,16 @@ export class IndexingRecovery {
       if (progress.status === "error") throw new Error(progress.message);
       if (progress.status === "paused") {
         if (!record.userPaused)
-          throw new Error(progress.message || "Indexing paused before completion.");
+          if (this.externalBlockReason) {
+            record.checked = false;
+            record.error = "";
+            record.retryAt = 0;
+            this.requested.add(stage.id);
+            this.persist();
+            return;
+          } else {
+            throw new Error(progress.message || "Indexing paused before completion.");
+          }
         record.checked = false;
         record.error = "";
         record.retryAt = 0;

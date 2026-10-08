@@ -3,6 +3,7 @@ export interface ContentPreferences {
     safeSearch: boolean;
     theme: "system" | "dark" | "light";
     autoplayGlobe: boolean;
+    preloadMapTextures: boolean;
     showBannedPeople: boolean;
 }
 export interface PublicContentSettings extends ContentPreferences {

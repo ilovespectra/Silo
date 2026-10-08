@@ -145,9 +145,16 @@ class AestheticScorer {
         this.backgroundQueue = [];
         this.libraryTotal = 0;
         this.running = false;
+        this.backgroundPaused = false;
         this.generation = 0;
         this.requestTotal = 0;
         this.requestPaths = new Set();
+    }
+    /** Pause library-wide work while keeping user-requested ranking work available. */
+    setBackgroundPaused(paused) {
+        this.backgroundPaused = paused;
+        if (!paused && (this.queue.length > 0 || this.backgroundQueue.length > 0))
+            void this.drain();
     }
     /** Analyzes the whole library at low priority; whatever the user is viewing always goes first. */
     async analyzeInBackground(items) {
@@ -324,7 +331,8 @@ class AestheticScorer {
                 .catch(() => null));
             let lastEmit = 0;
             const worker = async () => {
-                while (this.queue.length > 0 || this.backgroundQueue.length > 0) {
+                while (this.queue.length > 0 ||
+                    (!this.backgroundPaused && this.backgroundQueue.length > 0)) {
                     const foreground = this.queue.length > 0;
                     const item = foreground
                         ? this.queue.shift()

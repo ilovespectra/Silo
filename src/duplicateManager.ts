@@ -30,7 +30,7 @@ export interface DuplicateTrashEntry {
 }
 
 export interface DuplicateState {
-  status: "idle" | "scanning" | "complete" | "error";
+  status: "idle" | "scanning" | "paused" | "complete" | "error";
   scanned: number;
   total: number;
   duplicateFiles: number;
@@ -111,6 +111,7 @@ export class DuplicateManager {
   private trash: DuplicateTrashEntry[] = [];
   private permanentlyClearedBytes = 0;
   private scanPromise: Promise<DuplicateState> | null = null;
+  private pauseRequested = false;
   private prunePromise: Promise<boolean> | null = null;
   private writeChain: Promise<void> = Promise.resolve();
   private state: Omit<DuplicateState, "groups" | "trash"> = {
@@ -239,10 +240,21 @@ export class DuplicateManager {
 
   scan(files: IndexableFile[], sourceRoots: string[] = []) {
     if (this.scanPromise) return this.scanPromise;
+    this.pauseRequested = false;
     this.scanPromise = this.runScan(files, sourceRoots).finally(() => {
       this.scanPromise = null;
     });
     return this.scanPromise;
+  }
+
+  async pause() {
+    this.pauseRequested = true;
+    const activeScan = this.scanPromise;
+    if (activeScan) {
+      await activeScan;
+      return;
+    }
+    this.recalculate("paused", "Duplicate scanning paused.");
   }
 
   async quarantine(groupIds: string[]) {
@@ -523,6 +535,7 @@ export class DuplicateManager {
     const seenInodes = new Map<string, Set<string>>();
     const realRoots = new Map<string, string>();
     for (let index = 0; index < candidates.length; index += 1) {
+      if (this.pauseRequested) break;
       const file = candidates[index];
       try {
         let realRoot = realRoots.get(file.sourceId);
@@ -588,8 +601,10 @@ export class DuplicateManager {
       );
     await this.persistIndex();
     this.recalculate(
-      "complete",
-      `${this.groups.length.toLocaleString()} exact duplicate groups found within individual sources. Cross-source copies are excluded.`,
+      this.pauseRequested ? "paused" : "complete",
+      this.pauseRequested
+        ? "Duplicate scanning paused; verified progress was saved."
+        : `${this.groups.length.toLocaleString()} exact duplicate groups found within individual sources. Cross-source copies are excluded.`,
     );
     return this.getState();
   }

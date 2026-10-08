@@ -498,6 +498,16 @@ contextBridge.exposeInMainWorld("electron", {
   selectBackupDestination: () =>
     ipcRenderer.invoke("select-backup-destination"),
   getIndexStorageRoot: () => ipcRenderer.invoke("get-index-storage-root"),
+  getIndexStorageStatus: () => ipcRenderer.invoke("get-index-storage-status"),
+  getLocalIndexFallbackEnabled: () =>
+    ipcRenderer.invoke("get-local-index-fallback-enabled"),
+  setLocalIndexFallbackEnabled: (enabled) =>
+    ipcRenderer.invoke("set-local-index-fallback-enabled", enabled),
+  onIndexStorageStatus: (callback) => {
+    const listener = (_event, status) => callback(status);
+    ipcRenderer.on("index-storage-status", listener);
+    return () => ipcRenderer.removeListener("index-storage-status", listener);
+  },
   selectIndexStorageRoot: () =>
     ipcRenderer.invoke("select-index-storage-root"),
   startFaceIndexingForSource: (sourcePath) =>

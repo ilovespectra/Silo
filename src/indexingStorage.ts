@@ -10,6 +10,42 @@ interface IndexStorageSettings {
   version: number;
   path: string;
   pendingPath?: string;
+  allowLocalFallback?: boolean;
+}
+
+export const LOCAL_INDEX_STORAGE_RESERVE_BYTES = 10 * 1024 * 1024 * 1024;
+
+function freeBytesAt(storageRoot: string) {
+  return fsPromises.statfs(storageRoot).then(
+    (stats) => stats.bavail * stats.bsize,
+  );
+}
+
+async function migrationBytes(sourceRoots: readonly string[]) {
+  let requiredBytes = 0;
+  for (const sourceRoot of new Set(sourceRoots.map((root) => path.resolve(root)))) {
+    for (const entry of INDEX_STORAGE_ENTRIES) {
+      const source = path.join(sourceRoot, entry);
+      if (await exists(source)) requiredBytes += (await summarizeTree(source)).bytes;
+    }
+  }
+  return requiredBytes;
+}
+
+export async function getLocalIndexStorageFreeBytes(storageRoot: string) {
+  return freeBytesAt(storageRoot);
+}
+
+export async function assertLocalIndexStorageCapacity(
+  storageRoot: string,
+  additionalBytes = 0,
+) {
+  const freeBytes = await freeBytesAt(storageRoot);
+  if (freeBytes < LOCAL_INDEX_STORAGE_RESERVE_BYTES + additionalBytes)
+    throw new Error(
+      `Local cache fallback is paused to preserve at least ${Math.round(LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB of free space. Reconnect the selected destination or free space.`,
+    );
+  return freeBytes;
 }
 
 let activeIndexStorageRoot = "";
@@ -48,6 +84,14 @@ export function getIndexStorageExclusionRoots() {
 }
 
 export function getLocalFallbackIndexStorageRoot(userDataPath: string) {
+  const resolvedUserDataPath = path.resolve(userDataPath);
+  return path.join(
+    path.dirname(resolvedUserDataPath),
+    `${path.basename(resolvedUserDataPath)}-local-index-fallback`,
+  );
+}
+
+function getLegacyLocalFallbackIndexStorageRoot(userDataPath: string) {
   return path.join(path.resolve(userDataPath), ".silo-local-fallback-index");
 }
 
@@ -63,6 +107,30 @@ export async function readIndexStorageRoot(userDataPath: string) {
   return (await readIndexStorageSettings(userDataPath)).path;
 }
 
+export async function getIndexStorageSettings(userDataPath: string) {
+  const settings = await readIndexStorageSettings(userDataPath);
+  return {
+    path: settings.path,
+    allowLocalFallback: settings.allowLocalFallback !== false,
+  };
+}
+
+export async function setLocalIndexStorageFallback(
+  userDataPath: string,
+  enabled: boolean,
+) {
+  const settings = await readIndexStorageSettings(userDataPath);
+  const settingsPath = path.join(userDataPath, INDEX_STORAGE_SETTINGS_FILE);
+  const temporaryPath = `${settingsPath}.tmp-${process.pid}`;
+  await fsPromises.writeFile(
+    temporaryPath,
+    JSON.stringify({ ...settings, allowLocalFallback: enabled }, null, 2),
+    { mode: 0o600 },
+  );
+  await fsPromises.rename(temporaryPath, settingsPath);
+  return enabled;
+}
+
 async function readIndexStorageSettings(
   userDataPath: string,
 ): Promise<IndexStorageSettings> {
@@ -76,11 +144,14 @@ async function readIndexStorageSettings(
         format: "silo-index-storage",
         version: 1,
         path: path.resolve(userDataPath),
+        allowLocalFallback: true,
       };
     throw new Error(`Could not read the index storage setting: ${String(error)}`);
   }
   const storedPath = (settings as { path?: unknown })?.path;
   const pendingPath = (settings as { pendingPath?: unknown })?.pendingPath;
+  const allowLocalFallback = (settings as { allowLocalFallback?: unknown })
+    ?.allowLocalFallback;
   if (
     (settings as { format?: unknown })?.format !== "silo-index-storage" ||
     (settings as { version?: unknown })?.version !== 1 ||
@@ -93,6 +164,11 @@ async function readIndexStorageSettings(
     (typeof pendingPath !== "string" || !path.isAbsolute(pendingPath))
   )
     throw new Error("The pending index storage setting is invalid.");
+  if (
+    allowLocalFallback !== undefined &&
+    typeof allowLocalFallback !== "boolean"
+  )
+    throw new Error("The local fallback preference is invalid.");
   return {
     format: "silo-index-storage",
     version: 1,
@@ -100,6 +176,7 @@ async function readIndexStorageSettings(
     ...(typeof pendingPath === "string"
       ? { pendingPath: path.resolve(pendingPath) }
       : {}),
+    ...(typeof allowLocalFallback === "boolean" ? { allowLocalFallback } : {}),
   };
 }
 
@@ -111,10 +188,17 @@ export async function writeIndexStorageRoot(
     throw new Error("Index storage path must be absolute.");
   const settingsPath = path.join(userDataPath, INDEX_STORAGE_SETTINGS_FILE);
   const temporaryPath = `${settingsPath}.tmp-${process.pid}`;
+  const currentSettings = await readIndexStorageSettings(userDataPath);
   await fsPromises.writeFile(
     temporaryPath,
     JSON.stringify(
-      { format: "silo-index-storage", version: 1, path: path.resolve(storageRoot) },
+      {
+        ...currentSettings,
+        format: "silo-index-storage",
+        version: 1,
+        path: path.resolve(storageRoot),
+        pendingPath: undefined,
+      },
       null,
       2,
     ),
@@ -541,39 +625,126 @@ export async function prepareConfiguredIndexStorage(
   if (path.resolve(storageRoot) === path.resolve(userDataPath))
     return {
       storageRoot: path.resolve(userDataPath),
+      selectedStorageRoot: path.resolve(userDataPath),
+      usingLocalFallback: false,
+      destinationAvailable: true,
+      localFallbackEnabled: settings.allowLocalFallback !== false,
+      migrationCompleted: false,
+      migrationError: null as string | null,
       filesVerified: 0,
       bytesVerified: 0,
     };
 
-  let filesVerified = 0;
-  let bytesVerified = 0;
-  if (settings.pendingPath) {
+  const localFallbackRoot = getLocalFallbackIndexStorageRoot(userDataPath);
+  const legacyFallbackRoot = getLegacyLocalFallbackIndexStorageRoot(userDataPath);
+  try {
     await validateExternalVolume(userDataPath, storageRoot);
-    await fsPromises.mkdir(storageRoot, { recursive: true });
-    const sourceRoots = new Set([settings.path, path.resolve(userDataPath)]);
-    for (const sourceRoot of sourceRoots)
-      if (sourceRoot !== path.resolve(userDataPath) && sourceRoot !== storageRoot)
-        await fsPromises.stat(sourceRoot);
-    const result = await migrateIndexStorageRoots(
-      Array.from(sourceRoots).filter((sourceRoot) => sourceRoot !== storageRoot),
-      storageRoot,
-      INDEX_STORAGE_ENTRIES,
-      onProgress,
-      () => writeIndexStorageRoot(userDataPath, storageRoot),
-    );
-    filesVerified = result.filesVerified;
-    bytesVerified = result.bytesVerified;
-  } else {
-    await validateExternalVolume(userDataPath, storageRoot);
-    await fsPromises.mkdir(storageRoot, { recursive: true });
-    const result = await migrateIndexStorageEntries(
-      userDataPath,
-      storageRoot,
-      INDEX_STORAGE_ENTRIES,
-      onProgress,
-    );
-    filesVerified = result.filesVerified;
-    bytesVerified = result.bytesVerified;
+  } catch (error) {
+    if (!(error instanceof ExternalIndexStorageUnavailableError)) throw error;
+    const unavailableMessage =
+      `The selected cache destination is unavailable: ${storageRoot}`;
+    if (settings.allowLocalFallback === false)
+      return {
+        // Keep all cache paths pointed at the selected destination while it is
+        // offline. The caller blocks indexing until this path is writable.
+        storageRoot: path.resolve(storageRoot),
+        selectedStorageRoot: path.resolve(storageRoot),
+        usingLocalFallback: false,
+        destinationAvailable: false,
+        localFallbackEnabled: false,
+        migrationCompleted: false,
+        migrationError: unavailableMessage,
+        filesVerified: 0,
+        bytesVerified: 0,
+      };
+    try {
+      await fsPromises.mkdir(localFallbackRoot, { recursive: true });
+      const sourceRoots = [path.resolve(userDataPath), legacyFallbackRoot];
+      const requiredBytes = await migrationBytes(sourceRoots);
+      await assertLocalIndexStorageCapacity(localFallbackRoot, requiredBytes);
+      let legacyFilesVerified = 0;
+      let legacyBytesVerified = 0;
+      if (
+        path.resolve(legacyFallbackRoot) !== path.resolve(localFallbackRoot) &&
+        (await exists(legacyFallbackRoot))
+      ) {
+        const legacyResult = await migrateIndexStorageRoots(
+          [legacyFallbackRoot],
+          localFallbackRoot,
+          INDEX_STORAGE_ENTRIES,
+          onProgress,
+        );
+        legacyFilesVerified = legacyResult.filesVerified;
+        legacyBytesVerified = legacyResult.bytesVerified;
+      }
+      const result = await migrateIndexStorageRoots(
+        [path.resolve(userDataPath)],
+        localFallbackRoot,
+        INDEX_STORAGE_ENTRIES,
+        onProgress,
+      );
+      return {
+        storageRoot: localFallbackRoot,
+        selectedStorageRoot: path.resolve(storageRoot),
+        usingLocalFallback: true,
+        destinationAvailable: false,
+        localFallbackEnabled: true,
+        migrationCompleted: false,
+        migrationError: null,
+        filesVerified: legacyFilesVerified + result.filesVerified,
+        bytesVerified: legacyBytesVerified + result.bytesVerified,
+      };
+    } catch (fallbackError) {
+      return {
+        // If fallback preparation fails, keep cache paths bound to the selected
+        // destination. The caller pauses indexing until fallback or the volume
+        // becomes available; it must never silently redirect these caches.
+        storageRoot: path.resolve(storageRoot),
+        selectedStorageRoot: path.resolve(storageRoot),
+        usingLocalFallback: false,
+        destinationAvailable: false,
+        localFallbackEnabled: true,
+        migrationCompleted: false,
+        migrationError:
+          fallbackError instanceof Error
+            ? fallbackError.message
+            : String(fallbackError),
+        filesVerified: 0,
+        bytesVerified: 0,
+      };
+    }
   }
-  return { storageRoot, filesVerified, bytesVerified };
+
+  await fsPromises.mkdir(storageRoot, { recursive: true });
+  const sourceRoots = new Set([
+    settings.path,
+    path.resolve(userDataPath),
+    localFallbackRoot,
+    legacyFallbackRoot,
+  ]);
+  sourceRoots.delete(storageRoot);
+  for (const sourceRoot of sourceRoots)
+    if (!(await exists(sourceRoot))) sourceRoots.delete(sourceRoot);
+  const fallbackWasPresent =
+    sourceRoots.has(localFallbackRoot) || sourceRoots.has(legacyFallbackRoot);
+  const result = await migrateIndexStorageRoots(
+    Array.from(sourceRoots),
+    storageRoot,
+    INDEX_STORAGE_ENTRIES,
+    onProgress,
+    settings.pendingPath
+      ? () => writeIndexStorageRoot(userDataPath, storageRoot)
+      : undefined,
+  );
+  return {
+    storageRoot,
+    selectedStorageRoot: path.resolve(storageRoot),
+    usingLocalFallback: false,
+    destinationAvailable: true,
+    localFallbackEnabled: settings.allowLocalFallback !== false,
+    migrationCompleted: fallbackWasPresent,
+    migrationError: null,
+    filesVerified: result.filesVerified,
+    bytesVerified: result.bytesVerified,
+  };
 }

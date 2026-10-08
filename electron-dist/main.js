@@ -857,6 +857,24 @@ function reportStartupDetail(label) {
     sendToRenderer("startup-progress", startupState);
 }
 let mainWindow = null;
+let indexStorageDeviceId = null;
+let indexStorageAvailable = true;
+let indexStorageInitializationDeferred = false;
+let activeIndexStorageCacheWrites = 0;
+let indexStorageUnavailableMessage = null;
+let selectedIndexStorageRoot = indexStorageRoot;
+let indexStorageUsingLocalFallback = false;
+let indexStorageFallbackEnabled = true;
+let indexStorageDestinationAvailable = true;
+let indexStorageMessageText = null;
+let indexStorageFreeBytes = null;
+let indexStorageTransfer = null;
+let indexStorageMonitorTimer = null;
+let indexStorageMonitorRunning = false;
+let indexStorageTransferRunning = false;
+let indexStorageRelaunchPending = false;
+let indexStorageTransferRetryAt = 0;
+let heapPressureMessage = null;
 let rendererReady = false;
 let shuttingDown = false;
 let appUpdateState = {
@@ -1635,6 +1653,8 @@ function scheduleThumbnailPregeneration(markDirty = false) {
     }, 5000);
 }
 function getThumbnailIndexingWaitMessage() {
+    if (indexStorageUnavailableMessage)
+        return indexStorageUnavailableMessage;
     if (!semanticIndexer || !faceIndexer || !geoIndexer)
         return "Waiting for indexing services to start…";
     if (!startupIndexReconciliationSettled)
@@ -2810,7 +2830,7 @@ async function buildSourceList() {
             available: true,
             message: backup.failedFiles
                 ? `${backup.failedFiles} accessible files could not be copied.`
-                : "Browse and search this saved copy independently of the connected device.",
+                : "",
             offlineBackup: true,
             snapshotAt: backup.snapshotAt,
             ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
@@ -4220,6 +4240,332 @@ function schedulePeriodicCleanup() {
     }, 6 * 60 * 60 * 1000); // 6 hours
 }
 /** Standard menus, except Undo/Redo go to the renderer so they can undo People edits outside text fields. */
+function getIndexStorageDestinationLabel() {
+    return path.basename(path.resolve(selectedIndexStorageRoot)) || "selected destination";
+}
+function currentIndexStorageStatus() {
+    return {
+        message: indexStorageMessageText,
+        usingLocalFallback: indexStorageUsingLocalFallback,
+        localFallbackEnabled: indexStorageFallbackEnabled,
+        destinationAvailable: indexStorageDestinationAvailable,
+        selectedDestination: selectedIndexStorageRoot,
+        localFreeBytes: indexStorageFreeBytes,
+        reserveBytes: indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES,
+        transfer: indexStorageTransfer,
+    };
+}
+function publishIndexStorageStatus(message) {
+    if (message !== undefined)
+        indexStorageMessageText = message;
+    sendToRenderer("index-storage-status", currentIndexStorageStatus());
+}
+function unavailableIndexStorageMessage() {
+    const destination = getIndexStorageDestinationLabel();
+    if (indexStorageUsingLocalFallback)
+        return `Looks like we can’t locate your selected destination, ${destination}. Silo is using the local cache and will move it back automatically when the destination reconnects.`;
+    if (indexStorageFallbackEnabled)
+        return `Looks like we can’t locate your selected destination, ${destination}. Silo is preparing a local cache fallback and will move it back automatically when the destination reconnects.`;
+    return `Looks like we can’t locate your selected destination, ${destination}. Please reconnect it and indexing will resume automatically.`;
+}
+async function checkSelectedIndexStorageAvailable() {
+    const userDataPath = path.resolve(electron_1.app.getPath("userData"));
+    if (path.resolve(selectedIndexStorageRoot) === userDataPath)
+        return true;
+    try {
+        const [selectedStats, userDataStats] = await Promise.all([
+            fsPromises.stat(selectedIndexStorageRoot),
+            fsPromises.stat(userDataPath),
+        ]);
+        if (selectedStats.dev === userDataStats.dev)
+            return false;
+        await fsPromises.access(selectedIndexStorageRoot, fs.constants.R_OK | fs.constants.W_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+async function withIndexStorageCacheWrite(operation) {
+    if (!indexStorageAvailable)
+        throw new Error(indexStorageUnavailableMessage ?? "Index storage is unavailable.");
+    const activeRootIsAppData = path.resolve(indexStorageRoot) === path.resolve(electron_1.app.getPath("userData"));
+    const activeRootAvailable = activeRootIsAppData
+        ? true
+        : await fsPromises
+            .access(indexStorageRoot, fs.constants.R_OK | fs.constants.W_OK)
+            .then(() => true)
+            .catch(() => false);
+    if (!activeRootAvailable) {
+        void monitorIndexStorageAvailability();
+        throw new Error(unavailableIndexStorageMessage());
+    }
+    if (indexStorageUsingLocalFallback) {
+        indexStorageFreeBytes = await (0, indexingStorage_1.getLocalIndexStorageFreeBytes)(indexStorageRoot).catch(() => null);
+        if (indexStorageFreeBytes === null ||
+            indexStorageFreeBytes < indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES) {
+            void monitorIndexStorageAvailability();
+            throw new Error(`Local cache indexing is paused to preserve at least ${Math.round(indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB of free space.`);
+        }
+    }
+    if (!indexStorageAvailable)
+        throw new Error(indexStorageUnavailableMessage ?? "Index storage is unavailable.");
+    activeIndexStorageCacheWrites += 1;
+    try {
+        return await operation();
+    }
+    finally {
+        activeIndexStorageCacheWrites = Math.max(0, activeIndexStorageCacheWrites - 1);
+    }
+}
+function isBusyIndexStatus(status) {
+    return ["scanning", "indexing", "loading-model", "clustering", "generating"].includes(status);
+}
+function indexStorageWritersBusy() {
+    return Boolean((semanticIndexer && isBusyIndexStatus(semanticIndexer.getProgress().status)) ||
+        (faceIndexer && isBusyIndexStatus(faceIndexer.getProgress().status)) ||
+        (geoIndexer && isBusyIndexStatus(geoIndexer.getStatus().status)) ||
+        (duplicateManager && duplicateManager.getState().status === "scanning") ||
+        (petIndexer && isBusyIndexStatus(petIndexer.getProgress().status)) ||
+        audioInventoryRunning ||
+        (thumbnailPregenerator && ["scanning", "generating"].includes(thumbnailPregenerator.getProgress().status)) ||
+        magicLibraryProgress.running ||
+        activeIndexStorageCacheWrites > 0 ||
+        Boolean(libraryStatsManager?.getSnapshot().running));
+}
+async function waitForIndexStorageWritersToPause() {
+    const deadline = Date.now() + 60000;
+    while (indexStorageWritersBusy()) {
+        if (Date.now() >= deadline)
+            throw new Error("Indexing did not pause in time; the local cache was preserved.");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+}
+async function pauseIndexingForStorage(message) {
+    indexStorageAvailable = false;
+    indexStorageUnavailableMessage = message;
+    publishIndexStorageStatus(message);
+    aestheticScorer?.setBackgroundPaused(true);
+    if (indexStorageInitializationDeferred) {
+        await indexRecovery?.setBlocked(message);
+        return;
+    }
+    if (semanticIndexer)
+        await semanticIndexer.setHold(message);
+    await indexRecovery?.setBlocked(message);
+    await Promise.allSettled([
+        faceIndexer?.pause(),
+        geoIndexer?.pause(),
+        duplicateManager?.pause(),
+        petIndexer?.pause(),
+    ].filter(Boolean));
+    audioLibraryCache?.cancelScan();
+    await waitForIndexStorageWritersToPause();
+}
+async function resumeIndexingAfterStorage() {
+    if (indexStorageInitializationDeferred) {
+        indexStorageTransfer = {
+            state: "complete",
+            message: "The selected destination is back. Silo is restarting to reopen its indexes and resume automatically.",
+            filesVerified: 0,
+            bytesVerified: 0,
+        };
+        publishIndexStorageStatus(indexStorageTransfer.message);
+        scheduleIndexStorageRelaunch();
+        return;
+    }
+    indexStorageUnavailableMessage = null;
+    indexStorageAvailable = true;
+    aestheticScorer?.setBackgroundPaused(false);
+    const resumeSources = semanticIndexer
+        ? await semanticIndexer.setHold(heapPressureMessage)
+        : [];
+    await indexRecovery?.setBlocked(null);
+    if (resumeSources.length && !heapPressureMessage && !shuttingDown)
+        void semanticIndexer.start(resumeSources);
+    publishIndexStorageStatus(indexStorageUsingLocalFallback
+        ? `The selected destination is still unavailable. Silo is using the local cache and keeping at least ${Math.round(indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free.`
+        : null);
+}
+function scheduleIndexStorageRelaunch() {
+    if (indexStorageRelaunchPending)
+        return;
+    indexStorageRelaunchPending = true;
+    setTimeout(() => {
+        electron_1.app.relaunch();
+        electron_1.app.quit();
+    }, 3500);
+}
+async function prepareStorageTransition(reason) {
+    if (indexStorageTransferRunning || indexStorageRelaunchPending)
+        return;
+    if (Date.now() < indexStorageTransferRetryAt)
+        return;
+    indexStorageTransferRunning = true;
+    const destination = getIndexStorageDestinationLabel();
+    indexStorageTransfer = {
+        state: "moving",
+        message: reason === "destination"
+            ? "The destination reconnected. Indexing is paused while Silo verifies and moves the cache."
+            : "Indexing is paused while Silo prepares the local fallback cache.",
+        filesVerified: 0,
+        bytesVerified: 0,
+    };
+    publishIndexStorageStatus(unavailableIndexStorageMessage());
+    try {
+        await pauseIndexingForStorage(indexStorageTransfer.message);
+        const userDataPath = electron_1.app.getPath("userData");
+        const storage = await (0, indexingStorage_1.prepareConfiguredIndexStorage)(userDataPath, (filesVerified, bytesVerified) => {
+            indexStorageTransfer = {
+                state: "moving",
+                message: `Verifying cache transfer: ${filesVerified.toLocaleString()} files and ${(bytesVerified / 1024 / 1024 / 1024).toFixed(2)} GiB checked.`,
+                filesVerified,
+                bytesVerified,
+            };
+            publishIndexStorageStatus();
+        });
+        if (storage.migrationError || (!storage.destinationAvailable && !storage.usingLocalFallback))
+            throw new Error(storage.migrationError || "The selected cache destination is still unavailable.");
+        indexStorageRoot = storage.storageRoot;
+        selectedIndexStorageRoot = storage.selectedStorageRoot;
+        indexStorageUsingLocalFallback = storage.usingLocalFallback;
+        indexStorageFallbackEnabled = storage.localFallbackEnabled;
+        indexStorageDestinationAvailable = storage.destinationAvailable;
+        (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
+        if (storage.usingLocalFallback) {
+            indexStorageFreeBytes = await (0, indexingStorage_1.getLocalIndexStorageFreeBytes)(indexStorageRoot);
+            await (0, indexingStorage_1.assertLocalIndexStorageCapacity)(indexStorageRoot);
+        }
+        else {
+            indexStorageFreeBytes = null;
+        }
+        if (storage.destinationAvailable) {
+            const stats = await fsPromises.stat(indexStorageRoot);
+            indexStorageDeviceId = stats.dev;
+        }
+        else {
+            indexStorageDeviceId = null;
+        }
+        indexStorageTransfer = {
+            state: "complete",
+            message: storage.destinationAvailable
+                ? `Cache verified and moved to ${destination}. Silo is restarting and indexing will resume automatically.`
+                : `Local fallback cache is ready. Silo is restarting and indexing will continue locally.`,
+            filesVerified: storage.filesVerified,
+            bytesVerified: storage.bytesVerified,
+        };
+        indexStorageUnavailableMessage = null;
+        indexStorageAvailable = false;
+        publishIndexStorageStatus(indexStorageTransfer.message);
+        scheduleIndexStorageRelaunch();
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        indexStorageTransfer = {
+            state: "error",
+            message: `Cache transfer paused. Silo preserved the existing cache. ${message}`,
+            filesVerified: indexStorageTransfer.filesVerified,
+            bytesVerified: indexStorageTransfer.bytesVerified,
+        };
+        indexStorageTransferRetryAt = Date.now() + 15000;
+        const fallbackCanResume = indexStorageUsingLocalFallback &&
+            indexStorageFallbackEnabled &&
+            indexStorageRoot;
+        if (fallbackCanResume) {
+            indexStorageFreeBytes = await (0, indexingStorage_1.getLocalIndexStorageFreeBytes)(indexStorageRoot).catch(() => null);
+            if (indexStorageFreeBytes !== null && indexStorageFreeBytes >= indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES)
+                await resumeIndexingAfterStorage();
+        }
+        publishIndexStorageStatus(indexStorageTransfer.message);
+        runtimeLog("index-storage-transfer-failed", { message });
+    }
+    finally {
+        indexStorageTransferRunning = false;
+    }
+}
+async function monitorIndexStorageAvailability() {
+    if (indexStorageMonitorRunning || indexStorageTransferRunning || indexStorageRelaunchPending)
+        return;
+    indexStorageMonitorRunning = true;
+    try {
+        const externalDestination = path.resolve(selectedIndexStorageRoot) !== path.resolve(electron_1.app.getPath("userData"));
+        const destinationAvailable = await checkSelectedIndexStorageAvailable();
+        indexStorageDestinationAvailable = destinationAvailable;
+        if (!externalDestination) {
+            indexStorageUsingLocalFallback = false;
+            indexStorageFreeBytes = null;
+            if (!indexStorageAvailable)
+                await resumeIndexingAfterStorage();
+            else
+                publishIndexStorageStatus(null);
+            return;
+        }
+        if (destinationAvailable && indexStorageUsingLocalFallback) {
+            await prepareStorageTransition("destination");
+            return;
+        }
+        if (!destinationAvailable && !indexStorageUsingLocalFallback) {
+            const message = unavailableIndexStorageMessage();
+            if (indexStorageFallbackEnabled) {
+                await prepareStorageTransition("fallback");
+                return;
+            }
+            if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
+                await pauseIndexingForStorage(message);
+            indexStorageFreeBytes = null;
+            publishIndexStorageStatus(message);
+            return;
+        }
+        if (indexStorageUsingLocalFallback) {
+            indexStorageFreeBytes = await (0, indexingStorage_1.getLocalIndexStorageFreeBytes)(indexStorageRoot).catch(() => null);
+            if (!indexStorageFallbackEnabled) {
+                const message = `The selected destination, ${getIndexStorageDestinationLabel()}, is unavailable. Local fallback is off, so indexing is paused until it reconnects.`;
+                if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
+                    await pauseIndexingForStorage(message);
+                publishIndexStorageStatus(message);
+                return;
+            }
+            if (indexStorageFreeBytes === null || indexStorageFreeBytes < indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES) {
+                const message = `Local cache indexing is paused to keep at least ${Math.round(indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free. Reconnect ${getIndexStorageDestinationLabel()} or free local disk space.`;
+                if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
+                    await pauseIndexingForStorage(message);
+                publishIndexStorageStatus(message);
+                return;
+            }
+            if (!indexStorageAvailable)
+                await resumeIndexingAfterStorage();
+            else {
+                const message = `Selected destination ${getIndexStorageDestinationLabel()} is unavailable. Silo is using a local cache and keeping at least ${Math.round(indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free.`;
+                publishIndexStorageStatus(message);
+            }
+            return;
+        }
+        if (destinationAvailable && !indexStorageAvailable) {
+            const stats = await fsPromises.stat(selectedIndexStorageRoot);
+            indexStorageDeviceId = stats.dev;
+            await resumeIndexingAfterStorage();
+            return;
+        }
+        if (!destinationAvailable)
+            publishIndexStorageStatus(unavailableIndexStorageMessage());
+        else
+            publishIndexStorageStatus(null);
+    }
+    catch (error) {
+        runtimeLog("index-storage-monitor-error", {
+            message: error instanceof Error ? error.message : String(error),
+        });
+    }
+    finally {
+        indexStorageMonitorRunning = false;
+    }
+}
+function startIndexStorageAvailabilityMonitor() {
+    if (indexStorageMonitorTimer)
+        clearInterval(indexStorageMonitorTimer);
+    indexStorageMonitorTimer = setInterval(() => void monitorIndexStorageAvailability(), 1200);
+    void monitorIndexStorageAvailability();
+}
 function installApplicationMenu() {
     applicationMenuInstalled = true;
     const sendEdit = (command) => sendToRenderer("edit-menu-command", command);
@@ -4265,40 +4611,69 @@ electron_1.app.whenReady().then(async () => {
     if (!electron_1.app.isPackaged)
         electron_1.app.dock?.setIcon(appIconPath());
     installApplicationMenu();
-    const userDataPath = electron_1.app.getPath("userData");
-    let startupStorageNotice = null;
     configureAppUpdater();
+    const userDataPath = electron_1.app.getPath("userData");
+    let storage;
     try {
-        const storage = await (0, indexingStorage_1.prepareConfiguredIndexStorage)(userDataPath, (filesVerified, bytesVerified) => runtimeLog("index-storage-migration-progress", {
+        storage = await (0, indexingStorage_1.prepareConfiguredIndexStorage)(userDataPath, (filesVerified, bytesVerified) => runtimeLog("index-storage-migration-progress", {
             filesVerified,
             bytesVerified,
         }));
-        indexStorageRoot = storage.storageRoot;
-        (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
-        if (path.resolve(indexStorageRoot) !== path.resolve(userDataPath)) {
-            const migration = {
-                filesVerified: storage.filesVerified,
-                bytesVerified: storage.bytesVerified,
-            };
-            runtimeLog("external-index-storage-ready", { ...migration });
-        }
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (!(error instanceof indexingStorage_1.ExternalIndexStorageUnavailableError)) {
-            runtimeLog("index-storage-initialization-failed", { message });
-            electron_1.dialog.showErrorBox("Silo could not safely prepare its index", `${message}\n\nSilo stopped before opening the library. Existing index files were preserved. Resolve the storage issue and reopen Silo.`);
-            electron_1.app.quit();
-            return;
+        runtimeLog("index-storage-initialization-failed", { message });
+        electron_1.dialog.showErrorBox("Silo could not safely prepare its index", "Silo stopped before opening the library. Existing index files were preserved. Resolve the storage issue and reopen Silo.");
+        electron_1.app.quit();
+        return;
+    }
+    indexStorageRoot = storage.storageRoot;
+    selectedIndexStorageRoot = storage.selectedStorageRoot;
+    indexStorageUsingLocalFallback = storage.usingLocalFallback;
+    indexStorageFallbackEnabled = storage.localFallbackEnabled;
+    indexStorageDestinationAvailable = storage.destinationAvailable;
+    (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
+    indexStorageAvailable =
+        storage.destinationAvailable ||
+            (storage.usingLocalFallback && storage.localFallbackEnabled && !storage.migrationError);
+    if (storage.usingLocalFallback) {
+        indexStorageFreeBytes = await (0, indexingStorage_1.getLocalIndexStorageFreeBytes)(indexStorageRoot).catch(() => null);
+        if (indexStorageFreeBytes === null ||
+            indexStorageFreeBytes < indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES) {
+            indexStorageAvailable = false;
+            storage.migrationError = `Local cache indexing is paused to keep at least ${Math.round(indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free. Reconnect ${path.basename(storage.selectedStorageRoot)} or free local disk space.`;
         }
-        indexStorageRoot = (0, indexingStorage_1.getLocalFallbackIndexStorageRoot)(userDataPath);
-        await fsPromises.mkdir(indexStorageRoot, { recursive: true });
-        (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
-        (0, indexingStorage_1.setIndexStorageExclusionRoots)([error.storageRoot, indexStorageRoot]);
-        startupStorageNotice = `${message} Silo opened with separate local fallback index storage for this session. The configured external location and its data were left untouched.`;
-        runtimeLog("external-index-storage-unavailable", {
-            message,
-            fallback: indexStorageRoot,
+    }
+    indexStorageInitializationDeferred = !indexStorageAvailable;
+    if (!storage.destinationAvailable) {
+        const unavailableMessage = storage.usingLocalFallback
+            ? storage.migrationError || unavailableIndexStorageMessage()
+            : storage.localFallbackEnabled
+                ? storage.migrationError || unavailableIndexStorageMessage()
+                : unavailableIndexStorageMessage();
+        indexStorageUnavailableMessage = indexStorageAvailable ? null : unavailableMessage;
+        indexStorageMessageText = storage.migrationError || (storage.usingLocalFallback
+            ? `Selected destination ${path.basename(storage.selectedStorageRoot)} is unavailable. Silo is using a local cache and keeping at least ${Math.round(indexingStorage_1.LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free.`
+            : unavailableMessage);
+    }
+    else {
+        indexStorageUnavailableMessage = storage.migrationError;
+        indexStorageMessageText = storage.migrationError;
+    }
+    if (storage.destinationAvailable && path.resolve(selectedIndexStorageRoot) !== path.resolve(userDataPath)) {
+        const selectedStat = await fsPromises.stat(selectedIndexStorageRoot);
+        indexStorageDeviceId = selectedStat.dev;
+    }
+    else {
+        indexStorageDeviceId = null;
+    }
+    publishIndexStorageStatus();
+    if (path.resolve(indexStorageRoot) !== path.resolve(userDataPath)) {
+        runtimeLog("external-index-storage-ready", {
+            filesVerified: storage.filesVerified,
+            bytesVerified: storage.bytesVerified,
+            usingLocalFallback: storage.usingLocalFallback,
+            destinationAvailable: storage.destinationAvailable,
         });
     }
     // A restored config is swapped in before any store opens its files.
@@ -4319,16 +4694,6 @@ electron_1.app.whenReady().then(async () => {
     await contentSettingsStore.initialize();
     registerMediaProtocols();
     await createWindow();
-    if (startupStorageNotice && mainWindow) {
-        void electron_1.dialog.showMessageBox(mainWindow, {
-            type: "warning",
-            title: "Using Local Index Storage",
-            message: "Silo could not open the selected external storage drive.",
-            detail: startupStorageNotice,
-            buttons: ["Continue"],
-            defaultId: 0,
-        });
-    }
     if (electron_1.app.isPackaged && !electron_is_dev_1.default)
         void checkForAppUpdates();
     reportStartup("Loading content filters…");
@@ -4338,7 +4703,9 @@ electron_1.app.whenReady().then(async () => {
         : path.join(electron_1.app.getAppPath(), ".model-test-cache");
     const unifiedScanSource = await createUnifiedScanSource();
     libraryStatsManager = new libraryStats_1.LibraryStatsManager(indexStorageRoot, (sourcePath, onFile, isCancelled) => unifiedScanSource(sourcePath, (file) => onFile(file), isCancelled));
-    const libraryStatsLoad = libraryStatsManager.initialize();
+    const libraryStatsLoad = indexStorageInitializationDeferred
+        ? Promise.resolve()
+        : libraryStatsManager.initialize();
     semanticIndexer = new semanticIndexer_1.SemanticIndexer(electron_1.app.getPath("userData"), modelCachePath, unifiedScanSource, (progress) => {
         sendToRenderer("index-progress", progress);
         const now = Date.now();
@@ -4388,8 +4755,12 @@ electron_1.app.whenReady().then(async () => {
             return fsPromises.readFile(indexStoragePath("thumbnail-cache", fileName));
         },
     });
+    if (indexStorageUnavailableMessage && !indexStorageInitializationDeferred)
+        await semanticIndexer.setHold(indexStorageUnavailableMessage);
     semanticIndexer.setDemoFileLimit(fullAccessEnabled() ? null : demoLimits_1.DEMO_LIMITS.files);
-    const semanticLoad = semanticIndexer.initialize((fraction, records) => reportStartupDetail(`Opening search index… ${Math.round(fraction * 100)}% (${records.toLocaleString()} files)`));
+    const semanticLoad = indexStorageInitializationDeferred
+        ? Promise.resolve()
+        : semanticIndexer.initialize((fraction, records) => reportStartupDetail(`Opening search index… ${Math.round(fraction * 100)}% (${records.toLocaleString()} files)`));
     const faceModelPath = electron_1.app.isPackaged
         ? path.join(process.resourcesPath, "face-models")
         : path.join(electron_1.app.getAppPath(), "node_modules/@vladmandic/face-api/model");
@@ -4425,7 +4796,9 @@ electron_1.app.whenReady().then(async () => {
         return (semanticUnsafePaths.has(photoPath) ||
             (0, contentPolicy_1.fileTextLooksExplicit)({ name: path.basename(photoPath), path: photoPath }));
     });
-    const faceLoad = faceIndexer.initialize();
+    const faceLoad = indexStorageInitializationDeferred
+        ? Promise.resolve()
+        : faceIndexer.initialize();
     aestheticScorer = new aestheticScorer_1.AestheticScorer({
         cachePath: indexStoragePath("aesthetic-index.jsonl"),
         thumbnailFile: async (filePath) => {
@@ -4469,7 +4842,9 @@ electron_1.app.whenReady().then(async () => {
         },
     });
     petIndexer = new petIndexer_1.PetIndexer(indexStorageRoot, indexStoragePath("semantic-index"), semanticIndexer);
-    const petLoad = petIndexer.initialize();
+    const petLoad = indexStorageInitializationDeferred
+        ? Promise.resolve()
+        : petIndexer.initialize();
     phoneManager = new phoneManager_1.PhoneManager(electron_1.app.getPath("userData"), (progress) => {
         const key = `${progress.platform}:${progress.deviceId}`;
         const active = progress.status === "scanning" || progress.status === "backing-up";
@@ -4511,8 +4886,9 @@ electron_1.app.whenReady().then(async () => {
     phoneManagerBackupDestination = await phoneManager.getBackupDestination();
     console.log("[STARTUP] phoneManager initialized, creating Google/Message managers...");
     googleManager = new googleManager_1.GoogleManager(electron_1.app.getPath("userData"), indexStorageRoot);
-    await googleManager.initialize((await (0, googleManager_1.loadGoogleEnv)(path.join(electron_1.app.getPath("userData"), ".env"))) ??
-        (await (0, googleManager_1.loadGoogleEnv)(path.join(electron_1.app.getAppPath(), ".env"))));
+    if (!indexStorageInitializationDeferred)
+        await googleManager.initialize((await (0, googleManager_1.loadGoogleEnv)(path.join(electron_1.app.getPath("userData"), ".env"))) ??
+            (await (0, googleManager_1.loadGoogleEnv)(path.join(electron_1.app.getAppPath(), ".env"))));
     console.log("[STARTUP] googleManager initialized, creating messageExportCoordinator...");
     messageExportCoordinator = new messageExportCoordinator_1.MessageExportCoordinator(electron_1.app.getPath("userData"));
     // Sync phone backup destination to message coordinator
@@ -4529,13 +4905,18 @@ electron_1.app.whenReady().then(async () => {
         sendToRenderer("geo-index-progress", state);
         scheduleThumbnailPregeneration();
     }, indexStorageRoot);
-    const geoLoad = geoIndexer.initialize();
+    const geoLoad = indexStorageInitializationDeferred
+        ? Promise.resolve()
+        : geoIndexer.initialize();
     geocoder = new geocoder_1.Geocoder(electron_1.app.getPath("userData"), indexStorageRoot);
-    await geocoder.initialize();
+    if (!indexStorageInitializationDeferred)
+        await geocoder.initialize();
     duplicateManager = new duplicateManager_1.DuplicateManager(electron_1.app.getPath("userData"), (state) => {
         sendToRenderer("duplicate-progress", filterDuplicateState(state));
     }, indexStorageRoot);
-    const duplicateLoad = duplicateManager.initialize();
+    const duplicateLoad = indexStorageInitializationDeferred
+        ? Promise.resolve()
+        : duplicateManager.initialize();
     const trackLoad = (load, label) => load.then(() => reportStartup(label));
     reportStartup("Loading face, location and inventory caches…");
     // The search index can take a minute to open on big libraries; the app is usable meanwhile.
@@ -4552,7 +4933,8 @@ electron_1.app.whenReady().then(async () => {
             runtimeLog("startup-load-error", { message: String(result.reason) });
     }
     audioLibraryCache = new audioLibraryCache_1.AudioLibraryCache(indexStorageRoot);
-    await audioLibraryCache.initialize();
+    if (!indexStorageInitializationDeferred)
+        await audioLibraryCache.initialize();
     geoIndexer.setOverrides(stateStore.getState().geoOverrides);
     thumbnailPregenerator = new thumbnailPregenerator_1.ThumbnailPregenerator({
         getSourceRoots: getAllIndexSources,
@@ -4731,7 +5113,7 @@ electron_1.app.whenReady().then(async () => {
             lane: "analysis",
             blockedReason: analysisBlocker,
             progress: () => semanticIndexer.getProgress(),
-            ready: () => startupIndexReconciliationSettled && analysisIdle(),
+            ready: () => indexStorageAvailable && startupIndexReconciliationSettled && analysisIdle(),
             unresolvedWork: () => {
                 const count = semanticIndexer.getRetryableErrorCount(recoverySearchSourcePaths);
                 const coverageErrors = semanticIndexer.getSourceCoverageProgress(recoverySearchSourcePaths).errors;
@@ -4748,6 +5130,7 @@ electron_1.app.whenReady().then(async () => {
                 // Cached signatures skip successful embeddings; interrupted work is resumed.
                 await semanticIndexer.startFullScan(sources);
             },
+            pause: () => semanticIndexer.pause(),
         },
         {
             id: "faces",
@@ -4755,7 +5138,7 @@ electron_1.app.whenReady().then(async () => {
             blockedReason: analysisBlocker,
             needsInitialCheck: true,
             progress: () => faceIndexer.getProgress(),
-            ready: () => searchSettled() && analysisIdle(),
+            ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
             unresolvedWork: () => {
                 const errors = faceIndexer.getProgress().errors;
                 return errors
@@ -4763,6 +5146,7 @@ electron_1.app.whenReady().then(async () => {
                     : null;
             },
             start: () => faceIndexer.start(),
+            pause: () => faceIndexer.pause(),
         },
         {
             id: "locations",
@@ -4770,7 +5154,8 @@ electron_1.app.whenReady().then(async () => {
             blockedReason: analysisBlocker,
             progress: () => geoIndexer.getStatus(),
             needsInitialCheck: true,
-            ready: () => searchSettled() &&
+            ready: () => indexStorageAvailable &&
+                searchSettled() &&
                 geoIndexer.getStatus().status !== "scanning",
             unresolvedWork: () => {
                 const count = geoIndexer.getRetryableCount();
@@ -4779,6 +5164,7 @@ electron_1.app.whenReady().then(async () => {
                     : null;
             },
             start: () => kickGeoCheck(),
+            pause: () => geoIndexer.pause(),
         },
         {
             id: "duplicates",
@@ -4788,7 +5174,7 @@ electron_1.app.whenReady().then(async () => {
                 : analysisBlocker(),
             needsInitialCheck: true,
             progress: () => duplicateManager.getState(),
-            ready: () => searchSettled() && analysisIdle() && diskIdle(),
+            ready: () => indexStorageAvailable && searchSettled() && analysisIdle() && diskIdle(),
             unresolvedWork: () => {
                 const count = duplicateManager.getRetryableFailureCount();
                 return count
@@ -4799,6 +5185,7 @@ electron_1.app.whenReady().then(async () => {
                 const sources = await getAllIndexSources();
                 await duplicateManager.scan(semanticIndexer.getIndexedFiles(sources), sources);
             },
+            pause: () => duplicateManager.pause(),
         },
         {
             id: "pets",
@@ -4806,8 +5193,9 @@ electron_1.app.whenReady().then(async () => {
             blockedReason: analysisBlocker,
             needsInitialCheck: true,
             progress: () => petIndexer.getProgress(),
-            ready: () => searchSettled() && analysisIdle(),
+            ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
             start: async () => petIndexer.start((progress) => sendToRenderer("pet-progress", progress), await getAllIndexSources()),
+            pause: () => petIndexer.pause(),
         },
         {
             id: "thumbnails",
@@ -4819,7 +5207,8 @@ electron_1.app.whenReady().then(async () => {
                 status: "idle",
                 message: "Waiting for services",
             },
-            ready: () => Boolean(thumbnailPregenerator) &&
+            ready: () => indexStorageAvailable &&
+                Boolean(thumbnailPregenerator) &&
                 !getThumbnailIndexingWaitMessage() &&
                 duplicateManager.getState().status !== "scanning" &&
                 !["scanning", "generating"].includes(thumbnailPregenerator?.getProgress().status ?? "idle"),
@@ -4839,11 +5228,15 @@ electron_1.app.whenReady().then(async () => {
                 status: audioInventoryRunning ? "scanning" : "idle",
                 message: "Source-aware retry coverage",
             }),
-            ready: () => !audioInventoryRunning,
+            ready: () => indexStorageAvailable && !audioInventoryRunning,
             start: async () => {
                 const result = await refreshAudioInventory(-1, true);
                 if (!result.ok)
                     throw new Error(result.error);
+            },
+            pause: () => {
+                if (audioLibraryCache !== null)
+                    audioLibraryCache.cancelScan();
             },
         },
         {
@@ -4855,29 +5248,35 @@ electron_1.app.whenReady().then(async () => {
                 status: magicLibraryProgress.running ? "indexing" : "idle",
                 message: "Quality scoring",
             }),
-            ready: () => searchSettled() && analysisIdle(),
+            ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
             start: async () => {
                 const sources = await getAllIndexSources();
                 await aestheticScorer.analyzeInBackground(semanticIndexer
                     .getIndexedImages(sources)
                     .filter((file) => !isRemotePath(file.path)));
             },
+            pause: () => aestheticScorer.setBackgroundPaused(true),
         },
     ], Date.now, path.join(electron_1.app.getPath("userData"), "indexing-recovery.json"));
+    await monitorIndexStorageAvailability();
+    startIndexStorageAvailabilityMonitor();
     requestIndexRecoveryStages([]);
     indexRecoveryTimer = setInterval(() => void indexRecovery?.tick().catch((error) => runtimeLog("index-recovery-tick-error", { message: String(error) })), 5000);
     const heapGuard = new heapGuard_1.HeapGuard({
         onPressure: async (sample) => {
+            heapPressureMessage =
+                "Indexing paused briefly to free memory; progress so far is saved and it will resume automatically.";
             runtimeLog("heap-pressure", {
                 usedMb: Math.round(sample.used / 1024 / 1024),
                 limitMb: Math.round(sample.limit / 1024 / 1024),
             });
-            await semanticIndexer.setHold("Indexing paused briefly to free memory; progress so far is saved and it will resume automatically.");
+            await semanticIndexer.setHold(indexStorageUnavailableMessage ?? heapPressureMessage);
         },
         onRelief: async (sample) => {
             runtimeLog("heap-relief", { usedMb: Math.round(sample.used / 1024 / 1024) });
-            const resume = await semanticIndexer.setHold(null);
-            if (resume.length && !shuttingDown)
+            heapPressureMessage = null;
+            const resume = await semanticIndexer.setHold(indexStorageUnavailableMessage);
+            if (!indexStorageUnavailableMessage && resume.length && !shuttingDown)
                 void semanticIndexer.start(resume);
         },
     });
@@ -5570,6 +5969,8 @@ electron_1.ipcMain.handle("get-audio-library-cache", async () => {
     return getVisibleAudioSnapshot(audioLibraryCache.getSnapshot());
 });
 async function refreshAudioInventory(requestId, force = false) {
+    if (!indexStorageAvailable)
+        return { ok: false, error: indexStorageUnavailableMessage ?? "Index storage is unavailable." };
     if (!audioLibraryCache || typeof requestId !== "number")
         return { ok: false, error: "Audio library is unavailable." };
     const availableSources = (await listSources()).filter((source) => source.available && source.rootPath.trim());
@@ -6032,6 +6433,8 @@ electron_1.ipcMain.handle("remove-index-source", async (_event, sourcePath) => {
     return stateStore.getState();
 });
 electron_1.ipcMain.handle("start-indexing", async () => {
+    if (!indexStorageAvailable)
+        return semanticIndexer.getProgress();
     const sources = await getAllIndexSources();
     console.log("[start-indexing] Starting indexing with sources:", sources);
     if (sources.length === 0) {
@@ -8199,7 +8602,17 @@ electron_1.ipcMain.handle("select-backup-destination", async () => {
     }
     return null;
 });
-electron_1.ipcMain.handle("get-index-storage-root", () => indexStorageRoot);
+electron_1.ipcMain.handle("get-index-storage-root", () => selectedIndexStorageRoot);
+electron_1.ipcMain.handle("get-index-storage-status", () => currentIndexStorageStatus());
+electron_1.ipcMain.handle("get-local-index-fallback-enabled", () => indexStorageFallbackEnabled);
+electron_1.ipcMain.handle("set-local-index-fallback-enabled", async (_event, enabled) => {
+    if (typeof enabled !== "boolean")
+        throw new Error("Choose whether Silo may use a local cache fallback.");
+    await (0, indexingStorage_1.setLocalIndexStorageFallback)(electron_1.app.getPath("userData"), enabled);
+    indexStorageFallbackEnabled = enabled;
+    await monitorIndexStorageAvailability();
+    return { enabled, restarting: indexStorageRelaunchPending };
+});
 electron_1.ipcMain.handle("select-index-storage-root", async () => {
     if (!mainWindow)
         return { canceled: true };
@@ -8218,7 +8631,7 @@ electron_1.ipcMain.handle("select-index-storage-root", async () => {
             type: "warning",
             title: "Move Silo Cache and Restart?",
             message: "Silo will move its indexes and generated caches to this folder.",
-            detail: `About ${(requiredBytes / 1024 / 1024 / 1024).toFixed(1)} GiB may need to be copied and checksum-verified. The old copies are removed only after verification. Keep the selected drive connected; Silo will not fall back to local indexing if it is unavailable.`,
+            detail: `About ${(requiredBytes / 1024 / 1024 / 1024).toFixed(1)} GiB may need to be copied and checksum-verified. The old copies are removed only after verification. If the destination disconnects later, Silo follows your local-fallback setting in Settings.`,
             buttons: ["Move and restart", "Cancel"],
             defaultId: 1,
             cancelId: 1,

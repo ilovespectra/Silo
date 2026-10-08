@@ -212,11 +212,19 @@ export class AestheticScorer {
   private backgroundQueue: MagicItem[] = [];
   private libraryTotal = 0;
   private running = false;
+  private backgroundPaused = false;
   private generation = 0;
   private requestTotal = 0;
   private requestPaths = new Set<string>();
 
   constructor(private readonly deps: AestheticDeps) {}
+
+  /** Pause library-wide work while keeping user-requested ranking work available. */
+  setBackgroundPaused(paused: boolean) {
+    this.backgroundPaused = paused;
+    if (!paused && (this.queue.length > 0 || this.backgroundQueue.length > 0))
+      void this.drain();
+  }
 
   /** Analyzes the whole library at low priority; whatever the user is viewing always goes first. */
   async analyzeInBackground(items: MagicItem[]) {
@@ -438,7 +446,10 @@ export class AestheticScorer {
         .catch(() => null);
       let lastEmit = 0;
       const worker = async () => {
-        while (this.queue.length > 0 || this.backgroundQueue.length > 0) {
+        while (
+          this.queue.length > 0 ||
+          (!this.backgroundPaused && this.backgroundQueue.length > 0)
+        ) {
           const foreground = this.queue.length > 0;
           const item = foreground
             ? this.queue.shift()!

@@ -21,7 +21,7 @@ export interface DuplicateTrashEntry {
     deletedAt: number;
 }
 export interface DuplicateState {
-    status: "idle" | "scanning" | "complete" | "error";
+    status: "idle" | "scanning" | "paused" | "complete" | "error";
     scanned: number;
     total: number;
     duplicateFiles: number;
@@ -44,6 +44,7 @@ export declare class DuplicateManager {
     private trash;
     private permanentlyClearedBytes;
     private scanPromise;
+    private pauseRequested;
     private prunePromise;
     private writeChain;
     private state;
@@ -55,6 +56,7 @@ export declare class DuplicateManager {
     getState(): DuplicateState;
     getRetryableFailureCount(): number;
     scan(files: IndexableFile[], sourceRoots?: string[]): Promise<DuplicateState>;
+    pause(): Promise<void>;
     quarantine(groupIds: string[]): Promise<DuplicateState>;
     quarantineFiles(filePaths: string[]): Promise<DuplicateState>;
     private matchesHash;

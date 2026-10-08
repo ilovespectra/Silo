@@ -30,6 +30,250 @@ interface PhoneManagerPanelProps {
   ) => Promise<boolean>;
 }
 
+interface PhoneDeviceCardProps {
+  device: PhoneDevice;
+  active: boolean;
+  busyDeviceId: string | null;
+  backup?: PhoneBackupProgress;
+  restoreArchives: PhoneRestoreArchive[];
+  tooling: PhoneTooling | null;
+  formatFileSize: (bytes: number) => string;
+  onBrowse: (device: PhoneDevice) => void;
+  onConnect: (device: PhoneDevice) => void;
+  onDisconnect: (device: PhoneDevice) => void;
+  onRename: (device: PhoneDevice) => void;
+  onCreateRestoreArchive: (
+    device: PhoneDevice,
+    password: string,
+  ) => Promise<boolean>;
+  onRestoreFromArchive: (
+    targetDeviceId: string,
+    archive: PhoneRestoreArchive,
+    password: string,
+  ) => Promise<boolean>;
+}
+
+function PhoneDeviceCard({
+  device,
+  active,
+  busyDeviceId,
+  backup,
+  restoreArchives,
+  tooling,
+  formatFileSize,
+  onBrowse,
+  onConnect,
+  onDisconnect,
+  onRename,
+  onCreateRestoreArchive,
+  onRestoreFromArchive,
+}: PhoneDeviceCardProps) {
+  const deviceKey = `${device.platform}:${device.id}`;
+  const [backupPassword, setBackupPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [restorePassword, setRestorePassword] = useState("");
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreNotice, setRestoreNotice] = useState("");
+  const backupPercent = backup?.totalBytes
+    ? Math.min(100, (backup.completedBytes / backup.totalBytes) * 100)
+    : backup?.totalFiles
+      ? Math.min(100, (backup.completedFiles / backup.totalFiles) * 100)
+      : 0;
+
+  const createRestoreArchive = async () => {
+    if (backupPassword.length < 8 || backupPassword !== confirmPassword) {
+      setRestoreNotice("Enter a matching password with at least 8 characters.");
+      return;
+    }
+    setRestoreBusy(true);
+    setRestoreNotice("");
+    try {
+      if (await onCreateRestoreArchive(device, backupPassword)) {
+        setBackupPassword("");
+        setConfirmPassword("");
+      }
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
+
+  const restoreArchive = async (archive: PhoneRestoreArchive) => {
+    if (!restorePassword) {
+      setRestoreNotice("Enter the archive password before restoring.");
+      return;
+    }
+    setRestoreBusy(true);
+    setRestoreNotice("");
+    try {
+      if (
+        await onRestoreFromArchive(device.id, archive, restorePassword)
+      )
+        setRestorePassword("");
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
+
+  return (
+    <article className={`phone-device ${active ? "active" : ""}`}>
+      <div className="phone-device-info">
+        <span className={`phone-badge ${device.platform}`}>
+          {device.platform === "ios" ? "iOS" : "Android"}
+        </span>
+        <strong title={device.name}>{device.name}</strong>
+        <small className={`phone-status ${device.status}`}>
+          {device.message}
+        </small>
+      </div>
+      <div className="phone-device-actions" data-tour="mobile-device-actions" data-help="Rename a device, connect or browse it, or unmount an iPhone. Device actions affect the connection and saved source, not the contents of the phone by themselves.">
+        <button
+          onClick={() => onRename(device)}
+          title={`Rename ${device.name}`}
+          aria-label={`Rename ${device.name}`}
+        >
+          <FiEdit3 />
+        </button>
+        {device.status === "ready" && device.rootPath ? (
+          <>
+            <button
+              onClick={() => onBrowse(device)}
+              disabled={busyDeviceId === device.id}
+            >
+              Browse
+            </button>
+            {device.platform === "ios" && (
+              <button
+                onClick={() => onDisconnect(device)}
+                disabled={busyDeviceId === device.id}
+                title="Unmount device"
+                aria-label={`Disconnect ${device.name}`}
+              >
+                <FiX />
+              </button>
+            )}
+          </>
+        ) : (
+          <button
+            onClick={() => onConnect(device)}
+            disabled={busyDeviceId === device.id}
+          >
+            {busyDeviceId === device.id ? "Connecting…" : "Connect"}
+          </button>
+        )}
+      </div>
+      {backup && (
+        <div className={`phone-backup-progress ${backup.status}`}>
+          <div>
+            <span>
+              <strong>Browseable snapshot:</strong> {backup.message}
+            </span>
+            <strong>
+              {backup.status === "complete"
+                ? "100%"
+                : `${Math.round(backupPercent)}%`}
+            </strong>
+          </div>
+          <progress
+            value={backup.status === "complete" ? 100 : backupPercent}
+            max={100}
+          />
+          <small>
+            {backup.completedFiles.toLocaleString()} / {backup.totalFiles.toLocaleString()} files
+            {backup.totalBytes > 0 &&
+              ` · ${formatFileSize(backup.completedBytes)} / ${formatFileSize(backup.totalBytes)}`}
+            {backup.failedFiles > 0 &&
+              ` · ${backup.failedFiles.toLocaleString()} skipped`}
+            {backup.lastBackupAt &&
+              ` · ${new Date(backup.lastBackupAt).toLocaleString()}`}
+          </small>
+          {backup.currentFile && (
+            <small title={backup.currentFile}>{backup.currentFile}</small>
+          )}
+        </div>
+      )}
+      {device.platform === "ios" && device.status === "ready" && (
+        <div className="phone-restore-controls">
+          <strong>Encrypted restore archives</strong>
+          <label htmlFor={`phone-backup-password-${deviceKey}`}>
+            Backup password
+          </label>
+          <input
+            id={`phone-backup-password-${deviceKey}`}
+            type="password"
+            autoComplete="new-password"
+            value={backupPassword}
+            onChange={(event) => setBackupPassword(event.target.value)}
+            placeholder="At least 8 characters"
+          />
+          <label htmlFor={`phone-backup-password-confirm-${deviceKey}`}>
+            Confirm password to create
+          </label>
+          <input
+            id={`phone-backup-password-confirm-${deviceKey}`}
+            type="password"
+            autoComplete="new-password"
+            value={confirmPassword}
+            onChange={(event) => setConfirmPassword(event.target.value)}
+            placeholder="Re-enter password"
+          />
+          <small>
+            Silo never saves this password. Keep it safe; a lost
+            encrypted-backup password cannot be recovered here.
+          </small>
+          <button
+            className="small-button"
+            disabled={
+              restoreBusy ||
+              !tooling ||
+              tooling.ios.missing.includes("idevicebackup2")
+            }
+            onClick={() => void createRestoreArchive()}
+          >
+            {restoreBusy ? "Working…" : "Create encrypted restore archive"}
+          </button>
+          {restoreArchives
+            .filter((archive) => archive.platform === "ios")
+            .map((archive) => (
+              <div className="phone-restore-archive" key={archive.id}>
+                <small>
+                  {new Date(archive.createdAt).toLocaleString()} · {archive.deviceName} · {archive.deviceModel || "unknown model"}
+                  {archive.deviceId === device.id
+                    ? " · this device"
+                    : archive.deviceModel === device.model
+                      ? " · same model"
+                      : " · incompatible model"}
+                </small>
+                <button
+                  className="small-button"
+                  disabled={
+                    restoreBusy ||
+                    !device.model ||
+                    archive.deviceModel !== device.model
+                  }
+                  onClick={() => void restoreArchive(archive)}
+                >
+                  Restore this archive
+                </button>
+              </div>
+            ))}
+          <label htmlFor={`phone-restore-password-${deviceKey}`}>
+            Password for restore
+          </label>
+          <input
+            id={`phone-restore-password-${deviceKey}`}
+            type="password"
+            autoComplete="current-password"
+            value={restorePassword}
+            onChange={(event) => setRestorePassword(event.target.value)}
+            placeholder="Enter the archive password"
+          />
+          {restoreNotice && <small role="status">{restoreNotice}</small>}
+        </div>
+      )}
+    </article>
+  );
+}
+
 function PhoneManagerPanel({
   devices,
   tooling,
@@ -51,52 +295,6 @@ function PhoneManagerPanel({
   onCreateRestoreArchive,
   onRestoreFromArchive,
 }: PhoneManagerPanelProps) {
-  const [backupPasswords, setBackupPasswords] = useState<Record<string, string>>({});
-  const [confirmPasswords, setConfirmPasswords] = useState<Record<string, string>>({});
-  const [restorePasswords, setRestorePasswords] = useState<Record<string, string>>({});
-  const [restoreBusyKey, setRestoreBusyKey] = useState<string | null>(null);
-  const [restoreFormNotice, setRestoreFormNotice] = useState("");
-
-  const createRestoreArchive = async (device: PhoneDevice, deviceKey: string) => {
-    const password = backupPasswords[deviceKey] || "";
-    if (password.length < 8 || password !== (confirmPasswords[deviceKey] || "")) {
-      setRestoreFormNotice("Enter a matching password with at least 8 characters.");
-      return;
-    }
-    setRestoreBusyKey(deviceKey);
-    setRestoreFormNotice("");
-    try {
-      const created = await onCreateRestoreArchive(device, password);
-      if (created) {
-        setBackupPasswords((current) => ({ ...current, [deviceKey]: "" }));
-        setConfirmPasswords((current) => ({ ...current, [deviceKey]: "" }));
-      }
-    } finally {
-      setRestoreBusyKey(null);
-    }
-  };
-
-  const restoreFromArchive = async (
-    archive: PhoneRestoreArchive,
-    deviceKey: string,
-    targetDeviceId: string,
-  ) => {
-    const password = restorePasswords[deviceKey] || "";
-    if (!password) {
-      setRestoreFormNotice("Enter the archive password before restoring.");
-      return;
-    }
-    setRestoreBusyKey(deviceKey);
-    setRestoreFormNotice("");
-    try {
-      const restored = await onRestoreFromArchive(targetDeviceId, archive, password);
-      if (restored)
-        setRestorePasswords((current) => ({ ...current, [deviceKey]: "" }));
-    } finally {
-      setRestoreBusyKey(null);
-    }
-  };
-
   return (
     <section className="phone-manager-panel" aria-labelledby="phone-manager-title">
       <header className="mobile-section-heading" data-tour="mobile-devices">
@@ -183,197 +381,23 @@ function PhoneManagerPanel({
         <div className="phone-device-list">
           {devices.map((device) => {
             const deviceKey = `${device.platform}:${device.id}`;
-            const backup = backups[deviceKey];
-            const backupPercent = backup?.totalBytes
-              ? Math.min(100, (backup.completedBytes / backup.totalBytes) * 100)
-              : backup?.totalFiles
-                ? Math.min(
-                    100,
-                    (backup.completedFiles / backup.totalFiles) * 100,
-                  )
-                : 0;
-
             return (
-              <article
-                className={`phone-device ${activeDeviceKey === deviceKey ? "active" : ""}`}
+              <PhoneDeviceCard
                 key={deviceKey}
-              >
-                <div className="phone-device-info">
-                  <span className={`phone-badge ${device.platform}`}>
-                    {device.platform === "ios" ? "iOS" : "Android"}
-                  </span>
-                  <strong title={device.name}>{device.name}</strong>
-                  <small className={`phone-status ${device.status}`}>
-                    {device.message}
-                  </small>
-                </div>
-                <div className="phone-device-actions" data-tour="mobile-device-actions" data-help="Rename a device, connect or browse it, or unmount an iPhone. Device actions affect the connection and saved source, not the contents of the phone by themselves.">
-                  <button
-                    onClick={() => onRename(device)}
-                    title={`Rename ${device.name}`}
-                    aria-label={`Rename ${device.name}`}
-                  >
-                    <FiEdit3 />
-                  </button>
-                  {device.status === "ready" && device.rootPath ? (
-                    <>
-                      <button
-                        onClick={() => onBrowse(device)}
-                        disabled={busyDeviceId === device.id}
-                      >
-                        Browse
-                      </button>
-                      {device.platform === "ios" && (
-                        <button
-                          onClick={() => onDisconnect(device)}
-                          disabled={busyDeviceId === device.id}
-                          title="Unmount device"
-                          aria-label={`Disconnect ${device.name}`}
-                        >
-                          <FiX />
-                        </button>
-                      )}
-                    </>
-                  ) : (
-                    <button
-                      onClick={() => onConnect(device)}
-                      disabled={busyDeviceId === device.id}
-                    >
-                      {busyDeviceId === device.id ? "Connecting…" : "Connect"}
-                    </button>
-                  )}
-                </div>
-                {backup && (
-                  <div className={`phone-backup-progress ${backup.status}`}>
-                    <div>
-                          <span>
-                            <strong>Browseable snapshot:</strong> {backup.message}
-                          </span>
-                      <strong>
-                        {backup.status === "complete"
-                          ? "100%"
-                          : `${Math.round(backupPercent)}%`}
-                      </strong>
-                    </div>
-                    <progress
-                      value={backup.status === "complete" ? 100 : backupPercent}
-                      max={100}
-                    />
-                    <small>
-                      {backup.completedFiles.toLocaleString()} / {backup.totalFiles.toLocaleString()} files
-                      {backup.totalBytes > 0 &&
-                        ` · ${formatFileSize(backup.completedBytes)} / ${formatFileSize(backup.totalBytes)}`}
-                      {backup.failedFiles > 0 &&
-                        ` · ${backup.failedFiles.toLocaleString()} skipped`}
-                      {backup.lastBackupAt &&
-                        ` · ${new Date(backup.lastBackupAt).toLocaleString()}`}
-                    </small>
-                    {backup.currentFile && (
-                      <small title={backup.currentFile}>{backup.currentFile}</small>
-                    )}
-                  </div>
-                )}
-                {device.platform === "ios" && device.status === "ready" && (
-                  <div className="phone-restore-controls">
-                    <strong>Encrypted restore archives</strong>
-                    <label htmlFor={`phone-backup-password-${deviceKey}`}>
-                      Backup password
-                    </label>
-                    <input
-                      id={`phone-backup-password-${deviceKey}`}
-                      type="password"
-                      autoComplete="new-password"
-                      value={backupPasswords[deviceKey] || ""}
-                      onChange={(event) =>
-                        setBackupPasswords((current) => ({
-                          ...current,
-                          [deviceKey]: event.target.value,
-                        }))
-                      }
-                      placeholder="At least 8 characters"
-                    />
-                    <label htmlFor={`phone-backup-password-confirm-${deviceKey}`}>
-                      Confirm password to create
-                    </label>
-                    <input
-                      id={`phone-backup-password-confirm-${deviceKey}`}
-                      type="password"
-                      autoComplete="new-password"
-                      value={confirmPasswords[deviceKey] || ""}
-                      onChange={(event) =>
-                        setConfirmPasswords((current) => ({
-                          ...current,
-                          [deviceKey]: event.target.value,
-                        }))
-                      }
-                      placeholder="Re-enter password"
-                    />
-                    <small>
-                      Silo never saves this password. Keep it safe; a lost
-                      encrypted-backup password cannot be recovered here.
-                    </small>
-                    <button
-                      className="small-button"
-                      disabled={
-                        restoreBusyKey === deviceKey ||
-                        !tooling ||
-                        tooling.ios.missing.includes("idevicebackup2")
-                      }
-                      onClick={() => void createRestoreArchive(device, deviceKey)}
-                    >
-                      {restoreBusyKey === deviceKey
-                        ? "Working…"
-                        : "Create encrypted restore archive"}
-                    </button>
-                    {restoreArchives
-                      .filter((archive) => archive.platform === "ios")
-                      .map((archive) => (
-                        <div className="phone-restore-archive" key={archive.id}>
-                          <small>
-                            {new Date(archive.createdAt).toLocaleString()} · {archive.deviceName} · {archive.deviceModel || "unknown model"}
-                            {archive.deviceId === device.id
-                              ? " · this device"
-                              : archive.deviceModel === device.model
-                                ? " · same model"
-                                : " · incompatible model"}
-                          </small>
-                          <button
-                            className="small-button"
-                            disabled={
-                              restoreBusyKey === deviceKey ||
-                              !device.model ||
-                              archive.deviceModel !== device.model
-                            }
-                            onClick={() =>
-                              void restoreFromArchive(archive, deviceKey, device.id)
-                            }
-                          >
-                            Restore this archive
-                          </button>
-                        </div>
-                      ))}
-                    <label htmlFor={`phone-restore-password-${deviceKey}`}>
-                      Password for restore
-                    </label>
-                    <input
-                      id={`phone-restore-password-${deviceKey}`}
-                      type="password"
-                      autoComplete="current-password"
-                      value={restorePasswords[deviceKey] || ""}
-                      onChange={(event) =>
-                        setRestorePasswords((current) => ({
-                          ...current,
-                          [deviceKey]: event.target.value,
-                        }))
-                      }
-                      placeholder="Enter the archive password"
-                    />
-                    {restoreFormNotice && (
-                      <small role="status">{restoreFormNotice}</small>
-                    )}
-                  </div>
-                )}
-              </article>
+                device={device}
+                active={activeDeviceKey === deviceKey}
+                busyDeviceId={busyDeviceId}
+                backup={backups[deviceKey]}
+                restoreArchives={restoreArchives}
+                tooling={tooling}
+                formatFileSize={formatFileSize}
+                onBrowse={onBrowse}
+                onConnect={onConnect}
+                onDisconnect={onDisconnect}
+                onRename={onRename}
+                onCreateRestoreArchive={onCreateRestoreArchive}
+                onRestoreFromArchive={onRestoreFromArchive}
+              />
             );
           })}
         </div>

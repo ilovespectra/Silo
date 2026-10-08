@@ -41,6 +41,7 @@ class GeoIndexer {
         this.activeSources = new Set();
         this.runPromise = null;
         this.rerunRequested = false;
+        this.pauseRequested = false;
         this.latestImages = [];
         this.photosVersion = 0;
         this.cacheAppends = 0;
@@ -204,12 +205,14 @@ class GeoIndexer {
         this.emit();
     }
     start(images, sourcePaths) {
+        this.pauseRequested = false;
         const nextSources = sourcePaths.filter((sourcePath) => !sourcePath.startsWith("/__"));
         const connectedSources = new Set(nextSources.map((sourcePath) => path.resolve(sourcePath)));
         if (nextSources.some((sourcePath) => !this.activeSources.has(sourcePath)) ||
             nextSources.length !== this.activeSources.size)
             this.photosVersion += 1;
         this.activeSources = new Set(nextSources);
+        this.pauseRequested = false;
         this.latestImages = images
             .filter((image) => !image.path.startsWith("/__") && Array.from(connectedSources).some((root) => {
             const relative = path.relative(root, path.resolve(image.path));
@@ -229,9 +232,20 @@ class GeoIndexer {
         });
         return this.runPromise;
     }
+    async pause() {
+        this.pauseRequested = true;
+        const activeRun = this.runPromise;
+        if (activeRun) {
+            await activeRun;
+            return;
+        }
+        this.update({ status: "paused", message: "Location indexing paused." });
+    }
     async run() {
         try {
             do {
+                if (this.pauseRequested)
+                    break;
                 this.rerunRequested = false;
                 const pending = this.latestImages.filter((image) => this.checkedSignatures.get(image.path) !== this.signature(image));
                 if (pending.length === 0) {
@@ -250,6 +264,8 @@ class GeoIndexer {
                     message: `Reading embedded GPS data from ${pending.length.toLocaleString()} CLIP-indexed photos...`,
                 });
                 for (let index = 0; index < pending.length; index += 1) {
+                    if (this.pauseRequested)
+                        break;
                     const image = pending[index];
                     const photo = await this.readPhoto(image, this.findSource(image.path));
                     const entry = {
@@ -275,7 +291,11 @@ class GeoIndexer {
                         await new Promise((resolve) => setTimeout(resolve, 15));
                     }
                 }
-            } while (this.rerunRequested);
+            } while (this.rerunRequested && !this.pauseRequested);
+            if (this.pauseRequested) {
+                this.update({ status: "paused", message: "Location indexing paused." });
+                return;
+            }
             this.update({
                 status: "complete",
                 message: `${this.photos.size.toLocaleString()} geotagged photos ready.`,

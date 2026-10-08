@@ -52,10 +52,13 @@ export declare class AestheticScorer {
     private backgroundQueue;
     private libraryTotal;
     private running;
+    private backgroundPaused;
     private generation;
     private requestTotal;
     private requestPaths;
     constructor(deps: AestheticDeps);
+    /** Pause library-wide work while keeping user-requested ranking work available. */
+    setBackgroundPaused(paused: boolean): void;
     /** Analyzes the whole library at low priority; whatever the user is viewing always goes first. */
     analyzeInBackground(items: MagicItem[]): Promise<void>;
     /** Ranks what is already analyzed and queues the rest; call again (e.g. on progress) for a fresher order. */

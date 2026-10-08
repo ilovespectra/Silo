@@ -11,7 +11,7 @@ export interface GeoPhoto extends IndexableFile {
     locationSource: "embedded" | "manual";
 }
 export interface GeoIndexState {
-    status: "idle" | "scanning" | "complete" | "error";
+    status: "idle" | "scanning" | "paused" | "complete" | "error";
     scanned: number;
     total: number;
     geotagged: number;
@@ -31,6 +31,7 @@ export declare class GeoIndexer {
     private activeSources;
     private runPromise;
     private rerunRequested;
+    private pauseRequested;
     private latestImages;
     private photosVersion;
     private cacheAppends;
@@ -45,6 +46,7 @@ export declare class GeoIndexer {
     getState(): GeoIndexState;
     setOverrides(overrides: Record<string, GeoOverride>): void;
     start(images: IndexableFile[], sourcePaths: string[]): Promise<void>;
+    pause(): Promise<void>;
     private run;
     private readPhoto;
     private findSource;

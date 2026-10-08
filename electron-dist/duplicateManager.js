@@ -72,6 +72,7 @@ class DuplicateManager {
         this.trash = [];
         this.permanentlyClearedBytes = 0;
         this.scanPromise = null;
+        this.pauseRequested = false;
         this.prunePromise = null;
         this.writeChain = Promise.resolve();
         this.state = {
@@ -179,10 +180,20 @@ class DuplicateManager {
     scan(files, sourceRoots = []) {
         if (this.scanPromise)
             return this.scanPromise;
+        this.pauseRequested = false;
         this.scanPromise = this.runScan(files, sourceRoots).finally(() => {
             this.scanPromise = null;
         });
         return this.scanPromise;
+    }
+    async pause() {
+        this.pauseRequested = true;
+        const activeScan = this.scanPromise;
+        if (activeScan) {
+            await activeScan;
+            return;
+        }
+        this.recalculate("paused", "Duplicate scanning paused.");
     }
     async quarantine(groupIds) {
         const selected = new Set(groupIds);
@@ -426,6 +437,8 @@ class DuplicateManager {
         const seenInodes = new Map();
         const realRoots = new Map();
         for (let index = 0; index < candidates.length; index += 1) {
+            if (this.pauseRequested)
+                break;
             const file = candidates[index];
             try {
                 let realRoot = realRoots.get(file.sourceId);
@@ -487,7 +500,9 @@ class DuplicateManager {
         })
             .sort((first, second) => second.reclaimableBytes - first.reclaimableBytes);
         await this.persistIndex();
-        this.recalculate("complete", `${this.groups.length.toLocaleString()} exact duplicate groups found within individual sources. Cross-source copies are excluded.`);
+        this.recalculate(this.pauseRequested ? "paused" : "complete", this.pauseRequested
+            ? "Duplicate scanning paused; verified progress was saved."
+            : `${this.groups.length.toLocaleString()} exact duplicate groups found within individual sources. Cross-source copies are excluded.`);
         return this.getState();
     }
     hashFile(filePath) {

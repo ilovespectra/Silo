@@ -74,12 +74,11 @@ import {
 import {
   GRID_THUMBNAIL_SIZE,
   LRUCache,
-  loadThumbnail,
   refreshThumbnail,
-  subscribeThumbnail,
   thumbnailCache,
   thumbnailCacheKey,
 } from "./utils/thumbnailCache";
+import { useThumbnail } from "./utils/useThumbnail";
 import {
   publishPhotoIndicators,
   refreshPhotoIndicators,
@@ -180,6 +179,7 @@ const defaultContentSettings: PublicContentSettings = {
   safeSearch: true,
   theme: "system",
   autoplayGlobe: false,
+  preloadMapTextures: false,
   showBannedPeople: false,
   parentalPasswordSet: false,
 };
@@ -420,48 +420,33 @@ function FileThumbnail({
   thumbnailSize?: number;
 }) {
   const containerRef = React.useRef<HTMLDivElement>(null);
-  const [thumbnail, setThumbnail] = useState(
-    () =>
-      thumbnailCache.peek(thumbnailCacheKey(file.path, thumbnailSize)) || null,
-  );
+  const [thumbnailVisible, setThumbnailVisible] = useState(false);
   const isPreviewable = file.type === "image" || file.type === "video";
   const indicators = usePhotoIndicator(file.path, isPreviewable);
-
-  useEffect(
-    () => subscribeThumbnail(file.path, setThumbnail, thumbnailSize),
-    [file.path, thumbnailSize],
+  const { thumbnail } = useThumbnail(
+    file.path,
+    thumbnailVisible && isPreviewable,
+    false,
+    thumbnailSize,
   );
 
   useEffect(() => {
-    const cached = thumbnailCache.get(
-      thumbnailCacheKey(file.path, thumbnailSize),
-    );
-    setThumbnail(cached || null);
-    if (cached) onThumbnailLoaded?.(file.path);
-    if (!isPreviewable || cached || !window.electron) return;
-
     const element = containerRef.current;
-    if (!element) return;
-    let cancelled = false;
+    if (!element || !isPreviewable) return;
 
     const observer = new IntersectionObserver(
       (entries) => {
-        if (!entries[0].isIntersecting) return;
-        observer.disconnect();
-        void loadThumbnail(file.path, true, thumbnailSize).then((url) => {
-          if (cancelled || !url) return;
-          setThumbnail(url);
-          onThumbnailLoaded?.(file.path);
-        });
+        setThumbnailVisible(Boolean(entries[0]?.isIntersecting));
       },
       { rootMargin: "300px" },
     );
     observer.observe(element);
-    return () => {
-      cancelled = true;
-      observer.disconnect();
-    };
-  }, [file.path, isPreviewable, onThumbnailLoaded, thumbnailSize]);
+    return () => observer.disconnect();
+  }, [isPreviewable]);
+
+  useEffect(() => {
+    if (thumbnail) onThumbnailLoaded?.(file.path);
+  }, [file.path, onThumbnailLoaded, thumbnail]);
 
   return (
     <div
@@ -641,6 +626,17 @@ function App() {
     total: 1,
     label: "Starting…",
   });
+  const [indexStorageStatus, setIndexStorageStatus] =
+    useState<IndexStorageStatus>({
+      message: null,
+      usingLocalFallback: false,
+      localFallbackEnabled: true,
+      destinationAvailable: true,
+      selectedDestination: "",
+      localFreeBytes: null,
+      reserveBytes: 10 * 1024 * 1024 * 1024,
+      transfer: null,
+    });
   const [indexProgress, setIndexProgress] =
     useState<IndexProgress>(emptyIndexProgress);
   const [thumbnailPregen, setThumbnailPregen] =
@@ -674,11 +670,17 @@ function App() {
   );
   const [showSettings, setShowSettings] = useState(false);
   const [showBugReport, setShowBugReport] = useState(false);
+  const [showBugThanks, setShowBugThanks] = useState(false);
+  const [showBugReportToast, setShowBugReportToast] = useState(false);
+  const [bugReportToastFading, setBugReportToastFading] = useState(false);
+  const [hideBugThanksNextTime, setHideBugThanksNextTime] = useState(false);
   const [selectingBugReportScreenshot, setSelectingBugReportScreenshot] =
     useState(false);
   const [lifetimePromptRequest, setLifetimePromptRequest] = useState(0);
   const [demoModeActive, setDemoModeActive] = useState<boolean | null>(null);
   const [showGuidedTour, setShowGuidedTour] = useState(false);
+  const [showTourExitConfirm, setShowTourExitConfirm] = useState(false);
+  const [headerToolsCollapsed, setHeaderToolsCollapsed] = useState(false);
   const [showLocalHelp, setShowLocalHelp] = useState(false);
   const [tourContextStep, setTourContextStep] = useState<GuidedTourStep | null>(
     null,
@@ -1225,10 +1227,32 @@ function App() {
   }, [contentSettings.theme]);
 
   useEffect(() => {
-    if (!startupState.ready || !hydrated || startupTourChecked.current) return;
+    if (!contentSettings.preloadMapTextures) return;
+    const images = ["earth-blue-marble.jpg", "earth-night.jpg"].map((name) => {
+      const image = new Image();
+      image.decoding = "async";
+      image.src = `${process.env.PUBLIC_URL}/${name}`;
+      return image;
+    });
+    void Promise.all(images.map((image) => image.decode().catch(() => undefined)));
+  }, [contentSettings.preloadMapTextures]);
+
+  useEffect(() => {
+    if (!hydrated || startupTourChecked.current) return;
     startupTourChecked.current = true;
     if (showTourAtStartup) setShowGuidedTour(true);
-  }, [hydrated, showTourAtStartup, startupState.ready]);
+  }, [hydrated, showTourAtStartup]);
+
+  useEffect(() => {
+    if (!showBugReportToast) return;
+    setBugReportToastFading(false);
+    const fadeTimer = window.setTimeout(() => setBugReportToastFading(true), 3000);
+    const closeTimer = window.setTimeout(() => setShowBugReportToast(false), 4000);
+    return () => {
+      window.clearTimeout(fadeTimer);
+      window.clearTimeout(closeTimer);
+    };
+  }, [showBugReportToast]);
 
   const updateShowTourAtStartup = useCallback((show: boolean) => {
     setShowTourAtStartup(show);
@@ -1254,7 +1278,26 @@ function App() {
   const startGuidedTour = useCallback(() => {
     setTourContextStep(null);
     setShowLocalHelp(false);
+    setShowTourExitConfirm(false);
     setShowGuidedTour(true);
+  }, []);
+
+  const closeGuidedTour = useCallback(() => {
+    setShowGuidedTour(false);
+    if (!startupState.ready) setShowTourExitConfirm(true);
+  }, [startupState.ready]);
+
+  const handleBugReportSubmitted = useCallback(() => {
+    setShowBugReport(false);
+    setSelectingBugReportScreenshot(false);
+    let hideThanks = false;
+    try {
+      hideThanks = localStorage.getItem("silo.hideBugReportThanks") === "true";
+    } catch {
+      hideThanks = false;
+    }
+    if (hideThanks) setShowBugReportToast(true);
+    else setShowBugThanks(true);
   }, []);
 
   useEffect(() => {
@@ -1534,6 +1577,21 @@ function App() {
       .then(applyProgress)
       .catch(() => undefined);
     return electronAPI.onThumbnailPregenProgress(applyProgress);
+  }, [electronAPI]);
+
+  useEffect(() => {
+    if (!electronAPI?.getIndexStorageStatus || !electronAPI.onIndexStorageStatus)
+      return;
+    let disposed = false;
+    const applyStatus = (status: IndexStorageStatus) => {
+      if (!disposed) setIndexStorageStatus(status);
+    };
+    const removeListener = electronAPI.onIndexStorageStatus(applyStatus);
+    void electronAPI.getIndexStorageStatus().then(applyStatus).catch(() => undefined);
+    return () => {
+      disposed = true;
+      removeListener();
+    };
   }, [electronAPI]);
 
   useEffect(() => {
@@ -4406,7 +4464,25 @@ function App() {
           </span>
         </div>
       )}
-      <header className="header">
+      {(indexStorageStatus.message ||
+        indexStorageStatus.transfer?.state === "moving" ||
+        indexStorageStatus.transfer?.state === "complete" ||
+        indexStorageStatus.transfer?.state === "error") && (
+        <div className="index-storage-banner" role="status" aria-live="polite">
+          {indexStorageStatus.message && <strong>{indexStorageStatus.message}</strong>}
+          {indexStorageStatus.usingLocalFallback && (
+            <span>
+              {indexStorageStatus.localFallbackEnabled
+                ? `Local cache fallback is enabled with a ${Math.round(indexStorageStatus.reserveBytes / 1024 / 1024 / 1024)} GB free-space reserve. Silo will verify and move the cache back when the destination reconnects.`
+                : "Local cache fallback is off. Indexing is paused until the selected destination reconnects."}
+            </span>
+          )}
+          {indexStorageStatus.transfer && (
+            <span>{indexStorageStatus.transfer.message}</span>
+          )}
+        </div>
+      )}
+      <header className={`header${headerToolsCollapsed ? " header-tools-collapsed" : ""}`}>
         <div className="header-left" data-help="Use Back, Forward, and Parent to navigate folder history; Refresh reloads the current source view. These controls do not alter the underlying files.">
           <h1>silo</h1>
           <nav className="app-tabs" data-tour="app-tabs">
@@ -4467,6 +4543,16 @@ function App() {
               <FiHelpCircle /> Help
             </button>
           </nav>
+          <button
+            className="header-tools-toggle"
+            type="button"
+            aria-expanded={!headerToolsCollapsed}
+            onClick={() => setHeaderToolsCollapsed((current) => !current)}
+            title={headerToolsCollapsed ? "Show search and toolbar controls" : "Collapse search and toolbar controls"}
+          >
+            <FiChevronDown aria-hidden="true" />
+            {headerToolsCollapsed ? "Show tools" : "Hide tools"}
+          </button>
           {appSection === "files" && (
             <button className="btn btn-primary" onClick={selectDirectory}
               data-help="Choose a folder on this Mac and add it to Files as a source for browsing and indexing.">
@@ -7310,6 +7396,7 @@ function App() {
             setSelectingBugReportScreenshot(selecting);
             if (selecting) setShowSettings(false);
           }}
+          onSubmitted={handleBugReportSubmitted}
         />
       )}
 
@@ -7339,8 +7426,104 @@ function App() {
         contextStep={tourContextStep}
         onShowAtStartupChange={updateShowTourAtStartup}
         onNavigate={navigateGuidedTour}
-        onClose={() => setShowGuidedTour(false)}
+        onClose={closeGuidedTour}
       />
+      {showTourExitConfirm && (
+        <div className="tour-exit-backdrop" role="presentation">
+          <section
+            className="tour-exit-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="tour-exit-title"
+            aria-describedby="tour-exit-description"
+          >
+            <h2 id="tour-exit-title">Skip the tour while Silo starts?</h2>
+            <p id="tour-exit-description">
+              Silo can take a while to start, especially when you have many
+              sources. The tour can keep you busy while your library loads.
+            </p>
+            <div>
+              <button
+                className="settings-save"
+                onClick={() => {
+                  setShowTourExitConfirm(false);
+                  setShowGuidedTour(true);
+                }}
+              >
+                Take the tour
+              </button>
+              <button
+                className="settings-secondary"
+                onClick={() => setShowTourExitConfirm(false)}
+              >
+                No way, I’ll wait
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {showBugThanks && (
+        <div className="bug-report-thanks-backdrop" role="presentation">
+          <section
+            className="bug-report-thanks"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="bug-report-thanks-title"
+          >
+            <button
+              type="button"
+              className="bug-report-thanks-close"
+              aria-label="Close thank-you message"
+              onClick={() => {
+                if (hideBugThanksNextTime)
+                  localStorage.setItem("silo.hideBugReportThanks", "true");
+                setShowBugThanks(false);
+              }}
+            >
+              <FiX />
+            </button>
+            <FiCheck className="bug-report-thanks-check" aria-hidden="true" />
+            <h2 id="bug-report-thanks-title">Thanks for reporting a bug</h2>
+            <p>Keep taking a look around and enjoy Silo.</p>
+            <label>
+              <input
+                type="checkbox"
+                checked={hideBugThanksNextTime}
+                onChange={(event) =>
+                  setHideBugThanksNextTime(event.target.checked)
+                }
+              />
+              Don’t show this thank-you again
+            </label>
+            <button
+              className="settings-save"
+              onClick={() => {
+                if (hideBugThanksNextTime)
+                  localStorage.setItem("silo.hideBugReportThanks", "true");
+                setShowBugThanks(false);
+              }}
+            >
+              Keep exploring
+            </button>
+          </section>
+        </div>
+      )}
+      {showBugReportToast && (
+        <div
+          className={`bug-report-sent-toast${bugReportToastFading ? " fading" : ""}`}
+          role="status"
+          aria-live="polite"
+        >
+          <FiCheck aria-hidden="true" /> Report sent!
+          <button
+            type="button"
+            aria-label="Dismiss report sent message"
+            onClick={() => setShowBugReportToast(false)}
+          >
+            <FiX />
+          </button>
+        </div>
+      )}
       <InteractiveTooltip />
 
       {profilePicturePicker && viewerOpen && (
@@ -7512,7 +7695,7 @@ function App() {
             }}
           >
             {!filePreview ? (
-              <div className="viewer-status">Loading preview...</div>
+              <div className="viewer-status preview-loading">Loading preview...</div>
             ) : filePreview.documentPreview ? (
               <DocumentViewer
                 key={filePreview.path}

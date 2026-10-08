@@ -289,7 +289,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "settings-cache-destination",
     title: "Choose Silo’s cache destination",
-    body: "This shows where Silo stores indexes, face and place data, thumbnails, previews, and other generated cache files. Choose cache destination opens a folder picker; Silo restarts, verifies the cache copy, then removes the old cache. It does not move your original source files or Mac settings. Keep the destination drive connected.",
+    body: "This shows where Silo stores indexes, face and place data, thumbnails, previews, and other generated cache files. You can allow a local fallback that keeps at least 10 GB free, or turn it off so indexing pauses until the destination reconnects. Silo verifies and moves a fallback cache back automatically, showing status while it works. Changing the destination verifies the copied cache before removing the old copy. Original source files and Mac settings stay in place.",
     target: '[data-tour="settings-cache-destination"]',
     section: "settings",
   },

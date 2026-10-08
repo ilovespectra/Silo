@@ -33,6 +33,7 @@ const defaults = {
         safeSearch: true,
         theme: "system",
         autoplayGlobe: false,
+        preloadMapTextures: false,
         showBannedPeople: false,
     },
     passwordSalt: null,

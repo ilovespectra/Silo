@@ -44,13 +44,17 @@ export const thumbnailCacheKey = (filePath: string, size = GRID_THUMBNAIL_SIZE) 
 
 const inFlight = new Map<string, Promise<string | null>>();
 const failedAt = new Map<string, number>();
+const failedAttempts = new Map<string, number>();
 const FAILURE_RETRY_MS = 60 * 1000;
+const THUMBNAIL_RETRY_BASE_MS = 1000;
+const THUMBNAIL_RETRY_MAX_MS = 30 * 1000;
 const listeners = new Map<string, Set<(url: string) => void>>();
 
 function publish(filePath: string, url: string, size: number) {
   const key = thumbnailCacheKey(filePath, size);
   thumbnailCache.set(key, url);
   failedAt.delete(key);
+  failedAttempts.delete(key);
   listeners.get(key)?.forEach((listener) => listener(url));
 }
 
@@ -75,6 +79,18 @@ export function hasThumbnailFailed(filePath: string, size = GRID_THUMBNAIL_SIZE)
   return at !== undefined && Date.now() - at < FAILURE_RETRY_MS;
 }
 
+/** A visible grid tile retries indefinitely with capped backoff; hidden tiles stop retrying. */
+export function getThumbnailRetryDelay(
+  filePath: string,
+  size = GRID_THUMBNAIL_SIZE,
+) {
+  const attempts = failedAttempts.get(thumbnailCacheKey(filePath, size)) ?? 0;
+  return Math.min(
+    THUMBNAIL_RETRY_MAX_MS,
+    THUMBNAIL_RETRY_BASE_MS * 2 ** Math.min(attempts, 5),
+  );
+}
+
 /** Regenerates a thumbnail, bypassing failure memory on both sides (used when a file is opened). */
 export async function refreshThumbnail(filePath: string) {
   failedAt.delete(thumbnailCacheKey(filePath, 480));
@@ -92,10 +108,12 @@ export function loadThumbnail(
   filePath: string,
   urgent = false,
   size = GRID_THUMBNAIL_SIZE,
+  retryFailed = false,
 ): Promise<string | null> {
   const key = thumbnailCacheKey(filePath, size);
   const cached = thumbnailCache.get(key);
   if (cached) return Promise.resolve(cached);
+  if (retryFailed) failedAt.delete(key);
   if (hasThumbnailFailed(filePath, size) || !window.electron)
     return Promise.resolve(null);
   const pending = inFlight.get(key);
@@ -109,8 +127,8 @@ export function loadThumbnail(
       try {
         const url = await window.electron?.getThumbnail(
           filePath,
-          urgent,
-          false,
+          urgent || retryFailed,
+          retryFailed,
           size,
         );
         if (url) {
@@ -125,6 +143,7 @@ export function loadThumbnail(
           window.setTimeout(resolve, delays[attempt]),
         );
     }
+    failedAttempts.set(key, (failedAttempts.get(key) ?? 0) + 1);
     failedAt.set(key, Date.now());
     return null;
   })().finally(() => inFlight.delete(key));

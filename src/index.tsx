@@ -3,10 +3,6 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./index.css";
 
-// TEMP-DEBUG
-const originalConsoleError = console.error;
-console.error = (...args: unknown[]) => originalConsoleError(args.map(String).join(" | ").slice(0, 4000));
-
 interface AppBoundaryState {
   error: Error | null;
 }

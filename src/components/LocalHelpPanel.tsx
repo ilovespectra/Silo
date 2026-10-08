@@ -280,7 +280,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Silo cache destination",
     keywords: "settings cache index storage external drive thumbnails previews faces places move destination restart verify old cache",
     answer:
-      "Settings → Silo Cache Destination shows where Silo stores indexes, face/place data, thumbnails, previews, and other generated cache files. Choose cache destination opens a folder picker; Silo restarts, verifies the copied cache, and then removes the old cache. It does not move original source files or settings. Keep the destination drive connected. The help guide never changes the destination.",
+      "Settings → Silo Cache Destination shows where Silo stores indexes, face/place data, thumbnails, previews, and other generated cache files. Choose cache destination opens a folder picker; Silo verifies the copied cache before removing the old copy. You can allow a local fallback that preserves at least 10 GB of free space, or turn it off so indexing pauses until the destination reconnects. Silo automatically verifies and moves a fallback cache back, with status notices. It does not move original source files or settings. The help guide never changes the destination.",
     section: "settings",
     target: '[data-tour="settings-cache-destination"]',
   },
@@ -289,7 +289,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Appearance and behavior settings",
     keywords: "settings theme light dark system appearance globe rotate",
     answer:
-      "Settings → Appearance & behavior controls System, Dark, or Light theme and automatic globe rotation when Map opens.",
+      "Settings → Appearance & behavior controls System, Dark, or Light theme, automatic globe rotation, and optional background preloading of Map’s local day and night textures after Silo opens.",
     section: "settings",
     target: '[data-tour="settings-appearance"]',
   },

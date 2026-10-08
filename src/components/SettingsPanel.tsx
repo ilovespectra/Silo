@@ -47,9 +47,11 @@ function ScreenshotBeetle() {
 
 export function BugReportDialog({
   onClose,
+  onSubmitted,
   onScreenshotSelectionChange,
 }: {
   onClose: () => void;
+  onSubmitted: () => void;
   onScreenshotSelectionChange: (selecting: boolean) => void;
 }) {
   const electronAPI = window.electron;
@@ -276,7 +278,7 @@ export function BugReportDialog({
         return;
       }
       setSent(true);
-      setNotice("Your bug report was emailed to tani@kolektivkrog.si.");
+      onSubmitted();
     } catch (cause) {
       setNotice(
         cause instanceof Error
@@ -499,6 +501,7 @@ export default function SettingsPanel({
   );
   const [memoryDirectory, setMemoryDirectory] = useState<string | null>(null);
   const [cacheDestination, setCacheDestination] = useState("");
+  const [localFallbackEnabled, setLocalFallbackEnabled] = useState(true);
   const [showLifetimeUnlock, setShowLifetimeUnlock] = useState(false);
   const [lifetimeLicense, setLifetimeLicense] =
     useState<LifetimeLicenseState>({ isLicensed: false });
@@ -521,6 +524,18 @@ export default function SettingsPanel({
     void electronAPI?.getMemories?.(false)
       .then((state) => {
         if (!disposed) setMemoryDirectory(state.settings.movieDirectory ?? null);
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+    };
+  }, [electronAPI]);
+
+  useEffect(() => {
+    let disposed = false;
+    void electronAPI?.getLocalIndexFallbackEnabled()
+      .then((enabled) => {
+        if (!disposed) setLocalFallbackEnabled(enabled);
       })
       .catch(() => undefined);
     return () => {
@@ -656,6 +671,34 @@ export default function SettingsPanel({
         cause instanceof Error
           ? cause.message
           : "Silo cache destination could not be changed.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeLocalFallback = async () => {
+    if (!electronAPI?.setLocalIndexFallbackEnabled) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await electronAPI.setLocalIndexFallbackEnabled(
+        !localFallbackEnabled,
+      );
+      setLocalFallbackEnabled(result.enabled);
+      setNotice(
+        result.restarting
+          ? "Silo is restarting to apply the local cache choice."
+          : result.enabled
+            ? "Local cache fallback is enabled."
+            : "Indexing will pause when the selected destination is unavailable.",
+      );
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "The local cache preference could not be saved.",
       );
     } finally {
       setBusy(false);
@@ -1121,6 +1164,23 @@ export default function SettingsPanel({
               }
             />
           </label>
+          <label className="settings-toggle">
+            <div>
+              <strong>Preload Map textures</strong>
+              <span>
+                Load the day and night globe images after Silo opens for a faster
+                first visit to Map.
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              checked={settings.preloadMapTextures}
+              data-help="Load the local day and night globe images in the background after Silo opens so Map can appear sooner on its first visit."
+              onChange={(event) =>
+                void update({ preloadMapTextures: event.target.checked })
+              }
+            />
+          </label>
         </section>
 
         <section data-tour="settings-memories" data-help="Choose where generated Memory movies and spare story files are saved; this does not move source media.">
@@ -1188,6 +1248,22 @@ export default function SettingsPanel({
               <FiFolder /> Choose cache destination…
             </button>
           </div>
+          <label className="settings-cache-fallback-option">
+            <input
+              type="checkbox"
+              checked={localFallbackEnabled}
+              disabled={busy || !electronAPI}
+              onChange={() => void changeLocalFallback()}
+            />
+            <span>
+              <strong>Use a local cache if this destination disconnects</strong>
+              <small>
+                Silo keeps at least 10 GB free. When the destination reconnects,
+                it verifies and moves the local cache back automatically.
+                Clear this option to pause indexing instead.
+              </small>
+            </span>
+          </label>
         </section>
 
         <section data-tour="settings-backup" data-help="Export or review a Silo configuration restore. Restore replaces app setup and restarts Silo, but does not modify source media; protect exported credentials.">

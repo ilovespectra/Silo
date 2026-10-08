@@ -22,7 +22,7 @@ export interface GeoPhoto extends IndexableFile {
 }
 
 export interface GeoIndexState {
-  status: "idle" | "scanning" | "complete" | "error";
+  status: "idle" | "scanning" | "paused" | "complete" | "error";
   scanned: number;
   total: number;
   geotagged: number;
@@ -51,6 +51,7 @@ export class GeoIndexer {
   private activeSources = new Set<string>();
   private runPromise: Promise<void> | null = null;
   private rerunRequested = false;
+  private pauseRequested = false;
   private latestImages: IndexableFile[] = [];
   private photosVersion = 0;
   private cacheAppends = 0;
@@ -234,6 +235,7 @@ export class GeoIndexer {
   }
 
   start(images: IndexableFile[], sourcePaths: string[]) {
+    this.pauseRequested = false;
     const nextSources = sourcePaths.filter(
       (sourcePath) => !sourcePath.startsWith("/__"),
     );
@@ -244,6 +246,7 @@ export class GeoIndexer {
     )
       this.photosVersion += 1;
     this.activeSources = new Set(nextSources);
+    this.pauseRequested = false;
     this.latestImages = images
       .filter((image) => !image.path.startsWith("/__") && Array.from(connectedSources).some((root) => {
         const relative = path.relative(root, path.resolve(image.path));
@@ -265,9 +268,20 @@ export class GeoIndexer {
     return this.runPromise;
   }
 
+  async pause() {
+    this.pauseRequested = true;
+    const activeRun = this.runPromise;
+    if (activeRun) {
+      await activeRun;
+      return;
+    }
+    this.update({ status: "paused", message: "Location indexing paused." });
+  }
+
   private async run() {
     try {
       do {
+        if (this.pauseRequested) break;
         this.rerunRequested = false;
         const pending = this.latestImages.filter(
           (image) =>
@@ -290,6 +304,7 @@ export class GeoIndexer {
         });
 
         for (let index = 0; index < pending.length; index += 1) {
+          if (this.pauseRequested) break;
           const image = pending[index];
           const photo = await this.readPhoto(
             image,
@@ -318,8 +333,12 @@ export class GeoIndexer {
             await new Promise((resolve) => setTimeout(resolve, 15));
           }
         }
-      } while (this.rerunRequested);
+      } while (this.rerunRequested && !this.pauseRequested);
 
+      if (this.pauseRequested) {
+        this.update({ status: "paused", message: "Location indexing paused." });
+        return;
+      }
       this.update({
         status: "complete",
         message: `${this.photos.size.toLocaleString()} geotagged photos ready.`,
