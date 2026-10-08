@@ -13,7 +13,10 @@ require.extensions[".ts"] = (module, filename) => {
 const { PhoneManager } = require("../src/phoneManager.ts");
 
 async function run() {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "silo-offline-phone-"));
+  const workspaceRoot = path.resolve(__dirname, "../../..");
+  const tempBase = process.env.SILO_TEST_TMPDIR || path.join(workspaceRoot, "tmp");
+  await fs.mkdir(tempBase, { recursive: true });
+  const root = await fs.mkdtemp(path.join(tempBase, "silo-offline-phone-"));
   try {
     const backupRoot = path.join(root, "backup-drive");
     const cacheRoot = path.join(backupRoot, "ios", "device-1");

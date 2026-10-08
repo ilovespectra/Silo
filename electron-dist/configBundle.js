@@ -25,6 +25,8 @@ var __importStar = (this && this.__importStar) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.applyPendingImport = exports.cancelStagedImport = exports.commitStagedImport = exports.stageConfigImport = exports.exportConfig = exports.CONFIG_MANIFEST = void 0;
 const child_process_1 = require("child_process");
+const crypto_1 = require("crypto");
+const fs_1 = require("fs");
 const fsPromises = __importStar(require("fs/promises"));
 const path = __importStar(require("path"));
 const util_1 = require("util");
@@ -92,7 +94,11 @@ const INDEX_CONFIG_ROOTS = new Set([
 const ALLOWED_ROOTS = new Set(CONFIG_ENTRIES.map((entry) => entry.split("/")[0]).concat(exports.CONFIG_MANIFEST));
 // These folders hold other data (e.g. phone backups); only the listed files inside them are replaced.
 const MERGE_ROOTS = new Set(["phone-cache"]);
-const exists = (target) => fsPromises.lstat(target).then(() => true, () => false);
+const exists = (target) => fsPromises.lstat(target).then(() => true, (error) => {
+    if (error.code === "ENOENT")
+        return false;
+    throw error;
+});
 async function exportConfig(userData, target, appVersion, rendererPrefs, indexStoragePath = userData) {
     const entries = [];
     for (const entry of CONFIG_ENTRIES) {
@@ -188,36 +194,116 @@ async function cancelStagedImport(userData) {
     await fsPromises.rm(path.join(userData, READY_MARKER), { force: true });
 }
 exports.cancelStagedImport = cancelStagedImport;
-async function moveInto(source, target) {
-    await fsPromises.rm(target, { recursive: true, force: true });
-    await fsPromises.mkdir(path.dirname(target), { recursive: true });
-    await fsPromises.rename(source, target);
+async function hashFile(filePath) {
+    const hash = (0, crypto_1.createHash)("sha256");
+    await new Promise((resolve, reject) => {
+        const input = (0, fs_1.createReadStream)(filePath);
+        input.on("data", (chunk) => hash.update(chunk));
+        input.on("error", reject);
+        input.on("end", resolve);
+    });
+    return hash.digest("hex");
 }
-/** Runs at startup before any store opens its files: swaps the staged config into place. */
+async function treeManifest(root, relative = "") {
+    const current = path.join(root, relative);
+    const stats = await fsPromises.lstat(current);
+    if (stats.isSymbolicLink())
+        throw new Error(`Config restore refuses symbolic links: ${current}`);
+    if (stats.isFile())
+        return [`file:${relative}:${stats.size}:${await hashFile(current)}`];
+    if (!stats.isDirectory())
+        throw new Error(`Config restore found an unsupported item: ${current}`);
+    const children = (await fsPromises.readdir(current)).sort();
+    const manifest = [`directory:${relative}`];
+    for (const child of children)
+        manifest.push(...await treeManifest(root, path.join(relative, child)));
+    return manifest;
+}
+async function copyTreeVerified(source, destination) {
+    const sourceManifest = await treeManifest(source);
+    await fsPromises.cp(source, destination, {
+        recursive: true,
+        errorOnExist: true,
+        force: false,
+        preserveTimestamps: true,
+    });
+    const destinationManifest = await treeManifest(destination);
+    if (JSON.stringify(sourceManifest) !== JSON.stringify(destinationManifest))
+        throw new Error(`Config restore checksum verification failed for ${source}.`);
+}
+async function replaceFromVerifiedCopy(source, target) {
+    await fsPromises.mkdir(path.dirname(target), { recursive: true });
+    const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const staged = path.join(path.dirname(target), `.silo-restore-stage-${token}`);
+    const backup = path.join(path.dirname(target), `.silo-restore-backup-${token}`);
+    try {
+        // Copy to a sibling of the target so the final rename stays on the destination volume.
+        await copyTreeVerified(source, staged);
+        const hadTarget = await exists(target);
+        if (hadTarget)
+            await fsPromises.rename(target, backup);
+        try {
+            await fsPromises.rename(staged, target);
+        }
+        catch (error) {
+            if (hadTarget)
+                await fsPromises.rename(backup, target);
+            throw error;
+        }
+        return { target, backup: hadTarget ? backup : null };
+    }
+    catch (error) {
+        await fsPromises.rm(staged, { recursive: true, force: true }).catch(() => { });
+        throw error;
+    }
+}
+async function rollbackRestore(replacements) {
+    const failures = [];
+    for (const replacement of replacements.reverse()) {
+        try {
+            await fsPromises.rm(replacement.target, { recursive: true, force: true });
+            if (replacement.backup)
+                await fsPromises.rename(replacement.backup, replacement.target);
+        }
+        catch (error) {
+            failures.push(`${replacement.target}: ${String(error)}`);
+        }
+    }
+    return failures;
+}
 async function applyPendingImport(userData, indexStoragePath = userData) {
     const staging = path.join(userData, STAGING);
     if (!(await exists(path.join(userData, READY_MARKER))))
         return false;
+    const replacements = [];
     try {
-        for (const name of await fsPromises.readdir(staging)) {
+        for (const name of (await fsPromises.readdir(staging)).sort()) {
             if (name === exports.CONFIG_MANIFEST)
                 continue;
             const source = path.join(staging, name);
             if (MERGE_ROOTS.has(name)) {
-                for (const child of await fsPromises.readdir(source))
-                    await moveInto(path.join(source, child), path.join(userData, name, child));
+                for (const child of (await fsPromises.readdir(source)).sort())
+                    replacements.push(await replaceFromVerifiedCopy(path.join(source, child), path.join(userData, name, child)));
             }
             else {
                 const targetRoot = INDEX_CONFIG_ROOTS.has(name)
                     ? indexStoragePath
                     : userData;
-                await moveInto(source, path.join(targetRoot, name));
+                replacements.push(await replaceFromVerifiedCopy(source, path.join(targetRoot, name)));
             }
         }
     }
-    finally {
-        await cancelStagedImport(userData);
+    catch (error) {
+        const rollbackFailures = await rollbackRestore(replacements);
+        if (rollbackFailures.length)
+            throw new Error(`Config restore failed and rollback could not finish. The import and rollback copies were retained: ${rollbackFailures.join("; ")}. Original error: ${String(error)}`);
+        throw error;
     }
+    // Keep the import available until every destination has been replaced successfully.
+    for (const replacement of replacements)
+        if (replacement.backup)
+            await fsPromises.rm(replacement.backup, { recursive: true, force: true }).catch(() => { });
+    await cancelStagedImport(userData).catch(() => { });
     return true;
 }
 exports.applyPendingImport = applyPendingImport;

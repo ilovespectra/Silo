@@ -80,14 +80,12 @@ exports.canonicalPathFromSource = canonicalPathFromSource;
  * /__phone_backup__ roots.
  */
 function isAppDataPath(candidatePath, sourcePath, canonicalSourcePath, appDataPath, canonicalAppDataPath) {
-    const indexStorageRoot = (0, indexingStorage_1.getActiveIndexStorageRoot)();
+    const indexStorageRoots = (0, indexingStorage_1.getIndexStorageExclusionRoots)();
     const canonicalCandidate = canonicalPathFromSource(sourcePath, canonicalSourcePath, candidatePath);
     return (isPathWithin(candidatePath, appDataPath) ||
-        (indexStorageRoot.length > 0 &&
-            isPathWithin(candidatePath, indexStorageRoot)) ||
+        indexStorageRoots.some((root) => isPathWithin(candidatePath, root)) ||
         isPathWithin(canonicalCandidate, canonicalAppDataPath) ||
-        (indexStorageRoot.length > 0 &&
-            isPathWithin(canonicalCandidate, indexStorageRoot)));
+        indexStorageRoots.some((root) => isPathWithin(canonicalCandidate, root)));
 }
 exports.isAppDataPath = isAppDataPath;
 async function isSiloCloneDirectory(directoryPath) {

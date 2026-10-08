@@ -1521,7 +1521,10 @@ class PhoneManager {
             if (found)
                 break;
         }
-        index.hasFile.set(directory, found);
+        // A missing mounted backup volume can become available again without changing the manifest.
+        // Cache positive results, but recheck negative ones so reconnects show restored folders.
+        if (found)
+            index.hasFile.set(directory, true);
         return found;
     }
     invalidateListingIndexes() {

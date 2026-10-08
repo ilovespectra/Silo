@@ -1,5 +1,9 @@
 export declare function setActiveIndexStorageRoot(storageRoot: string): void;
+export declare function setIndexStorageExclusionRoots(storageRoots: readonly string[]): void;
+export declare function getIndexStorageExclusionRoots(): string[];
+export declare function getLocalFallbackIndexStorageRoot(userDataPath: string): string;
 export declare function getActiveIndexStorageRoot(): string;
+export declare function createIndexStoragePathResolver(getStorageRoot: () => string): (...segments: string[]) => string;
 export declare function readIndexStorageRoot(userDataPath: string): Promise<string>;
 export declare function writeIndexStorageRoot(userDataPath: string, storageRoot: string): Promise<void>;
 export declare function stageIndexStorageRoot(userDataPath: string, storageRoot: string): Promise<boolean>;
@@ -9,9 +13,14 @@ export interface IndexStorageMigrationResult {
     bytesVerified: number;
 }
 type ProgressListener = (filesVerified: number, bytesVerified: number) => void;
+export declare class ExternalIndexStorageUnavailableError extends Error {
+    readonly storageRoot: string;
+    constructor(storageRoot: string);
+}
 export declare function validateIndexStorageDestination(userDataPath: string, storageRoot: string): Promise<{
     requiredBytes: number;
 }>;
+export declare function migrateIndexStorageRoots(sourceRoots: readonly string[], storageRoot: string, entries?: readonly string[], onProgress?: ProgressListener, beforeSourceRemoval?: () => Promise<void>): Promise<IndexStorageMigrationResult>;
 export declare function migrateIndexStorageEntries(userDataPath: string, storageRoot: string, entries?: readonly string[], onProgress?: ProgressListener): Promise<IndexStorageMigrationResult>;
 export declare function prepareExternalIndexStorage(userDataPath: string, storageRoot: string, onProgress?: ProgressListener): Promise<IndexStorageMigrationResult>;
 export declare function prepareConfiguredIndexStorage(userDataPath: string, onProgress?: ProgressListener): Promise<{

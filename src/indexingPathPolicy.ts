@@ -1,6 +1,6 @@
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import { getActiveIndexStorageRoot } from "./indexingStorage";
+import { getIndexStorageExclusionRoots } from "./indexingStorage";
 
 const CLONE_MARKERS = [
   ".silo-clone-in-progress.json",
@@ -71,7 +71,7 @@ export function isAppDataPath(
   appDataPath: string,
   canonicalAppDataPath: string,
 ): boolean {
-  const indexStorageRoot = getActiveIndexStorageRoot();
+  const indexStorageRoots = getIndexStorageExclusionRoots();
   const canonicalCandidate = canonicalPathFromSource(
     sourcePath,
     canonicalSourcePath,
@@ -79,11 +79,9 @@ export function isAppDataPath(
   );
   return (
     isPathWithin(candidatePath, appDataPath) ||
-    (indexStorageRoot.length > 0 &&
-      isPathWithin(candidatePath, indexStorageRoot)) ||
+    indexStorageRoots.some((root) => isPathWithin(candidatePath, root)) ||
     isPathWithin(canonicalCandidate, canonicalAppDataPath) ||
-    (indexStorageRoot.length > 0 &&
-      isPathWithin(canonicalCandidate, indexStorageRoot))
+    indexStorageRoots.some((root) => isPathWithin(canonicalCandidate, root))
   );
 }
 

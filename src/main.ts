@@ -118,10 +118,14 @@ import {
 import { Geocoder, GeocodedLocation } from "./geocoder";
 import { DuplicateManager } from "./duplicateManager";
 import {
+  createIndexStoragePathResolver,
+  ExternalIndexStorageUnavailableError,
+  getLocalFallbackIndexStorageRoot,
   prepareConfiguredIndexStorage,
   stageIndexStorageRoot,
   validateIndexStorageDestination,
   setActiveIndexStorageRoot,
+  setIndexStorageExclusionRoots,
 } from "./indexingStorage";
 import {
   CLONE_ARCHIVE_EXTENSION,
@@ -191,8 +195,7 @@ app.setPath(
 );
 let indexStorageRoot = app.getPath("userData");
 setActiveIndexStorageRoot(indexStorageRoot);
-const indexStoragePath = (...segments: string[]) =>
-  path.join(indexStorageRoot, ...segments);
+const indexStoragePath = createIndexStoragePathResolver(() => indexStorageRoot);
 const diagnosticsDirectory = path.join(app.getPath("userData"), "diagnostics");
 const lifetimeLicensePath = path.join(
   app.getPath("userData"),
@@ -4559,9 +4562,20 @@ app.whenReady().then(async () => {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    indexStorageRoot = path.resolve(userDataPath);
+    if (!(error instanceof ExternalIndexStorageUnavailableError)) {
+      runtimeLog("index-storage-initialization-failed", { message });
+      dialog.showErrorBox(
+        "Silo could not safely prepare its index",
+        `${message}\n\nSilo stopped before opening the library. Existing index files were preserved. Resolve the storage issue and reopen Silo.`,
+      );
+      app.quit();
+      return;
+    }
+    indexStorageRoot = getLocalFallbackIndexStorageRoot(userDataPath);
+    await fsPromises.mkdir(indexStorageRoot, { recursive: true });
     setActiveIndexStorageRoot(indexStorageRoot);
-    startupStorageNotice = `${message} Silo opened with local index storage for this session. The configured external location and its data were left untouched.`;
+    setIndexStorageExclusionRoots([error.storageRoot, indexStorageRoot]);
+    startupStorageNotice = `${message} Silo opened with separate local fallback index storage for this session. The configured external location and its data were left untouched.`;
     runtimeLog("external-index-storage-unavailable", {
       message,
       fallback: indexStorageRoot,

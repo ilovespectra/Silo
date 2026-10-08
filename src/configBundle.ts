@@ -1,4 +1,6 @@
 import { execFile } from "child_process";
+import { createHash } from "crypto";
+import { createReadStream } from "fs";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -85,7 +87,10 @@ export interface ConfigManifest {
 const exists = (target: string) =>
   fsPromises.lstat(target).then(
     () => true,
-    () => false,
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    },
   );
 
 export async function exportConfig(
@@ -213,38 +218,131 @@ export async function cancelStagedImport(userData: string) {
   await fsPromises.rm(path.join(userData, READY_MARKER), { force: true });
 }
 
-async function moveInto(source: string, target: string) {
-  await fsPromises.rm(target, { recursive: true, force: true });
-  await fsPromises.mkdir(path.dirname(target), { recursive: true });
-  await fsPromises.rename(source, target);
+async function hashFile(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolve, reject) => {
+    const input = createReadStream(filePath);
+    input.on("data", (chunk) => hash.update(chunk));
+    input.on("error", reject);
+    input.on("end", resolve);
+  });
+  return hash.digest("hex");
 }
 
-/** Runs at startup before any store opens its files: swaps the staged config into place. */
+async function treeManifest(root: string, relative = ""): Promise<string[]> {
+  const current = path.join(root, relative);
+  const stats = await fsPromises.lstat(current);
+  if (stats.isSymbolicLink())
+    throw new Error(`Config restore refuses symbolic links: ${current}`);
+  if (stats.isFile())
+    return [`file:${relative}:${stats.size}:${await hashFile(current)}`];
+  if (!stats.isDirectory())
+    throw new Error(`Config restore found an unsupported item: ${current}`);
+  const children = (await fsPromises.readdir(current)).sort();
+  const manifest = [`directory:${relative}`];
+  for (const child of children)
+    manifest.push(...await treeManifest(root, path.join(relative, child)));
+  return manifest;
+}
+
+async function copyTreeVerified(source: string, destination: string) {
+  const sourceManifest = await treeManifest(source);
+  await fsPromises.cp(source, destination, {
+    recursive: true,
+    errorOnExist: true,
+    force: false,
+    preserveTimestamps: true,
+  });
+  const destinationManifest = await treeManifest(destination);
+  if (JSON.stringify(sourceManifest) !== JSON.stringify(destinationManifest))
+    throw new Error(`Config restore checksum verification failed for ${source}.`);
+}
+
+interface RestoreReplacement {
+  target: string;
+  backup: string | null;
+}
+
+async function replaceFromVerifiedCopy(
+  source: string,
+  target: string,
+): Promise<RestoreReplacement> {
+  await fsPromises.mkdir(path.dirname(target), { recursive: true });
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const staged = path.join(path.dirname(target), `.silo-restore-stage-${token}`);
+  const backup = path.join(path.dirname(target), `.silo-restore-backup-${token}`);
+  try {
+    // Copy to a sibling of the target so the final rename stays on the destination volume.
+    await copyTreeVerified(source, staged);
+    const hadTarget = await exists(target);
+    if (hadTarget) await fsPromises.rename(target, backup);
+    try {
+      await fsPromises.rename(staged, target);
+    } catch (error) {
+      if (hadTarget) await fsPromises.rename(backup, target);
+      throw error;
+    }
+    return { target, backup: hadTarget ? backup : null };
+  } catch (error) {
+    await fsPromises.rm(staged, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function rollbackRestore(replacements: RestoreReplacement[]) {
+  const failures: string[] = [];
+  for (const replacement of replacements.reverse()) {
+    try {
+      await fsPromises.rm(replacement.target, { recursive: true, force: true });
+      if (replacement.backup)
+        await fsPromises.rename(replacement.backup, replacement.target);
+    } catch (error) {
+      failures.push(`${replacement.target}: ${String(error)}`);
+    }
+  }
+  return failures;
+}
+
 export async function applyPendingImport(
   userData: string,
   indexStoragePath: string = userData,
 ) {
   const staging = path.join(userData, STAGING);
   if (!(await exists(path.join(userData, READY_MARKER)))) return false;
+  const replacements: RestoreReplacement[] = [];
   try {
-    for (const name of await fsPromises.readdir(staging)) {
+    for (const name of (await fsPromises.readdir(staging)).sort()) {
       if (name === CONFIG_MANIFEST) continue;
       const source = path.join(staging, name);
       if (MERGE_ROOTS.has(name)) {
-        for (const child of await fsPromises.readdir(source))
-          await moveInto(
+        for (const child of (await fsPromises.readdir(source)).sort())
+          replacements.push(await replaceFromVerifiedCopy(
             path.join(source, child),
             path.join(userData, name, child),
-          );
+          ));
       } else {
         const targetRoot = INDEX_CONFIG_ROOTS.has(name)
           ? indexStoragePath
           : userData;
-        await moveInto(source, path.join(targetRoot, name));
+        replacements.push(await replaceFromVerifiedCopy(
+          source,
+          path.join(targetRoot, name),
+        ));
       }
     }
-  } finally {
-    await cancelStagedImport(userData);
+  } catch (error) {
+    const rollbackFailures = await rollbackRestore(replacements);
+    if (rollbackFailures.length)
+      throw new Error(
+        `Config restore failed and rollback could not finish. The import and rollback copies were retained: ${rollbackFailures.join("; ")}. Original error: ${String(error)}`,
+      );
+    throw error;
   }
+
+  // Keep the import available until every destination has been replaced successfully.
+  for (const replacement of replacements)
+    if (replacement.backup)
+      await fsPromises.rm(replacement.backup, { recursive: true, force: true }).catch(() => {});
+  await cancelStagedImport(userData).catch(() => {});
   return true;
 }

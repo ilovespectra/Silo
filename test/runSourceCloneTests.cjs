@@ -28,7 +28,9 @@ function visit(node) {
   ts.forEachChild(node, visit);
 }
 visit(ast);
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "silo-source-clone-test-"));
+const workspaceTmp = process.env.SILO_TEST_TMPDIR || path.resolve(__dirname, "../../..", "tmp");
+fs.mkdirSync(workspaceTmp, { recursive: true });
+const root = fs.mkdtempSync(path.join(workspaceTmp, "silo-source-clone-test-"));
 const sourceRoot = path.join(root, "source");
 const userData = path.join(sourceRoot, ".silo-user-data");
 const secondSourceRoot = path.join(root, "camera");
@@ -97,7 +99,6 @@ const context = vm.createContext({
     { id: secondSourceRoot, rootPath: secondSourceRoot, label: "Camera", kind: "local", enabled: true, available: true },
     { id: "/disconnected", rootPath: "/disconnected", label: "Offline", kind: "local", enabled: true, available: false },
   ],
-  indexStorageRoot: userData,
   sourceCloneStatusPath: path.join(userData, "source-clone-status.json"),
   sourceCloneStatusCache: null,
   sourceCloneStatusWrite: Promise.resolve(),
@@ -228,8 +229,12 @@ async function run() {
     assert.equal(restored.restoredAliases, 2);
     assert.equal(await fsp.readFile(path.join(restored.destinationRoot, "01-Photos", "nested", "second.txt"), "utf8"), "second payload");
     assert.equal(await fsp.readFile(path.join(restored.destinationRoot, "02-Camera", "same-first.txt"), "utf8"), "first payload");
-    assert.equal((await fsp.stat(path.join(restored.destinationRoot, "01-Photos", "first.txt"))).mtimeMs,
-      (await fsp.stat(path.join(sourceRoot, "first.txt"))).mtimeMs, "extraction restores exact source modification times");
+    const restoredMtimeMs = (await fsp.stat(path.join(restored.destinationRoot, "01-Photos", "first.txt"))).mtimeMs;
+    const sourceMtimeMs = (await fsp.stat(path.join(sourceRoot, "first.txt"))).mtimeMs;
+    assert.ok(
+      Math.abs(restoredMtimeMs - sourceMtimeMs) < 1,
+      "extraction preserves source modification time within filesystem precision",
+    );
     const restoredManifest = JSON.parse(await fsp.readFile(path.join(restored.destinationRoot, "silo-clone-manifest.json"), "utf8"));
     assert.equal(restoredManifest.complete, true);
     const compressedStatus = JSON.parse(await fsp.readFile(context.sourceCloneStatusPath, "utf8"));

@@ -102,7 +102,7 @@ electron_1.app.setPath("userData", process.env.FILE_BROWSER_USER_DATA_DIR ||
     path.join(electron_1.app.getPath("appData"), "file-browser-electron"));
 let indexStorageRoot = electron_1.app.getPath("userData");
 (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
-const indexStoragePath = (...segments) => path.join(indexStorageRoot, ...segments);
+const indexStoragePath = (0, indexingStorage_1.createIndexStoragePathResolver)(() => indexStorageRoot);
 const diagnosticsDirectory = path.join(electron_1.app.getPath("userData"), "diagnostics");
 const lifetimeLicensePath = path.join(electron_1.app.getPath("userData"), "lifetime-license.json");
 const betaLicensePath = path.join(electron_1.app.getPath("userData"), "beta-license.json");
@@ -3848,9 +3848,17 @@ electron_1.app.whenReady().then(async () => {
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        indexStorageRoot = path.resolve(userDataPath);
+        if (!(error instanceof indexingStorage_1.ExternalIndexStorageUnavailableError)) {
+            runtimeLog("index-storage-initialization-failed", { message });
+            electron_1.dialog.showErrorBox("Silo could not safely prepare its index", `${message}\n\nSilo stopped before opening the library. Existing index files were preserved. Resolve the storage issue and reopen Silo.`);
+            electron_1.app.quit();
+            return;
+        }
+        indexStorageRoot = (0, indexingStorage_1.getLocalFallbackIndexStorageRoot)(userDataPath);
+        await fsPromises.mkdir(indexStorageRoot, { recursive: true });
         (0, indexingStorage_1.setActiveIndexStorageRoot)(indexStorageRoot);
-        startupStorageNotice = `${message} Silo opened with local index storage for this session. The configured external location and its data were left untouched.`;
+        (0, indexingStorage_1.setIndexStorageExclusionRoots)([error.storageRoot, indexStorageRoot]);
+        startupStorageNotice = `${message} Silo opened with separate local fallback index storage for this session. The configured external location and its data were left untouched.`;
         runtimeLog("external-index-storage-unavailable", {
             message,
             fallback: indexStorageRoot,
