@@ -368,6 +368,9 @@ export class SemanticIndexer {
   private revision = 0;
   private loaded: Promise<void> = Promise.resolve();
   private loadComplete = true;
+  private hasRestoredSearchableRecord = false;
+  private resolveFirstSearchableRecord: (() => void) | null = null;
+  private readonly firstSearchableRecord: Promise<void>;
   private writeChain: Promise<void> = Promise.resolve();
   private recordsBoundaryChecked = false;
   private dirtyWatchSources = new Set<string>();
@@ -384,6 +387,9 @@ export class SemanticIndexer {
     onDiagnostic: DiagnosticListener = () => undefined,
     indexStoragePath: string = userDataPath,
   ) {
+    this.firstSearchableRecord = new Promise((resolve) => {
+      this.resolveFirstSearchableRecord = resolve;
+    });
     this.userDataPath = path.resolve(userDataPath);
     this.canonicalUserDataPath = this.userDataPath;
     this.indexDirectory = path.join(indexStoragePath, "semantic-index");
@@ -401,6 +407,8 @@ export class SemanticIndexer {
     const task = this.openIndex(onLoadProgress);
     this.loaded = task.then(() => undefined, () => undefined).then(() => {
       this.loadComplete = true;
+      this.resolveFirstSearchableRecord?.();
+      this.resolveFirstSearchableRecord = null;
     });
     // Searches and concept scans queue behind the load instead of seeing a partial index.
     this.searchChain = this.loaded;
@@ -615,6 +623,11 @@ export class SemanticIndexer {
     this.latestRecords.set(record.path, record);
     this.updateRecordCounts(record, 1);
     this.revision += 1;
+    if (record.vectorOffset >= 0 && !this.hasRestoredSearchableRecord) {
+      this.hasRestoredSearchableRecord = true;
+      this.resolveFirstSearchableRecord?.();
+      this.resolveFirstSearchableRecord = null;
+    }
   }
 
   private deleteLatestRecord(filePath: string) {
@@ -1243,8 +1256,24 @@ export class SemanticIndexer {
       ? Math.max(0, Math.min(100, minimumConfidence))
       : 0;
     return (async () => {
-      // Search the records already restored while the remaining saved index loads.
-      if (!this.latestRecords.size && !this.loadComplete) await this.loaded;
+      // Begin against the first usable restored records instead of waiting for a
+      // large saved index to finish opening. The embedding work below gives the
+      // restore stream time to add more records before its snapshot is taken.
+      if (!this.loadComplete && !this.hasRestoredSearchableRecord && !isCancelled()) {
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearInterval(cancelCheck);
+            resolve();
+          };
+          const cancelCheck = setInterval(() => {
+            if (isCancelled()) finish();
+          }, 100);
+          void Promise.race([this.firstSearchableRecord, this.loaded]).then(finish);
+        });
+      }
       if (isCancelled()) return [];
       return this.runSearch(
         query,

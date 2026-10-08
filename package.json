@@ -38,7 +38,8 @@
     "test:access-branding": "node test/runAccessBrandingTests.cjs",
     "test:phone-restore-target": "node test/runPhoneRestoreTargetTests.cjs",
     "test:startup-smoke": "node test/runStartupSmokeTests.cjs",
-    "test:portable-storage": "node test/runPortableStorageTests.cjs && node test/runConfigBundleRestoreTests.cjs && node test/runPhoneRestoreTargetTests.cjs && node test/runOfflinePhoneBackupTests.cjs"
+    "test:portable-storage": "node test/runPortableStorageTests.cjs && node test/runConfigBundleRestoreTests.cjs && node test/runPhoneRestoreTargetTests.cjs && node test/runOfflinePhoneBackupTests.cjs",
+    "test:progress-throttle": "node test/runProgressThrottleTests.cjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

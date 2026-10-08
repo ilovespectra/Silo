@@ -732,6 +732,7 @@ function App() {
   const [searchResults, setSearchResults] = useState<SemanticSearchResult[]>(
     [],
   );
+  const [searchProgress, setSearchProgress] = useState({ scanned: 0, total: 0 });
   const [searching, setSearching] = useState(false);
   const [searchDone, setSearchDone] = useState(false);
   const [confidence, setConfidence] = useState(DEFAULT_SEMANTIC_SEARCH_CONFIDENCE);
@@ -3732,8 +3733,9 @@ function App() {
 
   const runSemanticSearch = useCallback(
     async (_showLoading: boolean) => {
-      if (!electronAPI || !searchQuery.trim()) return;
+      if (!electronAPI || appSection !== "files" || !searchQuery.trim()) return;
       const requestId = ++searchRequestRef.current;
+      setSearchProgress({ scanned: 0, total: 0 });
       setSearching(true);
       setSearchDone(false);
       setSearchError("");
@@ -3769,7 +3771,7 @@ function App() {
         }
       }
     },
-    [confidence, electronAPI, searchQuery],
+    [appSection, confidence, electronAPI, searchQuery],
   );
 
   useEffect(() => {
@@ -3782,6 +3784,7 @@ function App() {
           ? progress.results.filter((result) => !hidden.has(result.path))
           : progress.results,
       );
+      setSearchProgress({ scanned: progress.scanned, total: progress.total });
       const done = progress.status === "done";
       setSearching(!done);
       setSearchDone(done);
@@ -3789,9 +3792,10 @@ function App() {
   }, [electronAPI]);
 
   useEffect(() => {
-    if (!searchQuery.trim()) {
+    if (appSection !== "files" || !searchQuery.trim()) {
       searchRequestRef.current += 1;
       setSearchResults([]);
+      setSearchProgress({ scanned: 0, total: 0 });
       setSearching(false);
       setSearchDone(false);
       setSearchError("");
@@ -3803,11 +3807,12 @@ function App() {
       if (electronAPI)
         void electronAPI.cancelSemanticSearch().catch(() => undefined);
     };
-  }, [electronAPI, runSemanticSearch, searchQuery]);
+  }, [appSection, electronAPI, runSemanticSearch, searchQuery]);
 
   useEffect(() => {
-    if (contentSafetyRevision > 0) void runSemanticSearch(false);
-  }, [contentSafetyRevision, runSemanticSearch]);
+    if (contentSafetyRevision > 0 && appSection === "files")
+      void runSemanticSearch(false);
+  }, [appSection, contentSafetyRevision, runSemanticSearch]);
 
   const rawContentFiles: FileInfo[] = useMemo(() => {
     if (!searchQuery.trim()) return files;
@@ -5039,7 +5044,11 @@ function App() {
           </div>
           <span className="file-count">
             {searchQuery.trim()
-              ? `${filteredAndSortedFiles.length.toLocaleString()} matches from ${indexProgress.indexed.toLocaleString()} indexed files`
+              ? searching && searchProgress.total === 0
+                ? `${filteredAndSortedFiles.length.toLocaleString()} matches · opening saved index…`
+                : searching
+                  ? `${filteredAndSortedFiles.length.toLocaleString()} matches · searching ${searchProgress.scanned.toLocaleString()} of ${searchProgress.total.toLocaleString()} indexed files`
+                  : `${filteredAndSortedFiles.length.toLocaleString()} matches from ${searchProgress.total.toLocaleString()} indexed files`
               : `${filteredAndSortedFiles.length.toLocaleString()} items`}
           </span>
           {(() => {

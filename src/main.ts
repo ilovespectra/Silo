@@ -91,6 +91,7 @@ import {
 import { IndexingRecovery } from "./indexingRecovery";
 import { InventoryTransfers } from "./inventoryTransfer";
 import { RendererRecovery } from "./rendererRecovery";
+import { createProgressThrottle } from "./progressThrottle";
 import { MemoryManager, MemoryStoryCandidate } from "./memoryManager";
 import {
   DiscoveredConcept,
@@ -1087,6 +1088,13 @@ function configureAppUpdater() {
   }
 }
 
+const sendIndexProgress = createProgressThrottle((progress) =>
+  sendToRenderer("index-progress", progress),
+);
+const sendFaceIndexProgress = createProgressThrottle((progress) =>
+  sendToRenderer("face-index-progress", progress),
+);
+
 function reportStartup(label: string, ready = false) {
   startupState = {
     ready,
@@ -1863,6 +1871,8 @@ let enabledSourceCacheReady = false;
 let diagnosticsTimer: NodeJS.Timeout | null = null;
 let heapGuardTimer: NodeJS.Timeout | null = null;
 let lastIndexDiagnostic = 0;
+let lastSemanticProgressStatus: string | null = null;
+let lastFaceProgressStatus: string | null = null;
 // localeCompare with options builds a collator per call, which dominates sorts of 100k+ files.
 const naturalCollator = new Intl.Collator(undefined, {
   numeric: true,
@@ -5541,7 +5551,9 @@ app.whenReady().then(async () => {
     modelCachePath,
     unifiedScanSource,
     (progress) => {
-      sendToRenderer("index-progress", progress);
+      sendIndexProgress(progress);
+      const statusChanged = progress.status !== lastSemanticProgressStatus;
+      lastSemanticProgressStatus = progress.status;
       const now = Date.now();
       if (now - lastIndexDiagnostic >= 10000 || progress.status === "error") {
         lastIndexDiagnostic = now;
@@ -5565,9 +5577,11 @@ app.whenReady().then(async () => {
         void kickGeoCheck();
       }
       if (progress.status === "complete") kickMagicBackground(15000);
-      // Record changes debounce into one topic-profile refresh after indexing settles.
-      memoryProfileScheduler?.notify();
-      scheduleThumbnailPregeneration(progress.status === "indexing");
+      // Progress is emitted for every indexed item. The topic profile only needs
+      // the stage edges; per-item notifications just keep resetting its timer.
+      if (statusChanged) memoryProfileScheduler?.notify();
+      if (statusChanged)
+        scheduleThumbnailPregeneration(progress.status === "indexing");
     },
     runtimeLog,
     indexStorageRoot,
@@ -5621,8 +5635,11 @@ app.whenReady().then(async () => {
       return semanticIndexer.getIndexedImages(await getAllIndexSources());
     },
     (progress) => {
-      sendToRenderer("face-index-progress", progress);
-      scheduleThumbnailPregeneration();
+      sendFaceIndexProgress(progress);
+      const statusChanged = progress.status !== lastFaceProgressStatus;
+      lastFaceProgressStatus = progress.status;
+      if (statusChanged)
+        scheduleThumbnailPregeneration(progress.status === "indexing");
     },
     indexStorageRoot,
   );

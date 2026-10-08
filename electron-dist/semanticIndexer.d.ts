@@ -104,6 +104,9 @@ export declare class SemanticIndexer {
     private revision;
     private loaded;
     private loadComplete;
+    private hasRestoredSearchableRecord;
+    private resolveFirstSearchableRecord;
+    private readonly firstSearchableRecord;
     private writeChain;
     private recordsBoundaryChecked;
     private dirtyWatchSources;

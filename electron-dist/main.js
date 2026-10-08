@@ -60,6 +60,7 @@ const documentPreview_1 = require("./documentPreview");
 const indexingRecovery_1 = require("./indexingRecovery");
 const inventoryTransfer_1 = require("./inventoryTransfer");
 const rendererRecovery_1 = require("./rendererRecovery");
+const progressThrottle_1 = require("./progressThrottle");
 const memoryManager_1 = require("./memoryManager");
 const memoryDiscovery_1 = require("./memoryDiscovery");
 const memoryTopicProfile_1 = require("./memoryTopicProfile");
@@ -833,6 +834,8 @@ function configureAppUpdater() {
         });
     }
 }
+const sendIndexProgress = (0, progressThrottle_1.createProgressThrottle)((progress) => sendToRenderer("index-progress", progress));
+const sendFaceIndexProgress = (0, progressThrottle_1.createProgressThrottle)((progress) => sendToRenderer("face-index-progress", progress));
 function reportStartup(label, ready = false) {
     startupState = {
         ready,
@@ -1572,6 +1575,8 @@ let enabledSourceCacheReady = false;
 let diagnosticsTimer = null;
 let heapGuardTimer = null;
 let lastIndexDiagnostic = 0;
+let lastSemanticProgressStatus = null;
+let lastFaceProgressStatus = null;
 // localeCompare with options builds a collator per call, which dominates sorts of 100k+ files.
 const naturalCollator = new Intl.Collator(undefined, {
     numeric: true,
@@ -4707,7 +4712,9 @@ electron_1.app.whenReady().then(async () => {
         ? Promise.resolve()
         : libraryStatsManager.initialize();
     semanticIndexer = new semanticIndexer_1.SemanticIndexer(electron_1.app.getPath("userData"), modelCachePath, unifiedScanSource, (progress) => {
-        sendToRenderer("index-progress", progress);
+        sendIndexProgress(progress);
+        const statusChanged = progress.status !== lastSemanticProgressStatus;
+        lastSemanticProgressStatus = progress.status;
         const now = Date.now();
         if (now - lastIndexDiagnostic >= 10000 || progress.status === "error") {
             lastIndexDiagnostic = now;
@@ -4731,9 +4738,12 @@ electron_1.app.whenReady().then(async () => {
         }
         if (progress.status === "complete")
             kickMagicBackground(15000);
-        // Record changes debounce into one topic-profile refresh after indexing settles.
-        memoryProfileScheduler?.notify();
-        scheduleThumbnailPregeneration(progress.status === "indexing");
+        // Progress is emitted for every indexed item. The topic profile only needs
+        // the stage edges; per-item notifications just keep resetting its timer.
+        if (statusChanged)
+            memoryProfileScheduler?.notify();
+        if (statusChanged)
+            scheduleThumbnailPregeneration(progress.status === "indexing");
     }, runtimeLog, indexStorageRoot);
     libraryShareServer = new libraryShareServer_1.LibraryShareServer({
         getSources: async () => (await listSources()).map(({ id, label, rootPath, kind, available }) => ({
@@ -4770,8 +4780,11 @@ electron_1.app.whenReady().then(async () => {
     faceIndexer = new faceIndexer_1.FaceIndexer(electron_1.app.getPath("userData"), faceModelPath, faceWasmPath, async () => {
         return semanticIndexer.getIndexedImages(await getAllIndexSources());
     }, (progress) => {
-        sendToRenderer("face-index-progress", progress);
-        scheduleThumbnailPregeneration();
+        sendFaceIndexProgress(progress);
+        const statusChanged = progress.status !== lastFaceProgressStatus;
+        lastFaceProgressStatus = progress.status;
+        if (statusChanged)
+            scheduleThumbnailPregeneration(progress.status === "indexing");
     }, indexStorageRoot);
     faceIndexer.setRecognitionListener(({ added, removed }) => {
         const showBanned = Boolean(contentSettingsStore?.getPublicSettings().showBannedPeople);

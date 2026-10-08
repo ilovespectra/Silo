@@ -65,7 +65,52 @@ async function setup() {
   return { directory, indexer };
 }
 
+
+async function checkFaceInferenceThreadLimit() {
+  const Module = require("module") as any;
+  const originalLoad = Module._load;
+  const calls: string[] = [];
+  const faceapi = {
+    tf: {
+      setBackend: async (backend: string) => calls.push(`backend:${backend}`),
+      ready: async () => calls.push("ready"),
+    },
+    nets: {
+      tinyFaceDetector: { loadFromDisk: async () => calls.push("detector") },
+      faceLandmark68Net: { loadFromDisk: async () => calls.push("landmarks") },
+      faceRecognitionNet: { loadFromDisk: async () => calls.push("recognition") },
+    },
+  };
+  const wasm = {
+    setThreadsCount: (count: number) => calls.push(`threads:${count}`),
+    setWasmPaths: () => calls.push("wasm-paths"),
+  };
+  const sharp = Object.assign(() => undefined, {
+    concurrency: (count: number) => calls.push(`sharp:${count}`),
+  });
+  Module._load = function (request: string, parent: unknown, isMain: boolean) {
+    if (request === "@vladmandic/face-api/dist/face-api.node-wasm.js") return faceapi;
+    if (request === "@tensorflow/tfjs-backend-wasm") return wasm;
+    if (request === "sharp") return sharp;
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    const indexer = new FaceIndexer("/unused", "/models", "/wasm", () => [], () => undefined);
+    await (indexer as any).loadRuntime();
+    assert.deepStrictEqual(calls.slice(0, 5), [
+      "sharp:1",
+      "threads:2",
+      "wasm-paths",
+      "backend:wasm",
+      "ready",
+    ]);
+  } finally {
+    Module._load = originalLoad;
+  }
+}
+
 async function run() {
+  await checkFaceInferenceThreadLimit();
   const { directory, indexer } = await setup();
   try {
     const closeA = descriptor(1, 0);
