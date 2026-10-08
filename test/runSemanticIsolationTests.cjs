@@ -259,7 +259,14 @@ test("real child IPC preserves embedding APIs; native-style death rejects all pe
   const exit = diagnostics.find(
     (entry) => entry.event === "semantic-worker-exit",
   );
-  assert.equal(exit.details.signal, "SIGKILL");
+  assert.equal(
+    exit.details.signal,
+    process.platform === "win32" ? null : "SIGKILL",
+  );
+  assert.equal(
+    exit.details.code,
+    process.platform === "win32" ? 1 : null,
+  );
   assert.equal(exit.details.pendingCount, 2);
   assert.deepEqual(Array.from(exit.details.requestTypes), ["text"]);
   assert.ok(!JSON.stringify(diagnostics).includes("/private/"));
@@ -451,12 +458,22 @@ test("three native image crashes persist across restarts, quarantine only unchan
       ),
     );
     assert.equal(failures[0][1].attempts, attempt);
-    assert.match(failures[0][1].message, /SIGTRAP/);
+    assert.match(
+      failures[0][1].message,
+      process.platform === "win32" ? /exited \(1\)/ : /SIGTRAP/,
+    );
     assert.ok(failures[0][1].timestamp > 0);
     const exit = made.diagnostics.find(
       (entry) => entry.event === "semantic-worker-exit",
     );
-    assert.equal(exit.details.signal, "SIGTRAP");
+    assert.equal(
+      exit.details.signal,
+      process.platform === "win32" ? null : "SIGTRAP",
+    );
+    assert.equal(
+      exit.details.code,
+      process.platform === "win32" ? 1 : null,
+    );
     assert.equal(exit.details.pendingCount, 1);
     assert.deepEqual(Array.from(exit.details.requestTypes), ["image"]);
     assert.ok(exit.details.stderr.length <= 2000);

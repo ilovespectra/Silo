@@ -1,4 +1,14 @@
 // Model-free child used to exercise real process death and IPC supervision.
+function terminateLikeNativeCrash(signal) {
+  // Windows reports forced process termination as a nonzero exit code rather
+  // than a POSIX signal. Keep the failure fatal while matching that contract.
+  if (process.platform === "win32") {
+    process.exit(1);
+    return;
+  }
+  process.kill(process.pid, signal);
+}
+
 process.on("message", (request) => {
   if (request.type === "image" && request.filePath?.endsWith("trap.heic")) {
     process.stderr.write(
@@ -6,7 +16,7 @@ process.on("message", (request) => {
         "x".repeat(2500) +
         "\n/private/secret/last.heic\n",
     );
-    process.kill(process.pid, "SIGTRAP");
+    terminateLikeNativeCrash("SIGTRAP");
     return;
   }
   if (request.text === "disconnect") {
@@ -14,7 +24,7 @@ process.on("message", (request) => {
     return;
   }
   if (request.text === "crash" || request.text?.endsWith("\ncrash")) {
-    process.kill(process.pid, "SIGKILL");
+    terminateLikeNativeCrash("SIGKILL");
     return;
   }
   if (request.text === "hold") return;
