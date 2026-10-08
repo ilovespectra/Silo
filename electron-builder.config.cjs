@@ -1,4 +1,8 @@
 const packageJson = require('./package.json');
+const testOutput = process.env.SILO_TEST_OUTPUT_DIR;
+const extraResources = testOutput
+  ? packageJson.build.extraResources.filter(({ from }) => from !== '.model-test-cache')
+  : packageJson.build.extraResources;
 
 const signingSecrets = [
   'CSC_LINK',
@@ -13,6 +17,11 @@ const hasCompleteSigningSetup = signingSecrets.every((name) => {
 
 module.exports = {
   ...packageJson.build,
+  directories: {
+    ...packageJson.build.directories,
+    ...(testOutput ? { output: testOutput } : {}),
+  },
+  extraResources,
   afterPack: require('./signing/after-pack.cjs'),
   mac: {
     ...packageJson.build.mac,
@@ -24,5 +33,13 @@ module.exports = {
     notarize: hasCompleteSigningSetup
       ? { teamId: process.env.APPLE_TEAM_ID }
       : false,
+  },
+  dmg: {
+    background: 'public/dmg-background.png',
+    window: { width: 720, height: 500 },
+    contents: [
+      { x: 150, y: 175, type: 'file' },
+      { x: 570, y: 175, type: 'link', path: '/Applications' },
+    ],
   },
 };
