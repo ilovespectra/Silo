@@ -54,6 +54,12 @@ import {
 import MagicTools from "./MagicTools";
 import PersonPicker from "./PersonPicker";
 
+function mapAssetUrl(fileName: string): string {
+  return window.electron
+    ? `silo-asset://local/${encodeURIComponent(fileName)}`
+    : `${process.env.PUBLIC_URL}/${fileName}`;
+}
+
 interface MapPageProps {
   digitalFolders: DigitalFolder[];
   fileMetadata: Record<string, FileMetadata>;
@@ -696,10 +702,10 @@ export default function MapPage({
     let disposed = false;
     const textureLoader = new THREE.TextureLoader();
     const dayTexture = textureLoader.load(
-      `${process.env.PUBLIC_URL}/earth-blue-marble.jpg`,
+      mapAssetUrl("earth-blue-marble.jpg"),
     );
     const nightTexture = textureLoader.load(
-      `${process.env.PUBLIC_URL}/earth-night.jpg`,
+      mapAssetUrl("earth-night.jpg"),
     );
     let detailedBorders: any[] | null = null;
     let detailedBordersLoading = false;
@@ -921,7 +927,7 @@ export default function MapPage({
             .polygonStrokeColor(strokeColor);
         });
     };
-    void fetch(`${process.env.PUBLIC_URL}/us-states.geojson`)
+    void fetch(mapAssetUrl("us-states.geojson"))
       .then((response) => response.json())
       .then((geoJson) => {
         if (disposed) return;
@@ -935,7 +941,7 @@ export default function MapPage({
       })
       .catch(() => undefined);
     let borderIdleHandle: number | null = null;
-    void fetch(`${process.env.PUBLIC_URL}/countries.geojson`)
+    void fetch(mapAssetUrl("countries.geojson"))
       .then((response) => response.json())
       .then((geoJson) => {
         if (disposed) return;
@@ -983,7 +989,7 @@ export default function MapPage({
           usingDetailedBorders = true;
         } else if (!usingDetailedBorders && !detailedBordersLoading) {
           detailedBordersLoading = true;
-          void fetch(`${process.env.PUBLIC_URL}/countries-50m.geojson`)
+          void fetch(mapAssetUrl("countries-50m.geojson"))
             .then((response) => response.json())
             .then((geoJson) => {
               detailedBordersLoading = false;
@@ -1359,10 +1365,10 @@ export default function MapPage({
   useEffect(() => {
     let cancelled = false;
     void Promise.all([
-      fetch(`${process.env.PUBLIC_URL}/countries-50m.geojson`).then(
+      fetch(mapAssetUrl("countries-50m.geojson")).then(
         (response) => response.json(),
       ),
-      fetch(`${process.env.PUBLIC_URL}/us-states.geojson`).then((response) =>
+      fetch(mapAssetUrl("us-states.geojson")).then((response) =>
         response.json(),
       ),
     ])

@@ -58,6 +58,7 @@ const betaLicense_1 = require("./betaLicense");
 const betaLicensePublicKey_1 = require("./betaLicensePublicKey");
 const documentPreview_1 = require("./documentPreview");
 const indexingRecovery_1 = require("./indexingRecovery");
+const appAssets_1 = require("./appAssets");
 const inventoryTransfer_1 = require("./inventoryTransfer");
 const rendererRecovery_1 = require("./rendererRecovery");
 const progressThrottle_1 = require("./progressThrottle");
@@ -410,6 +411,15 @@ process.on("unhandledRejection", (reason) => runtimeLog("unhandled-rejection", {
 }));
 electron_1.app.on("child-process-gone", (_event, details) => runtimeLog("child-process-gone", { ...details }));
 electron_1.protocol.registerSchemesAsPrivileged([
+    {
+        scheme: "silo-asset",
+        privileges: {
+            standard: true,
+            secure: true,
+            supportFetchAPI: true,
+            corsEnabled: true,
+        },
+    },
     {
         scheme: "face-crop",
         privileges: { standard: true, secure: true, supportFetchAPI: true },
@@ -1748,6 +1758,26 @@ function kickGeoCheck(explicit = false) {
     return Promise.resolve();
 }
 function registerMediaProtocols() {
+    electron_1.protocol.handle("silo-asset", async (request) => {
+        const asset = (0, appAssets_1.resolveAppAssetRequest)(request.url, electron_1.app.getAppPath(), electron_1.app.isPackaged);
+        if (!asset)
+            return new Response("Not found", { status: 404 });
+        try {
+            const data = await fsPromises.readFile(asset.filePath);
+            return new Response(data, {
+                headers: {
+                    "access-control-allow-origin": "*",
+                    "cache-control": electron_1.app.isPackaged
+                        ? "public, max-age=31536000, immutable"
+                        : "no-cache",
+                    "content-type": asset.contentType,
+                },
+            });
+        }
+        catch {
+            return new Response("Not found", { status: 404 });
+        }
+    });
     electron_1.protocol.handle("face-crop", async (request) => {
         // Accept legacy absolute-path URLs too, but only ever serve from the active crops directory.
         const fileName = path.basename(decodeURIComponent(new URL(request.url).pathname.slice(1)));

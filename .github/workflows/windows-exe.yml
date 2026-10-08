@@ -25,8 +25,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - name: Check out main
+      - name: Check out requested ref
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -39,6 +41,12 @@ jobs:
 
       - name: Compile app
         run: npm run build
+
+      - name: Verify bundled map asset routing
+        run: npm run test:app-assets
+
+      - name: Verify People clustering behavior
+        run: npm run test:face-clustering
 
       - name: Smoke test bundled offline Windows semantic search
         shell: pwsh
@@ -82,6 +90,34 @@ jobs:
               MessageBox MB_ICONSTOP "Silo's bundled face analysis model is missing. Setup will stop rather than install an incomplete app."
               Abort
             ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\face-models\tiny_face_detector_model.bin"
+              MessageBox MB_ICONSTOP "Silo's bundled face detector weights are missing. Setup will stop rather than install broken People analysis."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\face-models\face_landmark_68_model.bin"
+              MessageBox MB_ICONSTOP "Silo's bundled face landmark model is missing. Setup will stop rather than install broken People analysis."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\face-models\face_recognition_model.bin"
+              MessageBox MB_ICONSTOP "Silo's bundled face recognition model is missing. Setup will stop rather than install broken People analysis."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\face-wasm\tfjs-backend-wasm.wasm"
+              MessageBox MB_ICONSTOP "Silo's offline face runtime is missing. Setup will stop rather than install broken People analysis."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\face-wasm\tfjs-backend-wasm-simd.wasm"
+              MessageBox MB_ICONSTOP "Silo's offline face runtime is incomplete. Setup will stop rather than install broken People analysis."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\face-wasm\tfjs-backend-wasm-threaded-simd.wasm"
+              MessageBox MB_ICONSTOP "Silo's offline face runtime is incomplete. Setup will stop rather than install broken People analysis."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\ffmpeg-static\ffmpeg.exe"
+              MessageBox MB_ICONSTOP "Silo's bundled FFmpeg is missing. Setup will stop rather than install broken Memories export."
+              Abort
+            ${EndIf}
             DetailPrint "Silo's core offline features are in place; your library stays on this PC."
             SetDetailsPrint none
           !macroend
@@ -97,12 +133,25 @@ jobs:
             "$resources/clip-model-cache/Xenova/clip-vit-base-patch32/onnx/text_model_quantized.onnx",
             "$resources/clip-model-cache/Xenova/clip-vit-base-patch32/onnx/vision_model_quantized.onnx",
             "$resources/face-models/tiny_face_detector_model-weights_manifest.json",
+            "$resources/face-models/tiny_face_detector_model.bin",
+            "$resources/face-models/face_landmark_68_model-weights_manifest.json",
+            "$resources/face-models/face_landmark_68_model.bin",
+            "$resources/face-models/face_recognition_model-weights_manifest.json",
+            "$resources/face-models/face_recognition_model.bin",
+            "$resources/face-wasm/tfjs-backend-wasm.wasm",
+            "$resources/face-wasm/tfjs-backend-wasm-simd.wasm",
+            "$resources/face-wasm/tfjs-backend-wasm-threaded-simd.wasm",
+            "$resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe",
             "$resources/app.asar.unpacked/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm",
             "$resources/app.asar.unpacked/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs"
           )
           foreach ($asset in $required) {
             if (-not (Test-Path $asset)) { throw "Missing packaged Silo asset: $asset" }
           }
+          node test/runWindowsPackageAssets.cjs 'release/win-unpacked/resources'
+          node test/runWindowsFaceRuntimeSmoke.cjs 'release/win-unpacked/resources'
+          node test/runWindowsGeoRuntimeSmoke.cjs
+          node test/runWindowsMemoryRuntimeSmoke.cjs 'release/win-unpacked/resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe'
 
       - name: Verify installer output
         shell: pwsh
