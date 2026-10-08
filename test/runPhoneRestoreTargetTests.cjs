@@ -8,6 +8,8 @@ const panel = fs.readFileSync(
   "utf8",
 );
 assert.match(app, /restorePhoneFromArchive\(\s*targetDeviceId\s*,/);
-assert.match(panel, /onRestoreFromArchive\(targetDeviceId,\s*archive,\s*password\)/);
-assert.match(panel, /restoreFromArchive\(archive,\s*deviceKey,\s*device\.id\)/);
+assert.match(
+  panel,
+  /onRestoreFromArchive\(\s*device\.id,\s*archive,\s*restorePassword\s*\)/,
+);
 console.log("Replacement-device restore target regression test passed.");
