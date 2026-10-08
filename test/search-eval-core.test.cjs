@@ -3,7 +3,10 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
+  COCO_ANNOTATION_LICENSE_SOURCE_URL,
+  COCO_ANNOTATION_LICENSE_URL,
   chooseFullPageDefault,
+  createSearchEvalIndexKey,
   evaluateSliderPositions,
   matchesGroundTruth,
   measureQuery,
@@ -20,6 +23,39 @@ test("measured default and slider mapping use the score floor directly", () => {
     confidenceSettingToMinimumThreshold(Number.NaN),
     DEFAULT_SEMANTIC_SEARCH_CONFIDENCE,
   );
+});
+
+test("search-eval index identity changes with image, model, or embedding code fingerprints", () => {
+  const base = {
+    imageFiles: ["0001.jpg", "0002.jpg"],
+    imageFingerprint: "image-hash-a",
+    modelFingerprint: "model-hash-a",
+    pipelineFingerprint: "pipeline-hash-a",
+  };
+  const original = createSearchEvalIndexKey(base);
+
+  assert.equal(createSearchEvalIndexKey(base), original);
+  assert.notEqual(
+    createSearchEvalIndexKey({ ...base, imageFingerprint: "image-hash-b" }),
+    original,
+  );
+  assert.notEqual(
+    createSearchEvalIndexKey({ ...base, modelFingerprint: "model-hash-b" }),
+    original,
+  );
+  assert.notEqual(
+    createSearchEvalIndexKey({ ...base, pipelineFingerprint: "pipeline-hash-b" }),
+    original,
+  );
+  assert.notEqual(
+    createSearchEvalIndexKey({ ...base, imageFiles: ["0001.jpg", "0003.jpg"] }),
+    original,
+  );
+});
+
+test("COCO annotation attribution uses its terms-of-use license, separate from photo licenses", () => {
+  assert.equal(COCO_ANNOTATION_LICENSE_URL, "https://creativecommons.org/licenses/by/4.0/");
+  assert.equal(COCO_ANNOTATION_LICENSE_SOURCE_URL, "https://cocodataset.org/#termsofuse");
 });
 
 test("COCO ground truth requires every category and caption group", () => {

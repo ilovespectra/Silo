@@ -1,6 +1,29 @@
 "use strict";
 
+const crypto = require("node:crypto");
+
 const DEFAULT_K = 10;
+const COCO_ANNOTATION_LICENSE_URL = "https://creativecommons.org/licenses/by/4.0/";
+const COCO_ANNOTATION_LICENSE_SOURCE_URL = "https://cocodataset.org/#termsofuse";
+
+function createSearchEvalIndexKey({
+  imageFiles,
+  imageFingerprint,
+  modelFingerprint,
+  pipelineFingerprint,
+}) {
+  const identity = {
+    imageFiles: [...imageFiles].map(String).sort(),
+    imageFingerprint,
+    modelFingerprint,
+    pipelineFingerprint,
+  };
+  for (const [name, fingerprint] of Object.entries(identity).filter(([name]) => name !== "imageFiles")) {
+    if (typeof fingerprint !== "string" || fingerprint.length === 0)
+      throw new Error(`Search-eval index identity is missing ${name}.`);
+  }
+  return crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+}
 
 function normalizeText(value) {
   return String(value ?? "")
@@ -103,7 +126,10 @@ function chooseFullPageDefault(sliderMetrics, k = DEFAULT_K) {
 }
 
 module.exports = {
+  COCO_ANNOTATION_LICENSE_SOURCE_URL,
+  COCO_ANNOTATION_LICENSE_URL,
   DEFAULT_K,
+  createSearchEvalIndexKey,
   chooseFullPageDefault,
   evaluateSliderPositions,
   hasPhrase,

@@ -1,11 +1,15 @@
 "use strict";
 
 const fs = require("node:fs/promises");
+const { createReadStream } = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 const {
+  COCO_ANNOTATION_LICENSE_SOURCE_URL,
+  COCO_ANNOTATION_LICENSE_URL,
   chooseFullPageDefault,
+  createSearchEvalIndexKey,
   evaluateSliderPositions,
   matchesGroundTruth,
 } = require("./search-eval-core.cjs");
@@ -47,6 +51,52 @@ function shuffle(items, random) {
 
 async function readJSON(filePath) {
   return JSON.parse(await fs.readFile(filePath, "utf8"));
+}
+
+async function hashFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.once("error", reject);
+    stream.once("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+async function fingerprintDirectory(rootPath) {
+  const hash = crypto.createHash("sha256");
+  async function visit(directory, relative = "") {
+    const entries = (await fs.readdir(directory, { withFileTypes: true }))
+      .sort((first, second) => first.name.localeCompare(second.name));
+    for (const entry of entries) {
+      const childRelative = path.join(relative, entry.name).split(path.sep).join("/");
+      const childPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        hash.update(`directory\0${childRelative}\n`);
+        await visit(childPath, childRelative);
+      } else if (entry.isFile()) {
+        const stats = await fs.stat(childPath);
+        hash.update(`file\0${childRelative}\0${stats.size}\0${await hashFile(childPath)}\n`);
+      } else {
+        throw new Error(`Unsupported model-cache entry: ${childPath}`);
+      }
+    }
+  }
+  await visit(rootPath);
+  return hash.digest("hex");
+}
+
+async function fingerprintFiles(filePaths, relativeRoot) {
+  const records = [];
+  for (const filePath of [...filePaths].sort()) {
+    const stats = await fs.stat(filePath);
+    records.push({
+      path: path.relative(relativeRoot, filePath).split(path.sep).join("/"),
+      size: stats.size,
+      sha256: await hashFile(filePath),
+    });
+  }
+  return crypto.createHash("sha256").update(JSON.stringify(records)).digest("hex");
 }
 
 async function downloadFile(url, filePath, validate, label) {
@@ -273,6 +323,8 @@ function buildReport({
   eligibleCount,
   photoLicenseUrl,
   annotationLicenseUrl,
+  annotationLicenseSourceUrl,
+  indexDigest,
   currentMetrics,
   fixedMetrics,
   recommended,
@@ -303,9 +355,9 @@ function buildReport({
     "",
     `- Indexed **${indexSummary.indexed}** of ${IMAGE_COUNT} downloaded COCO 2017 validation photos; indexing errors: **${indexSummary.errors}**.`,
     `- ${eligibleCount} of 5,000 validation photos carry image license id 4; this fixture uses a deterministic query-balanced sample of ${selectedImages.length}.`,
-    `- Photo license from COCO metadata: [${photoLicenseUrl}](${photoLicenseUrl}). Annotation/caption license from COCO metadata: [${annotationLicenseUrl}](${annotationLicenseUrl}).`,
+    `- Selected-photo license from COCO image metadata: [${photoLicenseUrl}](${photoLicenseUrl}). COCO annotation/caption license: [CC BY 4.0](${annotationLicenseUrl}), as stated in the [COCO terms of use](${annotationLicenseSourceUrl}).`,
     `- Dataset mirror used for the public COCO files: [merve/coco on Hugging Face](https://huggingface.co/datasets/merve/coco). Images and annotations stay under \`work/search-eval/\` and are not committed.`,
-    `- Search runtime: Silo's \`SemanticIndexer\` with the copied offline \`Xenova/clip-vit-base-patch32\` model; temporary index: \`work/search-eval/index-${crypto.createHash("sha256").update(selectedImages.map((image) => image.file_name).join("\n")).digest("hex").slice(0, 12)}\`.`,
+    `- Search runtime: Silo's \`SemanticIndexer\` with the offline \`Xenova/clip-vit-base-patch32\` model; temporary index: \`work/search-eval/index-${indexDigest.slice(0, 12)}\`, keyed by selected-image content, model-cache contents, and embedding-pipeline code.`,
     `- Indexing time: ${(indexMilliseconds / 1000).toFixed(1)} s; 50 text searches: ${(searchMilliseconds / 1000).toFixed(1)} s.`,
     "- Ground truth is derived from COCO instance categories and caption text using the query rules in `test/fixtures/search-eval-queries.json`; it is annotation based, not a manual visual relabeling.",
     "- Precision@10 uses a fixed denominator of 10; recall is relevant retrieved images divided by all labeled matches in the 500-photo fixture. Zero-result rate is the fraction of the 50 queries returning no image.",
@@ -403,11 +455,8 @@ async function main() {
   ]);
   if (queries.length !== 50) throw new Error(`Expected 50 queries, found ${queries.length}.`);
   const photoLicense = instances.licenses.find((license) => license.id === LICENSED_IMAGE_LICENSE_ID);
-  const annotationLicense = captions.licenses.find((license) => /creativecommons\.org\/licenses\/by\//i.test(license.url));
   if (!photoLicense || !/creativecommons\.org\/licenses\/by\/2\.0/i.test(photoLicense.url))
     throw new Error(`COCO image license id ${LICENSED_IMAGE_LICENSE_ID} is not the expected CC BY 2.0 license.`);
-  if (!annotationLicense)
-    throw new Error("Could not identify the CC BY caption license in COCO metadata.");
 
   const { imageById, labelsByImage } = buildImageLabels(instances, captions);
   const { selectedImages, positives, targets } = selectFixture(
@@ -426,7 +475,8 @@ async function main() {
         seed: 20261007,
         imageLicenseId: LICENSED_IMAGE_LICENSE_ID,
         imageLicenseUrl: photoLicense.url,
-        annotationLicenseUrl: annotationLicense.url,
+        annotationLicenseUrl: COCO_ANNOTATION_LICENSE_URL,
+        annotationLicenseSourceUrl: COCO_ANNOTATION_LICENSE_SOURCE_URL,
         selectedImages: selectedImages.map((image) => image.file_name),
         positiveCounts: queries.map((query, index) => ({
           query: query.query,
@@ -455,12 +505,36 @@ async function main() {
     queryRuns.push({ query: query.query, relevantPaths });
   }
 
-  const indexDigest = crypto
-    .createHash("sha256")
-    .update(selectedImages.map((image) => image.file_name).join("\n"))
-    .digest("hex")
-    .slice(0, 12);
-  const indexRoot = path.join(DATA_ROOT, `index-${indexDigest}`);
+  const imageFingerprint = await fingerprintFiles(
+    selectedImages.map((image) => path.join(IMAGE_ROOT, image.file_name)),
+    IMAGE_ROOT,
+  );
+  const modelFingerprint = await fingerprintDirectory(modelCachePath);
+  const pipelineFingerprint = await fingerprintFiles(
+    [
+      "src/semanticIndexer.ts",
+      "src/semanticWorker.ts",
+      "electron-dist/semanticIndexer.js",
+      "electron-dist/semanticWorker.js",
+      "package-lock.json",
+    ].map((filePath) => path.join(REPO_ROOT, filePath)),
+    REPO_ROOT,
+  );
+  const indexDigest = createSearchEvalIndexKey({
+    imageFiles: selectedImages.map((image) => image.file_name),
+    imageFingerprint,
+    modelFingerprint,
+    pipelineFingerprint,
+  });
+  const indexRoot = path.join(DATA_ROOT, `index-${indexDigest.slice(0, 12)}`);
+  const completedManifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+  Object.assign(completedManifest, {
+    imageFingerprint,
+    modelFingerprint,
+    pipelineFingerprint,
+    indexFingerprint: indexDigest,
+  });
+  await fs.writeFile(manifestPath, `${JSON.stringify(completedManifest, null, 2)}\n`);
   const indexer = new SemanticIndexer(
     path.join(DATA_ROOT, "temporary-user-data"),
     modelCachePath,
@@ -541,7 +615,9 @@ async function main() {
       selectedImages,
       eligibleCount: instances.images.filter((image) => image.license === LICENSED_IMAGE_LICENSE_ID).length,
       photoLicenseUrl: photoLicense.url,
-      annotationLicenseUrl: annotationLicense.url,
+      annotationLicenseUrl: COCO_ANNOTATION_LICENSE_URL,
+      annotationLicenseSourceUrl: COCO_ANNOTATION_LICENSE_SOURCE_URL,
+      indexDigest,
       currentMetrics: oldMetrics,
       fixedMetrics,
       recommended,
