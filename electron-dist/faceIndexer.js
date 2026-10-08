@@ -34,6 +34,7 @@ const COMBINE_CLUSTER_DISTANCE = 0.4;
 // Stricter than auto-clustering: a suggestion must sit close to an actual confirmed face.
 const TRAINED_MATCH_DISTANCE = 0.42;
 const MAX_EXEMPLARS = 64;
+const FACE_WASM_THREAD_LIMIT = 2;
 const MAX_EDIT_HISTORY = 100;
 const initialProgress = {
     status: "idle",
@@ -1105,6 +1106,9 @@ class FaceIndexer {
         const wasm = require("@tensorflow/tfjs-backend-wasm");
         const sharp = require("sharp");
         sharp.concurrency(1);
+        // Bound inference parallelism so large libraries do not spawn a host-sized
+        // worker pool while search and foreground app work need CPU time.
+        wasm.setThreadsCount(FACE_WASM_THREAD_LIMIT);
         wasm.setWasmPaths(`${this.wasmPath}${path.sep}`);
         await faceapi.tf.setBackend("wasm");
         await faceapi.tf.ready();
