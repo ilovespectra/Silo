@@ -258,6 +258,7 @@ if (
       "the stored image embedding is finite",
     );
 
+    await indexer.prepareVectorSearch(() => {});
     const results = await indexer.search(
       "a sailboat on calm blue water",
       23,
