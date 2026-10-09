@@ -19,6 +19,7 @@ paymentModule._compile(compiled, sourcePath);
 
 const {
   LIFETIME_PAYMENT_ADDRESS,
+  LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC,
   LIFETIME_USDC_MINT,
   createLifetimeSolanaPayUri,
   encodeSolanaPayReference,
@@ -86,6 +87,31 @@ assert.strictEqual(solanaPayParameters.get("spl-token"), LIFETIME_USDC_MINT);
 assert.strictEqual(solanaPayParameters.get("reference"), solanaPayReference);
 assert.throws(() => createLifetimeSolanaPayUri("bad-reference"), /reference is invalid/);
 assert.strictEqual(verifyParsedLifetimePayment(signature, makeRpcResponse()).status, "verified");
+assert.strictEqual(LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC, 23_750_000n);
+assert.strictEqual(
+  verifyParsedLifetimePayment(
+    signature,
+    makeRpcResponse({ receivedAmount: "23750000", transferAmount: "23750000" }),
+    LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC,
+  ).status,
+  "verified",
+);
+assert.strictEqual(
+  verifyParsedLifetimePayment(
+    signature,
+    makeRpcResponse({ receivedAmount: "23749999", transferAmount: "23749999" }),
+    LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC,
+  ).status,
+  "invalid",
+);
+assert.strictEqual(
+  verifyParsedLifetimePayment(
+    signature,
+    makeRpcResponse({ receivedAmount: "23750000", transferAmount: "23750000" }),
+  ).status,
+  "invalid",
+  "the direct wallet transfer path still requires the full 25 USDC",
+);
 assert.strictEqual(
   verifyParsedLifetimePayment(signature, makeRpcResponse({ receivedAmount: "24999999" })).status,
   "invalid",

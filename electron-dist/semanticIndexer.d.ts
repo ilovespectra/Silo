@@ -1,3 +1,4 @@
+import type { SearchPerformanceSettings } from "./contentSettings";
 export declare function confidenceSettingToMinimumThreshold(confidence: number): number;
 export interface IndexableFile {
     name: string;
@@ -21,9 +22,9 @@ export interface IndexProgress {
     currentFile: string | null;
     message: string;
 }
-type ScanSource = (sourcePath: string, onFile: (file: IndexableFile) => void, isCancelled: () => boolean) => Promise<void>;
+type ScanSource = (sourcePath: string, onFile: (file: IndexableFile) => void, isCancelled: () => boolean, shouldPauseForSearch?: () => boolean) => Promise<void>;
 type ProgressListener = (progress: IndexProgress) => void;
-type SearchProgressListener = (results: SearchResult[], scanned: number, total: number) => void;
+type SearchProgressListener = (results: SearchResult[], scanned: number, total: number, mode?: "ann") => void;
 type SourceCoverageStatus = "pending" | "scanning" | "completed" | "error" | "unavailable";
 type DiagnosticListener = (event: string, details?: Record<string, unknown>) => void;
 export declare class SemanticIndexer {
@@ -39,6 +40,19 @@ export declare class SemanticIndexer {
     private readonly onProgress;
     private readonly onDiagnostic;
     private readonly latestRecords;
+    private readonly latestRecordsByVectorKey;
+    private persistedVectorIndex;
+    private vectorIndexBuildPromise;
+    private performanceSettings;
+    private vectorIndexReady;
+    private resolveVectorIndexReady;
+    private rejectVectorIndexReady;
+    private readonly textRecordIds;
+    private readonly textRecordPaths;
+    private readonly textRecordTerms;
+    private readonly textPostingTerms;
+    private readonly textPostings;
+    private readonly activeTextSearches;
     private readonly indexedRecordListeners;
     private backgroundIndexWorkListener;
     private readonly searchEmbeddingCache;
@@ -119,12 +133,18 @@ export declare class SemanticIndexer {
     private filesToIndex;
     constructor(userDataPath: string, modelCachePath: string, scanSource: ScanSource, onProgress: ProgressListener, onDiagnostic?: DiagnosticListener, indexStoragePath?: string);
     setBackgroundIndexWorkListener(listener: ((changedFiles: Map<string, string>) => void) | null): void;
+    setPerformanceSettings(settings: SearchPerformanceSettings): void;
     initialize(onLoadProgress?: (fraction: number, records: number) => void): Promise<void>;
     /** False while the saved index is still being read; partial counts are shown meanwhile. */
     isLoaded(): boolean;
     whenLoaded(): Promise<void>;
+    prepareVectorSearch(onProgress: (fraction: number, records: number) => void): Promise<void>;
+    flushVectorSearch(): Promise<void>;
+    private beginInteractiveSearch;
+    private endInteractiveSearch;
     private openIndex;
     getProgress(): IndexProgress;
+    isSearchActive(): boolean;
     setDemoFileLimit(limit: number | null): void;
     private demoFilePaths;
     /** Cumulative counts from all current records, not just the active indexing batch. */
@@ -141,6 +161,10 @@ export declare class SemanticIndexer {
     getRetryableErrorCount(sourcePaths: string[]): number;
     private updateRecordCounts;
     private setLatestRecord;
+    private indexSearchableText;
+    private considerTextSearchRecord;
+    private publishTextSearchBatch;
+    private onTextSearchProgress;
     private deleteLatestRecord;
     /** Changes whenever any indexed record is added, changed, reindexed or removed. */
     getRevision(): number;
@@ -218,6 +242,11 @@ export declare class SemanticIndexer {
     };
     preloadClipModel(): Promise<void>;
     search(query: string, minimumConfidence: number, sourcePaths: string[], isCancelled?: () => boolean, onSearchProgress?: SearchProgressListener): Promise<SearchResult[]>;
+    /**
+     * Stream filename and path matches from the loaded index before CLIP finishes
+     * embedding or scoring a query.
+     */
+    searchTextMatches(query: string, sourcePaths: string[], isCancelled?: () => boolean, onMatches?: (matches: IndexableFile[], scanned: number, total: number, capped: boolean) => void): Promise<IndexableFile[]>;
     classifyUnsafeImages(sourcePaths: string[], unsafePrompt: string, safePrompt: string): Promise<string[]>;
     /** CLIP text embeddings for prompts, computed locally. */
     embedPreviewImage(filePath: string): Promise<Float32Array>;

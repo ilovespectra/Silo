@@ -1,9 +1,11 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.verifyParsedLifetimePayment = exports.isSolanaTransactionSignature = exports.createLifetimeSolanaPayUri = exports.isSolanaPayReference = exports.encodeSolanaPayReference = exports.LIFETIME_PAYMENT_MICRO_USDC = exports.LIFETIME_USDC_MINT = exports.LIFETIME_PAYMENT_ADDRESS = void 0;
+exports.verifyParsedLifetimePayment = exports.isSolanaTransactionSignature = exports.createLifetimeSolanaPayUri = exports.isSolanaPayReference = exports.encodeSolanaPayReference = exports.LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = exports.LIFETIME_PAYMENT_MICRO_USDC = exports.LIFETIME_USDC_MINT = exports.LIFETIME_PAYMENT_ADDRESS = void 0;
 exports.LIFETIME_PAYMENT_ADDRESS = "89Y6dpvpfTCBZjw2Xcb3KVVFTebdbGpzWTNEPMWEuMyu";
 exports.LIFETIME_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 exports.LIFETIME_PAYMENT_MICRO_USDC = 25000000n;
+// Preserve a $25 card price while allowing up to 5% seller-side checkout fees.
+exports.LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = 23750000n;
 const SOLANA_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function encodeSolanaPayReference(bytes) {
     if (bytes.length !== 32)
@@ -113,7 +115,7 @@ function isSolanaTransactionSignature(value) {
         /^[1-9A-HJ-NP-Za-km-z]+$/.test(value);
 }
 exports.isSolanaTransactionSignature = isSolanaTransactionSignature;
-function verifyParsedLifetimePayment(signature, rpcResponse) {
+function verifyParsedLifetimePayment(signature, rpcResponse, minimumPaymentMicroUsdc = exports.LIFETIME_PAYMENT_MICRO_USDC) {
     if (!isSolanaTransactionSignature(signature))
         return {
             status: "invalid",
@@ -208,11 +210,13 @@ function verifyParsedLifetimePayment(signature, rpcResponse) {
             continue;
         }
     }
-    if (netReceived < exports.LIFETIME_PAYMENT_MICRO_USDC ||
-        transferAmount < exports.LIFETIME_PAYMENT_MICRO_USDC)
+    if (netReceived < minimumPaymentMicroUsdc ||
+        transferAmount < minimumPaymentMicroUsdc)
         return {
             status: "invalid",
-            message: "No finalized payment of at least 25 USDC on Solana to Silo was found in that transaction.",
+            message: minimumPaymentMicroUsdc === exports.LIFETIME_PAYMENT_MICRO_USDC
+                ? "No finalized payment of at least 25 USDC on Solana to Silo was found in that transaction."
+                : "No finalized card settlement meeting Silo's minimum USDC amount was found in that transaction.",
         };
     return {
         status: "verified",

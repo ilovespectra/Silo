@@ -113,6 +113,7 @@ const lifetimeLicensePath = path.join(electron_1.app.getPath("userData"), "lifet
 const betaLicensePath = path.join(electron_1.app.getPath("userData"), "beta-license.json");
 const betaInstallationIdPath = path.join(electron_1.app.getPath("userData"), "beta-installation-id");
 const lifetimeRpcEndpoint = "https://optimistic-daisy-fast-mainnet.helius-rpc.com";
+const lifetimePaymentRelayBaseUrl = (process.env.SILO_PAYMENT_RELAY_URL || "https://license.kolektivkrog.si").replace(/\/$/, "");
 async function requestLifetimeRpc(method, params) {
     const abortController = new AbortController();
     const requestTimeout = setTimeout(() => abortController.abort(), 15000);
@@ -498,6 +499,7 @@ const EARLY_IPC_CHANNELS = new Set([
     "check-app-updates",
     "get-startup-state",
     "get-content-settings",
+    "get-search-performance-settings",
     "get-lifetime-license",
     "is-demo-mode",
     "get-bug-report-status",
@@ -846,6 +848,7 @@ function configureAppUpdater() {
 }
 const sendIndexProgress = (0, progressThrottle_1.createProgressThrottle)((progress) => sendToRenderer("index-progress", progress));
 const sendFaceIndexProgress = (0, progressThrottle_1.createProgressThrottle)((progress) => sendToRenderer("face-index-progress", progress));
+const sendSearchIndexReadiness = (0, progressThrottle_1.createProgressThrottle)((status) => sendToRenderer("search-index-readiness", status), 200);
 function reportStartup(label, ready = false) {
     startupState = {
         ready,
@@ -870,6 +873,19 @@ function reportStartupDetail(label) {
     sendToRenderer("startup-progress", startupState);
 }
 let mainWindow = null;
+let searchIndexReadiness = {
+    status: "preparing",
+    percentage: 0,
+    records: 0,
+    message: "Preparing the saved search index…",
+};
+function updateSearchIndexReadiness(status) {
+    searchIndexReadiness = status;
+    // Keep terminal readiness updates ordered behind any throttled progress.
+    // The throttle immediately flushes status transitions and replaces pending
+    // progress with the latest value, so an old 99% event cannot arrive after ready.
+    sendSearchIndexReadiness(status);
+}
 let indexStorageDeviceId = null;
 let indexStorageAvailable = true;
 let indexStorageInitializationDeferred = false;
@@ -1564,6 +1580,27 @@ let thumbnailPregenDirty = true;
 let startupIndexReconciliationSettled = false;
 let indexRecovery = null;
 let indexRecoveryTimer = null;
+let activeInteractiveSearches = 0;
+function trackInteractiveSearch(startSearch) {
+    activeInteractiveSearches += 1;
+    if (activeInteractiveSearches === 1)
+        void indexRecovery?.setSearchActive(true).catch(() => undefined);
+    let search;
+    try {
+        search = startSearch();
+    }
+    catch (error) {
+        activeInteractiveSearches = Math.max(0, activeInteractiveSearches - 1);
+        if (activeInteractiveSearches === 0)
+            void indexRecovery?.setSearchActive(false).catch(() => undefined);
+        return Promise.reject(error);
+    }
+    return search.finally(() => {
+        activeInteractiveSearches = Math.max(0, activeInteractiveSearches - 1);
+        if (activeInteractiveSearches === 0)
+            void indexRecovery?.setSearchActive(false).catch(() => undefined);
+    });
+}
 let recoverySearchSourcePaths = [];
 const queuedRecoveryStageIds = new Set();
 const ALL_INDEX_RECOVERY_STAGES = [
@@ -1571,7 +1608,6 @@ const ALL_INDEX_RECOVERY_STAGES = [
     "faces",
     "locations",
     "duplicates",
-    "pets",
     "thumbnails",
     "audio",
     "quality",
@@ -1669,7 +1705,6 @@ function requestSourceProcessingStages(sourcePaths) {
         "faces",
         "locations",
         "duplicates",
-        "pets",
         "thumbnails",
         "audio",
         "quality",
@@ -1712,14 +1747,14 @@ function getThumbnailIndexingWaitMessage() {
         return indexStorageUnavailableMessage;
     if (!semanticIndexer || !faceIndexer || !geoIndexer)
         return "Waiting for indexing services to start…";
+    if (semanticIndexer.isSearchActive())
+        return "Waiting for interactive search to finish…";
     if (!startupIndexReconciliationSettled)
         return "Waiting for search indexing to finish…";
     if (PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status))
         return "Waiting for search indexing to finish…";
     if (PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status))
         return "Waiting for face clustering to finish…";
-    if (["loading-model", "clustering"].includes(petIndexer?.getProgress().status))
-        return "Waiting for pet clustering to finish…";
     if (magicLibraryProgress.running)
         return "Waiting for photo quality analysis to finish…";
     if (duplicateManager?.getState().status === "scanning")
@@ -3071,7 +3106,9 @@ async function readAllSources(exploded, onProgress) {
             }
         }
     };
-    await Promise.all(Array.from({ length: Math.min(3, enabled.length) }, () => scanWorker()));
+    // Keep recursive discovery on one source at a time so large libraries do
+    // not saturate the disk and CPU while Silo is opening or searching.
+    await scanWorker();
     return results.flat();
 }
 function isRemotePath(candidate) {
@@ -3871,6 +3908,7 @@ async function createWindow() {
             contextIsolation: true,
             preload: preloadPath,
             sandbox: true,
+            autoplayPolicy: "no-user-gesture-required",
         },
     });
     const inventoryOwner = mainWindow.webContents.id;
@@ -4081,14 +4119,14 @@ async function indexNewSources(sourcePaths, reason) {
         return;
     await semanticIndexer.startWatching(activeSources);
     runtimeLog("auto-index-new-sources", { reason, sources: added });
-    queueSemanticIndexWork({ fullScanRoots: added }, ["faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality"]);
+    queueSemanticIndexWork({ fullScanRoots: added }, ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"]);
 }
 async function createUnifiedScanSource() {
     const appDataPath = path.resolve(electron_1.app.getPath("userData"));
     const canonicalAppDataPath = await fsPromises
         .realpath(appDataPath)
         .catch(() => appDataPath);
-    return async (sourcePath, onFile, isCancelled) => {
+    return async (sourcePath, onFile, isCancelled, shouldPauseForSearch = () => false) => {
         // Detect source type and delegate to appropriate scanner
         if (phoneManager.isPhonePath(sourcePath)) {
             await phoneManager.listPhoneFilesRecursively(sourcePath, onFile, isCancelled);
@@ -4126,7 +4164,18 @@ async function createUnifiedScanSource() {
         const results = [];
         const pendingDirectories = [sourcePath];
         const timeMachine = await (0, timeMachine_1.isTimeMachineDirectory)(sourcePath);
+        const DISCOVERY_COOLDOWN_EVERY_ENTRIES = 256;
+        const DISCOVERY_COOLDOWN_MAX_MS = 500;
+        let entriesSinceCooldown = 0;
+        let cooldownWindowStartedAt = Date.now();
+        const waitForSearchIdle = async () => {
+            while (!isCancelled() && shouldPauseForSearch())
+                await new Promise((resolve) => setTimeout(resolve, 75));
+            return !isCancelled();
+        };
         while (pendingDirectories.length > 0 && !isCancelled()) {
+            if (!(await waitForSearchIdle()))
+                return;
             const directoryPath = pendingDirectories.shift();
             if ((0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(directoryPath, sourcePath))
                 continue;
@@ -4148,9 +4197,12 @@ async function createUnifiedScanSource() {
             catch {
                 continue;
             }
-            const ENTRY_BATCH_SIZE = 128;
-            let processedEntries = 0;
+            const ENTRY_BATCH_SIZE = 32;
             for (let offset = 0; offset < entries.length; offset += ENTRY_BATCH_SIZE) {
+                if (isCancelled())
+                    return;
+                if (!(await waitForSearchIdle()))
+                    return;
                 const entryResults = await Promise.all(entries.slice(offset, offset + ENTRY_BATCH_SIZE).map(async (entry) => {
                     if (timeMachine && (0, timeMachine_1.shouldSkipTimeMachineEntry)(entry.name))
                         return null;
@@ -4204,17 +4256,25 @@ async function createUnifiedScanSource() {
                     }
                 }));
                 for (const result of entryResults) {
-                    processedEntries += 1;
-                    if (!result)
-                        continue;
                     if (isCancelled())
                         return;
-                    onFile(result.file);
-                    if (result.directoryPath) {
-                        pendingDirectories.push(result.directoryPath);
+                    if (shouldPauseForSearch() && !(await waitForSearchIdle()))
+                        return;
+                    entriesSinceCooldown += 1;
+                    if (result) {
+                        onFile(result.file);
+                        if (result.directoryPath) {
+                            pendingDirectories.push(result.directoryPath);
+                        }
                     }
-                    if (processedEntries % 256 === 0)
+                    if (entriesSinceCooldown >= DISCOVERY_COOLDOWN_EVERY_ENTRIES) {
+                        const workMs = Math.max(0, Date.now() - cooldownWindowStartedAt);
+                        const cooldownMs = Math.min(DISCOVERY_COOLDOWN_MAX_MS, Math.max(20, Math.round(workMs * 1.5)));
+                        await new Promise((resolve) => setTimeout(resolve, cooldownMs));
                         await new Promise((resolve) => setImmediate(resolve));
+                        entriesSinceCooldown = 0;
+                        cooldownWindowStartedAt = Date.now();
+                    }
                 }
             }
         }
@@ -4409,7 +4469,6 @@ function indexStorageWritersBusy() {
         (faceIndexer && isBusyIndexStatus(faceIndexer.getProgress().status)) ||
         (geoIndexer && isBusyIndexStatus(geoIndexer.getStatus().status)) ||
         (duplicateManager && duplicateManager.getState().status === "scanning") ||
-        (petIndexer && isBusyIndexStatus(petIndexer.getProgress().status)) ||
         audioInventoryRunning ||
         (thumbnailPregenerator && ["scanning", "generating"].includes(thumbnailPregenerator.getProgress().status)) ||
         magicLibraryProgress.running ||
@@ -4440,7 +4499,6 @@ async function pauseIndexingForStorage(message) {
         faceIndexer?.pause(),
         geoIndexer?.pause(),
         duplicateManager?.pause(),
-        petIndexer?.pause(),
     ].filter(Boolean));
     audioLibraryCache?.cancelScan();
     await waitForIndexStorageWritersToPause();
@@ -4459,7 +4517,7 @@ async function resumeIndexingAfterStorage() {
     }
     indexStorageUnavailableMessage = null;
     indexStorageAvailable = true;
-    aestheticScorer?.setBackgroundPaused(false);
+    aestheticScorer?.setBackgroundPaused(activeInteractiveSearches > 0);
     const resumeSources = semanticIndexer
         ? await semanticIndexer.setHold(heapPressureMessage)
         : [];
@@ -4823,6 +4881,7 @@ electron_1.app.whenReady().then(async () => {
         if (statusChanged)
             scheduleThumbnailPregeneration(progress.status === "indexing");
     }, runtimeLog, indexStorageRoot);
+    semanticIndexer.setPerformanceSettings(contentSettingsStore.getSearchPerformanceSnapshot().settings);
     semanticIndexer.setBackgroundIndexWorkListener((changedFiles) => queueSemanticIndexWork({ changedFiles }));
     libraryShareServer = new libraryShareServer_1.LibraryShareServer({
         getSources: async () => (await listSources()).map(({ id, label, rootPath, kind, available }) => ({
@@ -4833,7 +4892,7 @@ electron_1.app.whenReady().then(async () => {
             available,
         })),
         getIndexedFiles: (sourceRoots) => semanticIndexer.getIndexedFiles(sourceRoots),
-        search: (query, sourceRoots) => semanticIndexer.search(query, 0, sourceRoots),
+        search: (query, sourceRoots) => trackInteractiveSearch(() => semanticIndexer.search(query, 0, sourceRoots)),
         getThumbnail: async (filePath) => {
             const thumbnailUrl = await getThumbnail(filePath, false, 320);
             if (!thumbnailUrl)
@@ -4847,9 +4906,68 @@ electron_1.app.whenReady().then(async () => {
     if (indexStorageUnavailableMessage && !indexStorageInitializationDeferred)
         await semanticIndexer.setHold(indexStorageUnavailableMessage);
     semanticIndexer.setDemoFileLimit(fullAccessEnabled() ? null : demoLimits_1.DEMO_LIMITS.files);
+    let loadedSearchRecords = 0;
+    let searchPreparationFailureMessage = "Search index could not be opened.";
     const semanticLoad = indexStorageInitializationDeferred
-        ? Promise.resolve()
-        : semanticIndexer.initialize((fraction, records) => reportStartupDetail(`Opening search index… ${Math.round(fraction * 100)}% (${records.toLocaleString()} files)`));
+        ? Promise.resolve().then(() => {
+            updateSearchIndexReadiness({
+                status: "unavailable",
+                percentage: 0,
+                records: 0,
+                message: "Search index storage is unavailable.",
+            });
+        })
+        : semanticIndexer.initialize((fraction, records) => {
+            loadedSearchRecords = records;
+            const percentage = Math.min(20, Math.round(fraction * 20));
+            updateSearchIndexReadiness({
+                status: "preparing",
+                percentage,
+                records,
+                message: `Reading saved search records · ${percentage}%`,
+            });
+            reportStartupDetail(`Opening saved search records… ${percentage}% (${records.toLocaleString()} files)`);
+        });
+    const semanticSearchReady = semanticLoad.then(async () => {
+        if (indexStorageInitializationDeferred)
+            return;
+        // Opening the saved vectors is only half of search preparation. Start the
+        // offline CLIP worker now so the first user query never pays its cold-start
+        // cost while the UI claims search is ready.
+        updateSearchIndexReadiness({
+            status: "preparing",
+            percentage: 20,
+            records: loadedSearchRecords,
+            message: "Warming the offline search model…",
+        });
+        reportStartupDetail("Warming the offline search model…");
+        searchPreparationFailureMessage =
+            "The offline search model could not be prepared.";
+        await semanticIndexer.preloadClipModel();
+        runtimeLog("search-model-preloaded", {
+            elapsedMs: Date.now() - startupStartedAt,
+            records: loadedSearchRecords,
+        });
+        searchPreparationFailureMessage =
+            "The local semantic index could not be prepared.";
+        updateSearchIndexReadiness({
+            status: "preparing",
+            percentage: 30,
+            records: loadedSearchRecords,
+            message: "Building the fast local search index…",
+        });
+        reportStartupDetail("Building the fast local search index…");
+        await semanticIndexer.prepareVectorSearch((fraction, records) => {
+            const percentage = Math.min(99, 30 + Math.round(fraction * 69));
+            updateSearchIndexReadiness({
+                status: "preparing",
+                percentage,
+                records: Math.max(loadedSearchRecords, records),
+                message: `Building the fast local search index · ${percentage}%`,
+            });
+            reportStartupDetail(`Building the fast local search index… ${percentage}%`);
+        });
+    });
     const faceModelPath = electron_1.app.isPackaged
         ? path.join(process.resourcesPath, "face-models")
         : path.join(electron_1.app.getAppPath(), "node_modules/@vladmandic/face-api/model");
@@ -5012,7 +5130,24 @@ electron_1.app.whenReady().then(async () => {
     const trackLoad = (load, label) => load.then(() => reportStartup(label));
     reportStartup("Loading face, location and inventory caches…");
     // The search index can take a minute to open on big libraries; the app is usable meanwhile.
-    void semanticLoad.then(() => runtimeLog("search-index-loaded", { elapsedMs: Date.now() - startupStartedAt }), (error) => runtimeLog("startup-load-error", { message: String(error) }));
+    void semanticSearchReady.then(() => {
+        if (searchIndexReadiness.status !== "unavailable")
+            updateSearchIndexReadiness({
+                status: "ready",
+                percentage: 100,
+                records: loadedSearchRecords,
+                message: "Search index ready.",
+            });
+        runtimeLog("search-index-loaded", { elapsedMs: Date.now() - startupStartedAt });
+    }, (error) => {
+        updateSearchIndexReadiness({
+            status: "error",
+            percentage: searchIndexReadiness.percentage,
+            records: searchIndexReadiness.records,
+            message: searchPreparationFailureMessage,
+        });
+        runtimeLog("startup-load-error", { message: String(error) });
+    });
     const loadResults = await Promise.allSettled([
         trackLoad(libraryStatsLoad, "Inventory statistics ready"),
         trackLoad(faceLoad, "Faces ready"),
@@ -5120,11 +5255,11 @@ electron_1.app.whenReady().then(async () => {
                     const pausedByUser = progress.status === "paused" && !/interrupted/i.test(progress.message);
                     if (!pausedByUser && lifetimeFullScanPending) {
                         lifetimeFullScanPending = false;
-                        queueSemanticIndexWork({ fullScanAll: true, force: true }, ["faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality"]);
+                        queueSemanticIndexWork({ fullScanAll: true, force: true }, ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"]);
                     }
                     else if (!pausedByUser && !lifetimeLicensed) {
                         queueSemanticIndexWork({ fullScanAll: true }, [
-                            "faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality",
+                            "faces", "locations", "duplicates", "thumbnails", "audio", "quality",
                         ]);
                     }
                     else if (!pausedByUser) {
@@ -5137,7 +5272,7 @@ electron_1.app.whenReady().then(async () => {
                                 ...changedFiles,
                                 ...semanticIndexer.getRetryableFiles(sources),
                             ]),
-                        }, ["faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality"]);
+                        }, ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"]);
                     }
                 }
                 finally {
@@ -5165,8 +5300,6 @@ electron_1.app.whenReady().then(async () => {
             return "Search embeddings are being processed.";
         if (PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status))
             return "Face analysis is running.";
-        if (["loading-model", "clustering"].includes(petIndexer.getProgress().status))
-            return "Pet clustering is running.";
         if (magicLibraryProgress.running)
             return "Photo quality analysis is running.";
         if (!searchSettled())
@@ -5175,7 +5308,6 @@ electron_1.app.whenReady().then(async () => {
     };
     const analysisIdle = () => !PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) &&
         !PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status) &&
-        !["loading-model", "clustering"].includes(petIndexer.getProgress().status) &&
         !magicLibraryProgress.running;
     const diskIdle = () => !audioInventoryRunning &&
         duplicateManager.getState().status !== "scanning" &&
@@ -5293,16 +5425,6 @@ electron_1.app.whenReady().then(async () => {
             pause: () => duplicateManager.pause(),
         },
         {
-            id: "pets",
-            lane: "background",
-            blockedReason: analysisBlocker,
-            needsInitialCheck: true,
-            progress: () => petIndexer.getProgress(),
-            ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
-            start: async () => petIndexer.start((progress) => sendToRenderer("pet-progress", progress), await getAllIndexSources()),
-            pause: () => petIndexer.pause(),
-        },
-        {
             id: "thumbnails",
             lane: "background",
             blockedReason: () => getThumbnailIndexingWaitMessage() ||
@@ -5370,8 +5492,11 @@ electron_1.app.whenReady().then(async () => {
                     .filter((file) => !isRemotePath(file.path)));
             },
             pause: () => aestheticScorer.setBackgroundPaused(true),
+            resume: () => aestheticScorer.setBackgroundPaused(false),
         },
     ], Date.now, path.join(electron_1.app.getPath("userData"), "indexing-recovery.json"));
+    if (activeInteractiveSearches > 0)
+        await indexRecovery.setSearchActive(true);
     await monitorIndexStorageAvailability();
     startIndexStorageAvailabilityMonitor();
     requestIndexRecoveryStages([]);
@@ -5465,7 +5590,10 @@ electron_1.app.on("before-quit", (event) => {
     // Finish in-flight index writes so a restart never finds a torn record line.
     event.preventDefault();
     quitFlushed = true;
-    const flush = semanticIndexer.flushWrites();
+    const flush = Promise.all([
+        semanticIndexer.flushWrites(),
+        semanticIndexer.flushVectorSearch(),
+    ]);
     const deadline = new Promise((resolve) => setTimeout(resolve, 8000));
     void Promise.race([flush, deadline]).finally(() => electron_1.app.quit());
 });
@@ -6129,7 +6257,7 @@ async function refreshAudioInventory(requestId, force = false) {
                 requestId,
                 ...progress,
             });
-        }, force);
+        }, force, () => semanticIndexer.isSearchActive());
         sendToRenderer("audio-library-cache-changed", snapshot.scannedAt);
         runtimeLog("audio-inventory-checkpoint", {
             files: snapshot.files.length,
@@ -6349,7 +6477,14 @@ electron_1.ipcMain.handle("get-app-state", () => ({
     ...stateStore.getState(),
     indexProgress: semanticIndexer.getProgress(),
 }));
+electron_1.ipcMain.handle("get-search-index-readiness", () => searchIndexReadiness);
 electron_1.ipcMain.handle("get-content-settings", () => contentSettingsStore.getPublicSettings());
+electron_1.ipcMain.handle("get-search-performance-settings", () => contentSettingsStore.getSearchPerformanceSnapshot());
+electron_1.ipcMain.handle("update-search-performance-settings", async (_event, update) => {
+    const snapshot = await contentSettingsStore.updateSearchPerformanceSettings(update);
+    semanticIndexer?.setPerformanceSettings(snapshot.settings);
+    return snapshot;
+});
 electron_1.ipcMain.handle("set-parental-password", (_event, currentPassword, newPassword) => contentSettingsStore.setParentalPassword(currentPassword, newPassword));
 electron_1.ipcMain.handle("update-content-settings", async (_event, update, password) => {
     const settings = await contentSettingsStore.updatePreferences(update, password);
@@ -6544,7 +6679,7 @@ electron_1.ipcMain.handle("start-indexing", async () => {
     await semanticIndexer.startWatching(sources);
     queueSemanticIndexWork(fullAccessEnabled()
         ? { fullScanRoots: sources, force: true }
-        : { fullScanAll: true, force: true }, ["faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality"]);
+        : { fullScanAll: true, force: true }, ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"]);
     return semanticIndexer.getProgress();
 });
 electron_1.ipcMain.handle("pause-indexing", async () => {
@@ -6561,12 +6696,11 @@ const supersedeSemanticSearch = (sender) => {
 electron_1.ipcMain.handle("cancel-semantic-search", (event) => {
     supersedeSemanticSearch(event.sender);
 });
-electron_1.ipcMain.handle("semantic-search", async (event, query, confidence, requestId) => {
+electron_1.ipcMain.handle("semantic-search", async (event, query, _confidence, requestId) => {
     const sender = event.sender;
     const generation = supersedeSemanticSearch(sender);
     const isCancelled = () => sender.isDestroyed() || semanticSearchGenerations.get(sender) !== generation;
     const progressRequestId = Number.isSafeInteger(requestId) ? requestId : generation;
-    const minimumConfidence = (0, semanticIndexer_1.confidenceSettingToMinimumThreshold)(confidence);
     const contentSettings = contentSettingsStore.getPublicSettings();
     if (contentSettings.safeSearch && (0, contentPolicy_1.containsExplicitTerms)(query))
         throw new Error("This search is blocked by Safe Search. A parental password is required to change Safe Search in Settings.");
@@ -6579,10 +6713,15 @@ electron_1.ipcMain.handle("semantic-search", async (event, query, confidence, re
     const state = stateStore.getSearchState();
     const normalizedQuery = query.trim().toLowerCase();
     const priorityMatches = new Map();
-    const addPriorityMatch = (filePath, priority, source, name) => {
+    const addPriorityMatch = (filePath, priority, source, name, file) => {
         const previous = priorityMatches.get(filePath);
         if (!previous || priority < previous.priority)
-            priorityMatches.set(filePath, { priority, source, name });
+            priorityMatches.set(filePath, {
+                priority,
+                source,
+                name,
+                file: file ?? previous?.file,
+            });
     };
     const rankResults = (semanticResults) => {
         const semanticResultsByPath = new Map(semanticResults.map((result) => [result.path, result]));
@@ -6596,7 +6735,7 @@ electron_1.ipcMain.handle("semantic-search", async (event, query, confidence, re
         for (const [filePath, match] of priorityMatches) {
             const semanticResult = semanticResultsByPath.get(filePath);
             allResults.set(filePath, {
-                ...(semanticResult || {
+                ...(semanticResult || match.file || {
                     name: path.basename(filePath),
                     path: filePath,
                     relativePath: filePath,
@@ -6605,24 +6744,31 @@ electron_1.ipcMain.handle("semantic-search", async (event, query, confidence, re
                     isDirectory: false,
                     type: "image",
                     extension: path.extname(filePath).slice(1),
-                    confidence: 100,
                 }),
                 ...(match.name ? { name: match.name } : {}),
-                confidence: 100,
+                confidence: undefined,
                 _priority: match.priority,
                 _source: match.source,
             });
         }
-        const activeResults = filterForEnabledSources(Array.from(allResults.values()), new Set(sources)).filter((result) => Number.isFinite(result.confidence) &&
-            result.confidence >= minimumConfidence);
+        const activeResults = filterForEnabledSources(Array.from(allResults.values()), new Set(sources)).filter((result) => result._priority !== 3 || Number.isFinite(result.confidence));
         if (isCancelled())
             return [];
         return filterForContentSafety(activeResults).sort((first, second) => {
             const priorityDifference = (first._priority ?? 3) - (second._priority ?? 3);
-            return priorityDifference || second.confidence - first.confidence;
+            return priorityDifference || (second.confidence ?? 0) - (first.confidence ?? 0);
         });
     };
-    const publishProgress = (status, semanticResults, scanned = 0, total = 0) => {
+    let latestSemanticResults = [];
+    let semanticScanned = 0;
+    let semanticTotal = 0;
+    let semanticProgressMode;
+    let textScanned = 0;
+    let textTotal = 0;
+    let textCapped = false;
+    let lastTextPublishAt = 0;
+    let hasPublishedTextMatches = false;
+    const publishProgress = (status, semanticResults = latestSemanticResults, scanned = Math.max(semanticScanned, textScanned), total = Math.max(semanticTotal, textTotal)) => {
         if (isCancelled())
             return;
         sender.send("semantic-search-progress", {
@@ -6631,33 +6777,67 @@ electron_1.ipcMain.handle("semantic-search", async (event, query, confidence, re
             results: rankResults(semanticResults),
             scanned,
             total,
+            textCapped,
+            mode: semanticProgressMode,
         });
     };
-    // Kick off CLIP against the saved index before walking user-authored names.
-    // The callback streams verified semantic matches as soon as each vector batch
-    // is scored; previews remain separately labeled as unconfirmed in the UI.
     publishProgress("searching", []);
-    let scannedRecords = 0;
-    let totalRecords = 0;
-    const semanticResultsPromise = semanticIndexer.search(query, minimumConfidence, sources, isCancelled, (partialResults, scanned, total) => {
-        scannedRecords = scanned;
-        totalRecords = total;
-        publishProgress("searching", partialResults, scanned, total);
+    const semanticResultsPromise = trackInteractiveSearch(() => semanticIndexer.search(query, 0, sources, isCancelled, (partialResults, scanned, total, mode) => {
+        latestSemanticResults = partialResults;
+        semanticScanned = scanned;
+        semanticTotal = total;
+        semanticProgressMode = mode;
+        publishProgress("searching");
+    }));
+    const textMatchesPromise = semanticIndexer.searchTextMatches(query, sources, isCancelled, (files, scanned, total, capped) => {
+        textScanned = scanned;
+        textTotal = total;
+        textCapped || (textCapped = capped);
+        for (const file of files) {
+            const lowerName = file.name.toLowerCase();
+            const nameMatches = lowerName.includes(normalizedQuery);
+            const pathMatches = file.relativePath.toLowerCase().includes(normalizedQuery) ||
+                file.path.toLowerCase().includes(normalizedQuery);
+            addPriorityMatch(file.path, lowerName === normalizedQuery ? 0 : nameMatches ? 1 : 2, nameMatches ? "Name match" : pathMatches ? "Path match" : "Name match", undefined, file);
+        }
+        const now = Date.now();
+        if (files.length > 0 || capped) {
+            if (!hasPublishedTextMatches || now - lastTextPublishAt >= 120 || capped) {
+                hasPublishedTextMatches = true;
+                lastTextPublishAt = now;
+                publishProgress("searching");
+            }
+        }
     });
     if (normalizedQuery) {
+        let priorityWork = 0;
+        const yieldPriorityWork = async () => {
+            priorityWork += 1;
+            if (priorityWork % 2048 === 0) {
+                publishProgress("searching");
+                await new Promise((resolve) => setImmediate(resolve));
+            }
+            return !isCancelled();
+        };
         for (const folder of state.digitalFolders) {
             if (!folder.name.toLowerCase().includes(normalizedQuery))
                 continue;
-            for (const filePath of folder.filePaths)
+            for (const filePath of folder.filePaths) {
                 addPriorityMatch(filePath, 2, `In folder: ${folder.name}`);
+                if (!(await yieldPriorityWork()))
+                    return [];
+            }
         }
         // User-confirmed people photos outrank inferred visual similarity.
         for (const person of faceIndexer.getPeople()) {
             if (!person.name.toLowerCase().includes(normalizedQuery))
                 continue;
             const detail = faceIndexer.getPerson(person.id);
-            for (const filePath of detail?.confirmedPhotoPaths ?? [])
+            for (const filePath of detail?.confirmedPhotoPaths ?? []) {
                 addPriorityMatch(filePath, 1, `Named as: ${person.name}`);
+                if (!(await yieldPriorityWork()))
+                    return [];
+            }
         }
         // Pet names and other explicit name assignments remain searchable. Person
         // cluster suggestions are excluded here; only confirmed cluster photos win.
@@ -6670,18 +6850,30 @@ electron_1.ipcMain.handle("semantic-search", async (event, query, confidence, re
                 addPriorityMatch(fileEntry.path, 1, `Named as: ${entry.name}`);
                 if (entry.sourceType === "pet")
                     matchingPetPaths.add(fileEntry.path);
+                if (!(await yieldPriorityWork()))
+                    return [];
             }
         }
         if (matchingPetPaths.size) {
             for (const folder of state.digitalFolders) {
-                if (!folder.filePaths.some((filePath) => matchingPetPaths.has(filePath)))
-                    continue;
-                for (const filePath of folder.filePaths)
-                    addPriorityMatch(filePath, 1, `In folder: ${folder.name}`);
+                let containsPetPath = false;
+                for (const filePath of folder.filePaths) {
+                    if (matchingPetPaths.has(filePath))
+                        containsPetPath = true;
+                    if (!(await yieldPriorityWork()))
+                        return [];
+                }
+                if (containsPetPath)
+                    for (const filePath of folder.filePaths) {
+                        addPriorityMatch(filePath, 1, `In folder: ${folder.name}`);
+                        if (!(await yieldPriorityWork()))
+                            return [];
+                    }
             }
         }
         // User-authored aliases and keywords are the strongest exact matches.
-        for (const [filePath, metadata] of Object.entries(state.fileMetadata)) {
+        for (const filePath in state.fileMetadata) {
+            const metadata = state.fileMetadata[filePath];
             const aliasMatches = metadata.displayName
                 ?.toLowerCase()
                 .includes(normalizedQuery);
@@ -6690,19 +6882,25 @@ electron_1.ipcMain.handle("semantic-search", async (event, query, confidence, re
                 addPriorityMatch(filePath, 0, aliasMatches
                     ? `Virtual name: ${metadata.displayName}`
                     : `Keywords: ${metadata.keywords.join(", ")}`, metadata.displayName);
+            if (!(await yieldPriorityWork()))
+                return [];
         }
     }
-    publishProgress("searching", []);
-    const semanticResults = await semanticResultsPromise;
+    const [semanticResults] = await Promise.all([
+        semanticResultsPromise,
+        textMatchesPromise,
+    ]);
     if (isCancelled())
         return [];
+    latestSemanticResults = semanticResults;
     const results = rankResults(semanticResults);
     sender.send("semantic-search-progress", {
         requestId: progressRequestId,
         status: "done",
         results,
-        scanned: scannedRecords,
-        total: totalRecords,
+        scanned: Math.max(semanticScanned, textScanned),
+        total: Math.max(semanticTotal, textTotal),
+        textCapped,
     });
     return results;
 });
@@ -7227,7 +7425,6 @@ electron_1.ipcMain.handle("get-indexing-overview", async () => {
     const face = faceIndexer.getProgress();
     const geo = geoIndexer.getStatus();
     const duplicates = duplicateManager.getState();
-    const pets = petIndexer.getProgress();
     const thumbnails = thumbnailPregenerator?.getProgress();
     const audio = audioLibraryCache?.getSnapshot();
     const coveredAudioSources = audio?.sourceIds.filter((id) => Boolean(audio.sourceScannedAt?.[id]) &&
@@ -7295,16 +7492,6 @@ electron_1.ipcMain.handle("get-indexing-overview", async () => {
             unit: "candidates",
             message: duplicates.message,
             detail: `${duplicates.duplicateFiles.toLocaleString()} duplicate copies`,
-        },
-        {
-            id: "pets",
-            label: "Pets",
-            status: pets.status,
-            processed: pets.processed,
-            total: pets.total,
-            unit: "photos",
-            errors: pets.errors,
-            message: pets.message,
         },
         {
             id: "audio",
@@ -7744,12 +7931,9 @@ electron_1.ipcMain.handle("get-pet-state", async () => {
     };
 });
 electron_1.ipcMain.handle("start-pet-clustering", async () => {
-    await retryIndexRecoveryStage("pets");
     return petIndexer.getProgress();
 });
 electron_1.ipcMain.handle("pause-pet-clustering", async () => {
-    indexRecovery?.pause("pets");
-    petIndexer.pause();
     return petIndexer.getProgress();
 });
 electron_1.ipcMain.handle("rename-pet-cluster", async (_event, clusterId, name) => {
@@ -7772,6 +7956,90 @@ electron_1.ipcMain.handle("reject-name-file", async (_event, name, filePath) => 
 });
 // Handle isDev check for client
 electron_1.ipcMain.handle("get-lifetime-license", () => readLifetimeLicense());
+electron_1.ipcMain.handle("begin-lifetime-card-purchase", async () => {
+    try {
+        const installationId = await getBetaInstallationId();
+        const relayBase = new URL(lifetimePaymentRelayBaseUrl);
+        if (relayBase.protocol !== "https:" && relayBase.hostname !== "localhost")
+            throw new Error("The card payment relay must use HTTPS.");
+        const response = await electron_1.net.fetch(`${relayBase.origin}/api/purchase`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ installationId }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok)
+            throw new Error(typeof payload.error === "string"
+                ? payload.error
+                : "Card checkout could not be started.");
+        const checkoutUrl = new URL(payload.checkoutUrl);
+        if (checkoutUrl.protocol !== "https:" ||
+            checkoutUrl.origin !== relayBase.origin ||
+            checkoutUrl.pathname !== "/checkout.html" ||
+            typeof payload.purchaseId !== "string" ||
+            typeof payload.claimToken !== "string")
+            throw new Error("The payment relay returned an invalid checkout link.");
+        await electron_1.shell.openExternal(checkoutUrl.toString());
+        return {
+            ok: true,
+            purchaseId: payload.purchaseId,
+            claimToken: payload.claimToken,
+        };
+    }
+    catch (error) {
+        return {
+            ok: false,
+            error: error instanceof Error
+                ? error.message
+                : "Card checkout could not be started.",
+        };
+    }
+});
+electron_1.ipcMain.handle("check-lifetime-card-purchase", async (_event, purchaseIdValue, claimTokenValue) => {
+    if (typeof purchaseIdValue !== "string" ||
+        !/^[0-9a-f-]{36}$/i.test(purchaseIdValue) ||
+        typeof claimTokenValue !== "string" ||
+        claimTokenValue.length < 40 ||
+        claimTokenValue.length > 100)
+        return { status: "error", message: "The checkout reference is invalid." };
+    try {
+        const relayBase = new URL(lifetimePaymentRelayBaseUrl);
+        if (relayBase.protocol !== "https:")
+            throw new Error("The card payment relay must use HTTPS.");
+        const response = await electron_1.net.fetch(`${relayBase.origin}/api/purchase/${encodeURIComponent(purchaseIdValue)}`, {
+            headers: { "x-silo-claim-token": claimTokenValue },
+            redirect: "error",
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok)
+            return {
+                status: "error",
+                message: typeof payload.error === "string"
+                    ? payload.error
+                    : "The license relay could not be reached.",
+            };
+        if (payload.status === "verified" && typeof payload.signature === "string")
+            return {
+                status: "verified",
+                signature: payload.signature,
+                message: "Card payment verified. Saving your Silo license…",
+            };
+        if (payload.status === "expired")
+            return { status: "expired", message: "This checkout expired. Start a new card payment." };
+        return {
+            status: "pending",
+            message: typeof payload.message === "string"
+                ? payload.message
+                : "Waiting for Solana to finalize the card payment.",
+        };
+    }
+    catch {
+        return {
+            status: "error",
+            message: "The license relay is temporarily unavailable. Silo will keep checking.",
+        };
+    }
+});
 electron_1.ipcMain.handle("is-demo-mode", () => !fullAccessEnabled());
 electron_1.ipcMain.handle("get-bug-report-status", () => {
     const configuredEndpoint = process.env.SILO_BUG_REPORT_ENDPOINT?.trim() || defaultBugReportEndpoint;
@@ -8005,14 +8273,14 @@ electron_1.ipcMain.handle("activate-beta-license", async (_event, activationCode
         };
     }
 });
-electron_1.ipcMain.handle("verify-lifetime-payment", async (_event, signatureValue) => {
+async function verifyAndSaveLifetimePayment(signatureValue, minimumPaymentMicroUsdc) {
     if (typeof signatureValue !== "string")
         return {
             status: "invalid",
             message: "Paste the transaction signature shown by your Solana wallet.",
         };
     if (!(0, lifetimePayment_1.isSolanaTransactionSignature)(signatureValue))
-        return (0, lifetimePayment_1.verifyParsedLifetimePayment)(signatureValue, {});
+        return (0, lifetimePayment_1.verifyParsedLifetimePayment)(signatureValue, {}, minimumPaymentMicroUsdc);
     const existingLicense = await readLifetimeLicense();
     if (existingLicense.isLicensed)
         return {
@@ -8034,7 +8302,7 @@ electron_1.ipcMain.handle("verify-lifetime-payment", async (_event, signatureVal
                 status: "error",
                 message: "Helius could not be reached or is rate-limiting requests. Please try again shortly.",
             };
-        const verification = (0, lifetimePayment_1.verifyParsedLifetimePayment)(signatureValue, rpcResponse.result);
+        const verification = (0, lifetimePayment_1.verifyParsedLifetimePayment)(signatureValue, rpcResponse.result, minimumPaymentMicroUsdc);
         if (verification.status !== "verified")
             return verification;
         const verifiedAt = Date.now();
@@ -8056,7 +8324,9 @@ electron_1.ipcMain.handle("verify-lifetime-payment", async (_event, signatureVal
             message: "Could not verify with Solana right now. Check your connection and try again; no license status was changed.",
         };
     }
-});
+}
+electron_1.ipcMain.handle("verify-lifetime-payment", async (_event, signatureValue) => verifyAndSaveLifetimePayment(signatureValue, 25000000n));
+electron_1.ipcMain.handle("verify-lifetime-card-payment", async (_event, signatureValue) => verifyAndSaveLifetimePayment(signatureValue, lifetimePayment_1.LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC));
 electron_1.ipcMain.handle("check-lifetime-payment-reference", async (_event, referenceValue) => {
     if (typeof referenceValue !== "string" ||
         !(0, lifetimePayment_1.isSolanaPayReference)(referenceValue))

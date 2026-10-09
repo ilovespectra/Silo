@@ -30,7 +30,9 @@ const path = __importStar(require("path"));
 const readline = __importStar(require("readline"));
 // Bump when the raw measurements change so cached results are recomputed.
 const METRICS_VERSION = 2;
-const ANALYSIS_CONCURRENCY = 3;
+const ANALYSIS_CONCURRENCY = 1;
+const BACKGROUND_COOLDOWN_MIN_MS = 250;
+const BACKGROUND_COOLDOWN_MAX_MS = 3000;
 const DIVERSITY_WINDOW = 1500;
 const RANK_CACHE_SIZE = 12;
 // Every photo is compared against all prompts once; presets only choose which ones count.
@@ -339,14 +341,24 @@ class AestheticScorer {
                         : this.backgroundQueue.shift();
                     if (this.isFresh(item))
                         continue;
+                    const workStartedAt = Date.now();
                     await this.analyze(item, foreground);
                     if (Date.now() - lastEmit > 1500) {
                         lastEmit = Date.now();
                         this.emitProgress();
                     }
-                    // Background work yields so indexing and the UI stay responsive.
-                    if (!foreground)
-                        await new Promise((resolve) => setTimeout(resolve, 25));
+                    // Keep photo analysis at a low duty cycle. Search pauses this queue;
+                    // the cooldown also limits sustained CPU when no search is active.
+                    if (!foreground) {
+                        const workMs = Math.max(0, Date.now() - workStartedAt);
+                        const cooldownMs = Math.min(BACKGROUND_COOLDOWN_MAX_MS, Math.max(BACKGROUND_COOLDOWN_MIN_MS, Math.round(workMs * 2)));
+                        const cooldownUntil = Date.now() + cooldownMs;
+                        while (Date.now() < cooldownUntil &&
+                            !this.backgroundPaused &&
+                            this.queue.length === 0) {
+                            await new Promise((resolve) => setTimeout(resolve, Math.min(50, cooldownUntil - Date.now())));
+                        }
+                    }
                 }
             };
             await Promise.all(Array.from({ length: ANALYSIS_CONCURRENCY }, worker));

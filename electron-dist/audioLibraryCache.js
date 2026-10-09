@@ -7,6 +7,10 @@ exports.AudioLibraryCache = void 0;
 const fs_1 = require("fs");
 const path_1 = __importDefault(require("path"));
 const indexingPathPolicy_1 = require("./indexingPathPolicy");
+const AUDIO_SCAN_DIRECTORY_WORKERS = 1;
+const AUDIO_SCAN_COOLDOWN_EVERY_ENTRIES = 256;
+const AUDIO_SCAN_COOLDOWN_MIN_MS = 20;
+const AUDIO_SCAN_COOLDOWN_MAX_MS = 300;
 class AudioLibraryCache {
     constructor(userDataPath) {
         this.snapshot = {
@@ -57,20 +61,25 @@ class AudioLibraryCache {
     cancelScan() {
         this.cancelled = true;
     }
-    async scan(sources, isRemotePath, isAudio, listRemoteFiles, onProgress, force = false) {
+    async scan(sources, isRemotePath, isAudio, listRemoteFiles, onProgress, force = false, shouldPauseForSearch = () => false) {
         if (this.scanPromise)
             return this.scanPromise;
         this.cancelled = false;
         if (force)
             for (const source of sources)
                 this.sourceCooldowns.delete(source.id);
-        const pending = this.scanImpl(sources, isRemotePath, isAudio, listRemoteFiles, onProgress, force).finally(() => {
+        const pending = this.scanImpl(sources, isRemotePath, isAudio, listRemoteFiles, onProgress, force, shouldPauseForSearch).finally(() => {
             this.scanPromise = null;
         });
         this.scanPromise = pending;
         return pending;
     }
-    async scanImpl(sources, isRemotePath, isAudio, listRemoteFiles, onProgress, force) {
+    async scanImpl(sources, isRemotePath, isAudio, listRemoteFiles, onProgress, force, shouldPauseForSearch) {
+        const waitForSearchIdle = async () => {
+            while (!this.cancelled && shouldPauseForSearch())
+                await new Promise((resolve) => setTimeout(resolve, 75));
+            return !this.cancelled;
+        };
         const sourceIds = sources.map((source) => source.id);
         const next = new Map(this.snapshot.files
             .filter((file) => file.sourceId && sourceIds.includes(file.sourceId))
@@ -113,6 +122,7 @@ class AudioLibraryCache {
             let audioFound = 0;
             let scanned = 0;
             let succeeded = false;
+            let retryWholeSource = true;
             let lastError;
             for (let attempt = 0; attempt < 3 && !succeeded; attempt += 1) {
                 if (attempt > 0) {
@@ -129,8 +139,25 @@ class AudioLibraryCache {
                 }
                 if (this.cancelled)
                     return this.getSnapshot();
+                if (shouldPauseForSearch() &&
+                    !(await waitForSearchIdle()))
+                    return this.getSnapshot();
                 scanned = 0;
                 audioFound = 0;
+                let cooldownWindowStartedAt = Date.now();
+                let entriesSinceCooldown = 0;
+                const coolDownAfterAudioEntry = () => {
+                    entriesSinceCooldown += 1;
+                    if (entriesSinceCooldown < AUDIO_SCAN_COOLDOWN_EVERY_ENTRIES)
+                        return null;
+                    const workMs = Math.max(0, Date.now() - cooldownWindowStartedAt);
+                    const cooldownMs = Math.min(AUDIO_SCAN_COOLDOWN_MAX_MS, Math.max(AUDIO_SCAN_COOLDOWN_MIN_MS, workMs));
+                    return new Promise((resolve) => setTimeout(() => {
+                        entriesSinceCooldown = 0;
+                        cooldownWindowStartedAt = Date.now();
+                        resolve();
+                    }, cooldownMs));
+                };
                 const sourceFiles = new Map();
                 const pendingFiles = [];
                 const emitScanProgress = (message) => {
@@ -148,10 +175,19 @@ class AudioLibraryCache {
                 };
                 try {
                     if (isRemotePath(source.rootPath)) {
+                        if (shouldPauseForSearch() &&
+                            !(await waitForSearchIdle()))
+                            return this.getSnapshot();
                         const remoteFiles = await listRemoteFiles(source);
                         for (const file of remoteFiles) {
                             if (this.cancelled)
                                 return this.getSnapshot();
+                            if (shouldPauseForSearch() &&
+                                !(await waitForSearchIdle()))
+                                return this.getSnapshot();
+                            const cooldown = coolDownAfterAudioEntry();
+                            if (cooldown)
+                                await cooldown;
                             scanned += 1;
                             if (!file.isDirectory &&
                                 (file.type === "audio" || isAudio(file.name))) {
@@ -167,6 +203,8 @@ class AudioLibraryCache {
                                 if (audioFound === 1 || pendingFiles.length >= 24)
                                     emitScanProgress(`Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`);
                             }
+                            if (scanned % 500 === 0)
+                                emitScanProgress(`Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`);
                         }
                         if (pendingFiles.length > 0)
                             emitScanProgress(`Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`);
@@ -227,6 +265,11 @@ class AudioLibraryCache {
                             }
                         };
                         const scanDirectory = async (current) => {
+                            if (this.cancelled)
+                                return;
+                            if (shouldPauseForSearch() &&
+                                !(await waitForSearchIdle()))
+                                return;
                             if (isSiloAppData(current.directory))
                                 return;
                             if (await (0, indexingPathPolicy_1.isSiloCloneDirectory)(current.directory))
@@ -250,6 +293,12 @@ class AudioLibraryCache {
                             for await (const entry of directory) {
                                 if (this.cancelled || stopTraversal)
                                     return;
+                                if (shouldPauseForSearch() &&
+                                    !(await waitForSearchIdle()))
+                                    return;
+                                const cooldown = coolDownAfterAudioEntry();
+                                if (cooldown)
+                                    await cooldown;
                                 const fullPath = path_1.default.join(current.directory, entry.name);
                                 if (isSiloAppData(fullPath))
                                     continue;
@@ -314,7 +363,7 @@ class AudioLibraryCache {
                                 }
                             }
                         };
-                        await Promise.all(Array.from({ length: 4 }, () => worker()));
+                        await Promise.all(Array.from({ length: AUDIO_SCAN_DIRECTORY_WORKERS }, () => worker()));
                         if (this.cancelled)
                             return this.getSnapshot();
                         if (traversalError)
@@ -328,6 +377,9 @@ class AudioLibraryCache {
                             // coverage as fresh. Retry this source after the cooldown.
                             for (const [filePath, file] of sourceFiles)
                                 next.set(filePath, file);
+                            // A single unreadable nested entry should not trigger two more
+                            // complete walks of a potentially million-file source.
+                            retryWholeSource = false;
                             throw new Error(`${unreadableEntries} entries could not be read; partial audio results retained.`);
                         }
                     }
@@ -341,8 +393,9 @@ class AudioLibraryCache {
                 }
                 catch (error) {
                     lastError = error;
-                    if (error instanceof Error &&
-                        error.message.startsWith("DRIVE_PERMISSION_REQUIRED:"))
+                    if (!retryWholeSource ||
+                        (error instanceof Error &&
+                            error.message.startsWith("DRIVE_PERMISSION_REQUIRED:")))
                         break;
                 }
             }

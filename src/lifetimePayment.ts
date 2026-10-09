@@ -3,6 +3,8 @@ export const LIFETIME_PAYMENT_ADDRESS =
 export const LIFETIME_USDC_MINT =
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 export const LIFETIME_PAYMENT_MICRO_USDC = 25_000_000n;
+// Preserve a $25 card price while allowing up to 5% seller-side checkout fees.
+export const LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = 23_750_000n;
 
 const SOLANA_BASE58_ALPHABET =
   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -153,6 +155,7 @@ export function isSolanaTransactionSignature(value: string): boolean {
 export function verifyParsedLifetimePayment(
   signature: string,
   rpcResponse: unknown,
+  minimumPaymentMicroUsdc = LIFETIME_PAYMENT_MICRO_USDC,
 ): LifetimePaymentVerification {
   if (!isSolanaTransactionSignature(signature))
     return {
@@ -263,13 +266,15 @@ export function verifyParsedLifetimePayment(
   }
 
   if (
-    netReceived < LIFETIME_PAYMENT_MICRO_USDC ||
-    transferAmount < LIFETIME_PAYMENT_MICRO_USDC
+    netReceived < minimumPaymentMicroUsdc ||
+    transferAmount < minimumPaymentMicroUsdc
   )
     return {
       status: "invalid",
       message:
-        "No finalized payment of at least 25 USDC on Solana to Silo was found in that transaction.",
+        minimumPaymentMicroUsdc === LIFETIME_PAYMENT_MICRO_USDC
+          ? "No finalized payment of at least 25 USDC on Solana to Silo was found in that transaction."
+          : "No finalized card settlement meeting Silo's minimum USDC amount was found in that transaction.",
     };
 
   return {

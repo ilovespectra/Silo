@@ -39,6 +39,7 @@ export declare class ThumbnailPregenerator {
     start(): Promise<void>;
     private run;
     private collect;
+    private waitForIndexingIdle;
     private update;
 }
 export {};

@@ -38,6 +38,9 @@ class IndexingRecovery {
         this.requested = new Set();
         this.persistenceError = "";
         this.externalBlockReason = "";
+        this.interactiveSearchActive = false;
+        this.searchPausedStages = new Set();
+        this.searchTransition = Promise.resolve();
         this.restore();
     }
     restore() {
@@ -113,6 +116,9 @@ class IndexingRecovery {
         const record = this.records.get(id);
         const stage = this.stages.find((item) => item.id === id);
         const blocker = this.externalBlockReason ||
+            (this.interactiveSearchActive
+                ? "Waiting for interactive search to finish."
+                : "") ||
             (stage && !stage.ready()
                 ? stage.blockedReason?.() ||
                     "Waiting for another active index to release resources."
@@ -137,43 +143,85 @@ class IndexingRecovery {
     async setBlocked(reason) {
         this.externalBlockReason = reason ?? "";
         if (this.externalBlockReason) {
-            const busyStatuses = new Set([
-                "scanning",
-                "indexing",
-                "loading-model",
-                "clustering",
-                "generating",
-            ]);
-            const activeStages = this.stages.filter((stage) => busyStatuses.has(stage.progress().status));
-            for (const stage of activeStages) {
-                const record = this.records.get(stage.id) ?? {
-                    attempts: 0,
-                    error: "",
-                    retryAt: 0,
-                    running: false,
-                    checked: false,
-                    userPaused: false,
-                };
-                if (!record.userPaused) {
-                    record.checked = false;
-                    record.error = "";
-                    record.retryAt = 0;
-                    this.records.set(stage.id, record);
-                    this.requested.add(stage.id);
-                }
-                if (!stage.pause)
-                    continue;
-                try {
-                    await stage.pause();
-                }
-                catch (error) {
-                    console.error(`[IndexingRecovery] Could not pause ${stage.id}`, error);
-                }
-            }
+            await this.pauseActiveStages();
             this.persist();
             return;
         }
         await this.tick();
+    }
+    setSearchActive(active) {
+        this.interactiveSearchActive = active;
+        this.searchTransition = this.searchTransition.catch(() => undefined).then(async () => {
+            if (active) {
+                if (!this.interactiveSearchActive)
+                    return;
+                // Search indexing and audio inventory yield at their own batch boundaries.
+                await this.pauseActiveStages(new Set(["search", "audio"]), true);
+                this.persist();
+                return;
+            }
+            if (this.interactiveSearchActive)
+                return;
+            if (this.externalBlockReason) {
+                this.searchPausedStages.clear();
+                return;
+            }
+            for (const id of this.searchPausedStages) {
+                const stage = this.stages.find((item) => item.id === id);
+                if (!stage?.resume)
+                    continue;
+                try {
+                    await stage.resume();
+                }
+                catch (error) {
+                    console.error(`[IndexingRecovery] Could not resume ${id}`, error);
+                }
+            }
+            this.searchPausedStages.clear();
+            await this.tick();
+        });
+        return this.searchTransition;
+    }
+    async pauseActiveStages(excludedIds = new Set(), rememberForSearch = false) {
+        const busyStatuses = new Set([
+            "scanning",
+            "indexing",
+            "loading-model",
+            "clustering",
+            "generating",
+        ]);
+        const activeStages = this.stages.filter((stage) => !excludedIds.has(stage.id) &&
+            (!rememberForSearch || Boolean(stage.pause)) &&
+            busyStatuses.has(stage.progress().status));
+        const pauses = [];
+        for (const stage of activeStages) {
+            const record = this.records.get(stage.id) ?? {
+                attempts: 0,
+                error: "",
+                retryAt: 0,
+                running: false,
+                checked: false,
+                userPaused: false,
+            };
+            if (!record.userPaused) {
+                record.checked = false;
+                record.error = "";
+                record.retryAt = 0;
+                this.records.set(stage.id, record);
+                this.requested.add(stage.id);
+                if (rememberForSearch && stage.pause)
+                    this.searchPausedStages.add(stage.id);
+            }
+            if (!stage.pause)
+                continue;
+            pauses.push(Promise.resolve()
+                .then(() => stage.pause())
+                .then(() => undefined)
+                .catch((error) => {
+                console.error(`[IndexingRecovery] Could not pause ${stage.id}`, error);
+            }));
+        }
+        await Promise.all(pauses);
     }
     pause(id) {
         if (!this.stages.some((stage) => stage.id === id))
@@ -263,7 +311,10 @@ class IndexingRecovery {
         await this.tick();
     }
     async tick() {
-        if (this.stopped || this.externalBlockReason || this.tickRunning)
+        if (this.stopped ||
+            this.externalBlockReason ||
+            this.interactiveSearchActive ||
+            this.tickRunning)
             return;
         this.tickRunning = true;
         try {
@@ -271,7 +322,10 @@ class IndexingRecovery {
                 Number(this.requested.has(first.id)) ||
                 Number(second.id === "search") - Number(first.id === "search"));
             for (const stage of ordered) {
-                if (this.stopped || this.externalBlockReason || !stage.ready())
+                if (this.stopped ||
+                    this.externalBlockReason ||
+                    this.interactiveSearchActive ||
+                    !stage.ready())
                     continue;
                 const progress = stage.progress();
                 const record = this.records.get(stage.id);
@@ -324,7 +378,9 @@ class IndexingRecovery {
                 throw new Error(progress.message);
             if (progress.status === "paused") {
                 if (!record.userPaused)
-                    if (this.externalBlockReason) {
+                    if (this.externalBlockReason ||
+                        this.interactiveSearchActive ||
+                        this.searchPausedStages.has(stage.id)) {
                         record.checked = false;
                         record.error = "";
                         record.retryAt = 0;

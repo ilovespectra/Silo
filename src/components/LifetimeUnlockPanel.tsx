@@ -1,5 +1,12 @@
 import React, { FormEvent, useEffect, useRef, useState } from "react";
-import { FiCheck, FiCopy, FiLock, FiMail, FiX } from "react-icons/fi";
+import {
+  FiCheck,
+  FiCopy,
+  FiCreditCard,
+  FiLock,
+  FiMail,
+  FiX,
+} from "react-icons/fi";
 import { QRCodeSVG } from "qrcode.react";
 import type {
   LifetimeLicenseState,
@@ -55,6 +62,15 @@ export default function LifetimeUnlockPanel({
     "idle" | "copied" | "error"
   >("idle");
   const [paymentNotice, setPaymentNotice] = useState("");
+  const [cardPurchase, setCardPurchase] = useState<{
+    purchaseId: string;
+    claimToken: string;
+  } | null>(null);
+  const [startingCardPurchase, setStartingCardPurchase] = useState(false);
+  const [cardNotice, setCardNotice] = useState("");
+  const [cardStatus, setCardStatus] = useState<
+    "idle" | "pending" | "verified" | "error"
+  >("idle");
   const [paymentStatus, setPaymentStatus] =
     useState<LifetimePaymentStatus | "idle">("idle");
   const [signature, setSignature] = useState("");
@@ -195,6 +211,56 @@ export default function LifetimeUnlockPanel({
   }, [license.isLicensed, onVerified, paymentRequest]);
 
   useEffect(() => {
+    if (license.isLicensed || !cardPurchase || !window.electron) return;
+
+    const electron = window.electron;
+    let disposed = false;
+    let checking = false;
+    const checkCardPurchase = async () => {
+      if (disposed || checking) return;
+      checking = true;
+      try {
+        const result = await electron.checkLifetimeCardPurchase(
+          cardPurchase.purchaseId,
+          cardPurchase.claimToken,
+        );
+        if (disposed) return;
+        setCardNotice(result.message || "Waiting for payment verification…");
+        if (result.status === "verified" && result.signature) {
+          const localVerification = await electron.verifyLifetimeCardPayment(
+            result.signature,
+          );
+          if (disposed) return;
+          setCardStatus(localVerification.status === "verified" ? "verified" : "error");
+          setCardNotice(localVerification.message);
+          if (localVerification.license?.isLicensed)
+            onVerified(localVerification.license);
+        } else if (result.status === "error") {
+          setCardStatus("error");
+        } else if (result.status === "expired") {
+          setCardStatus("error");
+        } else {
+          setCardStatus("pending");
+        }
+      } catch {
+        if (!disposed) {
+          setCardStatus("error");
+          setCardNotice("The license relay is temporarily unavailable. Silo will keep checking.");
+        }
+      } finally {
+        checking = false;
+      }
+    };
+
+    void checkCardPurchase();
+    const timer = window.setInterval(() => void checkCardPurchase(), 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [cardPurchase, license.isLicensed, onVerified]);
+
+  useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
     };
@@ -218,6 +284,34 @@ export default function LifetimeUnlockPanel({
       setPaymentLinkCopyState("copied");
     } catch {
       setPaymentLinkCopyState("error");
+    }
+  };
+
+  const startCardPurchase = async () => {
+    if (!window.electron || startingCardPurchase) return;
+    setStartingCardPurchase(true);
+    setCardStatus("pending");
+    setCardNotice("Starting secure card checkout in your default browser…");
+    try {
+      const result = await window.electron.beginLifetimeCardPurchase();
+      if (!result.ok) {
+        setCardStatus("error");
+        setCardNotice(result.error);
+        return;
+      }
+      setCardPurchase({
+        purchaseId: result.purchaseId,
+        claimToken: result.claimToken,
+      });
+      setCardStatus("pending");
+      setCardNotice(
+        "Complete checkout in your browser. Keep Silo open; it will verify the payment and activate your license.",
+      );
+    } catch {
+      setCardStatus("error");
+      setCardNotice("Card checkout could not be started. No license status was changed.");
+    } finally {
+      setStartingCardPurchase(false);
     }
   };
 
@@ -363,6 +457,7 @@ export default function LifetimeUnlockPanel({
             <div className="lifetime-unlock-video-frame" ref={videoFrameRef}>
               <video
                 className="lifetime-unlock-video"
+                autoPlay
                 controls
                 preload="metadata"
                 playsInline
@@ -618,12 +713,14 @@ export default function LifetimeUnlockPanel({
 
             <section className="lifetime-beta-panel" aria-label="Beta tester access">
               <div className="lifetime-beta-heading">
-                <strong>Beta tester access</strong>
-                  <p>
-                    Send a beta-access request for this Silo installation. Its
-                    installation-specific request code will be emailed to{" "}
-                    {betaActivationInfo?.requestEmail ?? "the beta team"}.
-                  </p>
+                <strong>Request full lifetime access for beta testing</strong>
+                <p>
+                  If approved, please push Silo to its limits and try to break
+                  it. Share bugs and rough edges so we can improve it. We’ll
+                  send a follow-up survey one week after activation. This
+                  installation’s request code will be emailed to{" "}
+                  {betaActivationInfo?.requestEmail ?? "the beta team"}.
+                </p>
               </div>
               {betaActivationInfo ? (
                 <>
@@ -790,7 +887,7 @@ export default function LifetimeUnlockPanel({
             <header className="lifetime-survey-header">
               <div>
                 <span className="lifetime-unlock-eyebrow">LIFETIME ACCESS</span>
-                <h2 id="lifetime-payment-title">Pay with Solana</h2>
+                <h2 id="lifetime-payment-title">Choose how to pay</h2>
               </div>
               <button
                 className="lifetime-unlock-close"
@@ -802,8 +899,9 @@ export default function LifetimeUnlockPanel({
               </button>
             </header>
             <p className="lifetime-action-payment-intro">
-              Scan the request with your Solana wallet. Silo checks for the $25
-              USDC payment and unlocks automatically.
+              Send $25 USDC with the Solana Pay request, or use an installed
+              wallet or card in your browser. Silo verifies the finalized
+              payment before activation.
             </p>
             <div className="lifetime-solana-qr">
               {paymentRequest ? (
@@ -833,6 +931,38 @@ export default function LifetimeUnlockPanel({
                     : "Copy Solana Pay link"}
               </button>
             )}
+            <div className="lifetime-payment-divider">
+              <span>OR CHECK OUT IN YOUR BROWSER</span>
+            </div>
+            <section className="lifetime-card-checkout" aria-label="Wallet or card checkout">
+              <span className="lifetime-card-checkout-label">
+                INSTALLED WALLET OR CARD · HELIO
+              </span>
+              <button
+                className="lifetime-card-checkout-button"
+                type="button"
+                disabled={startingCardPurchase || license.isLicensed}
+                onClick={() => void startCardPurchase()}
+              >
+                <FiCreditCard aria-hidden="true" />
+                {startingCardPurchase
+                  ? "Opening secure checkout…"
+                  : "Open wallet or card checkout · $25"}
+              </button>
+              <p>
+                Connect an installed wallet or choose card checkout in your
+                browser. Card details stay with the payment provider.
+              </p>
+              {cardNotice && (
+                <p
+                  className="lifetime-card-checkout-note"
+                  data-status={cardStatus}
+                  role="status"
+                >
+                  {cardNotice}
+                </p>
+              )}
+            </section>
             <p className="lifetime-payment-safety-note">
               Never enter a seed phrase or private key in Silo.
             </p>

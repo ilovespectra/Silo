@@ -11,6 +11,7 @@ export interface RecoveryStage {
     lane?: "analysis" | "disk" | "light" | "background";
     blockedReason?: () => string;
     pause?: () => Promise<unknown> | unknown;
+    resume?: () => Promise<unknown> | unknown;
 }
 export declare class IndexingRecovery {
     private stages;
@@ -23,6 +24,9 @@ export declare class IndexingRecovery {
     private requested;
     private persistenceError;
     private externalBlockReason;
+    private interactiveSearchActive;
+    private searchPausedStages;
+    private searchTransition;
     constructor(stages: RecoveryStage[], now?: () => number, statePath?: string | undefined);
     private restore;
     private persist;
@@ -39,6 +43,8 @@ export declare class IndexingRecovery {
     };
     stop(): void;
     setBlocked(reason: string | null): Promise<void>;
+    setSearchActive(active: boolean): Promise<void>;
+    private pauseActiveStages;
     pause(id: string): void;
     clearUserPause(id: string): void;
     request(id: string): void;

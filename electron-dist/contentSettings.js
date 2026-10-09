@@ -23,10 +23,55 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ContentSettingsStore = void 0;
+exports.ContentSettingsStore = exports.defaultSearchPerformanceSettings = exports.getSearchPerformanceMachineInfo = void 0;
 const crypto_1 = require("crypto");
 const fsPromises = __importStar(require("fs/promises"));
+const os = __importStar(require("os"));
 const path = __importStar(require("path"));
+function getSearchPerformanceMachineInfo() {
+    const processors = os.cpus();
+    let availableProcessors = processors.length || 1;
+    try {
+        availableProcessors = Math.max(1, os.availableParallelism());
+    }
+    catch {
+        // Older runtimes may not expose availableParallelism; fall back to logical CPUs.
+    }
+    return {
+        processor: processors[0]?.model.trim() || "Processor information unavailable",
+        logicalProcessors: Math.max(1, processors.length),
+        availableProcessors,
+        totalMemoryBytes: os.totalmem(),
+        freeMemoryBytes: os.freemem(),
+        platform: os.platform(),
+        architecture: os.arch(),
+    };
+}
+exports.getSearchPerformanceMachineInfo = getSearchPerformanceMachineInfo;
+function defaultSearchPerformanceSettings(availableProcessors = getSearchPerformanceMachineInfo().availableProcessors) {
+    const cores = Math.max(1, Math.floor(availableProcessors));
+    return {
+        searchThreads: cores,
+        // Reserve one logical processor for the OS/UI and keep ANN preparation bounded.
+        indexThreads: Math.max(1, Math.min(4, cores - 1)),
+        backgroundWorkPercent: 55,
+    };
+}
+exports.defaultSearchPerformanceSettings = defaultSearchPerformanceSettings;
+function normalizeSearchPerformanceSettings(value, availableProcessors) {
+    const defaults = defaultSearchPerformanceSettings(availableProcessors);
+    const normalizeThreads = (candidate, fallback) => typeof candidate === "number" && Number.isFinite(candidate)
+        ? Math.max(1, Math.min(availableProcessors, Math.round(candidate)))
+        : fallback;
+    const backgroundCandidate = value?.backgroundWorkPercent;
+    return {
+        searchThreads: normalizeThreads(value?.searchThreads, defaults.searchThreads),
+        indexThreads: normalizeThreads(value?.indexThreads, defaults.indexThreads),
+        backgroundWorkPercent: typeof backgroundCandidate === "number" && Number.isFinite(backgroundCandidate)
+            ? Math.max(20, Math.min(100, Math.round(backgroundCandidate)))
+            : defaults.backgroundWorkPercent,
+    };
+}
 const defaults = {
     preferences: {
         showNsfw: false,
@@ -36,6 +81,7 @@ const defaults = {
         preloadMapTextures: false,
         showBannedPeople: false,
     },
+    performance: defaultSearchPerformanceSettings(),
     passwordSalt: null,
     passwordHash: null,
 };
@@ -52,6 +98,7 @@ class ContentSettingsStore {
                 ...structuredClone(defaults),
                 ...stored,
                 preferences: { ...defaults.preferences, ...stored.preferences },
+                performance: normalizeSearchPerformanceSettings(stored.performance, getSearchPerformanceMachineInfo().availableProcessors),
             };
         }
         catch {
@@ -63,6 +110,32 @@ class ContentSettingsStore {
             ...this.settings.preferences,
             parentalPasswordSet: Boolean(this.settings.passwordHash && this.settings.passwordSalt),
         };
+    }
+    getSearchPerformanceSnapshot() {
+        const machine = getSearchPerformanceMachineInfo();
+        this.settings.performance = normalizeSearchPerformanceSettings(this.settings.performance, machine.availableProcessors);
+        return { settings: { ...this.settings.performance }, machine };
+    }
+    async updateSearchPerformanceSettings(update) {
+        if (!update || typeof update !== "object" || Array.isArray(update))
+            throw new Error("Invalid performance settings.");
+        const candidate = update;
+        for (const key of ["searchThreads", "indexThreads", "backgroundWorkPercent"])
+            if (typeof candidate[key] !== "number" ||
+                !Number.isFinite(candidate[key]) ||
+                !Number.isInteger(candidate[key]))
+                throw new Error("Choose whole-number performance settings.");
+        const machine = getSearchPerformanceMachineInfo();
+        if (candidate.searchThreads < 1 ||
+            candidate.searchThreads > machine.availableProcessors ||
+            candidate.indexThreads < 1 ||
+            candidate.indexThreads > machine.availableProcessors ||
+            candidate.backgroundWorkPercent < 20 ||
+            candidate.backgroundWorkPercent > 100)
+            throw new Error("Performance settings are outside this computer’s supported range.");
+        this.settings.performance = normalizeSearchPerformanceSettings(candidate, machine.availableProcessors);
+        await this.persist();
+        return this.getSearchPerformanceSnapshot();
     }
     async setParentalPassword(currentPassword, newPassword) {
         if (this.settings.passwordHash && !this.verify(currentPassword))

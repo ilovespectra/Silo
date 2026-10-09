@@ -58,6 +58,7 @@ import {
   isSolanaTransactionSignature,
   type LifetimeLicenseState,
   type LifetimePaymentVerification,
+  LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC,
   LIFETIME_PAYMENT_ADDRESS,
   LIFETIME_USDC_MINT,
   verifyParsedLifetimePayment,
@@ -239,6 +240,9 @@ const betaInstallationIdPath = path.join(
 );
 const lifetimeRpcEndpoint =
   "https://optimistic-daisy-fast-mainnet.helius-rpc.com";
+const lifetimePaymentRelayBaseUrl = (
+  process.env.SILO_PAYMENT_RELAY_URL || "https://license.kolektivkrog.si"
+).replace(/\/$/, "");
 
 async function requestLifetimeRpc(
   method: string,
@@ -9563,6 +9567,107 @@ ipcMain.handle(
 
 // Handle isDev check for client
 ipcMain.handle("get-lifetime-license", () => readLifetimeLicense());
+ipcMain.handle("begin-lifetime-card-purchase", async () => {
+  try {
+    const installationId = await getBetaInstallationId();
+    const relayBase = new URL(lifetimePaymentRelayBaseUrl);
+    if (relayBase.protocol !== "https:" && relayBase.hostname !== "localhost")
+      throw new Error("The card payment relay must use HTTPS.");
+
+    const response = await net.fetch(`${relayBase.origin}/api/purchase`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ installationId }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok)
+      throw new Error(
+        typeof payload.error === "string"
+          ? payload.error
+          : "Card checkout could not be started.",
+      );
+
+    const checkoutUrl = new URL(payload.checkoutUrl);
+    if (
+      checkoutUrl.protocol !== "https:" ||
+      checkoutUrl.origin !== relayBase.origin ||
+      checkoutUrl.pathname !== "/checkout.html" ||
+      typeof payload.purchaseId !== "string" ||
+      typeof payload.claimToken !== "string"
+    )
+      throw new Error("The payment relay returned an invalid checkout link.");
+
+    await shell.openExternal(checkoutUrl.toString());
+    return {
+      ok: true as const,
+      purchaseId: payload.purchaseId,
+      claimToken: payload.claimToken,
+    };
+  } catch (error) {
+    return {
+      ok: false as const,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Card checkout could not be started.",
+    };
+  }
+});
+ipcMain.handle(
+  "check-lifetime-card-purchase",
+  async (_event, purchaseIdValue: unknown, claimTokenValue: unknown) => {
+    if (
+      typeof purchaseIdValue !== "string" ||
+      !/^[0-9a-f-]{36}$/i.test(purchaseIdValue) ||
+      typeof claimTokenValue !== "string" ||
+      claimTokenValue.length < 40 ||
+      claimTokenValue.length > 100
+    )
+      return { status: "error" as const, message: "The checkout reference is invalid." };
+
+    try {
+      const relayBase = new URL(lifetimePaymentRelayBaseUrl);
+      if (relayBase.protocol !== "https:")
+        throw new Error("The card payment relay must use HTTPS.");
+      const response = await net.fetch(
+        `${relayBase.origin}/api/purchase/${encodeURIComponent(purchaseIdValue)}`,
+        {
+          headers: { "x-silo-claim-token": claimTokenValue },
+          redirect: "error",
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok)
+        return {
+          status: "error" as const,
+          message:
+            typeof payload.error === "string"
+              ? payload.error
+              : "The license relay could not be reached.",
+        };
+      if (payload.status === "verified" && typeof payload.signature === "string")
+        return {
+          status: "verified" as const,
+          signature: payload.signature,
+          message: "Card payment verified. Saving your Silo license…",
+        };
+      if (payload.status === "expired")
+        return { status: "expired" as const, message: "This checkout expired. Start a new card payment." };
+      return {
+        status: "pending" as const,
+        message:
+          typeof payload.message === "string"
+            ? payload.message
+            : "Waiting for Solana to finalize the card payment.",
+      };
+    } catch {
+      return {
+        status: "error" as const,
+        message: "The license relay is temporarily unavailable. Silo will keep checking.",
+      };
+    }
+  },
+);
 ipcMain.handle("is-demo-mode", () => !fullAccessEnabled());
 ipcMain.handle("get-bug-report-status", () => {
   const configuredEndpoint =
@@ -9831,66 +9936,84 @@ ipcMain.handle(
     }
   },
 );
-ipcMain.handle(
-  "verify-lifetime-payment",
-  async (_event, signatureValue: unknown): Promise<LifetimePaymentVerification> => {
-    if (typeof signatureValue !== "string")
-      return {
-        status: "invalid",
-        message: "Paste the transaction signature shown by your Solana wallet.",
-      };
-    if (!isSolanaTransactionSignature(signatureValue))
-      return verifyParsedLifetimePayment(signatureValue, {});
+async function verifyAndSaveLifetimePayment(
+  signatureValue: unknown,
+  minimumPaymentMicroUsdc: bigint,
+): Promise<LifetimePaymentVerification> {
+  if (typeof signatureValue !== "string")
+    return {
+      status: "invalid",
+      message: "Paste the transaction signature shown by your Solana wallet.",
+    };
+  if (!isSolanaTransactionSignature(signatureValue))
+    return verifyParsedLifetimePayment(
+      signatureValue,
+      {},
+      minimumPaymentMicroUsdc,
+    );
 
-    const existingLicense = await readLifetimeLicense();
-    if (existingLicense.isLicensed)
-      return {
-        status: "already-licensed",
-        message: "Silo already has a lifetime license saved on this Mac.",
-        license: existingLicense,
-      };
+  const existingLicense = await readLifetimeLicense();
+  if (existingLicense.isLicensed)
+    return {
+      status: "already-licensed",
+      message: "Silo already has a lifetime license saved on this Mac.",
+      license: existingLicense,
+    };
 
-    try {
-      const rpcResponse = await requestLifetimeRpc("getTransaction", [
-        signatureValue,
-        {
-          commitment: "finalized",
-          encoding: "jsonParsed",
-          maxSupportedTransactionVersion: 1,
-        },
-      ]);
-      if (!rpcResponse.ok)
-        return {
-          status: "error",
-          message:
-            "Helius could not be reached or is rate-limiting requests. Please try again shortly.",
-        };
-      const verification = verifyParsedLifetimePayment(
-        signatureValue,
-        rpcResponse.result,
-      );
-      if (verification.status !== "verified") return verification;
-
-      const verifiedAt = Date.now();
-      await writeLifetimeLicense(signatureValue, verifiedAt);
-      enableLifetimeFeatures();
-      return {
-        ...verification,
-        license: {
-          isLicensed: true,
-          licenseType: "purchase",
-          signature: signatureValue,
-          verifiedAt,
-        },
-      };
-    } catch {
+  try {
+    const rpcResponse = await requestLifetimeRpc("getTransaction", [
+      signatureValue,
+      {
+        commitment: "finalized",
+        encoding: "jsonParsed",
+        maxSupportedTransactionVersion: 1,
+      },
+    ]);
+    if (!rpcResponse.ok)
       return {
         status: "error",
         message:
-          "Could not verify with Solana right now. Check your connection and try again; no license status was changed.",
+          "Helius could not be reached or is rate-limiting requests. Please try again shortly.",
       };
-    }
-  },
+    const verification = verifyParsedLifetimePayment(
+      signatureValue,
+      rpcResponse.result,
+      minimumPaymentMicroUsdc,
+    );
+    if (verification.status !== "verified") return verification;
+
+    const verifiedAt = Date.now();
+    await writeLifetimeLicense(signatureValue, verifiedAt);
+    enableLifetimeFeatures();
+    return {
+      ...verification,
+      license: {
+        isLicensed: true,
+        licenseType: "purchase",
+        signature: signatureValue,
+        verifiedAt,
+      },
+    };
+  } catch {
+    return {
+      status: "error",
+      message:
+        "Could not verify with Solana right now. Check your connection and try again; no license status was changed.",
+    };
+  }
+}
+ipcMain.handle(
+  "verify-lifetime-payment",
+  async (_event, signatureValue: unknown): Promise<LifetimePaymentVerification> =>
+    verifyAndSaveLifetimePayment(signatureValue, 25_000_000n),
+);
+ipcMain.handle(
+  "verify-lifetime-card-payment",
+  async (_event, signatureValue: unknown): Promise<LifetimePaymentVerification> =>
+    verifyAndSaveLifetimePayment(
+      signatureValue,
+      LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC,
+    ),
 );
 ipcMain.handle(
   "check-lifetime-payment-reference",

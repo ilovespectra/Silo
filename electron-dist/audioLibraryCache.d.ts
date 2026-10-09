@@ -55,7 +55,7 @@ export declare class AudioLibraryCache {
         rootPath: string;
         kind: string;
         label: string;
-    }) => Promise<CachedAudioFile[]>, onProgress: (progress: AudioLibraryScanProgress) => void, force?: boolean): Promise<AudioLibraryCacheSnapshot>;
+    }) => Promise<CachedAudioFile[]>, onProgress: (progress: AudioLibraryScanProgress) => void, force?: boolean, shouldPauseForSearch?: () => boolean): Promise<AudioLibraryCacheSnapshot>;
     private scanImpl;
     private persistSnapshot;
 }

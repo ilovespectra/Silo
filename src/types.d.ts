@@ -744,6 +744,18 @@ interface Window {
       screenshotDataUrl: string | null;
     }): Promise<{ ok: boolean; error?: string }>;
     getLifetimeLicense(): Promise<import("./lifetimePayment").LifetimeLicenseState>;
+    beginLifetimeCardPurchase(): Promise<
+      | { ok: true; purchaseId: string; claimToken: string }
+      | { ok: false; error: string }
+    >;
+    checkLifetimeCardPurchase(
+      purchaseId: string,
+      claimToken: string,
+    ): Promise<{
+      status: "pending" | "verified" | "expired" | "error";
+      signature?: string;
+      message?: string;
+    }>;
     getDemoTestingMode(): Promise<{ available: boolean; enabled: boolean }>;
     setDemoTestingMode(enabled: boolean): Promise<{
       available: boolean;
@@ -762,6 +774,9 @@ interface Window {
       callback: (access: { fullAccess: boolean; name: string }) => void,
     ): () => void;
     verifyLifetimePayment(
+      signature: string,
+    ): Promise<import("./lifetimePayment").LifetimePaymentVerification>;
+    verifyLifetimeCardPayment(
       signature: string,
     ): Promise<import("./lifetimePayment").LifetimePaymentVerification>;
     checkLifetimePaymentReference(

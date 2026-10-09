@@ -157,6 +157,14 @@ contextBridge.exposeInMainWorld("electron", {
     return () => ipcRenderer.removeListener("app-update-state", listener);
   },
   getLifetimeLicense: () => ipcRenderer.invoke("get-lifetime-license"),
+  beginLifetimeCardPurchase: () =>
+    ipcRenderer.invoke("begin-lifetime-card-purchase"),
+  checkLifetimeCardPurchase: (purchaseId, claimToken) =>
+    ipcRenderer.invoke(
+      "check-lifetime-card-purchase",
+      purchaseId,
+      claimToken,
+    ),
   getDemoTestingMode: () => ipcRenderer.invoke("get-demo-testing-mode"),
   setDemoTestingMode: (enabled) =>
     ipcRenderer.invoke("set-demo-testing-mode", enabled),
@@ -167,9 +175,15 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("activate-beta-license", activationCode),
   verifyLifetimePayment: (signature) =>
     ipcRenderer.invoke("verify-lifetime-payment", signature),
+  verifyLifetimeCardPayment: (signature) =>
+    ipcRenderer.invoke("verify-lifetime-card-payment", signature),
   checkLifetimePaymentReference: (reference) =>
     ipcRenderer.invoke("check-lifetime-payment-reference", reference),
   getContentSettings: () => ipcRenderer.invoke("get-content-settings"),
+  getSearchPerformanceSettings: () =>
+    ipcRenderer.invoke("get-search-performance-settings"),
+  updateSearchPerformanceSettings: (settings) =>
+    ipcRenderer.invoke("update-search-performance-settings", settings),
   setParentalPassword: (currentPassword, newPassword) =>
     ipcRenderer.invoke("set-parental-password", currentPassword, newPassword),
   updateContentSettings: (update, password) =>
