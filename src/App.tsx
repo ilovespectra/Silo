@@ -74,7 +74,6 @@ import {
 import {
   GRID_THUMBNAIL_SIZE,
   LRUCache,
-  refreshThumbnail,
   thumbnailCache,
   thumbnailCacheKey,
 } from "./utils/thumbnailCache";
@@ -522,6 +521,89 @@ function FileThumbnail({
   );
 }
 
+function SearchTiming({
+  startedAt,
+  firstResultAt,
+  completedAt,
+}: {
+  startedAt: number;
+  firstResultAt: number | null;
+  completedAt: number | null;
+}) {
+  const [now, setNow] = useState(() => performance.now());
+  useEffect(() => {
+    if (completedAt !== null) return;
+    const timer = window.setInterval(() => setNow(performance.now()), 50);
+    return () => window.clearInterval(timer);
+  }, [completedAt]);
+
+  const end = completedAt ?? now;
+  const total = Math.max(1, Math.round(end - startedAt));
+  const first =
+    firstResultAt === null
+      ? null
+      : Math.max(1, Math.round(firstResultAt - startedAt));
+  return (
+    <span title="Elapsed time for this query">
+      {first === null
+        ? completedAt === null
+          ? "Searching"
+          : "No result"
+        : `First ${first} ms`} · {total} ms
+    </span>
+  );
+}
+
+function cachedImagePreview(file: FileInfo): FilePreview | null {
+  if (file.type !== "image") return null;
+  const previewDataUrl = thumbnailCache.peek(
+    thumbnailCacheKey(file.path, GRID_THUMBNAIL_SIZE),
+  );
+  if (!previewDataUrl) return null;
+  const modified = Number(file.modified);
+  return {
+    name: file.name,
+    size: Number(file.size) || 0,
+    modified:
+      Number.isFinite(modified) && modified > 0
+        ? new Date(modified).toLocaleString()
+        : "",
+    mimeType: null,
+    extension: file.extension,
+    path: file.path,
+    previewDataUrl,
+  };
+}
+
+const FAST_FILE_SEARCH_RESULT_LIMIT = 5000;
+const FAST_FILE_SEARCH_CHUNK_SIZE = 4000;
+
+function getFileTextMatchPriority(
+  file: FileInfo,
+  query: string,
+): 0 | 1 | 2 | null {
+  const name = file.name.toLocaleLowerCase();
+  if (name === query) return 0;
+  if (name.includes(query)) return 1;
+  if (
+    file.relativePath.toLocaleLowerCase().includes(query) ||
+    file.path.toLocaleLowerCase().includes(query)
+  )
+    return 2;
+  return null;
+}
+
+function asFastFileSearchResult(
+  file: FileInfo,
+  priority: NonNullable<SemanticSearchResult["_priority"]>,
+): SemanticSearchResult {
+  return {
+    ...file,
+    _priority: priority,
+    _source: priority === 2 ? "Path match" : "Name match",
+  };
+}
+
 function App() {
   const electronAPI = window.electron;
   const [currentPath, setCurrentPath] = useState<string | null>(null);
@@ -716,6 +798,18 @@ function App() {
     string | null
   >(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const searchQueryRef = useRef(searchQuery);
+  searchQueryRef.current = searchQuery;
+  const searchQueryStartedAtRef = useRef<{
+    query: string;
+    startedAt: number;
+  } | null>(null);
+  const fastFileSearchFirstResultAtRef = useRef<{
+    query: string;
+    at: number;
+  } | null>(null);
+  const filesRef = useRef(files);
+  filesRef.current = files;
   const [searchHistory, setSearchHistory] = useState<string[]>(() => {
     try {
       const stored = JSON.parse(
@@ -733,10 +827,88 @@ function App() {
   const [searchResults, setSearchResults] = useState<SemanticSearchResult[]>(
     [],
   );
-  const [searchProgress, setSearchProgress] = useState({ scanned: 0, total: 0 });
+  const [searchIndexReadiness, setSearchIndexReadiness] =
+    useState<SearchIndexReadiness>({
+      status: "preparing",
+      percentage: 0,
+      records: 0,
+      message: "Preparing the saved search index…",
+    });
+  const searchIndexPreviousStatusRef = useRef(searchIndexReadiness.status);
+  const [searchTiming, setSearchTiming] = useState<{
+    query: string;
+    requestId: number;
+    startedAt: number;
+    firstResultAt: number | null;
+    completedAt: number | null;
+  } | null>(null);
+  const [searchResultOrder, setSearchResultOrder] = useState<string[]>([]);
+  const searchResultOrderRef = useRef<{ query: string; paths: string[] }>({
+    query: "",
+    paths: [],
+  });
+  const [freezeSearchResultOrder, setFreezeSearchResultOrder] =
+    useState(true);
+  const [fastFileSearchResults, setFastFileSearchResults] = useState<
+    SemanticSearchResult[]
+  >([]);
+  const [fastFileSearchCapped, setFastFileSearchCapped] = useState(false);
+  const fastFileSearchResultsRef = useRef(
+    new Map<string, SemanticSearchResult>(),
+  );
+  const fastFileSearchResultsQueryRef = useRef("");
+  const fastFileSearchGenerationRef = useRef(0);
+  const scheduleFastFileMatchesRef = useRef<
+    (candidates: FileInfo[], query: string, generation: number) => void
+  >(() => {});
+  scheduleFastFileMatchesRef.current = (candidates, query, generation) => {
+    let offset = 0;
+    const scanChunk = () => {
+      if (
+        generation !== fastFileSearchGenerationRef.current ||
+        query !== searchQueryRef.current.trim().toLocaleLowerCase()
+      )
+        return;
+      const matches = fastFileSearchResultsRef.current;
+      const end = Math.min(
+        offset + FAST_FILE_SEARCH_CHUNK_SIZE,
+        candidates.length,
+      );
+      let changed = false;
+      let capped = false;
+      for (; offset < end; offset += 1) {
+        const file = candidates[offset];
+        if (bannedHiddenPathsRef.current.has(file.path)) continue;
+        const priority = getFileTextMatchPriority(file, query);
+        if (priority === null || matches.has(file.path)) continue;
+        if (matches.size >= FAST_FILE_SEARCH_RESULT_LIMIT) {
+          capped = true;
+          continue;
+        }
+        matches.set(file.path, asFastFileSearchResult(file, priority));
+        changed = true;
+      }
+      if (changed) {
+        fastFileSearchResultsQueryRef.current = query;
+        if (fastFileSearchFirstResultAtRef.current?.query !== query)
+          fastFileSearchFirstResultAtRef.current = {
+            query,
+            at: performance.now(),
+          };
+        setFastFileSearchResults(Array.from(matches.values()));
+      }
+      if (capped) setFastFileSearchCapped(true);
+      if (offset < candidates.length) window.setTimeout(scanChunk, 0);
+    };
+    scanChunk();
+  };
+  const [searchProgress, setSearchProgress] = useState<{
+    scanned: number;
+    total: number;
+    mode?: "ann";
+  }>({ scanned: 0, total: 0 });
   const searchDebounceTimerRef = useRef<number | null>(null);
   const [searching, setSearching] = useState(false);
-  const [searchDone, setSearchDone] = useState(false);
   const [confidence, setConfidence] = useState(DEFAULT_SEMANTIC_SEARCH_CONFIDENCE);
   const [appSection, setAppSection] = useState<
     "files" | "people" | "map" | "duplicates" | "pets" | "mobile" | "memories" | "stats"
@@ -1395,6 +1567,27 @@ function App() {
     if (state.indexProgress) setIndexProgress(state.indexProgress);
   }, []);
 
+  const rememberSearchResultOrder = useCallback(
+    (results: readonly { path: string }[], query: string) => {
+      const cleanQuery = query.trim();
+      if (!cleanQuery) return;
+      const current = searchResultOrderRef.current;
+      const paths = current.query === cleanQuery ? current.paths : [];
+      const seen = new Set(paths);
+      let changed = current.query !== cleanQuery;
+      for (const result of results) {
+        if (seen.has(result.path)) continue;
+        seen.add(result.path);
+        paths.push(result.path);
+        changed = true;
+      }
+      if (!changed) return;
+      searchResultOrderRef.current = { query: cleanQuery, paths };
+      setSearchResultOrder(paths.slice());
+    },
+    [],
+  );
+
   const favoritePaths = useMemo(
     () =>
       new Set(
@@ -1599,6 +1792,38 @@ function App() {
   }, [electronAPI]);
 
   useEffect(() => {
+    if (
+      !electronAPI?.getSearchIndexReadiness ||
+      !electronAPI.onSearchIndexReadiness
+    )
+      return;
+    let disposed = false;
+    const applyReadiness = (status: SearchIndexReadiness) => {
+      if (!disposed) setSearchIndexReadiness(status);
+    };
+    const removeListener = electronAPI.onSearchIndexReadiness(applyReadiness);
+    void electronAPI
+      .getSearchIndexReadiness()
+      .then(applyReadiness)
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      removeListener();
+    };
+  }, [electronAPI]);
+
+  useEffect(() => {
+    const previousStatus = searchIndexPreviousStatusRef.current;
+    searchIndexPreviousStatusRef.current = searchIndexReadiness.status;
+    const query = searchQuery.trim();
+    if (previousStatus !== "ready" && searchIndexReadiness.status === "ready" && query)
+      searchQueryStartedAtRef.current = {
+        query,
+        startedAt: performance.now(),
+      };
+  }, [searchIndexReadiness.status, searchQuery]);
+
+  useEffect(() => {
     if (!electronAPI) return;
     let cancelled = false;
     const removeProgressListener =
@@ -1623,7 +1848,17 @@ function App() {
         }));
         setViewMode(state.ui.viewMode);
         setShowFilters(state.ui.showFilters);
-        setConfidence(state.ui.confidence);
+        const confidenceMigrationKey = "silo.search-confidence-default.v1";
+        let restoredConfidence = state.ui.confidence;
+        try {
+          if (localStorage.getItem(confidenceMigrationKey) !== "25") {
+            restoredConfidence = DEFAULT_SEMANTIC_SEARCH_CONFIDENCE;
+            localStorage.setItem(confidenceMigrationKey, "25");
+          }
+        } catch {
+          restoredConfidence = DEFAULT_SEMANTIC_SEARCH_CONFIDENCE;
+        }
+        setConfidence(restoredConfidence);
         const persistedPath = state.ui.currentPath;
         const pathIsAvailable = availableSources.some(
           (source) =>
@@ -1662,6 +1897,13 @@ function App() {
     return electronAPI.onFileScanProgress((progress) => {
       if (progress.requestId !== scanRequestRef.current) return;
       setFileScanProgress(progress);
+      const query = searchQueryRef.current.trim().toLocaleLowerCase();
+      if (query && progress.fileDeltas?.length)
+        scheduleFastFileMatchesRef.current(
+          progress.fileDeltas,
+          query,
+          fastFileSearchGenerationRef.current,
+        );
       // The initial library scan can continue for a long time. Let the Files
       // view become usable as soon as it has its first results instead of
       // keeping the startup overlay up until the complete inventory arrives.
@@ -1688,7 +1930,7 @@ function App() {
             () =>
               requestId !== scanRequestRef.current ||
               settledScanRef.current === requestId,
-          )
+            )
             .then((cached) => {
               if (
                 requestId === scanRequestRef.current &&
@@ -1700,6 +1942,17 @@ function App() {
                   for (const file of current) merged.set(file.path, file);
                   return Array.from(merged.values());
                 });
+              if (requestId === scanRequestRef.current && cached.length) {
+                const query = searchQueryRef.current
+                  .trim()
+                  .toLocaleLowerCase();
+                if (query)
+                  scheduleFastFileMatchesRef.current(
+                    cached,
+                    query,
+                    fastFileSearchGenerationRef.current,
+                  );
+              }
             })
             .catch((cause) =>
               console.error("Cached inventory transfer failed", cause),
@@ -2529,12 +2782,11 @@ function App() {
       if (!electronAPI || file.isDirectory) return;
       const request = ++filePreviewRequestRef.current;
       setSelectedFile(file);
-      setFilePreview(null);
-      if (file.type === "image" || file.type === "video")
-        void refreshThumbnail(file.path);
+      setFilePreview(cachedImagePreview(file));
       try {
         const preview = await electronAPI.getFilePreview(file.path);
-        if (request === filePreviewRequestRef.current) setFilePreview(preview);
+        if (request === filePreviewRequestRef.current && preview)
+          setFilePreview(preview);
       } catch (error) {
         if (request === filePreviewRequestRef.current)
           setBrowseError(
@@ -2551,15 +2803,13 @@ function App() {
       setSelectedFile(file);
       setViewerScopeFiles(scopeFiles ?? null);
       const request = ++filePreviewRequestRef.current;
-      if (file.type === "image" || file.type === "video")
-        void refreshThumbnail(file.path);
       const livePhotoVideo =
         file.type === "image"
           ? findLivePhotoVideo(file, scopeFiles ?? files)
           : null;
       const playbackFile = livePhotoVideo ?? file;
       setViewerMediaFile(playbackFile);
-      setFilePreview(null);
+      setFilePreview(cachedImagePreview(playbackFile));
       setViewerZoom(1);
       setViewerFit(true);
       setViewerDimensions({ width: 0, height: 0 });
@@ -2572,7 +2822,8 @@ function App() {
       setViewerOpen(true);
       try {
         const preview = await electronAPI.getFilePreview(playbackFile.path);
-        if (request === filePreviewRequestRef.current) setFilePreview(preview);
+        if (request === filePreviewRequestRef.current && preview)
+          setFilePreview(preview);
       } catch (error) {
         if (request === filePreviewRequestRef.current)
           setMediaError(
@@ -3100,8 +3351,17 @@ function App() {
     return selectedFile && !selectedFile.isDirectory ? [selectedFile.path] : [];
   }, [selectedFile, selectedFilePaths]);
   const locationTargetFiles = useMemo(
-    () => selectedMedia<FileInfo>(metadataTargets, files, searchResults),
-    [files, metadataTargets, searchResults],
+    () =>
+      selectedMedia<FileInfo>(
+        metadataTargets,
+        files,
+        searchResults.filter(
+          (result) =>
+            result._priority !== 3 ||
+            (result.confidence ?? -Infinity) >= confidence,
+        ),
+      ),
+    [confidence, files, metadataTargets, searchResults],
   );
   const personMediaPaths = useMemo(
     () => new Set(locationTargetFiles.map((file) => file.path)),
@@ -3745,27 +4005,48 @@ function App() {
 
   const runSemanticSearch = useCallback(
     async (_showLoading: boolean) => {
-      if (!electronAPI || appSection !== "files" || !searchQuery.trim()) return;
+      if (
+        !electronAPI ||
+        appSection !== "files" ||
+        !searchQuery.trim() ||
+        searchIndexReadiness.status === "unavailable" ||
+        searchIndexReadiness.status === "error"
+      )
+        return;
       const requestId = ++searchRequestRef.current;
+      const query = searchQuery.trim();
+      const startedAt =
+        searchQueryStartedAtRef.current?.query === query
+          ? searchQueryStartedAtRef.current.startedAt
+          : performance.now();
+      const initialFastResult =
+        fastFileSearchFirstResultAtRef.current?.query === query
+          ? fastFileSearchFirstResultAtRef.current.at
+          : null;
+      setSearchTiming({
+        query,
+        requestId,
+        startedAt,
+        firstResultAt: initialFastResult,
+        completedAt: null,
+      });
       setSearchProgress({ scanned: 0, total: 0 });
       setSearching(true);
-      setSearchDone(false);
       setSearchError("");
-      let succeeded = false;
       try {
         const results = await electronAPI.semanticSearch(
           searchQuery,
-          confidence,
+          0,
           requestId,
         );
         if (requestId === searchRequestRef.current) {
+          rememberSearchResultOrder(results, searchQuery);
           const hidden = bannedHiddenPathsRef.current;
           setSearchResults(
             hidden.size > 0
               ? results.filter((result) => !hidden.has(result.path))
               : results,
           );
-          succeeded = true;
         }
       } catch (cause) {
         if (requestId === searchRequestRef.current) {
@@ -3778,30 +4059,132 @@ function App() {
         }
       } finally {
         if (requestId === searchRequestRef.current) {
+          const completedAt = performance.now();
+          setSearchTiming((current) =>
+            current?.requestId === requestId
+              ? { ...current, completedAt: current.completedAt ?? completedAt }
+              : current,
+          );
           setSearching(false);
-          setSearchDone(succeeded);
         }
       }
     },
-    [appSection, confidence, electronAPI, searchQuery],
+    [
+      appSection,
+      electronAPI,
+      rememberSearchResultOrder,
+      searchIndexReadiness.status,
+      searchQuery,
+    ],
   );
 
   useEffect(() => {
     if (!electronAPI) return;
     return electronAPI.onSemanticSearchProgress((progress) => {
       if (progress.requestId !== searchRequestRef.current) return;
+      rememberSearchResultOrder(progress.results, searchQueryRef.current);
+      const receivedAt = performance.now();
+      const done = progress.status === "done";
+      setSearchTiming((current) =>
+        current?.requestId === progress.requestId
+          ? {
+              ...current,
+              firstResultAt:
+                current.firstResultAt ??
+                (progress.results.length > 0 ? receivedAt : null),
+              completedAt:
+                done ? (current.completedAt ?? receivedAt) : current.completedAt,
+            }
+          : current,
+      );
       const hidden = bannedHiddenPathsRef.current;
       setSearchResults(
         hidden.size > 0
           ? progress.results.filter((result) => !hidden.has(result.path))
           : progress.results,
       );
-      setSearchProgress({ scanned: progress.scanned, total: progress.total });
-      const done = progress.status === "done";
+      if (progress.textCapped) setFastFileSearchCapped(true);
+      setSearchProgress({
+        scanned: progress.scanned,
+        total: progress.total,
+        mode: progress.mode,
+      });
       setSearching(!done);
-      setSearchDone(done);
     });
-  }, [electronAPI]);
+  }, [electronAPI, rememberSearchResultOrder]);
+
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (searchQueryStartedAtRef.current?.query !== query)
+      searchQueryStartedAtRef.current = {
+        query,
+        startedAt: performance.now(),
+      };
+    fastFileSearchFirstResultAtRef.current = null;
+    searchResultOrderRef.current = { query, paths: [] };
+    setSearchResultOrder([]);
+    setFreezeSearchResultOrder(true);
+    setSearchResults([]);
+    fastFileSearchResultsRef.current.clear();
+    fastFileSearchResultsQueryRef.current = "";
+    setFastFileSearchResults([]);
+    setFastFileSearchCapped(false);
+    setSearchProgress({ scanned: 0, total: 0 });
+    setSearchTiming(null);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    const generation = ++fastFileSearchGenerationRef.current;
+    const matches = fastFileSearchResultsRef.current;
+    matches.clear();
+    setFastFileSearchResults([]);
+    setFastFileSearchCapped(false);
+    const query = searchQuery.trim().toLocaleLowerCase();
+    if (
+      appSection !== "files" ||
+      !query ||
+      searchIndexReadiness.status === "unavailable" ||
+      searchIndexReadiness.status === "error"
+    )
+      return;
+
+    scheduleFastFileMatchesRef.current(filesRef.current, query, generation);
+    return () => {
+      fastFileSearchGenerationRef.current += 1;
+    };
+  }, [
+    appSection,
+    bannedHiddenPaths,
+    searchIndexReadiness.status,
+    searchQuery,
+  ]);
+
+  useEffect(() => {
+    if (
+      !searchQuery.trim() ||
+      searchIndexReadiness.status === "unavailable" ||
+      searchIndexReadiness.status === "error" ||
+      fastFileSearchResultsQueryRef.current !==
+        searchQuery.trim().toLocaleLowerCase()
+    )
+      return;
+    rememberSearchResultOrder(fastFileSearchResults, searchQuery);
+    if (fastFileSearchResults.length > 0) {
+      const receivedAt = performance.now();
+      setSearchTiming((current) =>
+        current &&
+        current.query === searchQuery.trim() &&
+        current.firstResultAt === null
+          ? { ...current, firstResultAt: receivedAt }
+          : current,
+      );
+    }
+  }, [
+    fastFileSearchResults,
+    rememberSearchResultOrder,
+    searchIndexReadiness.status,
+    searchQuery,
+  ]);
 
   useEffect(() => {
     if (appSection !== "files" || !searchQuery.trim()) {
@@ -3809,8 +4192,14 @@ function App() {
       setSearchResults([]);
       setSearchProgress({ scanned: 0, total: 0 });
       setSearching(false);
-      setSearchDone(false);
       setSearchError("");
+      return;
+    }
+    if (
+      searchIndexReadiness.status === "unavailable" ||
+      searchIndexReadiness.status === "error"
+    ) {
+      setSearching(false);
       return;
     }
     const timer = window.setTimeout(() => {
@@ -3825,7 +4214,13 @@ function App() {
       if (electronAPI)
         void electronAPI.cancelSemanticSearch().catch(() => undefined);
     };
-  }, [appSection, electronAPI, runSemanticSearch, searchQuery]);
+  }, [
+    appSection,
+    electronAPI,
+    runSemanticSearch,
+    searchIndexReadiness.status,
+    searchQuery,
+  ]);
 
   useEffect(() => {
     if (contentSafetyRevision > 0 && appSection === "files")
@@ -3834,14 +4229,48 @@ function App() {
 
   const rawContentFiles: FileInfo[] = useMemo(() => {
     if (!searchQuery.trim()) return files;
-    if (!activeDigitalFolderId) return searchResults;
-    const resultsByPath = new Map(
-      searchResults.map((result) => [result.path, result]),
-    );
+    const resultsByPath = new Map<string, SemanticSearchResult>();
+    for (const result of fastFileSearchResults)
+      if (!bannedHiddenPaths.has(result.path))
+        resultsByPath.set(result.path, result);
+    for (const result of searchResults) {
+      if (bannedHiddenPaths.has(result.path)) continue;
+      if (
+        result._priority === 3 &&
+        (result.confidence ?? -Infinity) < confidence
+      )
+        continue;
+      const textMatch = resultsByPath.get(result.path);
+      const textPriority = textMatch?._priority ?? 3;
+      const resultPriority = result._priority ?? 3;
+      resultsByPath.set(
+        result.path,
+        textMatch
+          ? {
+              ...textMatch,
+              ...result,
+              _priority: Math.min(textPriority, resultPriority) as 0 | 1 | 2 | 3,
+              _source:
+                textPriority <= resultPriority
+                  ? textMatch._source
+                  : result._source,
+            }
+          : result,
+      );
+    }
+    if (!activeDigitalFolderId) return Array.from(resultsByPath.values());
     return files
       .filter((file) => resultsByPath.has(file.path))
       .map((file) => ({ ...file, ...resultsByPath.get(file.path) }));
-  }, [activeDigitalFolderId, files, searchQuery, searchResults]);
+  }, [
+    activeDigitalFolderId,
+    bannedHiddenPaths,
+    fastFileSearchResults,
+    files,
+    confidence,
+    searchQuery,
+    searchResults,
+  ]);
   const contentFiles = useMemo(
     () =>
       rawContentFiles.map((file) => {
@@ -3982,6 +4411,16 @@ function App() {
     magicPrefs.preset,
   );
 
+  const searchResultPositions = useMemo(
+    () =>
+      new Map(
+        searchResultOrder.map(
+          (filePath, position) => [filePath, position] as const,
+        ),
+      ),
+    [searchResultOrder],
+  );
+
   const filteredAndSortedFiles = useMemo(() => {
     const filtered = contentFiles.filter((file) => {
       if (file.isDirectory)
@@ -4016,6 +4455,20 @@ function App() {
     });
 
     filtered.sort((first, second) => {
+      if (
+        searchQuery.trim() &&
+        freezeSearchResultOrder &&
+        searchResultOrderRef.current.query === searchQuery.trim()
+      ) {
+        const firstPosition = searchResultPositions.get(first.path);
+        const secondPosition = searchResultPositions.get(second.path);
+        if (firstPosition !== undefined || secondPosition !== undefined) {
+          if (firstPosition === undefined) return 1;
+          if (secondPosition === undefined) return -1;
+          if (firstPosition !== secondPosition)
+            return firstPosition - secondPosition;
+        }
+      }
       if (searchQuery.trim()) {
         const firstPriority = (first as SemanticSearchResult)._priority ?? 3;
         const secondPriority = (second as SemanticSearchResult)._priority ?? 3;
@@ -4031,7 +4484,7 @@ function App() {
       );
     });
 
-    return exploded
+    return exploded || (searchQuery.trim() && freezeSearchResultOrder)
       ? filtered
       : [
           ...filtered.filter((file) => file.isDirectory),
@@ -4046,6 +4499,8 @@ function App() {
     magicState.ranks,
     searchQuery,
     sortIndicators,
+    freezeSearchResultOrder,
+    searchResultPositions,
     peopleFilter,
     locationFilter,
     sort,
@@ -4290,35 +4745,52 @@ function App() {
     Math.floor(500 / Math.max(1, yearSections.years.length)),
   );
   const displayItems = useMemo(
-    () => [
-      ...yearSections.folders.map((file) => ({ kind: "file" as const, file })),
-      ...yearSections.years.flatMap((year) => [
-        {
-          kind: "year" as const,
-          year,
-          count: yearSections.byYear.get(year)?.length ?? 0,
-        },
-        ...(expandedYears.has(year)
-          ? (yearSections.byYear.get(year) ?? [])
-              .slice(0, yearDisplayLimits[year] ?? yearPageSize)
-              .map((file) => ({ kind: "file" as const, file }))
-          : []),
-        ...(expandedYears.has(year) &&
-        (yearSections.byYear.get(year)?.length ?? 0) >
-          (yearDisplayLimits[year] ?? yearPageSize)
-          ? [
-              {
-                kind: "more" as const,
-                year,
-                count:
-                  yearSections.byYear.get(year)!.length -
-                  (yearDisplayLimits[year] ?? yearPageSize),
-              },
-            ]
-          : []),
-      ]),
+    () => {
+      // Search results arrive in stable first-seen order. Keep them in one
+      // continuous list so newly found files append at the end instead of
+      // changing each year's share of the grid and shifting loaded thumbnails.
+      if (searchQuery.trim())
+        return filteredAndSortedFiles
+          .slice(0, displayLimit)
+          .map((file) => ({ kind: "file" as const, file }));
+      return [
+        ...yearSections.folders.map((file) => ({ kind: "file" as const, file })),
+        ...yearSections.years.flatMap((year) => [
+          {
+            kind: "year" as const,
+            year,
+            count: yearSections.byYear.get(year)?.length ?? 0,
+          },
+          ...(expandedYears.has(year)
+            ? (yearSections.byYear.get(year) ?? [])
+                .slice(0, yearDisplayLimits[year] ?? yearPageSize)
+                .map((file) => ({ kind: "file" as const, file }))
+            : []),
+          ...(expandedYears.has(year) &&
+          (yearSections.byYear.get(year)?.length ?? 0) >
+            (yearDisplayLimits[year] ?? yearPageSize)
+            ? [
+                {
+                  kind: "more" as const,
+                  year,
+                  count:
+                    yearSections.byYear.get(year)!.length -
+                    (yearDisplayLimits[year] ?? yearPageSize),
+                },
+              ]
+            : []),
+        ]),
+      ];
+    },
+    [
+      displayLimit,
+      expandedYears,
+      filteredAndSortedFiles,
+      searchQuery,
+      yearDisplayLimits,
+      yearSections,
+      yearPageSize,
     ],
-    [expandedYears, yearDisplayLimits, yearSections, yearPageSize],
   );
   const displayedFiles = useMemo(
     () =>
@@ -4418,6 +4890,7 @@ function App() {
     : -1;
 
   const changeSort = (value: string) => {
+    setFreezeSearchResultOrder(false);
     const [field, direction] = value.split("-") as [
       SortState["field"],
       "asc" | "desc",
@@ -4426,6 +4899,7 @@ function App() {
   };
 
   const handleHeaderSort = (field: SortState["field"]) => {
+    setFreezeSearchResultOrder(false);
     // If clicking the same field, toggle ascending/descending
     // Otherwise, start with ascending order
     if (sort.field === field) {
@@ -4600,7 +5074,14 @@ function App() {
                 <FiSearch />
                 <input
                   value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.target.value)}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    searchQueryStartedAtRef.current = {
+                      query: value.trim(),
+                      startedAt: performance.now(),
+                    };
+                    setSearchQuery(value);
+                  }}
                   onFocus={() => {
                     setSearchFocused(true);
                     setHistoryLevel(0);
@@ -4609,6 +5090,10 @@ function App() {
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       rememberSearch(searchQuery);
+                      searchQueryStartedAtRef.current = {
+                        query: searchQuery.trim(),
+                        startedAt: performance.now(),
+                      };
                       if (searchDebounceTimerRef.current !== null) {
                         window.clearTimeout(searchDebounceTimerRef.current);
                         searchDebounceTimerRef.current = null;
@@ -4618,12 +5103,37 @@ function App() {
                     if (event.key === "Escape")
                       (event.target as HTMLInputElement).blur();
                   }}
-                  placeholder="Search images and documents by meaning"
+                  placeholder={
+                    searchIndexReadiness.status === "ready"
+                      ? "Search names, folders, and by meaning"
+                      : "Search becomes available when the index is ready"
+                  }
                   aria-label="Semantic search"
                   data-help="Describe what you remember in ordinary language to find matching indexed photos and documents locally."
                 />
                 <span className="semantic-search-status" role="status" aria-live="polite">
-                  {searching ? "Searching…" : searchDone ? "Done!" : ""}
+                  {searchIndexReadiness.status === "preparing" ? (
+                    <span className="search-index-meter" title={searchIndexReadiness.message}>
+                      <span>Index {searchIndexReadiness.percentage}%</span>
+                      <span className="search-index-meter-track" aria-hidden="true">
+                        <span style={{ width: `${searchIndexReadiness.percentage}%` }} />
+                      </span>
+                    </span>
+                  ) : searchIndexReadiness.status === "ready" ? (
+                    searchQuery.trim() && searchTiming ? (
+                      <SearchTiming
+                        startedAt={searchTiming.startedAt}
+                        firstResultAt={searchTiming.firstResultAt}
+                        completedAt={searchTiming.completedAt}
+                      />
+                    ) : searchQuery.trim() && searching ? (
+                      "Searching…"
+                    ) : (
+                      "Search ready"
+                    )
+                  ) : (
+                    "Index unavailable"
+                  )}
                 </span>
                 {searchQuery && (
                   <button onClick={() => setSearchQuery("")} title="Clear search" aria-label="Clear search"
@@ -5092,12 +5602,19 @@ function App() {
           </div>
           <span className="file-count">
             {searchQuery.trim()
-              ? searching && searchProgress.total === 0
-                ? `${filteredAndSortedFiles.length.toLocaleString()} matches · opening saved index…`
-                : searching
-                  ? `${filteredAndSortedFiles.length.toLocaleString()} matches · searching ${searchProgress.scanned.toLocaleString()} of ${searchProgress.total.toLocaleString()} indexed files`
-                  : `${filteredAndSortedFiles.length.toLocaleString()} matches from ${searchProgress.total.toLocaleString()} indexed files`
+              ? searchIndexReadiness.status === "preparing"
+                ? `${filteredAndSortedFiles.length.toLocaleString()} matches · preparing semantic index ${searchIndexReadiness.percentage}%`
+                : searching && searchProgress.total === 0
+                ? `${filteredAndSortedFiles.length.toLocaleString()} matches · finding first results`
+                : searching && searchProgress.mode === "ann"
+                  ? `${filteredAndSortedFiles.length.toLocaleString()} matches · ranking semantic candidates`
+                  : searching
+                    ? `${filteredAndSortedFiles.length.toLocaleString()} matches · searching ${searchProgress.scanned.toLocaleString()} of ${searchProgress.total.toLocaleString()} indexed files`
+                    : `${filteredAndSortedFiles.length.toLocaleString()} matches from ${searchProgress.total.toLocaleString()} indexed files`
               : `${filteredAndSortedFiles.length.toLocaleString()} items`}
+            {searchQuery.trim() && fastFileSearchCapped
+              ? " · showing first 5,000 text matches"
+              : ""}
           </span>
           {(() => {
             const snapshot = sources
@@ -6725,7 +7242,7 @@ function App() {
               />
               <output>{thumbnailSize}px</output>
             </div>
-            {loading && files.length > 0 && (
+            {loading && !searchQuery.trim() && files.length > 0 && (
               <div className="file-scan-banner">
                 <span>
                   Scanning this folder tree
@@ -6760,11 +7277,38 @@ function App() {
                 <h2>No directory selected</h2>
                 <p>Open a directory to get started</p>
               </div>
-            ) : (loading && filteredAndSortedFiles.length === 0) ||
-              (searching && searchResults.length === 0) ? (
+            ) : searchQuery.trim() &&
+              (searchIndexReadiness.status === "unavailable" ||
+                searchIndexReadiness.status === "error") ? (
+              <div className="empty-state" role="status">
+                <h2>Search index unavailable</h2>
+                <p>{searchIndexReadiness.message}</p>
+              </div>
+            ) : (!searchQuery.trim() && loading && filteredAndSortedFiles.length === 0) ||
+              (searchQuery.trim() &&
+                searchIndexReadiness.status === "preparing" &&
+                filteredAndSortedFiles.length === 0) ||
+              (searching && filteredAndSortedFiles.length === 0) ? (
               <div className="loading">
-                <div>Scanning files...</div>
-                {loading && filteredAndSortedFiles.length === 0 && (
+                <div>
+                  {searchQuery.trim()
+                    ? searchIndexReadiness.status === "preparing"
+                      ? `Preparing semantic index · ${searchIndexReadiness.percentage}%`
+                      : "Finding first results…"
+                    : "Scanning files..."}
+                </div>
+                {searchQuery.trim() && searchIndexReadiness.status === "preparing" && (
+                  <div className="loading-progress">
+                    <div className="progress-bar">
+                      <div
+                        className="progress-fill"
+                        style={{ width: `${searchIndexReadiness.percentage}%` }}
+                      />
+                    </div>
+                    <p>{searchIndexReadiness.records.toLocaleString()} index records prepared</p>
+                  </div>
+                )}
+                {!searchQuery.trim() && loading && filteredAndSortedFiles.length === 0 && (
                   <div className="loading-progress">
                     <div className="progress-bar">
                       <div
@@ -6959,10 +7503,11 @@ function App() {
                                     "Semantic match"}
                                 </td>
                                 <td>
-                                  {Math.round(
+                                  {Number.isFinite(
                                     (file as SemanticSearchResult).confidence,
-                                  )}
-                                  %
+                                  )
+                                    ? `${Math.round((file as SemanticSearchResult).confidence!)}%`
+                                    : "Text match"}
                                 </td>
                               </>
                             )}
@@ -7120,10 +7665,11 @@ function App() {
                             )}
                             {searchQuery.trim() && (
                               <p className="confidence">
-                                {Math.round(
+                                {Number.isFinite(
                                   (file as SemanticSearchResult).confidence,
-                                )}
-                                % match
+                                )
+                                  ? `${Math.round((file as SemanticSearchResult).confidence!)}% match`
+                                  : "Text match"}
                                 {(file as SemanticSearchResult)._source &&
                                   ` • ${(file as SemanticSearchResult)._source}`}
                               </p>
@@ -7136,7 +7682,22 @@ function App() {
                 )}
               </div>
             )}
-            {yearSections.folders.length < yearSections.allFolders.length && (
+            {searchQuery.trim() &&
+            filteredAndSortedFiles.length > displayLimit ? (
+              <div className="load-more-container">
+                <p className="results-info">
+                  {displayLimit.toLocaleString()} of{" "}
+                  {filteredAndSortedFiles.length.toLocaleString()} search results shown
+                </p>
+                <button
+                  className="load-more"
+                  onClick={() => setDisplayLimit((limit) => limit + 500)}
+                >
+                  Load 500 more results
+                </button>
+              </div>
+            ) : !searchQuery.trim() &&
+              yearSections.folders.length < yearSections.allFolders.length && (
               <div className="load-more-container">
                 <p className="results-info">
                   {yearSections.folders.length.toLocaleString()} of{" "}

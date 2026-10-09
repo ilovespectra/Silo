@@ -219,6 +219,13 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.on("index-progress", listener);
     return () => ipcRenderer.removeListener("index-progress", listener);
   },
+  getSearchIndexReadiness: () =>
+    ipcRenderer.invoke("get-search-index-readiness"),
+  onSearchIndexReadiness: (callback) => {
+    const listener = (_event, status) => callback(status);
+    ipcRenderer.on("search-index-readiness", listener);
+    return () => ipcRenderer.removeListener("search-index-readiness", listener);
+  },
   getGeoState: () => ipcRenderer.invoke("get-geo-state"),
   refreshGeoState: () => ipcRenderer.invoke("refresh-geo-state"),
   getStartupState: () => ipcRenderer.invoke("get-startup-state"),

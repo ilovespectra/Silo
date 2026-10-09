@@ -11,6 +11,7 @@ export interface RecoveryStage {
   lane?: "analysis" | "disk" | "light" | "background";
   blockedReason?: () => string;
   pause?: () => Promise<unknown> | unknown;
+  resume?: () => Promise<unknown> | unknown;
 }
 
 interface RecoveryRecord {
@@ -30,6 +31,9 @@ export class IndexingRecovery {
   private requested = new Set<string>();
   private persistenceError = "";
   private externalBlockReason = "";
+  private interactiveSearchActive = false;
+  private searchPausedStages = new Set<string>();
+  private searchTransition: Promise<void> = Promise.resolve();
   constructor(
     private stages: RecoveryStage[],
     private now = Date.now,
@@ -114,6 +118,9 @@ export class IndexingRecovery {
     const stage = this.stages.find((item) => item.id === id);
     const blocker =
       this.externalBlockReason ||
+      (this.interactiveSearchActive
+        ? "Waiting for interactive search to finish."
+        : "") ||
       (stage && !stage.ready()
         ? stage.blockedReason?.() ||
           "Waiting for another active index to release resources."
@@ -140,43 +147,90 @@ export class IndexingRecovery {
   async setBlocked(reason: string | null) {
     this.externalBlockReason = reason ?? "";
     if (this.externalBlockReason) {
-      const busyStatuses = new Set([
-        "scanning",
-        "indexing",
-        "loading-model",
-        "clustering",
-        "generating",
-      ]);
-      const activeStages = this.stages.filter((stage) =>
-        busyStatuses.has(stage.progress().status),
-      );
-      for (const stage of activeStages) {
-        const record = this.records.get(stage.id) ?? {
-          attempts: 0,
-          error: "",
-          retryAt: 0,
-          running: false,
-          checked: false,
-          userPaused: false,
-        };
-        if (!record.userPaused) {
-          record.checked = false;
-          record.error = "";
-          record.retryAt = 0;
-          this.records.set(stage.id, record);
-          this.requested.add(stage.id);
-        }
-        if (!stage.pause) continue;
-        try {
-          await stage.pause();
-        } catch (error) {
-          console.error(`[IndexingRecovery] Could not pause ${stage.id}`, error);
-        }
-      }
+      await this.pauseActiveStages();
       this.persist();
       return;
     }
     await this.tick();
+  }
+
+  setSearchActive(active: boolean): Promise<void> {
+    this.interactiveSearchActive = active;
+    this.searchTransition = this.searchTransition.catch(() => undefined).then(async () => {
+      if (active) {
+        if (!this.interactiveSearchActive) return;
+        // Search indexing and audio inventory yield at their own batch boundaries.
+        await this.pauseActiveStages(new Set(["search", "audio"]), true);
+        this.persist();
+        return;
+      }
+      if (this.interactiveSearchActive) return;
+      if (this.externalBlockReason) {
+        this.searchPausedStages.clear();
+        return;
+      }
+      for (const id of this.searchPausedStages) {
+        const stage = this.stages.find((item) => item.id === id);
+        if (!stage?.resume) continue;
+        try {
+          await stage.resume();
+        } catch (error) {
+          console.error(`[IndexingRecovery] Could not resume ${id}`, error);
+        }
+      }
+      this.searchPausedStages.clear();
+      await this.tick();
+    });
+    return this.searchTransition;
+  }
+
+  private async pauseActiveStages(
+    excludedIds = new Set<string>(),
+    rememberForSearch = false,
+  ) {
+    const busyStatuses = new Set([
+      "scanning",
+      "indexing",
+      "loading-model",
+      "clustering",
+      "generating",
+    ]);
+    const activeStages = this.stages.filter(
+      (stage) =>
+        !excludedIds.has(stage.id) &&
+        (!rememberForSearch || Boolean(stage.pause)) &&
+        busyStatuses.has(stage.progress().status),
+    );
+    const pauses: Promise<void>[] = [];
+    for (const stage of activeStages) {
+      const record = this.records.get(stage.id) ?? {
+        attempts: 0,
+        error: "",
+        retryAt: 0,
+        running: false,
+        checked: false,
+        userPaused: false,
+      };
+      if (!record.userPaused) {
+        record.checked = false;
+        record.error = "";
+        record.retryAt = 0;
+        this.records.set(stage.id, record);
+        this.requested.add(stage.id);
+        if (rememberForSearch && stage.pause)
+          this.searchPausedStages.add(stage.id);
+      }
+      if (!stage.pause) continue;
+      pauses.push(
+        Promise.resolve()
+          .then(() => stage.pause!())
+          .then(() => undefined)
+          .catch((error) => {
+            console.error(`[IndexingRecovery] Could not pause ${stage.id}`, error);
+          }),
+      );
+    }
+    await Promise.all(pauses);
   }
 
   pause(id: string) {
@@ -266,7 +320,13 @@ export class IndexingRecovery {
   }
 
   async tick() {
-    if (this.stopped || this.externalBlockReason || this.tickRunning) return;
+    if (
+      this.stopped ||
+      this.externalBlockReason ||
+      this.interactiveSearchActive ||
+      this.tickRunning
+    )
+      return;
     this.tickRunning = true;
     try {
       const ordered = [...this.stages].sort(
@@ -276,7 +336,13 @@ export class IndexingRecovery {
           Number(second.id === "search") - Number(first.id === "search"),
       );
       for (const stage of ordered) {
-        if (this.stopped || this.externalBlockReason || !stage.ready()) continue;
+        if (
+          this.stopped ||
+          this.externalBlockReason ||
+          this.interactiveSearchActive ||
+          !stage.ready()
+        )
+          continue;
         const progress = stage.progress();
         const record = this.records.get(stage.id);
         const interrupted =
@@ -328,7 +394,11 @@ export class IndexingRecovery {
       if (progress.status === "error") throw new Error(progress.message);
       if (progress.status === "paused") {
         if (!record.userPaused)
-          if (this.externalBlockReason) {
+          if (
+            this.externalBlockReason ||
+            this.interactiveSearchActive ||
+            this.searchPausedStages.has(stage.id)
+          ) {
             record.checked = false;
             record.error = "";
             record.retryAt = 0;

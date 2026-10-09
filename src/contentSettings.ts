@@ -1,5 +1,6 @@
 import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import * as fsPromises from "fs/promises";
+import * as os from "os";
 import * as path from "path";
 
 export interface ContentPreferences {
@@ -15,8 +16,81 @@ export interface PublicContentSettings extends ContentPreferences {
   parentalPasswordSet: boolean;
 }
 
+export interface SearchPerformanceSettings {
+  searchThreads: number;
+  indexThreads: number;
+  backgroundWorkPercent: number;
+}
+
+export interface SearchPerformanceMachineInfo {
+  processor: string;
+  logicalProcessors: number;
+  availableProcessors: number;
+  totalMemoryBytes: number;
+  freeMemoryBytes: number;
+  platform: string;
+  architecture: string;
+}
+
+export interface SearchPerformanceSnapshot {
+  settings: SearchPerformanceSettings;
+  machine: SearchPerformanceMachineInfo;
+}
+
+export function getSearchPerformanceMachineInfo(): SearchPerformanceMachineInfo {
+  const processors = os.cpus();
+  let availableProcessors = processors.length || 1;
+  try {
+    availableProcessors = Math.max(1, os.availableParallelism());
+  } catch {
+    // Older runtimes may not expose availableParallelism; fall back to logical CPUs.
+  }
+  return {
+    processor: processors[0]?.model.trim() || "Processor information unavailable",
+    logicalProcessors: Math.max(1, processors.length),
+    availableProcessors,
+    totalMemoryBytes: os.totalmem(),
+    freeMemoryBytes: os.freemem(),
+    platform: os.platform(),
+    architecture: os.arch(),
+  };
+}
+
+export function defaultSearchPerformanceSettings(
+  availableProcessors = getSearchPerformanceMachineInfo().availableProcessors,
+): SearchPerformanceSettings {
+  const cores = Math.max(1, Math.floor(availableProcessors));
+  return {
+    searchThreads: cores,
+    // Reserve one logical processor for the OS/UI and keep ANN preparation bounded.
+    indexThreads: Math.max(1, Math.min(4, cores - 1)),
+    backgroundWorkPercent: 55,
+  };
+}
+
+function normalizeSearchPerformanceSettings(
+  value: Partial<SearchPerformanceSettings> | undefined,
+  availableProcessors: number,
+): SearchPerformanceSettings {
+  const defaults = defaultSearchPerformanceSettings(availableProcessors);
+  const normalizeThreads = (candidate: unknown, fallback: number) =>
+    typeof candidate === "number" && Number.isFinite(candidate)
+      ? Math.max(1, Math.min(availableProcessors, Math.round(candidate)))
+      : fallback;
+  const backgroundCandidate = value?.backgroundWorkPercent;
+  return {
+    searchThreads: normalizeThreads(value?.searchThreads, defaults.searchThreads),
+    indexThreads: normalizeThreads(value?.indexThreads, defaults.indexThreads),
+    backgroundWorkPercent:
+      typeof backgroundCandidate === "number" && Number.isFinite(backgroundCandidate)
+        ? Math.max(20, Math.min(100, Math.round(backgroundCandidate)))
+        : defaults.backgroundWorkPercent,
+  };
+}
+
 interface StoredContentSettings {
   preferences: ContentPreferences;
+  performance: SearchPerformanceSettings;
   passwordSalt: string | null;
   passwordHash: string | null;
 }
@@ -30,6 +104,7 @@ const defaults: StoredContentSettings = {
     preloadMapTextures: false,
     showBannedPeople: false,
   },
+  performance: defaultSearchPerformanceSettings(),
   passwordSalt: null,
   passwordHash: null,
 };
@@ -52,6 +127,10 @@ export class ContentSettingsStore {
         ...structuredClone(defaults),
         ...stored,
         preferences: { ...defaults.preferences, ...stored.preferences },
+        performance: normalizeSearchPerformanceSettings(
+          stored.performance,
+          getSearchPerformanceMachineInfo().availableProcessors,
+        ),
       };
     } catch {
       await this.persist();
@@ -65,6 +144,46 @@ export class ContentSettingsStore {
         this.settings.passwordHash && this.settings.passwordSalt,
       ),
     };
+  }
+
+  getSearchPerformanceSnapshot(): SearchPerformanceSnapshot {
+    const machine = getSearchPerformanceMachineInfo();
+    this.settings.performance = normalizeSearchPerformanceSettings(
+      this.settings.performance,
+      machine.availableProcessors,
+    );
+    return { settings: { ...this.settings.performance }, machine };
+  }
+
+  async updateSearchPerformanceSettings(
+    update: unknown,
+  ): Promise<SearchPerformanceSnapshot> {
+    if (!update || typeof update !== "object" || Array.isArray(update))
+      throw new Error("Invalid performance settings.");
+    const candidate = update as Record<string, unknown>;
+    for (const key of ["searchThreads", "indexThreads", "backgroundWorkPercent"])
+      if (
+        typeof candidate[key] !== "number" ||
+        !Number.isFinite(candidate[key]) ||
+        !Number.isInteger(candidate[key])
+      )
+        throw new Error("Choose whole-number performance settings.");
+    const machine = getSearchPerformanceMachineInfo();
+    if (
+      (candidate.searchThreads as number) < 1 ||
+      (candidate.searchThreads as number) > machine.availableProcessors ||
+      (candidate.indexThreads as number) < 1 ||
+      (candidate.indexThreads as number) > machine.availableProcessors ||
+      (candidate.backgroundWorkPercent as number) < 20 ||
+      (candidate.backgroundWorkPercent as number) > 100
+    )
+      throw new Error("Performance settings are outside this computer’s supported range.");
+    this.settings.performance = normalizeSearchPerformanceSettings(
+      candidate as Partial<SearchPerformanceSettings>,
+      machine.availableProcessors,
+    );
+    await this.persist();
+    return this.getSearchPerformanceSnapshot();
   }
 
   async setParentalPassword(currentPassword: string, newPassword: string) {

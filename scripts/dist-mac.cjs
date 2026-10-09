@@ -83,8 +83,10 @@ function buildMac() {
       if (process.env.SILO_TEST_DIR_ONLY === "1") {
         buildArguments.push("--dir");
       }
-      const outputDirectory = process.env.SILO_TEST_OUTPUT_DIR
-        ? path.resolve(process.env.SILO_TEST_OUTPUT_DIR)
+      const configuredOutputDirectory =
+        process.env.SILO_RELEASE_OUTPUT_DIR || process.env.SILO_TEST_OUTPUT_DIR;
+      const outputDirectory = configuredOutputDirectory
+        ? path.resolve(configuredOutputDirectory)
         : path.join(projectRoot, "release", architecture);
       buildArguments.push(
         `--config.directories.output=${outputDirectory}`,

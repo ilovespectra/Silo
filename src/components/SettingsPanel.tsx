@@ -5,6 +5,7 @@ import {
   FiBarChart2,
   FiCamera,
   FiCheck,
+  FiCpu,
   FiDownload,
   FiFolder,
   FiHardDrive,
@@ -26,6 +27,220 @@ interface SettingsPanelProps {
   onOpenBugReport: () => void;
   hideSettingsForScreenshot?: boolean;
   lifetimePromptRequest?: number;
+}
+
+function formatSystemMemory(bytes: number) {
+  const gigabytes = bytes / 1024 ** 3;
+  return `${gigabytes >= 10 ? gigabytes.toFixed(0) : gigabytes.toFixed(1)} GB`;
+}
+
+function PerformanceSettingsSection() {
+  const electronAPI = window.electron;
+  const [snapshot, setSnapshot] = useState<SearchPerformanceSnapshot | null>(null);
+  const [draft, setDraft] = useState<SearchPerformanceSettings | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    void electronAPI?.getSearchPerformanceSettings()
+      .then((next) => {
+        if (!active) return;
+        setSnapshot(next);
+        setDraft(next.settings);
+      })
+      .catch((cause) => {
+        if (active)
+          setError(
+            cause instanceof Error
+              ? cause.message
+              : "Computer performance details could not be loaded.",
+          );
+      });
+    return () => {
+      active = false;
+    };
+  }, [electronAPI]);
+
+  const save = async () => {
+    if (!electronAPI || !draft) return;
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      const next = await electronAPI.updateSearchPerformanceSettings(draft);
+      setSnapshot(next);
+      setDraft(next.settings);
+      setMessage("Performance settings saved.");
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Performance settings could not be saved.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const reset = () => {
+    if (!snapshot) return;
+    const available = snapshot.machine.availableProcessors;
+    setDraft({
+      searchThreads: available,
+      indexThreads: Math.max(1, Math.min(4, available - 1)),
+      backgroundWorkPercent: 55,
+    });
+    setMessage("");
+    setError("");
+  };
+
+  const machine = snapshot?.machine;
+  const platform =
+    machine?.platform === "darwin"
+      ? "macOS"
+      : machine?.platform === "win32"
+        ? "Windows"
+        : machine?.platform === "linux"
+          ? "Linux"
+          : machine?.platform ?? "This computer";
+  const dirty = Boolean(
+    snapshot && draft &&
+      (snapshot.settings.searchThreads !== draft.searchThreads ||
+        snapshot.settings.indexThreads !== draft.indexThreads ||
+        snapshot.settings.backgroundWorkPercent !== draft.backgroundWorkPercent),
+  );
+
+  return (
+    <section
+      className="settings-performance-section"
+      data-tour="settings-performance"
+      data-help="Tune the CPU threads used for semantic search and background indexing. Silo reports the hardware available to it and applies an honest work-time budget instead of promising a whole-computer CPU cap."
+    >
+      <div className="settings-section-title">
+        <FiCpu />
+        <div>
+          <h3>Performance</h3>
+          <p>Choose how much CPU time semantic search and indexing can use.</p>
+        </div>
+      </div>
+
+      {machine ? (
+        <div className="settings-performance-machine" aria-label="Detected computer">
+          <strong>{machine.processor}</strong>
+          <span>
+            {machine.availableProcessors} of {machine.logicalProcessors} logical
+            processor threads available to Silo
+          </span>
+          <span>
+            {formatSystemMemory(machine.totalMemoryBytes)} memory ·{" "}
+            {formatSystemMemory(machine.freeMemoryBytes)} currently free
+          </span>
+          <span>{platform} · {machine.architecture}</span>
+        </div>
+      ) : (
+        <p className="settings-footnote">Reading this computer’s available CPU and memory…</p>
+      )}
+
+      {draft && machine && (
+        <>
+          <label className="settings-performance-control">
+            <span>
+              <strong>Interactive semantic search</strong>
+              <b>{draft.searchThreads} {draft.searchThreads === 1 ? "thread" : "threads"}</b>
+            </span>
+            <input
+              type="range"
+              min={1}
+              max={machine.availableProcessors}
+              step={1}
+              value={draft.searchThreads}
+              disabled={busy}
+              aria-label="Maximum CPU threads for interactive semantic search"
+              onChange={(event) => {
+                setDraft({ ...draft, searchThreads: Number(event.target.value) });
+                setMessage("");
+              }}
+            />
+            <small>Uses up to the selected number of threads to rank a search.</small>
+          </label>
+
+          <label className="settings-performance-control">
+            <span>
+              <strong>Background index preparation</strong>
+              <b>{draft.indexThreads} {draft.indexThreads === 1 ? "thread" : "threads"}</b>
+            </span>
+            <input
+              type="range"
+              min={1}
+              max={machine.availableProcessors}
+              step={1}
+              value={draft.indexThreads}
+              disabled={busy}
+              aria-label="Maximum CPU threads for background index preparation"
+              onChange={(event) => {
+                setDraft({ ...draft, indexThreads: Number(event.target.value) });
+                setMessage("");
+              }}
+            />
+            <small>Limits the threads used to build and update the saved vector index.</small>
+          </label>
+
+          <label className="settings-performance-control">
+            <span>
+              <strong>Background indexing pace</strong>
+              <b>{draft.backgroundWorkPercent}%</b>
+            </span>
+            <input
+              type="range"
+              min={20}
+              max={100}
+              step={5}
+              value={draft.backgroundWorkPercent}
+              disabled={busy}
+              aria-label="Background semantic indexing work-time budget"
+              onChange={(event) => {
+                setDraft({ ...draft, backgroundWorkPercent: Number(event.target.value) });
+                setMessage("");
+              }}
+            />
+            <small>
+              Sets the share of each background work interval Silo aims to spend
+              indexing. The operating system still schedules CPU use, so this is
+              not a whole-computer CPU percentage cap.
+            </small>
+          </label>
+        </>
+      )}
+
+      <p className="settings-footnote">
+        Search gets priority over ongoing semantic file indexing. Thread limits
+        apply to Silo’s vector-search operations; other app work and the operating
+        system can affect total CPU use.
+      </p>
+      {error && <p className="settings-message error" role="alert">{error}</p>}
+      {message && <p className="settings-message" role="status">{message}</p>}
+      <div className="settings-performance-actions">
+        <button
+          className="settings-save"
+          type="button"
+          disabled={!dirty || busy || !draft}
+          onClick={() => void save()}
+        >
+          {busy ? "Saving…" : "Apply performance settings"}
+        </button>
+        <button
+          className="settings-secondary"
+          type="button"
+          disabled={!machine || busy}
+          onClick={reset}
+        >
+          Recommended defaults
+        </button>
+      </div>
+    </section>
+  );
 }
 
 function ScreenshotBeetle() {
@@ -1182,6 +1397,8 @@ export default function SettingsPanel({
             />
           </label>
         </section>
+
+        <PerformanceSettingsSection />
 
         <section data-tour="settings-memories" data-help="Choose where generated Memory movies and spare story files are saved; this does not move source media.">
           <div className="settings-section-title">

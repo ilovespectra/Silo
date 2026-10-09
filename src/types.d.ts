@@ -273,6 +273,27 @@ interface PublicContentSettings extends ContentPreferences {
   parentalPasswordSet: boolean;
 }
 
+interface SearchPerformanceSettings {
+  searchThreads: number;
+  indexThreads: number;
+  backgroundWorkPercent: number;
+}
+
+interface SearchPerformanceMachineInfo {
+  processor: string;
+  logicalProcessors: number;
+  availableProcessors: number;
+  totalMemoryBytes: number;
+  freeMemoryBytes: number;
+  platform: string;
+  architecture: string;
+}
+
+interface SearchPerformanceSnapshot {
+  settings: SearchPerformanceSettings;
+  machine: SearchPerformanceMachineInfo;
+}
+
 interface DuplicateGroup {
   id: string;
   sourceId: string;
@@ -558,7 +579,7 @@ interface PersistedAppState {
 }
 
 interface SemanticSearchResult extends FileInfo {
-  confidence: number;
+  confidence?: number;
   _priority?: 0 | 1 | 2 | 3; // 0=user metadata, 1=name, 2=folder, 3=semantic
   _source?: string; // Human-readable source: "Named as: John", "In folder: yoshimi"
 }
@@ -569,6 +590,15 @@ interface SemanticSearchProgress {
   results: SemanticSearchResult[];
   scanned: number;
   total: number;
+  textCapped?: boolean;
+  mode?: "ann";
+}
+
+interface SearchIndexReadiness {
+  status: "preparing" | "ready" | "unavailable" | "error";
+  percentage: number;
+  records: number;
+  message: string;
 }
 
 interface FaceIndexProgress {
@@ -885,6 +915,10 @@ interface Window {
     ): Promise<FileOperationResult>;
     getAppState(): Promise<PersistedAppState>;
     getContentSettings(): Promise<PublicContentSettings>;
+    getSearchPerformanceSettings(): Promise<SearchPerformanceSnapshot>;
+    updateSearchPerformanceSettings(
+      settings: SearchPerformanceSettings,
+    ): Promise<SearchPerformanceSnapshot>;
     setParentalPassword(
       currentPassword: string,
       newPassword: string,
@@ -933,6 +967,10 @@ interface Window {
       callback: (progress: SemanticSearchProgress) => void,
     ): () => void;
     onIndexProgress(callback: (progress: IndexProgress) => void): () => void;
+    getSearchIndexReadiness(): Promise<SearchIndexReadiness>;
+    onSearchIndexReadiness(
+      callback: (status: SearchIndexReadiness) => void,
+    ): () => void;
     getGeoState(): Promise<GeoIndexState>;
     refreshGeoState(): Promise<GeoIndexState>;
     getStartupState(): Promise<StartupState>;

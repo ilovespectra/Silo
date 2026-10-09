@@ -2,6 +2,8 @@ import * as path from "path";
 import * as fsPromises from "fs/promises";
 import * as fs from "fs";
 import * as os from "os";
+import { defaultSearchPerformanceSettings } from "./contentSettings";
+import type { SearchPerformanceSettings } from "./contentSettings";
 import { DEFAULT_SEMANTIC_SEARCH_CONFIDENCE } from "./searchSettings";
 import {
   isAppDataPath,
@@ -12,6 +14,7 @@ import {
   isWithinSiloClone,
 } from "./indexingPathPolicy";
 import { formatDemoFileSample, selectDemoFilePaths } from "./demoLimits";
+import { PersistedVectorIndex, VectorSearchGroup, VectorSearchKind } from "./persistedVectorIndex";
 import { ChildProcess, execFile, fork } from "child_process";
 import { promisify } from "util";
 
@@ -39,8 +42,10 @@ const VECTOR_SIZE = 512;
 const VECTOR_BYTES = VECTOR_SIZE * Float32Array.BYTES_PER_ELEMENT;
 const SEARCH_VECTOR_WINDOW_BYTES = 8 * 1024 * 1024;
 const SEARCH_MAX_RECORDS_PER_WINDOW = 4096;
+const SEARCH_FIRST_WINDOW_RECORDS = 512;
 const SEARCH_RESULTS_PER_TYPE = 500;
 const SEARCH_RESULT_PRUNE_THRESHOLD = SEARCH_RESULTS_PER_TYPE * 2;
+const SEARCH_TEXT_RESULT_LIMIT = 5000;
 const SEARCH_EMBEDDING_CACHE_LIMIT = 32;
 const RECONCILIATION_DEBOUNCE_MS = 1000; // Debounce reconciliation checks
 const INCREMENTAL_BATCH_SIZE = 250;
@@ -149,6 +154,35 @@ interface IndexRecord {
   error?: string;
 }
 
+interface ActiveTextSearch {
+  queryTerms: string[];
+  sourcePaths: Set<string>;
+  demoPaths: Set<string> | null;
+  onMatches?: (
+    matches: IndexableFile[],
+    scanned: number,
+    total: number,
+    capped: boolean,
+  ) => void;
+  seenRecordIds: Set<number>;
+  matches: IndexableFile[];
+  batch: IndexableFile[];
+  scanned: number;
+  capped: boolean;
+  lastPublishedAt: number;
+}
+
+function searchTerms(value: string): string[] {
+  return Array.from(
+    new Set(
+      value
+        .normalize("NFKC")
+        .toLocaleLowerCase()
+        .match(/[\p{L}\p{N}]+/gu) ?? [],
+    ),
+  );
+}
+
 interface ClipRuntime {
   worker?: true;
   child?: ChildProcess;
@@ -163,12 +197,14 @@ type ScanSource = (
   sourcePath: string,
   onFile: (file: IndexableFile) => void,
   isCancelled: () => boolean,
+  shouldPauseForSearch?: () => boolean,
 ) => Promise<void>;
 type ProgressListener = (progress: IndexProgress) => void;
 type SearchProgressListener = (
   results: SearchResult[],
   scanned: number,
   total: number,
+  mode?: "ann",
 ) => void;
 type SourceCoverageStatus =
   | "pending"
@@ -209,6 +245,20 @@ export class SemanticIndexer {
   private readonly onProgress: ProgressListener;
   private readonly onDiagnostic: DiagnosticListener;
   private readonly latestRecords = new Map<string, IndexRecord>();
+  private readonly latestRecordsByVectorKey = new Map<number, IndexRecord>();
+  private persistedVectorIndex: PersistedVectorIndex | null = null;
+  private vectorIndexBuildPromise: Promise<void> | null = null;
+  private performanceSettings: SearchPerformanceSettings =
+    defaultSearchPerformanceSettings();
+  private vectorIndexReady: Promise<void>;
+  private resolveVectorIndexReady!: () => void;
+  private rejectVectorIndexReady!: (error: Error) => void;
+  private readonly textRecordIds = new Map<string, number>();
+  private readonly textRecordPaths: string[] = [];
+  private readonly textRecordTerms: Array<Set<string>> = [];
+  private readonly textPostingTerms: Array<Set<string>> = [];
+  private readonly textPostings = new Map<string, number[]>();
+  private readonly activeTextSearches = new Set<ActiveTextSearch>();
   private readonly indexedRecordListeners = new Set<
     (record: IndexRecord) => void
   >();
@@ -408,12 +458,21 @@ export class SemanticIndexer {
     this.scanSource = scanSource;
     this.onProgress = onProgress;
     this.onDiagnostic = onDiagnostic;
+    this.vectorIndexReady = new Promise<void>((resolve, reject) => {
+      this.resolveVectorIndexReady = resolve;
+      this.rejectVectorIndexReady = reject;
+    });
   }
 
   setBackgroundIndexWorkListener(
     listener: ((changedFiles: Map<string, string>) => void) | null,
   ) {
     this.backgroundIndexWorkListener = listener;
+  }
+
+  setPerformanceSettings(settings: SearchPerformanceSettings) {
+    this.performanceSettings = { ...settings };
+    this.persistedVectorIndex?.updateSettings(this.performanceSettings);
   }
 
   async initialize(onLoadProgress?: (fraction: number, records: number) => void) {
@@ -434,6 +493,62 @@ export class SemanticIndexer {
 
   whenLoaded(): Promise<void> {
     return this.loaded;
+  }
+
+  async prepareVectorSearch(
+    onProgress: (fraction: number, records: number) => void,
+  ): Promise<void> {
+    await this.loaded;
+    if (this.vectorIndexBuildPromise) return this.vectorIndexBuildPromise;
+    const grouped = new Map<
+      string,
+      { sourcePath: string; kind: VectorSearchKind; keys: number[] }
+    >();
+    for (const [key, record] of this.latestRecordsByVectorKey) {
+      const kind: VectorSearchKind = record.type === "image" ? "image" : "document";
+      const groupKey = `${record.sourcePath}\0${kind}`;
+      let group = grouped.get(groupKey);
+      if (!group) {
+        group = { sourcePath: record.sourcePath, kind, keys: [] };
+        grouped.set(groupKey, group);
+      }
+      group.keys.push(key);
+    }
+    const groups: VectorSearchGroup[] = Array.from(grouped.values(), (group) => ({
+      sourcePath: group.sourcePath,
+      kind: group.kind,
+      keys: BigUint64Array.from(group.keys, (key) => BigInt(key)),
+    }));
+    this.persistedVectorIndex = new PersistedVectorIndex(
+      this.vectorsPath,
+      path.join(this.indexDirectory, "ann"),
+      onProgress,
+      (error) => this.onDiagnostic("semantic-ann-index-error", { message: error.message }),
+      this.performanceSettings,
+    );
+    this.vectorIndexBuildPromise = this.persistedVectorIndex
+      .initialize(groups)
+      .then(() => {
+        this.resolveVectorIndexReady();
+      })
+      .catch((error) => {
+        const normalized = error instanceof Error ? error : new Error(String(error));
+        this.rejectVectorIndexReady(normalized);
+        throw normalized;
+      });
+    return this.vectorIndexBuildPromise;
+  }
+
+  async flushVectorSearch(): Promise<void> {
+    await this.persistedVectorIndex?.shutdown(6500);
+  }
+
+  private beginInteractiveSearch() {
+    this.activeSearchCount += 1;
+  }
+
+  private endInteractiveSearch() {
+    this.activeSearchCount = Math.max(0, this.activeSearchCount - 1);
   }
 
   private async openIndex(onLoadProgress?: (fraction: number, records: number) => void) {
@@ -522,6 +637,10 @@ export class SemanticIndexer {
 
   getProgress(): IndexProgress {
     return { ...this.progress };
+  }
+
+  isSearchActive(): boolean {
+    return this.activeSearchCount > 0;
   }
 
   setDemoFileLimit(limit: number | null): void {
@@ -658,9 +777,113 @@ export class SemanticIndexer {
     if (previous) this.updateRecordCounts(previous, -1);
     this.latestRecords.set(record.path, record);
     this.updateRecordCounts(record, 1);
+    if (previous && previous.vectorOffset >= 0) {
+      const previousKey = previous.vectorOffset / VECTOR_BYTES;
+      if (this.latestRecordsByVectorKey.get(previousKey)?.path === previous.path)
+        this.latestRecordsByVectorKey.delete(previousKey);
+      if (this.persistedVectorIndex)
+        this.persistedVectorIndex.remove(
+          previous.sourcePath,
+          previous.type === "image" ? "image" : "document",
+          previousKey,
+        );
+    }
+    if (record.vectorOffset >= 0) {
+      const vectorKey = record.vectorOffset / VECTOR_BYTES;
+      this.latestRecordsByVectorKey.set(vectorKey, record);
+      this.persistedVectorIndex?.upsert(
+        record.sourcePath,
+        record.type === "image" ? "image" : "document",
+        vectorKey,
+      );
+    }
+    const recordId = this.indexSearchableText(record);
+    for (const search of this.activeTextSearches)
+      this.considerTextSearchRecord(search, recordId, record);
     this.revision += 1;
     if (record.vectorOffset >= 0)
       for (const listener of this.indexedRecordListeners) listener(record);
+  }
+
+  private indexSearchableText(record: IndexRecord): number {
+    let recordId = this.textRecordIds.get(record.path);
+    if (recordId === undefined) {
+      recordId = this.textRecordPaths.length;
+      this.textRecordIds.set(record.path, recordId);
+      this.textRecordPaths.push(record.path);
+      this.textRecordTerms.push(new Set());
+      this.textPostingTerms.push(new Set());
+    }
+    const currentTerms = searchTerms(`${record.name} ${record.relativePath}`);
+    const indexedTerms = this.textPostingTerms[recordId];
+    const currentTermSet = new Set(currentTerms);
+    this.textRecordTerms[recordId] = currentTermSet;
+    for (const term of currentTermSet) {
+      if (indexedTerms.has(term)) continue;
+      indexedTerms.add(term);
+      const posting = this.textPostings.get(term) ?? [];
+      posting.push(recordId);
+      this.textPostings.set(term, posting);
+    }
+    return recordId;
+  }
+
+  private considerTextSearchRecord(
+    search: ActiveTextSearch,
+    recordId: number,
+    record: IndexRecord,
+  ) {
+    if (search.seenRecordIds.has(recordId)) return;
+    search.seenRecordIds.add(recordId);
+    search.scanned += 1;
+    if (
+      !search.sourcePaths.has(record.sourcePath) ||
+      !this.isIndexable(record, record.sourcePath) ||
+      (search.demoPaths && !search.demoPaths.has(record.path))
+    )
+      return;
+    const terms = this.textRecordTerms[recordId];
+    if (!terms || !search.queryTerms.every((term) => terms.has(term))) return;
+    if (search.matches.length >= SEARCH_TEXT_RESULT_LIMIT) {
+      search.capped = true;
+      return;
+    }
+    const file: IndexableFile = {
+      name: record.name,
+      path: record.path,
+      relativePath: record.relativePath,
+      size: record.size,
+      modified: record.modified,
+      isDirectory: false,
+      type: record.type,
+      extension: record.extension,
+    };
+    search.matches.push(file);
+    search.batch.push(file);
+    const now = Date.now();
+    if (
+      search.matches.length === 1 ||
+      search.batch.length >= 64 ||
+      now - search.lastPublishedAt >= 50
+    )
+      this.publishTextSearchBatch(search);
+  }
+
+  private publishTextSearchBatch(search: ActiveTextSearch) {
+    search.onMatches?.(
+      search.batch.splice(0),
+      search.scanned,
+      this.latestRecords.size,
+      search.capped,
+    );
+    search.lastPublishedAt = Date.now();
+  }
+
+  private onTextSearchProgress(search: ActiveTextSearch, force: boolean) {
+    const now = Date.now();
+    if (force || now - search.lastPublishedAt >= 50)
+      search.onMatches?.([], search.scanned, this.latestRecords.size, search.capped);
+    search.lastPublishedAt = now;
   }
 
   private deleteLatestRecord(filePath: string) {
@@ -668,6 +891,16 @@ export class SemanticIndexer {
     if (!previous) return;
     this.latestRecords.delete(filePath);
     this.updateRecordCounts(previous, -1);
+    if (previous.vectorOffset >= 0) {
+      const vectorKey = previous.vectorOffset / VECTOR_BYTES;
+      if (this.latestRecordsByVectorKey.get(vectorKey)?.path === previous.path)
+        this.latestRecordsByVectorKey.delete(vectorKey);
+      this.persistedVectorIndex?.remove(
+        previous.sourcePath,
+        previous.type === "image" ? "image" : "document",
+        vectorKey,
+      );
+    }
     this.revision += 1;
   }
 
@@ -1229,7 +1462,12 @@ export class SemanticIndexer {
   ): Promise<void> {
     // Use the standard scanSource for now, but could be optimized
     // to use a shallow scan for reconciliation
-    await this.scanSource(sourcePath, onFile, () => false);
+    await this.scanSource(
+      sourcePath,
+      onFile,
+      () => false,
+      () => this.activeSearchCount > 0,
+    );
   }
 
   /**
@@ -1317,6 +1555,7 @@ export class SemanticIndexer {
     const confidenceThreshold = Number.isFinite(minimumConfidence)
       ? Math.max(0, Math.min(100, minimumConfidence))
       : 0;
+    await this.loaded;
     // Searches use the saved index immediately and temporarily take priority
     // between background embeddings while the results are being ranked.
     this.activeSearchCount += 1;
@@ -1330,6 +1569,78 @@ export class SemanticIndexer {
       );
     } finally {
       this.activeSearchCount = Math.max(0, this.activeSearchCount - 1);
+    }
+  }
+
+  /**
+   * Stream filename and path matches from the loaded index before CLIP finishes
+   * embedding or scoring a query.
+   */
+  async searchTextMatches(
+    query: string,
+    sourcePaths: string[],
+    isCancelled: () => boolean = () => false,
+    onMatches?: (
+      matches: IndexableFile[],
+      scanned: number,
+      total: number,
+      capped: boolean,
+    ) => void,
+  ): Promise<IndexableFile[]> {
+    const queryTerms = searchTerms(query);
+    if (!queryTerms.length || sourcePaths.length === 0 || isCancelled())
+      return [];
+    if (isCancelled()) return [];
+
+    const search: ActiveTextSearch = {
+      queryTerms,
+      sourcePaths: new Set(sourcePaths),
+      demoPaths: this.demoFilePaths(sourcePaths),
+      onMatches,
+      seenRecordIds: new Set(),
+      matches: [],
+      batch: [],
+      scanned: 0,
+      capped: false,
+      lastPublishedAt: 0,
+    };
+    this.activeTextSearches.add(search);
+    try {
+    const postings = queryTerms
+        .map((term) => this.textPostings.get(term) ?? [])
+        .sort((first, second) => first.length - second.length);
+      const candidates = postings[0] ?? [];
+      if (this.loadComplete && queryTerms.some((_, index) => postings[index].length === 0))
+        return [];
+      this.beginInteractiveSearch();
+      try {
+        let index = 0;
+        while (!isCancelled() && !search.capped) {
+          while (index < candidates.length && !isCancelled() && !search.capped) {
+            const recordId = candidates[index++];
+            const record = this.latestRecords.get(this.textRecordPaths[recordId]);
+            if (
+              record &&
+              queryTerms.every((term) => this.textRecordTerms[recordId].has(term))
+            )
+              this.considerTextSearchRecord(search, recordId, record);
+            if (index > 0 && index % 512 === 0) {
+              this.onTextSearchProgress(search, false);
+              await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+          }
+          if (this.loadComplete || isCancelled() || search.capped) break;
+          this.onTextSearchProgress(search, false);
+          await new Promise<void>((resolve) => setTimeout(resolve, 40));
+        }
+        if (search.batch.length || search.capped)
+          this.publishTextSearchBatch(search);
+        return search.matches;
+      } finally {
+        this.endInteractiveSearch();
+      }
+    } finally {
+      this.activeTextSearches.delete(search);
     }
   }
 
@@ -1549,8 +1860,6 @@ export class SemanticIndexer {
       this.searchEmbeddingCache.delete(embeddingKey);
       this.searchEmbeddingCache.set(embeddingKey, searchEmbeddings);
     } else {
-      // Queue both interactive text embeddings together so an indexing job cannot
-      // slip between the document and photo prompts.
       const [document, image] = await Promise.all([
         this.embedText(cleanQuery, runtime, 10),
         this.embedText(`a photo of ${cleanQuery}`, runtime, 10),
@@ -1563,212 +1872,45 @@ export class SemanticIndexer {
       }
     }
     if (isCancelled()) return [];
-    const documentQuery = searchEmbeddings.document;
-    const imageQuery = searchEmbeddings.image;
 
-    const activeSources = new Set(sourcePaths);
-    const sourceKey = Array.from(activeSources).sort().join("\0");
-    const demoPaths = this.demoFilePaths(sourcePaths);
-    const pendingIndexedRecords = new Map<string, IndexRecord>();
-    const activeSearchRecordListener = (record: IndexRecord) => {
-      if (
-        record.vectorOffset < 0 ||
-        !activeSources.has(record.sourcePath) ||
-        (demoPaths && !demoPaths.has(record.path))
-      )
-        return;
-      pendingIndexedRecords.set(record.path, record);
-    };
-    this.indexedRecordListeners.add(activeSearchRecordListener);
-    if (
-      !this.indexedSearchSnapshotCache ||
-      this.indexedSearchSnapshotCache.revision !== this.revision ||
-      this.indexedSearchSnapshotCache.sourceKey !== sourceKey
-    ) {
-      this.indexedSearchSnapshotCache = {
-        revision: this.revision,
-        sourceKey,
-        records: Array.from(this.latestRecords.values())
-          .filter((record) => record.vectorOffset >= 0 && activeSources.has(record.sourcePath))
-          .sort((first, second) => first.vectorOffset - second.vectorOffset),
-      };
-    }
-    const indexedSnapshot = this.indexedSearchSnapshotCache.records.filter(
-      (record) =>
-        !this.processingPaths.has(record.path) &&
-        (!demoPaths || demoPaths.has(record.path)),
+    await this.vectorIndexReady;
+    if (isCancelled()) return [];
+    const indexedRecordCount = this.latestRecordsByVectorKey.size;
+    onSearchProgress?.([], 0, indexedRecordCount, "ann");
+    const hits = await this.persistedVectorIndex!.search(
+      sourcePaths,
+      searchEmbeddings.image,
+      searchEmbeddings.document,
+      SEARCH_RESULTS_PER_TYPE,
     );
-    for (const record of indexedSnapshot)
-      pendingIndexedRecords.delete(record.path);
-    let total = indexedSnapshot.length;
-    const moreIndexRecordsExpected = () =>
-      Boolean(this.runPromise) || !this.loadComplete;
-    if (isCancelled() || (total === 0 && !moreIndexRecordsExpected())) {
-      this.indexedRecordListeners.delete(activeSearchRecordListener);
-      onSearchProgress?.([], 0, total);
-      return [];
+    if (isCancelled()) return [];
+
+    const results: SearchResult[] = [];
+    for (const hit of hits) {
+      const record = this.latestRecordsByVectorKey.get(hit.key);
+      if (
+        !record ||
+        record.vectorOffset / VECTOR_BYTES !== hit.key ||
+        !sourcePaths.includes(record.sourcePath) ||
+        hit.confidence < minimumConfidence
+      )
+        continue;
+      results.push({
+        name: record.name,
+        path: record.path,
+        relativePath: record.relativePath,
+        size: record.size,
+        modified: record.modified,
+        isDirectory: false,
+        type: record.type,
+        extension: record.extension,
+        confidence: hit.confidence,
+      });
     }
-
-    // Wait for the vector file to appear when the first saved or new record is
-    // still being restored. Do not create an empty file ahead of index recovery.
-    let vectorHandle = await fsPromises.open(this.vectorsPath, "r").catch(() => null);
-    while (!vectorHandle && moreIndexRecordsExpected() && !isCancelled()) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
-      vectorHandle = await fsPromises.open(this.vectorsPath, "r").catch(() => null);
-    }
-    if (!vectorHandle) {
-      this.indexedRecordListeners.delete(activeSearchRecordListener);
-      onSearchProgress?.([], 0, total);
-      return [];
-    }
-    const imageResults = new Map<string, SearchResult>();
-    const documentResults = new Map<string, SearchResult>();
-    const trimResults = (results: Map<string, SearchResult>) => {
-      if (results.size <= SEARCH_RESULT_PRUNE_THRESHOLD) return;
-      const top = Array.from(results.values())
-        .sort((first, second) => second.confidence - first.confidence)
-        .slice(0, SEARCH_RESULTS_PER_TYPE);
-      results.clear();
-      for (const result of top) results.set(result.path, result);
-    };
-    const currentResults = () => [
-      ...Array.from(imageResults.values()),
-      ...Array.from(documentResults.values()),
-    ].sort((first, second) => second.confidence - first.confidence);
-    let scanned = 0;
-    let lastProgressAt = 0;
-    const publishProgress = (force = false) => {
-      const now = Date.now();
-      if (!force && now - lastProgressAt < 250) return;
-      lastProgressAt = now;
-      if (!isCancelled()) onSearchProgress?.(currentResults(), scanned, total);
-    };
-
-    try {
-      const vectorFileSize = (await vectorHandle.stat()).size;
-      let snapshotIndex = 0;
-      const scoreRecord = (
-        record: IndexRecord,
-        vectors: Float32Array,
-        vectorStart: number,
-      ) => {
-        const queryVector = record.type === "image" ? imageQuery : documentQuery;
-        let similarity = 0;
-        for (let dimension = 0; dimension < VECTOR_SIZE; dimension += 1)
-          similarity += queryVector[dimension] * vectors[vectorStart + dimension];
-        if (!Number.isFinite(similarity)) return;
-        const confidence = Math.max(0, Math.min(100, similarity * 100));
-        if (confidence < minimumConfidence) return;
-        const result: SearchResult = {
-          name: record.name,
-          path: record.path,
-          relativePath: record.relativePath,
-          size: record.size,
-          modified: record.modified,
-          isDirectory: false,
-          type: record.type,
-          extension: record.extension,
-          confidence,
-        };
-        (record.type === "image" ? imageResults : documentResults).set(record.path, result);
-      };
-
-      while (
-        snapshotIndex < indexedSnapshot.length ||
-        pendingIndexedRecords.size > 0 ||
-        moreIndexRecordsExpected()
-      ) {
-        if (isCancelled()) return [];
-        if (snapshotIndex >= indexedSnapshot.length) {
-          if (pendingIndexedRecords.size > 0) {
-            const batch = Array.from(pendingIndexedRecords.values()).sort(
-              (first, second) => first.vectorOffset - second.vectorOffset,
-            );
-            pendingIndexedRecords.clear();
-            const startOffset = batch[0].vectorOffset;
-            const lastRecord = batch[batch.length - 1];
-            const bytesToRead = lastRecord.vectorOffset + VECTOR_BYTES - startOffset;
-            const vectorBuffer = Buffer.allocUnsafeSlow(bytesToRead);
-            const { bytesRead } = await vectorHandle.read(
-              vectorBuffer,
-              0,
-              bytesToRead,
-              startOffset,
-            );
-            if (isCancelled()) return [];
-            const vectors = new Float32Array(
-              vectorBuffer.buffer,
-              vectorBuffer.byteOffset,
-              Math.floor(bytesRead / Float32Array.BYTES_PER_ELEMENT),
-            );
-            for (const record of batch) {
-              const localByteOffset = record.vectorOffset - startOffset;
-              if (localByteOffset + VECTOR_BYTES <= bytesRead)
-                scoreRecord(
-                  record,
-                  vectors,
-                  localByteOffset / Float32Array.BYTES_PER_ELEMENT,
-                );
-              scanned += 1;
-            }
-            total += batch.length;
-            trimResults(imageResults);
-            trimResults(documentResults);
-            publishProgress();
-            continue;
-          }
-          if (!moreIndexRecordsExpected()) break;
-          await new Promise<void>((resolve) => setTimeout(resolve, 100));
-          continue;
-        }
-        const firstBatch = snapshotIndex === 0;
-        const startOffset = indexedSnapshot[snapshotIndex].vectorOffset;
-        if (startOffset + VECTOR_BYTES > vectorFileSize) break;
-
-        let batchEnd = snapshotIndex + 1;
-        while (
-          batchEnd < total &&
-          batchEnd - snapshotIndex < SEARCH_MAX_RECORDS_PER_WINDOW &&
-          indexedSnapshot[batchEnd].vectorOffset + VECTOR_BYTES - startOffset <= SEARCH_VECTOR_WINDOW_BYTES
-        ) batchEnd += 1;
-
-        const lastRecord = indexedSnapshot[batchEnd - 1];
-        const bytesToRead = Math.min(lastRecord.vectorOffset + VECTOR_BYTES, vectorFileSize) - startOffset;
-        if (bytesToRead >= VECTOR_BYTES) {
-          const vectorBuffer = Buffer.allocUnsafeSlow(bytesToRead);
-          const { bytesRead } = await vectorHandle.read(vectorBuffer, 0, bytesToRead, startOffset);
-          if (isCancelled()) return [];
-          const vectors = new Float32Array(
-            vectorBuffer.buffer,
-            vectorBuffer.byteOffset,
-            Math.floor(bytesRead / Float32Array.BYTES_PER_ELEMENT),
-          );
-          for (let index = snapshotIndex; index < batchEnd; index += 1) {
-            const record = indexedSnapshot[index];
-            const localByteOffset = record.vectorOffset - startOffset;
-            if (localByteOffset + VECTOR_BYTES <= bytesRead) {
-              const vectorStart = localByteOffset / Float32Array.BYTES_PER_ELEMENT;
-              scoreRecord(record, vectors, vectorStart);
-            }
-            scanned += 1;
-          }
-          trimResults(imageResults);
-          trimResults(documentResults);
-          snapshotIndex = batchEnd;
-          publishProgress(firstBatch);
-        } else {
-          scanned = batchEnd;
-          snapshotIndex = batchEnd;
-          publishProgress(firstBatch);
-        }
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
-      publishProgress(true);
-      return isCancelled() ? [] : currentResults();
-    } finally {
-      this.indexedRecordListeners.delete(activeSearchRecordListener);
-      await vectorHandle.close();
-    }
+    results.sort((first, second) => second.confidence - first.confidence);
+    if (!isCancelled())
+      onSearchProgress?.(results, hits.length, indexedRecordCount, "ann");
+    return isCancelled() ? [] : results;
   }
 
   private preservePendingFiles(
@@ -2125,6 +2267,7 @@ export class SemanticIndexer {
                   }
                 },
                 () => this.pauseRequested || demoSourceSampleReached,
+                () => this.activeSearchCount > 0,
               );
             } catch (error) {
               this.searchDiscovery.error =
@@ -2382,6 +2525,7 @@ export class SemanticIndexer {
         const { file, sourcePath } = pending[index];
         await this.updateProgress({ currentFile: file.name }, false);
         this.processingPaths.add(file.path);
+        const fileWorkStartedAt = Date.now();
         let succeeded = false;
         try {
           const vector =
@@ -2465,8 +2609,24 @@ export class SemanticIndexer {
           if (isIncremental) await this.checkpointPendingWork(sourcePaths, true);
         }
         await new Promise<void>((resolve) => setImmediate(resolve));
-        // An active search gets the next inference slot; don't add a fixed delay
-        // to every file when nobody is searching.
+        // Treat the preference as a background work-time budget, not a claim
+        // about total machine CPU usage. Interactive searches take priority.
+        const fileWorkMs = Math.max(1, Date.now() - fileWorkStartedAt);
+        let cooldownRemaining = Math.ceil(
+          fileWorkMs *
+            ((100 - this.performanceSettings.backgroundWorkPercent) /
+              this.performanceSettings.backgroundWorkPercent),
+        );
+        while (
+          cooldownRemaining > 0 &&
+          this.activeSearchCount === 0 &&
+          !this.pauseRequested
+        ) {
+          const sliceMs = Math.min(50, cooldownRemaining);
+          await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
+          cooldownRemaining -= sliceMs;
+        }
+        // An active search gets the next inference slot.
         while (this.activeSearchCount > 0 && !this.pauseRequested)
           await new Promise<void>((resolve) => setTimeout(resolve, 40));
       }
@@ -3303,6 +3463,7 @@ export class SemanticIndexer {
     } catch {
       await fsPromises.writeFile(this.vectorsPath, Buffer.alloc(0));
     }
+    onLoadProgress?.(1, recordCount);
   }
 
   private async updateProgress(

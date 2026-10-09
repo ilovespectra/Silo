@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { FiCheck, FiPause, FiAlertCircle, FiRefreshCw } from "react-icons/fi";
+import { FiAlertCircle, FiRefreshCw } from "react-icons/fi";
 import { describeIndexingConnectionError } from "../utils/indexingConnection";
 
 const activeStatuses = new Set([
@@ -9,6 +9,18 @@ const activeStatuses = new Set([
   "generating",
   "clustering",
 ]);
+
+const stageDescriptions: Record<string, string> = {
+  startup: "Opening saved indexes",
+  discovery: "Finding files in connected sources",
+  search: "Adding files to search",
+  faces: "Grouping people in photos",
+  locations: "Reading photo location data",
+  duplicates: "Checking for duplicate files",
+  audio: "Finding audio files",
+  quality: "Scoring photo quality",
+  thumbnails: "Preparing file previews",
+};
 
 interface IndexingPanelProps {
   onStagesChange?: (stages: IndexingStageProgress[]) => void;
@@ -146,7 +158,12 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
         const complete = stage.status === "complete";
         const running = activeStatuses.has(stage.status);
         const percent =
-          total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+          complete
+            ? 100
+            : total > 0
+              ? Math.min(100, Math.round((processed / total) * 100))
+              : 0;
+        const processDescription = stageDescriptions[stage.id] ?? "Indexing files";
         return (
           <div
             key={stage.id}
@@ -154,19 +171,7 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
           >
             <header>
               <strong>{stage.label}</strong>
-              <span>
-                {complete ? (
-                  <FiCheck aria-label="Complete" />
-                ) : stage.status === "paused" ? (
-                  <FiPause aria-label="Paused" />
-                ) : stage.status === "error" ? (
-                  <FiAlertCircle aria-label="Error" />
-                ) : running && total > 0 ? (
-                  `${percent}%`
-                ) : (
-                  stage.status.replace(/-/g, " ")
-                )}
-              </span>
+              <span>{percent}%</span>
             </header>
             <progress
               aria-label={`${stage.label} progress`}
@@ -179,53 +184,9 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
               }
               max={Math.max(total, 1)}
             />
-            <div className="indexing-stage-count">
-              {processed.toLocaleString()} /{" "}
-              {total > 0
-                ? total.toLocaleString()
-                : running
-                  ? "discovering"
-                  : "—"}{" "}
-              {stage.unit}
-            </div>
-            {stage.detail && <small>{stage.detail}</small>}
-            {Boolean(stage.errors) && (
-              <small className="indexing-stage-errors">
-                {stage.errors!.toLocaleString()} {stage.id === "search" ? "failed files" : "errors / unresolved"}
-              </small>
-            )}
-            {stage.id === "search" && stage.retryable !== undefined && (
-              <small>
-                {stage.retryable.toLocaleString()} retryable files; retry state is saved across restarts
-              </small>
-            )}
             <small className="indexing-stage-message" title={stage.message}>
-              {stage.message}
+              {processDescription}
             </small>
-            {stage.resumeQueued && (
-              <small role="status">
-                Resume queued —{" "}
-                {stage.blockedReason ||
-                  "starting as soon as resources are available."}
-              </small>
-            )}
-            {!stage.resumeQueued &&
-              stage.blockedReason &&
-              !running &&
-              !complete && <small>{stage.blockedReason}</small>}
-            {stage.recoveryError && (
-              <small className="indexing-stage-errors">
-                {stage.recoveryError}
-                {stage.retryExhausted
-                  ? " · Repeated failures: cooling down for 5 minutes, then automatic retries resume. You can retry manually now."
-                  : ` · Automatic retry ${stage.attempts ?? 0}/3; next attempt ${stage.retryAt ? new Date(stage.retryAt).toLocaleTimeString() : "pending"}.`}
-              </small>
-            )}
-            {stage.persistenceError && (
-              <small role="alert" className="indexing-stage-errors">
-                Automatic retry state could not be saved: {stage.persistenceError}
-              </small>
-            )}
             {stageRetryError?.id === stage.id && (
               <small role="alert" className="indexing-stage-errors">
                 {stageRetryError.message}

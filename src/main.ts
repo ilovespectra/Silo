@@ -23,7 +23,6 @@ import * as fsPromises from "fs/promises";
 import isDev from "electron-is-dev";
 import { autoUpdater } from "electron-updater";
 import {
-  confidenceSettingToMinimumThreshold,
   IndexableFile,
   SearchResult,
   SemanticIndexer,
@@ -719,6 +718,7 @@ const EARLY_IPC_CHANNELS = new Set([
   "check-app-updates",
   "get-startup-state",
   "get-content-settings",
+  "get-search-performance-settings",
   "get-lifetime-license",
   "is-demo-mode",
   "get-bug-report-status",
@@ -1104,6 +1104,11 @@ const sendIndexProgress = createProgressThrottle((progress) =>
 const sendFaceIndexProgress = createProgressThrottle((progress) =>
   sendToRenderer("face-index-progress", progress),
 );
+const sendSearchIndexReadiness = createProgressThrottle(
+  (status: SearchIndexReadiness) =>
+    sendToRenderer("search-index-readiness", status),
+  200,
+);
 
 function reportStartup(label: string, ready = false) {
   startupState = {
@@ -1131,7 +1136,27 @@ function reportStartupDetail(label: string) {
   sendToRenderer("startup-progress", startupState);
 }
 
+interface SearchIndexReadiness {
+  status: "preparing" | "ready" | "unavailable" | "error";
+  percentage: number;
+  records: number;
+  message: string;
+}
+
 let mainWindow: BrowserWindow | null = null;
+let searchIndexReadiness: SearchIndexReadiness = {
+  status: "preparing",
+  percentage: 0,
+  records: 0,
+  message: "Preparing the saved search index…",
+};
+function updateSearchIndexReadiness(status: SearchIndexReadiness) {
+  searchIndexReadiness = status;
+  // Keep terminal readiness updates ordered behind any throttled progress.
+  // The throttle immediately flushes status transitions and replaces pending
+  // progress with the latest value, so an old 99% event cannot arrive after ready.
+  sendSearchIndexReadiness(status);
+}
 let indexStorageDeviceId: number | null = null;
 let indexStorageAvailable = true;
 let indexStorageInitializationDeferred = false;
@@ -1860,6 +1885,26 @@ let thumbnailPregenDirty = true;
 let startupIndexReconciliationSettled = false;
 let indexRecovery: IndexingRecovery | null = null;
 let indexRecoveryTimer: NodeJS.Timeout | null = null;
+let activeInteractiveSearches = 0;
+function trackInteractiveSearch<T>(startSearch: () => Promise<T>): Promise<T> {
+  activeInteractiveSearches += 1;
+  if (activeInteractiveSearches === 1)
+    void indexRecovery?.setSearchActive(true).catch(() => undefined);
+  let search: Promise<T>;
+  try {
+    search = startSearch();
+  } catch (error) {
+    activeInteractiveSearches = Math.max(0, activeInteractiveSearches - 1);
+    if (activeInteractiveSearches === 0)
+      void indexRecovery?.setSearchActive(false).catch(() => undefined);
+    return Promise.reject(error);
+  }
+  return search.finally(() => {
+    activeInteractiveSearches = Math.max(0, activeInteractiveSearches - 1);
+    if (activeInteractiveSearches === 0)
+      void indexRecovery?.setSearchActive(false).catch(() => undefined);
+  });
+}
 let recoverySearchSourcePaths: string[] = [];
 const queuedRecoveryStageIds = new Set<string>();
 const ALL_INDEX_RECOVERY_STAGES = [
@@ -1867,7 +1912,6 @@ const ALL_INDEX_RECOVERY_STAGES = [
   "faces",
   "locations",
   "duplicates",
-  "pets",
   "thumbnails",
   "audio",
   "quality",
@@ -1983,7 +2027,6 @@ function requestSourceProcessingStages(sourcePaths: string[]) {
     "faces",
     "locations",
     "duplicates",
-    "pets",
     "thumbnails",
     "audio",
     "quality",
@@ -2025,16 +2068,14 @@ function getThumbnailIndexingWaitMessage(): string | null {
   if (indexStorageUnavailableMessage) return indexStorageUnavailableMessage;
   if (!semanticIndexer || !faceIndexer || !geoIndexer)
     return "Waiting for indexing services to start…";
+  if (semanticIndexer.isSearchActive())
+    return "Waiting for interactive search to finish…";
   if (!startupIndexReconciliationSettled)
     return "Waiting for search indexing to finish…";
   if (PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status))
     return "Waiting for search indexing to finish…";
   if (PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status))
     return "Waiting for face clustering to finish…";
-  if (
-    ["loading-model", "clustering"].includes(petIndexer?.getProgress().status)
-  )
-    return "Waiting for pet clustering to finish…";
   if (magicLibraryProgress.running)
     return "Waiting for photo quality analysis to finish…";
   if (duplicateManager?.getState().status === "scanning")
@@ -3732,12 +3773,9 @@ async function readAllSources(
     }
   };
 
-  await Promise.all(
-    Array.from(
-      { length: Math.min(3, enabled.length) },
-      () => scanWorker(),
-    ),
-  );
+  // Keep recursive discovery on one source at a time so large libraries do
+  // not saturate the disk and CPU while Silo is opening or searching.
+  await scanWorker();
   return results.flat();
 }
 
@@ -4592,6 +4630,7 @@ async function createWindow() {
       contextIsolation: true,
       preload: preloadPath,
       sandbox: true,
+      autoplayPolicy: "no-user-gesture-required",
     },
   });
   const inventoryOwner = mainWindow.webContents.id;
@@ -4861,7 +4900,7 @@ async function indexNewSources(sourcePaths: string[], reason: string) {
   runtimeLog("auto-index-new-sources", { reason, sources: added });
   queueSemanticIndexWork(
     { fullScanRoots: added },
-    ["faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality"],
+    ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
   );
 }
 
@@ -4874,6 +4913,7 @@ async function createUnifiedScanSource() {
     sourcePath: string,
     onFile: (file: any) => void,
     isCancelled: () => boolean,
+    shouldPauseForSearch: () => boolean = () => false,
   ): Promise<void> => {
     // Detect source type and delegate to appropriate scanner
     if (phoneManager.isPhonePath(sourcePath)) {
@@ -4925,8 +4965,18 @@ async function createUnifiedScanSource() {
     const results: any[] = [];
     const pendingDirectories = [sourcePath];
     const timeMachine = await isTimeMachineDirectory(sourcePath);
+    const DISCOVERY_COOLDOWN_EVERY_ENTRIES = 256;
+    const DISCOVERY_COOLDOWN_MAX_MS = 500;
+    let entriesSinceCooldown = 0;
+    let cooldownWindowStartedAt = Date.now();
+    const waitForSearchIdle = async () => {
+      while (!isCancelled() && shouldPauseForSearch())
+        await new Promise<void>((resolve) => setTimeout(resolve, 75));
+      return !isCancelled();
+    };
 
     while (pendingDirectories.length > 0 && !isCancelled()) {
+      if (!(await waitForSearchIdle())) return;
       const directoryPath = pendingDirectories.shift()!;
       if (isMacDataVolumePathExcluded(directoryPath, sourcePath)) continue;
       if (machineDevice !== null) {
@@ -4945,9 +4995,10 @@ async function createUnifiedScanSource() {
         continue;
       }
 
-      const ENTRY_BATCH_SIZE = 128;
-      let processedEntries = 0;
+      const ENTRY_BATCH_SIZE = 32;
       for (let offset = 0; offset < entries.length; offset += ENTRY_BATCH_SIZE) {
+        if (isCancelled()) return;
+        if (!(await waitForSearchIdle())) return;
         const entryResults = await Promise.all(
           entries.slice(offset, offset + ENTRY_BATCH_SIZE).map(async (entry) => {
           if (timeMachine && shouldSkipTimeMachineEntry(entry.name))
@@ -4998,15 +5049,26 @@ async function createUnifiedScanSource() {
         );
 
         for (const result of entryResults) {
-          processedEntries += 1;
-          if (!result) continue;
           if (isCancelled()) return;
-          onFile(result.file);
-          if (result.directoryPath) {
-            pendingDirectories.push(result.directoryPath);
+          if (shouldPauseForSearch() && !(await waitForSearchIdle())) return;
+          entriesSinceCooldown += 1;
+          if (result) {
+            onFile(result.file);
+            if (result.directoryPath) {
+              pendingDirectories.push(result.directoryPath);
+            }
           }
-          if (processedEntries % 256 === 0)
+          if (entriesSinceCooldown >= DISCOVERY_COOLDOWN_EVERY_ENTRIES) {
+            const workMs = Math.max(0, Date.now() - cooldownWindowStartedAt);
+            const cooldownMs = Math.min(
+              DISCOVERY_COOLDOWN_MAX_MS,
+              Math.max(20, Math.round(workMs * 1.5)),
+            );
+            await new Promise<void>((resolve) => setTimeout(resolve, cooldownMs));
             await new Promise<void>((resolve) => setImmediate(resolve));
+            entriesSinceCooldown = 0;
+            cooldownWindowStartedAt = Date.now();
+          }
         }
       }
     }
@@ -5235,7 +5297,6 @@ function indexStorageWritersBusy() {
     (faceIndexer && isBusyIndexStatus(faceIndexer.getProgress().status)) ||
     (geoIndexer && isBusyIndexStatus(geoIndexer.getStatus().status)) ||
     (duplicateManager && duplicateManager.getState().status === "scanning") ||
-    (petIndexer && isBusyIndexStatus(petIndexer.getProgress().status)) ||
     audioInventoryRunning ||
     (thumbnailPregenerator && ["scanning", "generating"].includes(thumbnailPregenerator.getProgress().status)) ||
     magicLibraryProgress.running ||
@@ -5268,7 +5329,6 @@ async function pauseIndexingForStorage(message: string) {
     faceIndexer?.pause(),
     geoIndexer?.pause(),
     duplicateManager?.pause(),
-    petIndexer?.pause(),
   ].filter(Boolean) as Promise<unknown>[]);
   audioLibraryCache?.cancelScan();
   await waitForIndexStorageWritersToPause();
@@ -5288,7 +5348,7 @@ async function resumeIndexingAfterStorage() {
   }
   indexStorageUnavailableMessage = null;
   indexStorageAvailable = true;
-  aestheticScorer?.setBackgroundPaused(false);
+  aestheticScorer?.setBackgroundPaused(activeInteractiveSearches > 0);
   const resumeSources = semanticIndexer
     ? await semanticIndexer.setHold(heapPressureMessage)
     : [];
@@ -5678,6 +5738,9 @@ app.whenReady().then(async () => {
     runtimeLog,
     indexStorageRoot,
   );
+  semanticIndexer.setPerformanceSettings(
+    contentSettingsStore.getSearchPerformanceSnapshot().settings,
+  );
   semanticIndexer.setBackgroundIndexWorkListener((changedFiles) =>
     queueSemanticIndexWork({ changedFiles }),
   );
@@ -5692,7 +5755,7 @@ app.whenReady().then(async () => {
       })),
     getIndexedFiles: (sourceRoots) => semanticIndexer.getIndexedFiles(sourceRoots),
     search: (query, sourceRoots) =>
-      semanticIndexer.search(query, 0, sourceRoots),
+      trackInteractiveSearch(() => semanticIndexer.search(query, 0, sourceRoots)),
     getThumbnail: async (filePath) => {
       const thumbnailUrl = await getThumbnail(filePath, false, 320);
       if (!thumbnailUrl) return null;
@@ -5706,13 +5769,69 @@ app.whenReady().then(async () => {
   semanticIndexer.setDemoFileLimit(
     fullAccessEnabled() ? null : DEMO_LIMITS.files,
   );
+  let loadedSearchRecords = 0;
+  let searchPreparationFailureMessage = "Search index could not be opened.";
   const semanticLoad = indexStorageInitializationDeferred
-    ? Promise.resolve()
-    : semanticIndexer.initialize((fraction, records) =>
+    ? Promise.resolve().then(() => {
+        updateSearchIndexReadiness({
+          status: "unavailable",
+          percentage: 0,
+          records: 0,
+          message: "Search index storage is unavailable.",
+        });
+      })
+    : semanticIndexer.initialize((fraction, records) => {
+        loadedSearchRecords = records;
+        const percentage = Math.min(20, Math.round(fraction * 20));
+        updateSearchIndexReadiness({
+          status: "preparing",
+          percentage,
+          records,
+          message: `Reading saved search records · ${percentage}%`,
+        });
         reportStartupDetail(
-          `Opening search index… ${Math.round(fraction * 100)}% (${records.toLocaleString()} files)`,
-        ),
-      );
+          `Opening saved search records… ${percentage}% (${records.toLocaleString()} files)`,
+        );
+      });
+  const semanticSearchReady = semanticLoad.then(async () => {
+    if (indexStorageInitializationDeferred) return;
+    // Opening the saved vectors is only half of search preparation. Start the
+    // offline CLIP worker now so the first user query never pays its cold-start
+    // cost while the UI claims search is ready.
+    updateSearchIndexReadiness({
+      status: "preparing",
+      percentage: 20,
+      records: loadedSearchRecords,
+      message: "Warming the offline search model…",
+    });
+    reportStartupDetail("Warming the offline search model…");
+    searchPreparationFailureMessage =
+      "The offline search model could not be prepared.";
+    await semanticIndexer.preloadClipModel();
+    runtimeLog("search-model-preloaded", {
+      elapsedMs: Date.now() - startupStartedAt,
+      records: loadedSearchRecords,
+    });
+    searchPreparationFailureMessage =
+      "The local semantic index could not be prepared.";
+    updateSearchIndexReadiness({
+      status: "preparing",
+      percentage: 30,
+      records: loadedSearchRecords,
+      message: "Building the fast local search index…",
+    });
+    reportStartupDetail("Building the fast local search index…");
+    await semanticIndexer.prepareVectorSearch((fraction, records) => {
+      const percentage = Math.min(99, 30 + Math.round(fraction * 69));
+      updateSearchIndexReadiness({
+        status: "preparing",
+        percentage,
+        records: Math.max(loadedSearchRecords, records),
+        message: `Building the fast local search index · ${percentage}%`,
+      });
+      reportStartupDetail(`Building the fast local search index… ${percentage}%`);
+    });
+  });
   const faceModelPath = app.isPackaged
     ? path.join(process.resourcesPath, "face-models")
     : path.join(app.getAppPath(), "node_modules/@vladmandic/face-api/model");
@@ -5924,9 +6043,26 @@ app.whenReady().then(async () => {
     load.then(() => reportStartup(label));
   reportStartup("Loading face, location and inventory caches…");
   // The search index can take a minute to open on big libraries; the app is usable meanwhile.
-  void semanticLoad.then(
-    () => runtimeLog("search-index-loaded", { elapsedMs: Date.now() - startupStartedAt }),
-    (error) => runtimeLog("startup-load-error", { message: String(error) }),
+  void semanticSearchReady.then(
+    () => {
+      if (searchIndexReadiness.status !== "unavailable")
+        updateSearchIndexReadiness({
+          status: "ready",
+          percentage: 100,
+          records: loadedSearchRecords,
+          message: "Search index ready.",
+        });
+      runtimeLog("search-index-loaded", { elapsedMs: Date.now() - startupStartedAt });
+    },
+    (error) => {
+      updateSearchIndexReadiness({
+        status: "error",
+        percentage: searchIndexReadiness.percentage,
+        records: searchIndexReadiness.records,
+        message: searchPreparationFailureMessage,
+      });
+      runtimeLog("startup-load-error", { message: String(error) });
+    },
   );
   const loadResults = await Promise.allSettled([
     trackLoad(libraryStatsLoad, "Inventory statistics ready"),
@@ -6060,11 +6196,11 @@ app.whenReady().then(async () => {
             lifetimeFullScanPending = false;
             queueSemanticIndexWork(
               { fullScanAll: true, force: true },
-              ["faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality"],
+              ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
             );
           } else if (!pausedByUser && !lifetimeLicensed) {
             queueSemanticIndexWork({ fullScanAll: true }, [
-              "faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality",
+              "faces", "locations", "duplicates", "thumbnails", "audio", "quality",
             ]);
           } else if (!pausedByUser) {
             queueSemanticIndexWork(
@@ -6078,7 +6214,7 @@ app.whenReady().then(async () => {
                   ...semanticIndexer.getRetryableFiles(sources),
                 ]),
               },
-              ["faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality"],
+              ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
             );
           }
         } finally {
@@ -6108,10 +6244,6 @@ app.whenReady().then(async () => {
       return "Search embeddings are being processed.";
     if (PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status))
       return "Face analysis is running.";
-    if (
-      ["loading-model", "clustering"].includes(petIndexer.getProgress().status)
-    )
-      return "Pet clustering is running.";
     if (magicLibraryProgress.running)
       return "Photo quality analysis is running.";
     if (!searchSettled())
@@ -6121,9 +6253,6 @@ app.whenReady().then(async () => {
   const analysisIdle = () =>
     !PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) &&
     !PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status) &&
-    !["loading-model", "clustering"].includes(
-      petIndexer.getProgress().status,
-    ) &&
     !magicLibraryProgress.running;
   const diskIdle = () =>
     !audioInventoryRunning &&
@@ -6251,20 +6380,6 @@ app.whenReady().then(async () => {
       pause: () => duplicateManager.pause(),
     },
     {
-      id: "pets",
-      lane: "background",
-      blockedReason: analysisBlocker,
-      needsInitialCheck: true,
-      progress: () => petIndexer.getProgress(),
-      ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
-      start: async () =>
-        petIndexer.start(
-          (progress) => sendToRenderer("pet-progress", progress),
-          await getAllIndexSources(),
-        ),
-      pause: () => petIndexer.pause(),
-    },
-    {
       id: "thumbnails",
       lane: "background",
       blockedReason: () =>
@@ -6338,8 +6453,11 @@ app.whenReady().then(async () => {
         );
       },
       pause: () => aestheticScorer.setBackgroundPaused(true),
+      resume: () => aestheticScorer.setBackgroundPaused(false),
     },
   ], Date.now, path.join(app.getPath("userData"), "indexing-recovery.json"));
+  if (activeInteractiveSearches > 0)
+    await indexRecovery.setSearchActive(true);
   await monitorIndexStorageAvailability();
   startIndexStorageAvailabilityMonitor();
   requestIndexRecoveryStages([]);
@@ -6441,7 +6559,10 @@ app.on("before-quit", (event) => {
   // Finish in-flight index writes so a restart never finds a torn record line.
   event.preventDefault();
   quitFlushed = true;
-  const flush = semanticIndexer.flushWrites();
+  const flush = Promise.all([
+    semanticIndexer.flushWrites(),
+    semanticIndexer.flushVectorSearch(),
+  ]);
   const deadline = new Promise((resolve) => setTimeout(resolve, 8000));
   void Promise.race([flush, deadline]).finally(() => app.quit());
 });
@@ -7202,6 +7323,7 @@ async function refreshAudioInventory(requestId: number, force = false) {
         });
       },
       force,
+      () => semanticIndexer.isSearchActive(),
     );
     sendToRenderer("audio-library-cache-changed", snapshot.scannedAt);
     runtimeLog("audio-inventory-checkpoint", {
@@ -7474,8 +7596,21 @@ ipcMain.handle("get-app-state", () => ({
   indexProgress: semanticIndexer.getProgress(),
 }));
 
+ipcMain.handle("get-search-index-readiness", () => searchIndexReadiness);
+
 ipcMain.handle("get-content-settings", () =>
   contentSettingsStore.getPublicSettings(),
+);
+ipcMain.handle("get-search-performance-settings", () =>
+  contentSettingsStore.getSearchPerformanceSnapshot(),
+);
+ipcMain.handle(
+  "update-search-performance-settings",
+  async (_event, update: unknown) => {
+    const snapshot = await contentSettingsStore.updateSearchPerformanceSettings(update);
+    semanticIndexer?.setPerformanceSettings(snapshot.settings);
+    return snapshot;
+  },
 );
 ipcMain.handle(
   "set-parental-password",
@@ -7731,7 +7866,7 @@ ipcMain.handle("start-indexing", async () => {
     fullAccessEnabled()
       ? { fullScanRoots: sources, force: true }
       : { fullScanAll: true, force: true },
-    ["faces", "locations", "duplicates", "pets", "thumbnails", "audio", "quality"],
+    ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
   );
   return semanticIndexer.getProgress();
 });
@@ -7755,13 +7890,12 @@ ipcMain.handle("cancel-semantic-search", (event) => {
 
 ipcMain.handle(
   "semantic-search",
-  async (event, query: string, confidence: number, requestId: number) => {
+  async (event, query: string, _confidence: number, requestId: number) => {
     const sender = event.sender;
     const generation = supersedeSemanticSearch(sender);
     const isCancelled = () =>
       sender.isDestroyed() || semanticSearchGenerations.get(sender) !== generation;
     const progressRequestId = Number.isSafeInteger(requestId) ? requestId : generation;
-    const minimumConfidence = confidenceSettingToMinimumThreshold(confidence);
     const contentSettings = contentSettingsStore.getPublicSettings();
     if (contentSettings.safeSearch && containsExplicitTerms(query))
       throw new Error(
@@ -7777,17 +7911,28 @@ ipcMain.handle(
     const normalizedQuery = query.trim().toLowerCase();
     const priorityMatches = new Map<
       string,
-      { priority: number; source: string; name?: string }
+      {
+        priority: number;
+        source: string;
+        name?: string;
+        file?: IndexableFile;
+      }
     >();
     const addPriorityMatch = (
       filePath: string,
       priority: number,
       source: string,
       name?: string,
+      file?: IndexableFile,
     ) => {
       const previous = priorityMatches.get(filePath);
       if (!previous || priority < previous.priority)
-        priorityMatches.set(filePath, { priority, source, name });
+        priorityMatches.set(filePath, {
+          priority,
+          source,
+          name,
+          file: file ?? previous?.file,
+        });
     };
 
     const rankResults = (semanticResults: SearchResult[]) => {
@@ -7805,7 +7950,7 @@ ipcMain.handle(
       for (const [filePath, match] of priorityMatches) {
         const semanticResult = semanticResultsByPath.get(filePath);
         allResults.set(filePath, {
-          ...(semanticResult || {
+          ...(semanticResult || match.file || {
             name: path.basename(filePath),
             path: filePath,
             relativePath: filePath,
@@ -7814,10 +7959,9 @@ ipcMain.handle(
             isDirectory: false,
             type: "image",
             extension: path.extname(filePath).slice(1),
-            confidence: 100,
           }),
           ...(match.name ? { name: match.name } : {}),
-          confidence: 100,
+          confidence: undefined,
           _priority: match.priority,
           _source: match.source,
         });
@@ -7828,21 +7972,29 @@ ipcMain.handle(
         new Set(sources),
       ).filter(
         (result) =>
-          Number.isFinite(result.confidence) &&
-          result.confidence >= minimumConfidence,
+          result._priority !== 3 || Number.isFinite(result.confidence),
       );
       if (isCancelled()) return [];
       return filterForContentSafety(activeResults).sort((first, second) => {
         const priorityDifference = (first._priority ?? 3) - (second._priority ?? 3);
-        return priorityDifference || second.confidence - first.confidence;
+        return priorityDifference || (second.confidence ?? 0) - (first.confidence ?? 0);
       });
     };
 
+    let latestSemanticResults: SearchResult[] = [];
+    let semanticScanned = 0;
+    let semanticTotal = 0;
+    let semanticProgressMode: "ann" | undefined;
+    let textScanned = 0;
+    let textTotal = 0;
+    let textCapped = false;
+    let lastTextPublishAt = 0;
+    let hasPublishedTextMatches = false;
     const publishProgress = (
       status: "searching" | "done",
-      semanticResults: SearchResult[],
-      scanned = 0,
-      total = 0,
+      semanticResults: SearchResult[] = latestSemanticResults,
+      scanned = Math.max(semanticScanned, textScanned),
+      total = Math.max(semanticTotal, textTotal),
     ) => {
       if (isCancelled()) return;
       sender.send("semantic-search-progress", {
@@ -7851,40 +8003,88 @@ ipcMain.handle(
         results: rankResults(semanticResults),
         scanned,
         total,
+        textCapped,
+        mode: semanticProgressMode,
       });
     };
 
-    // Kick off CLIP against the saved index before walking user-authored names.
-    // The callback streams verified semantic matches as soon as each vector batch
-    // is scored; previews remain separately labeled as unconfirmed in the UI.
     publishProgress("searching", []);
-    let scannedRecords = 0;
-    let totalRecords = 0;
-    const semanticResultsPromise = semanticIndexer.search(
+    const semanticResultsPromise = trackInteractiveSearch(() =>
+      semanticIndexer.search(
+        query,
+        0,
+        sources,
+        isCancelled,
+        (partialResults, scanned, total, mode) => {
+          latestSemanticResults = partialResults;
+          semanticScanned = scanned;
+          semanticTotal = total;
+          semanticProgressMode = mode;
+          publishProgress("searching");
+        },
+      ),
+    );
+    const textMatchesPromise = semanticIndexer.searchTextMatches(
       query,
-      minimumConfidence,
       sources,
       isCancelled,
-      (partialResults, scanned, total) => {
-        scannedRecords = scanned;
-        totalRecords = total;
-        publishProgress("searching", partialResults, scanned, total);
+      (files, scanned, total, capped) => {
+        textScanned = scanned;
+        textTotal = total;
+        textCapped ||= capped;
+        for (const file of files) {
+          const lowerName = file.name.toLowerCase();
+          const nameMatches = lowerName.includes(normalizedQuery);
+          const pathMatches =
+            file.relativePath.toLowerCase().includes(normalizedQuery) ||
+            file.path.toLowerCase().includes(normalizedQuery);
+          addPriorityMatch(
+            file.path,
+            lowerName === normalizedQuery ? 0 : nameMatches ? 1 : 2,
+            nameMatches ? "Name match" : pathMatches ? "Path match" : "Name match",
+            undefined,
+            file,
+          );
+        }
+        const now = Date.now();
+        if (
+          files.length > 0 || capped
+        ) {
+          if (!hasPublishedTextMatches || now - lastTextPublishAt >= 120 || capped) {
+            hasPublishedTextMatches = true;
+            lastTextPublishAt = now;
+            publishProgress("searching");
+          }
+        }
       },
     );
 
     if (normalizedQuery) {
+      let priorityWork = 0;
+      const yieldPriorityWork = async () => {
+        priorityWork += 1;
+        if (priorityWork % 2048 === 0) {
+          publishProgress("searching");
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        return !isCancelled();
+      };
       for (const folder of state.digitalFolders) {
         if (!folder.name.toLowerCase().includes(normalizedQuery)) continue;
-        for (const filePath of folder.filePaths)
+        for (const filePath of folder.filePaths) {
           addPriorityMatch(filePath, 2, `In folder: ${folder.name}`);
+          if (!(await yieldPriorityWork())) return [];
+        }
       }
 
       // User-confirmed people photos outrank inferred visual similarity.
       for (const person of faceIndexer.getPeople()) {
         if (!person.name.toLowerCase().includes(normalizedQuery)) continue;
         const detail = faceIndexer.getPerson(person.id);
-        for (const filePath of detail?.confirmedPhotoPaths ?? [])
+        for (const filePath of detail?.confirmedPhotoPaths ?? []) {
           addPriorityMatch(filePath, 1, `Named as: ${person.name}`);
+          if (!(await yieldPriorityWork())) return [];
+        }
       }
 
       // Pet names and other explicit name assignments remain searchable. Person
@@ -7898,19 +8098,27 @@ ipcMain.handle(
         for (const fileEntry of entry.filePaths) {
           addPriorityMatch(fileEntry.path, 1, `Named as: ${entry.name}`);
           if (entry.sourceType === "pet") matchingPetPaths.add(fileEntry.path);
+          if (!(await yieldPriorityWork())) return [];
         }
       }
       if (matchingPetPaths.size) {
         for (const folder of state.digitalFolders) {
-          if (!folder.filePaths.some((filePath) => matchingPetPaths.has(filePath)))
-            continue;
-          for (const filePath of folder.filePaths)
-            addPriorityMatch(filePath, 1, `In folder: ${folder.name}`);
+          let containsPetPath = false;
+          for (const filePath of folder.filePaths) {
+            if (matchingPetPaths.has(filePath)) containsPetPath = true;
+            if (!(await yieldPriorityWork())) return [];
+          }
+          if (containsPetPath)
+            for (const filePath of folder.filePaths) {
+              addPriorityMatch(filePath, 1, `In folder: ${folder.name}`);
+              if (!(await yieldPriorityWork())) return [];
+            }
         }
       }
 
       // User-authored aliases and keywords are the strongest exact matches.
-      for (const [filePath, metadata] of Object.entries(state.fileMetadata)) {
+      for (const filePath in state.fileMetadata) {
+        const metadata = state.fileMetadata[filePath];
         const aliasMatches = metadata.displayName
           ?.toLowerCase()
           .includes(normalizedQuery);
@@ -7926,19 +8134,24 @@ ipcMain.handle(
               : `Keywords: ${metadata.keywords.join(", ")}`,
             metadata.displayName,
           );
+        if (!(await yieldPriorityWork())) return [];
       }
     }
 
-    publishProgress("searching", []);
-    const semanticResults = await semanticResultsPromise;
+    const [semanticResults] = await Promise.all([
+      semanticResultsPromise,
+      textMatchesPromise,
+    ]);
     if (isCancelled()) return [];
+    latestSemanticResults = semanticResults;
     const results = rankResults(semanticResults);
     sender.send("semantic-search-progress", {
       requestId: progressRequestId,
       status: "done",
       results,
-      scanned: scannedRecords,
-      total: totalRecords,
+      scanned: Math.max(semanticScanned, textScanned),
+      total: Math.max(semanticTotal, textTotal),
+      textCapped,
     });
     return results;
   },
@@ -8553,7 +8766,6 @@ ipcMain.handle("get-indexing-overview", async () => {
   const face = faceIndexer.getProgress();
   const geo = geoIndexer.getStatus();
   const duplicates = duplicateManager.getState();
-  const pets = petIndexer.getProgress();
   const thumbnails = thumbnailPregenerator?.getProgress();
   const audio = audioLibraryCache?.getSnapshot();
   const coveredAudioSources =
@@ -8626,16 +8838,6 @@ ipcMain.handle("get-indexing-overview", async () => {
       unit: "candidates",
       message: duplicates.message,
       detail: `${duplicates.duplicateFiles.toLocaleString()} duplicate copies`,
-    },
-    {
-      id: "pets",
-      label: "Pets",
-      status: pets.status,
-      processed: pets.processed,
-      total: pets.total,
-      unit: "photos",
-      errors: pets.errors,
-      message: pets.message,
     },
     {
       id: "audio",
@@ -9314,12 +9516,9 @@ ipcMain.handle("get-pet-state", async () => {
   };
 });
 ipcMain.handle("start-pet-clustering", async () => {
-  await retryIndexRecoveryStage("pets");
   return petIndexer.getProgress();
 });
 ipcMain.handle("pause-pet-clustering", async () => {
-  indexRecovery?.pause("pets");
-  petIndexer.pause();
   return petIndexer.getProgress();
 });
 ipcMain.handle(

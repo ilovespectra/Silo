@@ -82,8 +82,10 @@ export class ThumbnailPregenerator {
     );
     try {
       const files: string[] = [];
-      for (const root of new Set(await this.deps.getSourceRoots()))
+      for (const root of new Set(await this.deps.getSourceRoots())) {
+        await this.waitForIndexingIdle();
         await this.collect(root, files);
+      }
       this.update(
         {
           status: "generating",
@@ -141,11 +143,13 @@ export class ThumbnailPregenerator {
   // Iterative walk keeps memory flat on very large libraries.
   private async collect(root: string, files: string[]) {
     if (this.deps.isRemotePath(root)) {
+      await this.waitForIndexingIdle();
       files.push(...(await this.deps.listRemoteMediaFiles(root)));
       return;
     }
     const stack = [root];
     while (stack.length > 0) {
+      await this.waitForIndexingIdle();
       const directory = stack.pop()!;
       let handle;
       try {
@@ -154,6 +158,7 @@ export class ThumbnailPregenerator {
         continue;
       }
       for await (const entry of handle) {
+        await this.waitForIndexingIdle();
         if (entry.name.startsWith(".")) continue;
         const fullPath = path.join(directory, entry.name);
         if (entry.isDirectory()) stack.push(fullPath);
@@ -166,6 +171,11 @@ export class ThumbnailPregenerator {
           message: `Finding photos and videos… ${files.length.toLocaleString()}`,
         });
     }
+  }
+
+  private async waitForIndexingIdle() {
+    while (this.deps.getIndexingWaitMessage())
+      await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   private update(patch: Partial<ThumbnailPregenProgress>, force = false) {
