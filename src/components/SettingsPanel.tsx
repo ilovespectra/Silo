@@ -1,12 +1,14 @@
 import React, { useEffect, useState } from "react";
-import { FaBug } from "react-icons/fa";
+import { FaBug, FaGithub } from "react-icons/fa";
 import {
   FiAlertCircle,
   FiBarChart2,
+  FiBookOpen,
   FiCamera,
   FiCheck,
   FiCpu,
   FiDownload,
+  FiExternalLink,
   FiFolder,
   FiHardDrive,
   FiLock,
@@ -1208,6 +1210,39 @@ export default function SettingsPanel({
           >
             <FaBug /> Report a Bug
           </button>
+        </section>
+
+        <section
+          className="settings-bug-report"
+          data-help="Open the Silo user guide for walkthroughs, feature explanations, limitations, and troubleshooting."
+        >
+          <div className="settings-section-title">
+            <FiBookOpen />
+            <div>
+              <h3>Help & Documentation</h3>
+              <p>Browse the Silo walkthrough, feature guides, and troubleshooting tips.</p>
+            </div>
+          </div>
+          <div className="settings-help-links">
+            <a
+              className="settings-secondary"
+              href="https://repo-six-inky-51.vercel.app/"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <FiBookOpen aria-hidden="true" /> Silo Docs <FiExternalLink aria-hidden="true" />
+            </a>
+            <a
+              className="settings-secondary settings-help-github"
+              href="https://github.com/ilovespectra/Silo"
+              target="_blank"
+              rel="noreferrer"
+              aria-label="Silo source code on GitHub"
+              title="Silo source code on GitHub"
+            >
+              <FaGithub aria-hidden="true" />
+            </a>
+          </div>
         </section>
 
         <LibraryShareSettings />

@@ -2,6 +2,12 @@
 
 A local-first file browser built with Electron, React, and TypeScript. Browse drives, Time Machine backups, phones, and Google accounts from one interface — with offline semantic search, face grouping, and non-destructive "digital folders".
 
+## Silo links
+
+- [Try Silo website](https://trysilo-seven.vercel.app/)
+- [Silo user guide](https://repo-six-inky-51.vercel.app/)
+- [Silo source on GitHub](https://github.com/ilovespectra/Silo)
+
 ## Features
 
 ### Browsing
@@ -37,7 +43,8 @@ Phone and cloud files behave like local files: thumbnails, preview, explode, dig
 ## Installation
 
 ```bash
-cd file-browser-electron
+git clone https://github.com/ilovespectra/Silo.git
+cd Silo
 npm install
 ```
 
@@ -251,7 +258,7 @@ Editing Photos is limited to albums and media your app itself created (`photosli
 ## Project Structure
 
 ```
-file-browser-electron/
+Silo/
 ├── src/
 │   ├── main.ts             # Electron main process and IPC handlers
 │   ├── phoneManager.ts     # iOS/Android detection, pairing, mounting, adb bridge
