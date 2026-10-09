@@ -7830,6 +7830,24 @@ function App() {
         </div>
       )}
 
+      <footer className="app-footer">
+        <div className="app-footer-branding">
+          <span className="app-footer-product">solo: <strong>Silo</strong></span>
+          <span className="app-footer-copyright">© 2026 Silo</span>
+        </div>
+        <nav aria-label="Silo links">
+          <a href="https://trysilo-seven.vercel.app/" target="_blank" rel="noreferrer">
+            TrySilo <span aria-hidden="true">↗</span>
+          </a>
+          <a href="https://repo-six-inky-51.vercel.app/" target="_blank" rel="noreferrer">
+            Docs <span aria-hidden="true">↗</span>
+          </a>
+          <a href="https://github.com/ilovespectra/Silo" target="_blank" rel="noreferrer">
+            GitHub <span aria-hidden="true">↗</span>
+          </a>
+        </nav>
+      </footer>
+
       {showSourceClone && electronAPI && (
         <SourceClonePanel
           electronAPI={electronAPI}

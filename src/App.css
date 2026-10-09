@@ -188,6 +188,60 @@ body {
   background: var(--bg);
 }
 
+.app-footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  min-width: 0;
+  padding: 6px clamp(12px, 1.5vw, 24px);
+  border-top: 1px solid var(--line);
+  background: var(--surface-header);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.app-footer-branding,
+.app-footer nav {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.app-footer-product {
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.app-footer-product strong {
+  color: var(--orange);
+}
+
+.app-footer-copyright {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.app-footer a {
+  color: var(--muted);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.app-footer a:hover,
+.app-footer a:focus-visible {
+  color: var(--orange);
+}
+
+.app-footer a span {
+  margin-left: 3px;
+}
+
 .header {
   position: sticky;
   top: 0;
