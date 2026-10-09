@@ -18,7 +18,8 @@
   "include": [
     "src/main.ts",
     "src/semanticWorker.ts",
-    "src/documentPreviewWorker.ts"
+    "src/documentPreviewWorker.ts",
+    "src/searchVectorIndexWorker.ts"
   ],
   "exclude": ["node_modules"]
 }

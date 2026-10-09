@@ -126,6 +126,7 @@ function makeIndexer(
     for (const child of activeChildren) child.kill("SIGKILL");
     await Promise.all(exits);
     await indexer.runPromise?.catch(() => undefined);
+    await indexer.flushVectorSearch();
     await indexer.flushWrites();
     if (ownsUserDataPath)
       fs.rmSync(userDataPath, { recursive: true, force: true });
@@ -193,6 +194,7 @@ if (
         await exited;
       }
       await indexer?.runPromise?.catch(() => undefined);
+      await indexer?.flushVectorSearch();
       await indexer?.flushWrites();
       fs.rmSync(sourcePath, { recursive: true, force: true });
       fs.rmSync(userDataPath, { recursive: true, force: true });
@@ -1082,43 +1084,16 @@ test("confidence slider maps higher settings to stricter match thresholds", (t) 
 });
 
 test("semantic search applies confidence and excludes unfinished or inactive records", async (t) => {
-  const { indexer, userDataPath } = makeIndexer(t);
+  const { indexer } = makeIndexer(t);
   const vectorBytes = 512 * Float32Array.BYTES_PER_ELEMENT;
-  const vectorPath = path.join(userDataPath, "search-vectors.bin");
-  const vectors = Buffer.alloc(vectorBytes * 4);
   const records = [
-    {
-      path: "/photos/high.jpg",
-      sourcePath: "/photos",
-      vectorOffset: 0,
-      type: "image",
-    },
-    {
-      path: "/photos/weak.jpg",
-      sourcePath: "/photos",
-      vectorOffset: vectorBytes,
-      type: "image",
-    },
-    {
-      path: "/other/high.jpg",
-      sourcePath: "/other",
-      vectorOffset: vectorBytes * 2,
-      type: "image",
-    },
-    {
-      path: "/photos/processing.jpg",
-      sourcePath: "/photos",
-      vectorOffset: vectorBytes * 3,
-      type: "image",
-    },
-    {
-      path: "/photos/pending.jpg",
-      sourcePath: "/photos",
-      vectorOffset: -1,
-      type: "image",
-    },
+    { path: "/photos/high.jpg", sourcePath: "/photos", vectorOffset: 0, type: "image" },
+    { path: "/photos/weak.jpg", sourcePath: "/photos", vectorOffset: vectorBytes, type: "image" },
+    { path: "/other/high.jpg", sourcePath: "/other", vectorOffset: vectorBytes * 2, type: "image" },
+    { path: "/photos/processing.jpg", sourcePath: "/photos", vectorOffset: vectorBytes * 3, type: "image" },
+    { path: "/photos/pending.jpg", sourcePath: "/photos", vectorOffset: -1, type: "image" },
   ];
-  for (const [index, record] of records.entries()) {
+  for (const record of records) {
     const completeRecord = {
       name: path.basename(record.path),
       relativePath: path.basename(record.path),
@@ -1129,11 +1104,10 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
       ...record,
     };
     indexer.latestRecords.set(record.path, completeRecord);
-    if (record.vectorOffset >= 0)
-      vectors.writeFloatLE(index === 1 ? 0.2 : 1, record.vectorOffset);
+    if (record.path !== "/photos/processing.jpg" && record.vectorOffset >= 0)
+      indexer.latestRecordsByVectorKey.set(record.vectorOffset / vectorBytes, completeRecord);
   }
   indexer.processingPaths.add("/photos/processing.jpg");
-  indexer.vectorsPath = vectorPath;
   indexer.demoFilePaths = () => null;
   indexer.loadClipRuntime = async () => ({});
   indexer.embedText = async () => {
@@ -1141,7 +1115,16 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
     queryVector[0] = 1;
     return queryVector;
   };
-  fs.writeFileSync(vectorPath, vectors);
+  indexer.vectorIndexReady = Promise.resolve();
+  indexer.persistedVectorIndex = {
+    search: async () => [
+      { key: 0, confidence: 60 },
+      { key: 1, confidence: 20 },
+      { key: 2, confidence: 90 },
+      { key: 3, confidence: 99 },
+    ],
+    shutdown: async () => {},
+  };
 
   const strictResults = await indexer.search("cat", 25, ["/photos"]);
   assert.deepEqual(
@@ -1156,37 +1139,20 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
   );
 });
 
-test("semantic search discards results when cancelled during its yield", async (t) => {
+test("semantic search discards results when cancelled during embedding", async (t) => {
   let cancelled = false;
-  const { indexer, userDataPath } = makeIndexer(t, {
-    setImmediateImpl: (callback) => {
-      cancelled = true;
-      return setImmediate(callback);
-    },
-  });
-  const vectorPath = path.join(userDataPath, "search-vectors.bin");
-  const vector = Buffer.alloc(512 * Float32Array.BYTES_PER_ELEMENT);
-  vector.writeFloatLE(1, 0);
-  fs.writeFileSync(vectorPath, vector);
-  indexer.latestRecords.set("/photos/one.jpg", {
-    path: "/photos/one.jpg",
-    name: "one.jpg",
-    sourcePath: "/photos",
-    relativePath: "one.jpg",
-    size: 1,
-    modified: 1,
-    type: "image",
-    extension: "jpg",
-    signature: "fixture",
-    vectorOffset: 0,
-  });
-  indexer.vectorsPath = vectorPath;
+  const { indexer } = makeIndexer(t);
   indexer.demoFilePaths = () => null;
   indexer.loadClipRuntime = async () => ({});
   indexer.embedText = async () => {
-    const queryVector = new Float32Array(512);
-    queryVector[0] = 1;
-    return queryVector;
+    cancelled = true;
+    return new Float32Array(512);
+  };
+  indexer.persistedVectorIndex = {
+    search: async () => {
+      assert.fail("a cancelled semantic search must not query the vector index");
+    },
+    shutdown: async () => {},
   };
 
   const results = await indexer.search(
@@ -1198,50 +1164,29 @@ test("semantic search discards results when cancelled during its yield", async (
   assert.equal(results.length, 0);
 });
 
-test("semantic search streams its first record when indexing starts from an empty index", async (t) => {
-  const { indexer, userDataPath } = makeIndexer(t);
-  const vectorPath = path.join(userDataPath, "progressive-search-vectors.bin");
-  fs.mkdirSync(path.dirname(vectorPath), { recursive: true });
-  indexer.vectorsPath = vectorPath;
+test("filename search streams its first match while the index is hydrating", async (t) => {
+  const { indexer } = makeIndexer(t);
   indexer.demoFilePaths = () => null;
-  indexer.loadClipRuntime = async () => ({});
-  indexer.embedText = async () => {
-    const queryVector = new Float32Array(512);
-    queryVector[0] = 1;
-    return queryVector;
-  };
   indexer.loadComplete = false;
-  let finishIndexing;
-  indexer.runPromise = new Promise((resolve) => {
-    finishIndexing = resolve;
-  });
 
   let resolveStreamed;
   const streamed = new Promise((resolve) => {
     resolveStreamed = resolve;
   });
-  let searchResults;
-  const searchPromise = indexer.runSearch(
-    "progressive-first-record",
-    0,
+  const searchPromise = indexer.searchTextMatches(
+    "first",
     ["/photos"],
     () => false,
-    (results) => {
-      if (results.length > 0) resolveStreamed(results);
+    (matches) => {
+      if (matches.length > 0) resolveStreamed(matches);
     },
-  ).then((results) => {
-    searchResults = results;
-    return results;
-  });
+  );
 
   try {
-    for (let attempt = 0; attempt < 50 && indexer.indexedRecordListeners.size === 0; attempt++)
+    for (let attempt = 0; attempt < 50 && indexer.activeTextSearches.size === 0; attempt++)
       await new Promise(setImmediate);
-    assert.equal(indexer.indexedRecordListeners.size, 1);
+    assert.equal(indexer.activeTextSearches.size, 1);
 
-    const vector = Buffer.alloc(512 * Float32Array.BYTES_PER_ELEMENT);
-    vector.writeFloatLE(1, 0);
-    fs.writeFileSync(vectorPath, vector);
     indexer.setLatestRecord({
       path: "/photos/first.jpg",
       name: "first.jpg",
@@ -1252,13 +1197,13 @@ test("semantic search streams its first record when indexing starts from an empt
       type: "image",
       extension: "jpg",
       signature: "fixture",
-      vectorOffset: 0,
+      vectorOffset: -1,
     });
 
     const streamedResults = await Promise.race([
       streamed,
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("The first indexed result was not streamed.")), 2000),
+        setTimeout(() => reject(new Error("The first filename match was not streamed.")), 2000),
       ),
     ]);
     assert.deepEqual(
@@ -1266,13 +1211,7 @@ test("semantic search streams its first record when indexing starts from an empt
       ["/photos/first.jpg"],
     );
   } finally {
-    finishIndexing();
-    indexer.runPromise = null;
     indexer.loadComplete = true;
     await searchPromise;
   }
-  assert.deepEqual(
-    Array.from(searchResults, (result) => result.path),
-    ["/photos/first.jpg"],
-  );
 });
