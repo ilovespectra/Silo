@@ -1,4 +1,5 @@
 // Model-free child used to exercise real process death and IPC supervision.
+const heldRequests = [];
 function terminateLikeNativeCrash(signal) {
   // Windows reports forced process termination as a nonzero exit code rather
   // than a POSIX signal. Keep the failure fatal while matching that contract.
@@ -27,7 +28,19 @@ process.on("message", (request) => {
     terminateLikeNativeCrash("SIGKILL");
     return;
   }
-  if (request.text === "hold") return;
+  if (request.text === "hold") {
+    heldRequests.push(request);
+    return;
+  }
+  if (request.text === "release-held") {
+    const held = heldRequests.shift();
+    if (held)
+      process.send({
+        id: held.id,
+        values: Array.from({ length: 512 }, (_, i) => (i === 0 ? 1 : 0)),
+      });
+    return;
+  }
   if (request.text === "malformed") {
     process.send({ id: request.id, values: [1] });
     return;

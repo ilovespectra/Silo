@@ -447,6 +447,16 @@ export default function LifetimeUnlockPanel({
               <button type="button" onClick={() => activatePaywallAction("bug")}>
                 Report a Bug
               </button>
+              <button
+                type="button"
+                onClick={() =>
+                  document
+                    .getElementById("lifetime-beta-access")
+                    ?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+                }
+              >
+                Request Beta Access
+              </button>
               <button type="button" onClick={() => activatePaywallAction("survey")}>
                 Complete Survey
               </button>
@@ -711,7 +721,11 @@ export default function LifetimeUnlockPanel({
               </div>
             </details>
 
-            <section className="lifetime-beta-panel" aria-label="Beta tester access">
+            <section
+              id="lifetime-beta-access"
+              className="lifetime-beta-panel"
+              aria-label="Beta tester access"
+            >
               <div className="lifetime-beta-heading">
                 <strong>Request full lifetime access for beta testing</strong>
                 <p>

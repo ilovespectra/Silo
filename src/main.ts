@@ -11,6 +11,7 @@ import {
   shell,
 } from "electron";
 import { createHash, randomBytes } from "crypto";
+import * as http from "http";
 import * as https from "https";
 import { execFile, spawn } from "child_process";
 import { Readable, Transform } from "stream";
@@ -27,6 +28,7 @@ import {
   IndexableFile,
   SearchResult,
   SemanticIndexer,
+  type IndexProgress,
 } from "./semanticIndexer";
 import { DuplicateState } from "./duplicateManager";
 import {
@@ -245,17 +247,48 @@ const lifetimePaymentRelayBaseUrl = (
   process.env.SILO_PAYMENT_RELAY_URL || "https://license.kolektivkrog.si"
 ).replace(/\/$/, "");
 
-async function requestLifetimeCardPurchase(
+interface DiagnosticReport {
+  id: string;
+  createdAt: number;
+  reason: "indexing-error" | "indexing-stalled" | "app-crash";
+  message: string;
+}
+
+async function requestRelayJson(
   endpoint: URL,
-  installationId: string,
+  options: {
+    method: "GET" | "POST";
+    headers?: Record<string, string>;
+    body?: unknown;
+    timeoutMs?: number;
+    timeoutMessage?: string;
+  },
 ): Promise<{
   ok: boolean;
   statusCode: number;
   payload: Record<string, any>;
 }> {
-  const body = JSON.stringify({ installationId });
+  const isLocalHttp =
+    endpoint.protocol === "http:" &&
+    ["localhost", "127.0.0.1", "::1"].includes(endpoint.hostname);
+  if (endpoint.protocol !== "https:" && !isLocalHttp)
+    throw new Error("The relay must use HTTPS.");
+
+  const body = options.body === undefined ? undefined : JSON.stringify(options.body);
+  const headers: Record<string, string> = { ...options.headers };
+  if (body !== undefined) {
+    headers["Content-Type"] ??= "application/json";
+    headers["Content-Length"] = String(Buffer.byteLength(body));
+  }
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const timeoutMessage = options.timeoutMessage ?? "The relay request timed out.";
+
   return new Promise((resolve, reject) => {
     let settled = false;
+    let request: http.ClientRequest;
+    let requestTimeout: NodeJS.Timeout;
+    let responseBytes = 0;
+    const chunks: Buffer[] = [];
     const finish = (
       error?: Error,
       result?: {
@@ -270,42 +303,60 @@ async function requestLifetimeCardPurchase(
       if (error) reject(error);
       else resolve(result!);
     };
-    const request = https.request(
-      endpoint,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-      },
-      (response) => {
-        const chunks: Buffer[] = [];
-        response.on("data", (chunk: Buffer | string) => {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const onResponse = (response: http.IncomingMessage) => {
+      response.on("data", (chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        responseBytes += buffer.length;
+        if (responseBytes > 1024 * 1024) {
+          response.destroy(new Error("The relay response is too large."));
+          return;
+        }
+        chunks.push(buffer);
+      });
+      response.on("error", (error) => finish(error));
+      response.on("end", () => {
+        let payload: Record<string, any> = {};
+        try {
+          const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+            payload = parsed as Record<string, any>;
+        } catch {}
+        const statusCode = response.statusCode || 0;
+        finish(undefined, {
+          ok: statusCode >= 200 && statusCode < 300,
+          statusCode,
+          payload,
         });
-        response.on("error", (error) => finish(error));
-        response.on("end", () => {
-          let payload: Record<string, any> = {};
-          try {
-            const parsed: unknown = JSON.parse(
-              Buffer.concat(chunks).toString("utf8"),
-            );
-            if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
-              payload = parsed as Record<string, any>;
-          } catch {}
-          const statusCode = response.statusCode || 0;
-          finish(undefined, {
-            ok: statusCode >= 200 && statusCode < 300,
-            statusCode,
-            payload,
-          });
-        });
-      },
-    );
-    const requestTimeout = setTimeout(
-      () => request.destroy(new Error("The payment relay request timed out.")),
-      15000,
+      });
+    };
+
+    const requestOptions = { method: options.method, headers };
+    request = endpoint.protocol === "https:"
+      ? https.request(endpoint, requestOptions, onResponse)
+      : http.request(endpoint, requestOptions, onResponse);
+    requestTimeout = setTimeout(
+      () => request.destroy(new Error(timeoutMessage)),
+      timeoutMs,
     );
     request.on("error", (error) => finish(error));
-    request.end(body);
+    if (body === undefined) request.end();
+    else request.end(body);
+  });
+}
+
+async function requestLifetimeCardPurchase(
+  endpoint: URL,
+  installationId: string,
+): Promise<{
+  ok: boolean;
+  statusCode: number;
+  payload: Record<string, any>;
+}> {
+  return requestRelayJson(endpoint, {
+    method: "POST",
+    body: { installationId },
+    timeoutMs: 15000,
+    timeoutMessage: "The payment relay request timed out.",
   });
 }
 
@@ -651,6 +702,14 @@ app.on("second-instance", () => {
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const)
   process.on(signal, () => app.quit());
 const diagnosticsPath = path.join(diagnosticsDirectory, "runtime.jsonl");
+const pendingDiagnosticReportPath = path.join(
+  diagnosticsDirectory,
+  "pending-report.json",
+);
+const activeSessionMarkerPath = path.join(
+  diagnosticsDirectory,
+  "active-session.json",
+);
 const maxBugReportScreenshotBytes = 3 * 1024 * 1024;
 const defaultBugReportEndpoint =
   "https://silo-bug-report-relay.vercel.app/api/bug-report";
@@ -676,12 +735,317 @@ function runtimeLog(event: string, details: Record<string, unknown> = {}) {
   }
 }
 
-process.on("uncaughtException", (error) =>
+function safeRuntimeDiagnosticText(value: unknown) {
+  if (typeof value !== "string") return "";
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (/(?:[A-Za-z]:\\|\/)/.test(compact))
+    return "Error details withheld because they contain a filesystem path.";
+  return compact.slice(0, 320);
+}
+
+function logIndexingDiagnostic(event: string, details: Record<string, unknown> = {}) {
+  runtimeLog(event, details);
+  if (!event.startsWith("semantic-worker-")) return;
+
+  const safe: Record<string, string | number | boolean> = {
+    event,
+    at: new Date().toISOString(),
+  };
+  for (const key of ["code", "signal", "requestType", "pendingCount"]) {
+    const value = details[key];
+    if (typeof value === "string" || typeof value === "number") safe[key] = value;
+  }
+  if (typeof details.infrastructure === "boolean")
+    safe.infrastructure = details.infrastructure;
+  const safeMessage = safeRuntimeDiagnosticText(details.message);
+  if (safeMessage) safe.message = safeMessage;
+  const safeFailureReason = safeRuntimeDiagnosticText(details.failureReason);
+  if (safeFailureReason) safe.failureReason = safeFailureReason;
+  const requestTypes = details.requestTypes;
+  if (Array.isArray(requestTypes))
+    safe.requestTypes = requestTypes
+      .filter((value): value is string => typeof value === "string")
+      .slice(0, 8)
+      .join(", ");
+  indexingDiagnosticEvents.push(safe);
+  if (indexingDiagnosticEvents.length > 12) indexingDiagnosticEvents.shift();
+}
+
+function persistPendingDiagnosticReport() {
+  if (!pendingDiagnosticReport) return;
+  try {
+    fs.writeFileSync(
+      pendingDiagnosticReportPath,
+      JSON.stringify(pendingDiagnosticReport),
+      { encoding: "utf8", mode: 0o600 },
+    );
+  } catch (error) {
+    runtimeLog("diagnostic-report-persist-failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function loadPendingDiagnosticReport() {
+  try {
+    const parsed: unknown = JSON.parse(
+      fs.readFileSync(pendingDiagnosticReportPath, "utf8"),
+    );
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const report = parsed as Partial<DiagnosticReport>;
+    if (
+      typeof report.id === "string" &&
+      typeof report.createdAt === "number" &&
+      ["indexing-error", "indexing-stalled", "app-crash"].includes(
+        String(report.reason),
+      ) &&
+      typeof report.message === "string"
+    )
+      pendingDiagnosticReport = report as DiagnosticReport;
+  } catch {
+    // A missing or incomplete report is ignored; the runtime log remains intact.
+  }
+}
+
+function getRecentSafeRuntimeEvents() {
+  const allowedFields = [
+    "reason", "signal", "code", "exitCode", "status", "requestType",
+    "requestTypes", "infrastructure", "pendingCount", "message", "failureReason",
+  ];
+  try {
+    const content = fs.readFileSync(diagnosticsPath, "utf8").slice(-512 * 1024);
+    return content
+      .split("\n")
+      .filter(Boolean)
+      .flatMap((line) => {
+        try {
+          const entry = JSON.parse(line) as Record<string, unknown>;
+          const event = typeof entry.event === "string" ? entry.event : "";
+          if (
+            !event.startsWith("semantic-worker-") &&
+            !["render-process-gone", "renderer-unresponsive"].includes(event)
+          )
+            return [];
+          const safeDetails = allowedFields.flatMap((key) => {
+            const value = entry[key];
+            if (typeof value === "string") {
+              const safeValue = safeRuntimeDiagnosticText(value);
+              return safeValue ? [`${key}=${safeValue.slice(0, 180)}`] : [];
+            }
+            if (typeof value === "number" || typeof value === "boolean")
+              return [`${key}=${String(value).slice(0, 80)}`];
+            return [];
+          });
+          return [`- ${String(entry.time || "unknown time")}: ${event}${
+            safeDetails.length ? ` ${safeDetails.join(" ")}` : ""
+          }`];
+        } catch {
+          return [];
+        }
+      })
+      .slice(-8);
+  } catch {
+    return [];
+  }
+}
+
+function publishDiagnosticReport(
+  reason: DiagnosticReport["reason"],
+  message: string,
+  details: Record<string, unknown> = {},
+) {
+  if (pendingDiagnosticReport) return false;
+  pendingDiagnosticReport = {
+    id: `${Date.now()}-${randomBytes(6).toString("hex")}`,
+    createdAt: Date.now(),
+    reason,
+    message,
+  };
+  persistPendingDiagnosticReport();
+  runtimeLog("diagnostic-report-created", { reason, ...details });
+  sendToRenderer("diagnostic-report", pendingDiagnosticReport);
+  return true;
+}
+
+function createIndexingDiagnosticReport(
+  reason: "indexing-error" | "indexing-stalled",
+  progress: IndexProgress,
+  stalledForMs = 0,
+) {
+  const reasonText = reason === "indexing-error"
+    ? progress.status === "complete" && progress.errors > 0
+      ? `Indexing completed with ${progress.errors.toLocaleString()} file errors.`
+      : "The indexer reported an error."
+    : `Indexing made no measurable progress for ${Math.floor(stalledForMs / 60000)} minutes.`;
+  const workerEvents = indexingDiagnosticEvents.slice(-8).map((entry) => {
+    const details = Object.entries(entry)
+      .filter(([key]) => key !== "at")
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join(" ");
+    return `- ${entry.at}: ${details}`;
+  });
+  const message = [
+    "Silo automatic indexing diagnostic — please review before sending.",
+    `Trigger: ${reasonText}`,
+    `App version: ${app.getVersion()}`,
+    `System: ${process.platform} ${os.release()} (${process.arch})`,
+    `Index status: ${progress.status}`,
+    `Progress: ${progress.indexed} indexed, ${progress.remaining} remaining, ${progress.total} total, ${progress.errors} errors.`,
+    workerEvents.length
+      ? `Recent semantic worker diagnostics:
+${workerEvents.join("\n")}`
+      : "Recent semantic worker diagnostics: none recorded in this session.",
+    "Privacy: this report excludes filenames, folder paths, file contents, screenshots, and crash dumps.",
+  ].join("\n\n");
+  return publishDiagnosticReport(reason, message, {
+    status: progress.status,
+    total: progress.total,
+    indexed: progress.indexed,
+    remaining: progress.remaining,
+    errors: progress.errors,
+  });
+}
+
+function createAppCrashDiagnosticReport(
+  trigger: string,
+  details: { reason?: unknown; exitCode?: unknown } = {},
+) {
+  const allowedReasons = new Set([
+    "crashed",
+    "killed",
+    "oom",
+    "launch-failed",
+    "integrity-failure",
+    "abnormal-exit",
+  ]);
+  const safeReason =
+    typeof details.reason === "string" && allowedReasons.has(details.reason)
+      ? details.reason
+      : null;
+  const safeExitCode =
+    typeof details.exitCode === "number" ? details.exitCode : null;
+  const recentEvents = getRecentSafeRuntimeEvents();
+  const message = [
+    "Silo automatic crash diagnostic — please review before sending.",
+    `Trigger: ${trigger}`,
+    `App version: ${app.getVersion()}`,
+    `System: ${process.platform} ${os.release()} (${process.arch})`,
+    ...(safeReason ? [`Renderer exit reason: ${safeReason}`] : []),
+    ...(safeExitCode !== null ? [`Renderer exit code: ${safeExitCode}`] : []),
+    recentEvents.length
+      ? `Recent safe runtime events:\n${recentEvents.join("\n")}`
+      : "Recent safe runtime events: none recorded.",
+    "Privacy: this report excludes filenames, folder paths, file contents, screenshots, stack traces, and crash dumps.",
+  ].join("\n\n");
+  return publishDiagnosticReport("app-crash", message, {
+    trigger,
+    reason: safeReason,
+    exitCode: safeExitCode,
+  });
+}
+
+function monitorIndexing(progress: IndexProgress, now = Date.now()) {
+  const active = ["scanning", "loading-model", "indexing"].includes(progress.status);
+
+  if (progress.status === "complete" && progress.errors > 0) {
+    if (
+      indexingMonitor?.status === "complete" &&
+      indexingMonitor.total === progress.total &&
+      indexingMonitor.indexed === progress.indexed &&
+      indexingMonitor.remaining === progress.remaining &&
+      indexingMonitor.errors === progress.errors
+    )
+      return;
+    const created = createIndexingDiagnosticReport("indexing-error", progress);
+    indexingMonitor = {
+      status: "complete",
+      total: progress.total,
+      indexed: progress.indexed,
+      remaining: progress.remaining,
+      errors: progress.errors,
+      currentFile: null,
+      lastProgressAt: now,
+      reportCreated: created,
+    };
+    return;
+  }
+
+  if (progress.status === "error") {
+    if (!indexingMonitor || indexingMonitor.status !== "error") {
+      const created = createIndexingDiagnosticReport("indexing-error", progress);
+      indexingMonitor = {
+        status: "error",
+        total: progress.total,
+        indexed: progress.indexed,
+        remaining: progress.remaining,
+        currentFile: progress.currentFile,
+        lastProgressAt: now,
+        reportCreated: created,
+      };
+    }
+    return;
+  }
+
+  if (!active) {
+    indexingMonitor = null;
+    return;
+  }
+
+  if (!indexingMonitor || indexingMonitor.status === "error") {
+    indexingMonitor = {
+      status: progress.status,
+      total: progress.total,
+      indexed: progress.indexed,
+      remaining: progress.remaining,
+      currentFile: progress.currentFile,
+      lastProgressAt: now,
+      reportCreated: false,
+    };
+    return;
+  }
+
+  const changed =
+    indexingMonitor.status !== progress.status ||
+    indexingMonitor.total !== progress.total ||
+    indexingMonitor.indexed !== progress.indexed ||
+    indexingMonitor.remaining !== progress.remaining ||
+    indexingMonitor.currentFile !== progress.currentFile;
+  if (changed) {
+    indexingMonitor.status = progress.status;
+    indexingMonitor.total = progress.total;
+    indexingMonitor.indexed = progress.indexed;
+    indexingMonitor.remaining = progress.remaining;
+    indexingMonitor.currentFile = progress.currentFile;
+    indexingMonitor.lastProgressAt = now;
+    indexingMonitor.reportCreated = false;
+    return;
+  }
+
+  const stalledForMs = now - indexingMonitor.lastProgressAt;
+  if (
+    stalledForMs >= indexingStallThresholdMs &&
+    !indexingMonitor.reportCreated
+  ) {
+    createIndexingDiagnosticReport("indexing-stalled", progress, stalledForMs);
+    indexingMonitor.reportCreated = true;
+  }
+}
+
+let terminatingAfterUncaughtException = false;
+process.on("uncaughtException", (error) => {
+  if (terminatingAfterUncaughtException) {
+    process.exit(1);
+    return;
+  }
+  terminatingAfterUncaughtException = true;
   runtimeLog("uncaught-exception", {
     message: error.message,
     stack: error.stack,
-  }),
-);
+  });
+  createAppCrashDiagnosticReport("The main process encountered an uncaught exception.");
+  process.exitCode = 1;
+  app.quit();
+});
 process.on("unhandledRejection", (reason) =>
   runtimeLog("unhandled-rejection", {
     reason:
@@ -2120,6 +2484,19 @@ let heapGuardTimer: NodeJS.Timeout | null = null;
 let lastIndexDiagnostic = 0;
 let lastSemanticProgressStatus: string | null = null;
 let lastFaceProgressStatus: string | null = null;
+const indexingStallThresholdMs = 10 * 60 * 1000;
+const indexingDiagnosticEvents: Array<Record<string, string | number | boolean>> = [];
+let indexingMonitor: {
+  status: string;
+  total: number;
+  indexed: number;
+  remaining: number;
+  errors?: number;
+  currentFile: string | null;
+  lastProgressAt: number;
+  reportCreated: boolean;
+} | null = null;
+let pendingDiagnosticReport: DiagnosticReport | null = null;
 // localeCompare with options builds a collator per call, which dominates sorts of 100k+ files.
 const naturalCollator = new Intl.Collator(undefined, {
   numeric: true,
@@ -4905,6 +5282,11 @@ async function createWindow() {
   );
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
     runtimeLog("render-process-gone", { ...details });
+    if (!shuttingDown)
+      createAppCrashDiagnosticReport("The Silo interface process stopped.", {
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
     const window = mainWindow;
     if (!window || window.isDestroyed()) return;
     rendererReady = false;
@@ -5796,6 +6178,21 @@ function installApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  loadPendingDiagnosticReport();
+  const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
+  if (previousSessionWasUnclosed)
+    createAppCrashDiagnosticReport("The previous Silo session did not close normally.");
+  try {
+    fs.writeFileSync(
+      activeSessionMarkerPath,
+      JSON.stringify({ startedAt: new Date().toISOString(), version: app.getVersion() }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+  } catch (error) {
+    runtimeLog("diagnostic-session-marker-failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
   // Packaged builds carry the .icns in the bundle; development runs from Electron.app.
   if (!app.isPackaged) app.dock?.setIcon(appIconPath());
   installApplicationMenu();
@@ -5914,6 +6311,7 @@ app.whenReady().then(async () => {
     unifiedScanSource,
     (progress) => {
       sendIndexProgress(progress);
+      monitorIndexing(progress);
       const statusChanged = progress.status !== lastSemanticProgressStatus;
       lastSemanticProgressStatus = progress.status;
       const now = Date.now();
@@ -5945,7 +6343,7 @@ app.whenReady().then(async () => {
       if (statusChanged)
         scheduleThumbnailPregeneration(progress.status === "indexing");
     },
-    runtimeLog,
+    logIndexingDiagnostic,
     indexStorageRoot,
   );
   semanticIndexer.setPerformanceSettings(
@@ -6482,7 +6880,10 @@ app.whenReady().then(async () => {
       lane: "background",
       blockedReason: analysisBlocker,
       progress: () => semanticIndexer.getProgress(),
-      ready: () => indexStorageAvailable && startupIndexReconciliationSettled && analysisIdle(),
+      ready: () =>
+        indexStorageAvailable &&
+        analysisIdle() &&
+        (startupIndexReconciliationSettled || semanticIndexer.hasPendingIndexWork()),
       unresolvedWork: () => {
         const count = semanticIndexer.getRetryableErrorCount(recoverySearchSourcePaths);
         const coverageErrors = semanticIndexer.getSourceCoverageProgress(
@@ -6714,6 +7115,7 @@ app.whenReady().then(async () => {
   diagnosticsTimer = setInterval(() => {
     const memory = process.memoryUsage();
     const progress = semanticIndexer.getProgress();
+    monitorIndexing(progress);
     const faceProgress = faceIndexer.getProgress();
     const geoState = geoIndexer.getStatus();
     const duplicateState = duplicateManager.getState();
@@ -6782,6 +7184,15 @@ app.on("before-quit", (event) => {
   ]);
   const deadline = new Promise((resolve) => setTimeout(resolve, 8000));
   void Promise.race([flush, deadline]).finally(() => app.quit());
+});
+app.on("will-quit", () => {
+  try {
+    fs.rmSync(activeSessionMarkerPath, { force: true });
+  } catch (error) {
+    runtimeLog("diagnostic-session-marker-remove-failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 app.on("activate", () => {
@@ -8929,6 +9340,22 @@ async function readRuntimeDiagnostics(cursorValue: unknown) {
 }
 
 ipcMain.handle("get-runtime-diagnostics", (_event, cursor: unknown) => readRuntimeDiagnostics(cursor));
+ipcMain.handle("get-pending-diagnostic-report", (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return null;
+  return pendingDiagnosticReport;
+});
+ipcMain.handle("dismiss-diagnostic-report", (event, reportId: unknown) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return false;
+  if (
+    typeof reportId === "string" &&
+    pendingDiagnosticReport?.id === reportId
+  ) {
+    pendingDiagnosticReport = null;
+    fs.rmSync(pendingDiagnosticReportPath, { force: true });
+    return true;
+  }
+  return false;
+});
 
 ipcMain.handle("get-indexing-overview", async () => {
   const registeredSources = Array.from(
@@ -9841,22 +10268,32 @@ ipcMain.handle(
       const relayBase = new URL(lifetimePaymentRelayBaseUrl);
       if (relayBase.protocol !== "https:")
         throw new Error("The card payment relay must use HTTPS.");
-      const response = await net.fetch(
-        `${relayBase.origin}/api/purchase/${encodeURIComponent(purchaseIdValue)}`,
+      const response = await requestRelayJson(
+        new URL(
+          `${relayBase.origin}/api/purchase/${encodeURIComponent(purchaseIdValue)}`,
+        ),
         {
+          method: "GET",
           headers: { "x-silo-claim-token": claimTokenValue },
-          redirect: "error",
+          timeoutMs: 15000,
+          timeoutMessage: "The payment status request timed out.",
         },
       );
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok)
+      const payload = response.payload;
+      if (!response.ok) {
+        const message =
+          typeof payload.error === "string"
+            ? payload.error
+            : "The license relay could not be reached.";
+        runtimeLog("lifetime-license-poll-http-error", {
+          status: response.statusCode,
+          message: message.slice(0, 500),
+        });
         return {
           status: "error" as const,
-          message:
-            typeof payload.error === "string"
-              ? payload.error
-              : "The license relay could not be reached.",
+          message: `${message} (HTTP ${response.statusCode})`,
         };
+      }
       if (payload.status === "verified" && typeof payload.signature === "string")
         return {
           status: "verified" as const,
@@ -9872,7 +10309,14 @@ ipcMain.handle(
             ? payload.message
             : "Waiting for Solana to finalize the card payment.",
       };
-    } catch {
+    } catch (error) {
+      runtimeLog("lifetime-license-poll-network-error", {
+        name: error instanceof Error ? error.name : "UnknownError",
+        message: (error instanceof Error ? error.message : String(error)).slice(
+          0,
+          500,
+        ),
+      });
       return {
         status: "error" as const,
         message: "The license relay is temporarily unavailable. Silo will keep checking.",
@@ -9881,18 +10325,45 @@ ipcMain.handle(
   },
 );
 ipcMain.handle("is-demo-mode", () => !fullAccessEnabled());
-ipcMain.handle("get-bug-report-status", () => {
+ipcMain.handle("get-bug-report-status", async () => {
   const configuredEndpoint =
     process.env.SILO_BUG_REPORT_ENDPOINT?.trim() || defaultBugReportEndpoint;
+  let endpoint: URL;
   try {
-    const endpoint = new URL(configuredEndpoint);
+    endpoint = new URL(configuredEndpoint);
     if (endpoint.protocol !== "https:")
       throw new Error("HTTPS is required for the report relay.");
-    return { available: true, message: "Reports are sent securely by email." };
   } catch {
     return {
       available: false,
       message: "The report relay needs a valid HTTPS endpoint.",
+    };
+  }
+  try {
+    const response = await requestRelayJson(endpoint, {
+      method: "GET",
+      timeoutMs: 8000,
+      timeoutMessage: "The report relay check timed out.",
+    });
+    if (
+      response.statusCode >= 200 &&
+      response.statusCode < 500 &&
+      response.statusCode !== 404
+    )
+      return {
+        available: true,
+        message: "The secure report relay is reachable.",
+      };
+    return {
+      available: false,
+      message: response.statusCode
+        ? `The report relay returned HTTP ${response.statusCode}.`
+        : "The report relay did not return a valid response.",
+    };
+  } catch {
+    return {
+      available: false,
+      message: "Silo could not reach the secure report relay.",
     };
   }
 });
@@ -9956,26 +10427,24 @@ ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
     screenshotBase64 = match[1];
   }
 
-  const abortController = new AbortController();
-  const timeout = setTimeout(() => abortController.abort(), 15000);
   try {
-    const response = await net.fetch(endpoint.href, {
+    const response = await requestRelayJson(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      body: {
         message,
         feature: feature || null,
         screenshotBase64,
         appVersion: app.getVersion(),
         platform: process.platform,
         createdAt: new Date().toISOString(),
-      }),
-      signal: abortController.signal,
+      },
+      timeoutMs: 15000,
+      timeoutMessage: "The report relay request timed out.",
     });
     if (!response.ok)
       return {
         ok: false,
-        error: `The report relay returned HTTP ${response.status}.`,
+        error: `The report relay returned HTTP ${response.statusCode}.`,
       };
     return { ok: true };
   } catch {
@@ -9983,8 +10452,6 @@ ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
       ok: false,
       error: "Silo could not reach the report relay. Your report is still here.",
     };
-  } finally {
-    clearTimeout(timeout);
   }
 });
 ipcMain.handle("get-demo-testing-mode", () => ({
@@ -10066,19 +10533,17 @@ ipcMain.handle(
       app.getVersion(),
       process.platform,
     );
-    const abortController = new AbortController();
-    const timeout = setTimeout(() => abortController.abort(), 15000);
     try {
-      const response = await net.fetch(endpoint.href, {
+      const response = await requestRelayJson(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: abortController.signal,
+        body: payload,
+        timeoutMs: 15000,
+        timeoutMessage: "The beta request relay timed out.",
       });
       if (!response.ok)
         return {
           ok: false,
-          error: `The beta request relay returned HTTP ${response.status}.`,
+          error: `The beta request relay returned HTTP ${response.statusCode}.`,
         };
       return { ok: true };
     } catch {
@@ -10086,8 +10551,6 @@ ipcMain.handle(
         ok: false,
         error: "Silo could not reach the beta request relay. Try again when online.",
       };
-    } finally {
-      clearTimeout(timeout);
     }
   },
 );

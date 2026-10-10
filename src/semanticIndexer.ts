@@ -19,7 +19,7 @@ import { ChildProcess, execFile, fork } from "child_process";
 import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
-const EMBEDDING_REQUEST_TIMEOUT_MS = 90_000;
+const SLOW_EMBEDDING_REQUEST_WARNING_MS = 90_000;
 
 class EmbeddingProcessError extends Error {
   constructor(
@@ -302,6 +302,7 @@ export class SemanticIndexer {
     {
       pendingCount: number;
       requestTypes: string[];
+      failureReason?: string;
     }
   >();
   private embeddingRequestId = 0;
@@ -309,7 +310,7 @@ export class SemanticIndexer {
     number,
     {
       type: "preload" | "text" | "image";
-      timer: NodeJS.Timeout;
+      timer: NodeJS.Timeout | null;
       resolve: (values: number[]) => void;
       reject: (error: Error) => void;
     }
@@ -2945,8 +2946,16 @@ export class SemanticIndexer {
       const request = this.embeddingRequests.get(message.id);
       if (!request) return;
       this.embeddingRequests.delete(message.id);
-      clearTimeout(request.timer);
+      if (request.timer) clearTimeout(request.timer);
       if (typeof message.error === "string") {
+        const diagnosticMessage = message.error
+          .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "[path]")
+          .slice(0, 1200);
+        this.onDiagnostic("semantic-worker-request-failed", {
+          requestType: request.type,
+          infrastructure: Boolean(message.infrastructure),
+          message: diagnosticMessage,
+        });
         const error =
           message.infrastructure || request.type === "preload"
             ? new EmbeddingProcessError(
@@ -3031,6 +3040,10 @@ export class SemanticIndexer {
     error: EmbeddingProcessError,
   ) {
     if (this.embeddingWorker !== worker) return;
+    const diagnosticReason = error.message
+      .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "[path]")
+      .slice(0, 1200);
+    const previousExitDetails = this.embeddingExitDetails.get(worker);
     this.embeddingExitDetails.set(worker, {
       pendingCount: this.embeddingRequests.size,
       requestTypes: [
@@ -3038,12 +3051,13 @@ export class SemanticIndexer {
           [...this.embeddingRequests.values()].map((request) => request.type),
         ),
       ],
+      failureReason: diagnosticReason || previousExitDetails?.failureReason,
     });
     this.embeddingWorker = null;
     this.clipRuntime = null;
     this.clipRuntimePromise = null;
     for (const request of this.embeddingRequests.values()) {
-      clearTimeout(request.timer);
+      if (request.timer) clearTimeout(request.timer);
       request.reject(error);
     }
     this.embeddingRequests.clear();
@@ -3065,17 +3079,16 @@ export class SemanticIndexer {
     const id = ++this.embeddingRequestId;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.onDiagnostic("semantic-worker-timeout", {
+        // A slow model request is not a failed request: keep it pending so the
+        // persisted index can continue as soon as the worker responds. In
+        // particular, never kill the only semantic worker because one file
+        // takes longer than expected on a slower machine.
+        this.onDiagnostic("semantic-worker-slow-request", {
           requestType: type,
           pendingCount: this.embeddingRequests.size,
+          thresholdMs: SLOW_EMBEDDING_REQUEST_WARNING_MS,
         });
-        this.failEmbeddingWorker(
-          worker,
-          new EmbeddingProcessError(
-            "Semantic embedding request exceeded 90 seconds.",
-          ),
-        );
-      }, EMBEDDING_REQUEST_TIMEOUT_MS);
+      }, SLOW_EMBEDDING_REQUEST_WARNING_MS);
       this.embeddingRequests.set(id, { type, timer, resolve, reject });
       try {
         worker.send({ id, type, ...payload }, (error) => {
@@ -3412,8 +3425,16 @@ export class SemanticIndexer {
     try {
       // Stream the file instead of loading it all into memory to avoid OOM with large indexes
       const readline = require("readline") as any;
+      let recordsStats = await fsPromises.stat(this.recordsPath).catch(() => null);
+      if (!recordsStats) {
+        // Establish the journal before creating a stream. Starting a read stream
+        // for a missing file can emit ENOENT before readline has attached its
+        // error listener during a fresh profile's first startup.
+        await fsPromises.writeFile(this.recordsPath, "", { flag: "a" });
+        recordsStats = await fsPromises.stat(this.recordsPath);
+      }
+      const totalBytes = recordsStats.size;
       const fileStream = fs.createReadStream(this.recordsPath);
-      const totalBytes = (await fsPromises.stat(this.recordsPath).catch(() => null))?.size ?? 0;
       let lastReport = 0;
       const rl = readline.createInterface({
         input: fileStream,

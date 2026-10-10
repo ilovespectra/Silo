@@ -36,7 +36,7 @@ const persistedVectorIndex_1 = require("./persistedVectorIndex");
 const child_process_1 = require("child_process");
 const util_1 = require("util");
 const execFileAsync = (0, util_1.promisify)(child_process_1.execFile);
-const EMBEDDING_REQUEST_TIMEOUT_MS = 90000;
+const SLOW_EMBEDDING_REQUEST_WARNING_MS = 90000;
 class EmbeddingProcessError extends Error {
     constructor(message, nativeImageCrash = false) {
         super(message);
@@ -2331,8 +2331,17 @@ class SemanticIndexer {
             if (!request)
                 return;
             this.embeddingRequests.delete(message.id);
-            clearTimeout(request.timer);
+            if (request.timer)
+                clearTimeout(request.timer);
             if (typeof message.error === "string") {
+                const diagnosticMessage = message.error
+                    .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "[path]")
+                    .slice(0, 1200);
+                this.onDiagnostic("semantic-worker-request-failed", {
+                    requestType: request.type,
+                    infrastructure: Boolean(message.infrastructure),
+                    message: diagnosticMessage,
+                });
                 const error = message.infrastructure || request.type === "preload"
                     ? new EmbeddingProcessError(`Semantic model initialization failed: ${message.error}`)
                     : new Error(message.error);
@@ -2394,17 +2403,23 @@ class SemanticIndexer {
     failEmbeddingWorker(worker, error) {
         if (this.embeddingWorker !== worker)
             return;
+        const diagnosticReason = error.message
+            .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "[path]")
+            .slice(0, 1200);
+        const previousExitDetails = this.embeddingExitDetails.get(worker);
         this.embeddingExitDetails.set(worker, {
             pendingCount: this.embeddingRequests.size,
             requestTypes: [
                 ...new Set([...this.embeddingRequests.values()].map((request) => request.type)),
             ],
+            failureReason: diagnosticReason || previousExitDetails?.failureReason,
         });
         this.embeddingWorker = null;
         this.clipRuntime = null;
         this.clipRuntimePromise = null;
         for (const request of this.embeddingRequests.values()) {
-            clearTimeout(request.timer);
+            if (request.timer)
+                clearTimeout(request.timer);
             request.reject(error);
         }
         this.embeddingRequests.clear();
@@ -2419,12 +2434,16 @@ class SemanticIndexer {
         const id = ++this.embeddingRequestId;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                this.onDiagnostic("semantic-worker-timeout", {
+                // A slow model request is not a failed request: keep it pending so the
+                // persisted index can continue as soon as the worker responds. In
+                // particular, never kill the only semantic worker because one file
+                // takes longer than expected on a slower machine.
+                this.onDiagnostic("semantic-worker-slow-request", {
                     requestType: type,
                     pendingCount: this.embeddingRequests.size,
+                    thresholdMs: SLOW_EMBEDDING_REQUEST_WARNING_MS,
                 });
-                this.failEmbeddingWorker(worker, new EmbeddingProcessError("Semantic embedding request exceeded 90 seconds."));
-            }, EMBEDDING_REQUEST_TIMEOUT_MS);
+            }, SLOW_EMBEDDING_REQUEST_WARNING_MS);
             this.embeddingRequests.set(id, { type, timer, resolve, reject });
             try {
                 worker.send({ id, type, ...payload }, (error) => {

@@ -266,10 +266,12 @@ export function BugReportDialog({
   onClose,
   onSubmitted,
   onScreenshotSelectionChange,
+  diagnosticReport = null,
 }: {
   onClose: () => void;
   onSubmitted: () => void;
   onScreenshotSelectionChange: (selecting: boolean) => void;
+  diagnosticReport?: IndexingDiagnosticReport | null;
 }) {
   const electronAPI = window.electron;
   const [relayStatus, setRelayStatus] = useState<{
@@ -282,6 +284,7 @@ export function BugReportDialog({
   const [features, setFeatures] = useState<string[]>([]);
   const [feature, setFeature] = useState("");
   const [message, setMessage] = useState("");
+  const [diagnosticConsent, setDiagnosticConsent] = useState(false);
   const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(
     null,
   );
@@ -301,6 +304,20 @@ export function BugReportDialog({
   const screenshotActionRef = React.useRef<HTMLButtonElement>(null);
   const selectionWasActive = React.useRef(false);
   const pointerPositionRef = React.useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    if (!diagnosticReport) return;
+    setMessage(diagnosticReport.message);
+    setFeature(
+      diagnosticReport.reason === "indexing-error" ||
+        diagnosticReport.reason === "indexing-stalled"
+        ? "Indexing"
+        : "App crash",
+    );
+    setDiagnosticConsent(false);
+    setScreenshotDataUrl(null);
+    setNotice("");
+  }, [diagnosticReport?.id]);
 
   useEffect(() => {
     let active = true;
@@ -478,6 +495,10 @@ export function BugReportDialog({
       setNotice("Add a short description before sending your report.");
       return;
     }
+    if (diagnosticReport && !diagnosticConsent) {
+      setNotice("Confirm email consent before sending this diagnostic report.");
+      return;
+    }
     if (!relayStatus.available) {
       setNotice(relayStatus.message);
       return;
@@ -549,6 +570,25 @@ export function BugReportDialog({
           A screenshot is attached only if you choose one; source paths are not
           added automatically.
         </p>
+        {diagnosticReport && (
+          <div className="bug-report-diagnostic-consent">
+            <p>
+              Silo generated this diagnostic report locally. Review or edit it
+              below. No filenames, folder paths, file contents, or screenshot
+              are included automatically; you can add a screenshot yourself.
+              Nothing is sent unless you consent and press Send report.
+            </p>
+            <label>
+              <input
+                type="checkbox"
+                checked={diagnosticConsent}
+                onChange={(event) => setDiagnosticConsent(event.target.checked)}
+                disabled={busy || sent}
+              />
+              I agree to email this report to tani@kolektivkrog.si.
+            </label>
+          </div>
+        )}
         <label className="bug-report-field">
           <span>What happened?</span>
           <textarea
@@ -570,6 +610,7 @@ export function BugReportDialog({
             disabled={busy || sent}
           >
             <option value="">Choose a visible feature…</option>
+            <option value="Indexing">Indexing</option>
             {features.map((label) => (
               <option key={label} value={label}>
                 {label}
@@ -641,9 +682,15 @@ export function BugReportDialog({
           <button
             className="settings-save"
             type="submit"
-            disabled={busy || sent}
+            disabled={busy || sent || Boolean(diagnosticReport && !diagnosticConsent)}
           >
-            {busy ? "Sending…" : sent ? "Report sent" : "Send report"}
+            {busy
+              ? "Sending…"
+              : sent
+                ? "Report sent"
+                : diagnosticReport
+                  ? "Send diagnostic report"
+                  : "Send report"}
           </button>
         </footer>
         </form>

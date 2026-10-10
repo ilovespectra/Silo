@@ -334,7 +334,9 @@ async function testNewFilesDetection(): Promise<void> {
 async function testNewFilesDuringActiveScan(): Promise<void> {
   console.log("\n✓ Test: Indexing new files added during an active scan");
 
-  imageReadDelayMs = 1600;
+  // Keep indexing active through the watcher debounce without letting the default
+  // 5% background budget stretch this correctness check beyond its timeout.
+  imageReadDelayMs = 300;
   await createTestFile("initial.jpg");
   await semanticIndexer.startWatching([testSourceDir]);
   const initialRun = semanticIndexer.start([testSourceDir]);

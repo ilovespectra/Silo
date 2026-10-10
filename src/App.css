@@ -305,6 +305,59 @@ body {
   border-left: 1px solid var(--line);
 }
 
+.preview-construction-banner {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  padding: 9px clamp(14px, 1.5vw, 24px);
+  border-bottom: 1px solid var(--border-warning);
+  background: var(--surface-warning);
+  color: var(--warning-text);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.preview-construction-banner > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.preview-construction-banner strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.preview-construction-banner button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 5px 11px;
+  border: 1px solid var(--border-warning);
+  border-radius: 6px;
+  background: var(--surface-control);
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.preview-construction-banner button:hover {
+  background: var(--surface-hover);
+}
+
+@media (max-width: 680px) {
+  .preview-construction-banner {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .preview-construction-banner button {
+    align-self: flex-start;
+  }
+}
+
 .app-notice-stack {
   position: fixed;
   z-index: 1200;
@@ -8283,6 +8336,27 @@ input[type="range"]::-moz-range-progress {
 .bug-report-screenshot-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .bug-report-screenshot-actions .settings-secondary { min-height: 32px; padding: 0 10px; }
 .bug-report-screenshot-preview { display: block; width: 100%; max-height: 230px; object-fit: contain; border: 1px solid var(--line); border-radius: 5px; background: #09090a; }
+.bug-report-diagnostic-consent {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-warning);
+  border-radius: 7px;
+  background: var(--surface-warning);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.bug-report-diagnostic-consent p { margin: 0; }
+.bug-report-diagnostic-consent label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text);
+  font-weight: 700;
+}
+.bug-report-diagnostic-consent input { margin-top: 2px; }
+
 .bug-report-relay,
 .bug-report-notice { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
 .bug-report-relay.ready,

@@ -272,6 +272,14 @@ async function validateExternalVolume(userDataPath, storageRoot) {
         getExistingAncestor(storageRoot),
         fsPromises.stat(userDataPath),
     ]);
+    // On macOS, /Volumes itself is only a mount-point container. If the
+    // selected volume is absent, treating that container as the destination
+    // volume can pass the device check and make Silo try to create a path under
+    // /Volumes. Report it as unavailable so the configured local fallback works.
+    if (process.platform === "darwin" &&
+        path.resolve(existingAncestor) === path.resolve("/Volumes") &&
+        path.resolve(storageRoot) !== path.resolve("/Volumes"))
+        throw new ExternalIndexStorageUnavailableError(storageRoot);
     const volume = await fsPromises.stat(existingAncestor);
     if (volume.dev === userData.dev) {
         if (!(await exists(storageRoot)))

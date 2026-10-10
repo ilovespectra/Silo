@@ -490,6 +490,15 @@ interface IndexProgress {
   message: string;
 }
 
+interface DiagnosticReport {
+  id: string;
+  createdAt: number;
+  reason: "indexing-error" | "indexing-stalled" | "app-crash";
+  message: string;
+}
+
+type IndexingDiagnosticReport = DiagnosticReport;
+
 interface FileScanProgress {
   inventory?: { inventoryToken: string; total: number };
   requestId: number;
@@ -983,6 +992,11 @@ interface Window {
       callback: (progress: SemanticSearchProgress) => void,
     ): () => void;
     onIndexProgress(callback: (progress: IndexProgress) => void): () => void;
+    getPendingDiagnosticReport(): Promise<DiagnosticReport | null>;
+    dismissDiagnosticReport(reportId: string): Promise<boolean>;
+    onDiagnosticReport(
+      callback: (report: DiagnosticReport) => void,
+    ): () => void;
     getSearchIndexReadiness(): Promise<SearchIndexReadiness>;
     onSearchIndexReadiness(
       callback: (status: SearchIndexReadiness) => void,

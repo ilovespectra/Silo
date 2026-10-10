@@ -758,6 +758,8 @@ function App() {
   );
   const [showSettings, setShowSettings] = useState(false);
   const [showBugReport, setShowBugReport] = useState(false);
+  const [indexingDiagnosticReport, setIndexingDiagnosticReport] =
+    useState<DiagnosticReport | null>(null);
   const [showBugThanks, setShowBugThanks] = useState(false);
   const [showBugReportToast, setShowBugReportToast] = useState(false);
   const [bugReportToastFading, setBugReportToastFading] = useState(false);
@@ -1426,6 +1428,27 @@ function App() {
   }, [hydrated, showTourAtStartup]);
 
   useEffect(() => {
+    if (!electronAPI) return;
+    let active = true;
+    const showDiagnosticReport = (report: DiagnosticReport | null) => {
+      if (!active || !report) return;
+      setIndexingDiagnosticReport(report);
+      setShowBugReport(true);
+    };
+    const removeListener = electronAPI.onDiagnosticReport((report) =>
+      showDiagnosticReport(report),
+    );
+    void electronAPI
+      .getPendingDiagnosticReport()
+      .then(showDiagnosticReport)
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      removeListener();
+    };
+  }, [electronAPI]);
+
+  useEffect(() => {
     if (!showBugReportToast) return;
     setBugReportToastFading(false);
     const fadeTimer = window.setTimeout(() => setBugReportToastFading(true), 3000);
@@ -1470,6 +1493,9 @@ function App() {
   }, [startupState.ready]);
 
   const handleBugReportSubmitted = useCallback(() => {
+    if (indexingDiagnosticReport)
+      void electronAPI?.dismissDiagnosticReport(indexingDiagnosticReport.id);
+    setIndexingDiagnosticReport(null);
     setShowBugReport(false);
     setSelectingBugReportScreenshot(false);
     let hideThanks = false;
@@ -1480,7 +1506,7 @@ function App() {
     }
     if (hideThanks) setShowBugReportToast(true);
     else setShowBugThanks(true);
-  }, []);
+  }, [electronAPI, indexingDiagnosticReport]);
 
   useEffect(() => {
     sortRef.current = sort;
@@ -5065,6 +5091,20 @@ function App() {
 
   return (
     <div className="app">
+      <div className="preview-construction-banner" role="note">
+        <div>
+          <strong>Silo is under construction!</strong>
+          <span>
+            Downloads are welcome: these are early pre-release builds for testing.
+            Some features may be unavailable or unfinished. This is not the full
+            demo mode; we’ll announce when the official demo is live. Thanks for
+            trying Silo. If something isn’t working, please report it.
+          </span>
+        </div>
+        <button type="button" onClick={() => setShowBugReport(true)}>
+          Report a Bug
+        </button>
+      </div>
       {!(startupState.ready && hydrated) && (
         <div className="startup-progress" role="status" aria-live="polite">
           <div className="startup-progress-track">
@@ -8204,7 +8244,11 @@ function App() {
       )}
       {showBugReport && (
         <BugReportDialog
+          diagnosticReport={indexingDiagnosticReport}
           onClose={() => {
+            if (indexingDiagnosticReport)
+              void electronAPI.dismissDiagnosticReport(indexingDiagnosticReport.id);
+            setIndexingDiagnosticReport(null);
             setShowBugReport(false);
             setSelectingBugReportScreenshot(false);
           }}

@@ -233,6 +233,15 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.on("index-progress", listener);
     return () => ipcRenderer.removeListener("index-progress", listener);
   },
+  getPendingDiagnosticReport: () =>
+    ipcRenderer.invoke("get-pending-diagnostic-report"),
+  dismissDiagnosticReport: (reportId) =>
+    ipcRenderer.invoke("dismiss-diagnostic-report", reportId),
+  onDiagnosticReport: (callback) => {
+    const listener = (_event, report) => callback(report);
+    ipcRenderer.on("diagnostic-report", listener);
+    return () => ipcRenderer.removeListener("diagnostic-report", listener);
+  },
   getSearchIndexReadiness: () =>
     ipcRenderer.invoke("get-search-index-readiness"),
   onSearchIndexReadiness: (callback) => {

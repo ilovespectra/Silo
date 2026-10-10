@@ -10,6 +10,12 @@ const activeStatuses = new Set([
   "clustering",
 ]);
 
+const stageErrorStyle: React.CSSProperties = {
+  overflowWrap: "anywhere",
+  whiteSpace: "normal",
+  lineHeight: 1.4,
+};
+
 const stageDescriptions: Record<string, string> = {
   startup: "Opening saved indexes",
   discovery: "Finding files in connected sources",
@@ -164,6 +170,9 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
               ? Math.min(100, Math.round((processed / total) * 100))
               : 0;
         const processDescription = stageDescriptions[stage.id] ?? "Indexing files";
+        const showStageReason =
+          (stage.status === "error" || stage.status === "paused") &&
+          Boolean(stage.message?.trim());
         return (
           <div
             key={stage.id}
@@ -187,8 +196,48 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
             <small className="indexing-stage-message" title={stage.message}>
               {processDescription}
             </small>
+            {showStageReason && (
+              <small
+                role={stage.status === "error" ? "alert" : undefined}
+                className="indexing-stage-errors"
+                style={stageErrorStyle}
+              >
+                {stage.message}
+              </small>
+            )}
+            {stage.recoveryError && stage.recoveryError !== stage.message && (
+              <small
+                role="alert"
+                className="indexing-stage-errors"
+                style={stageErrorStyle}
+              >
+                Retry error: {stage.recoveryError}
+              </small>
+            )}
+            {stage.recoveryRunning && (
+              <small className="indexing-stage-errors" style={stageErrorStyle}>
+                Retry is running.
+              </small>
+            )}
+            {stage.resumeQueued && (
+              <small className="indexing-stage-errors" style={stageErrorStyle}>
+                Retry queued{stage.blockedReason ? ` · Waiting: ${stage.blockedReason}` : "."}
+              </small>
+            )}
+            {!stage.resumeQueued &&
+              !stage.recoveryRunning &&
+              stage.status === "error" &&
+              stage.blockedReason && (
+                <small className="indexing-stage-errors" style={stageErrorStyle}>
+                  Retry blocked: {stage.blockedReason}
+                </small>
+              )}
             {stageRetryError?.id === stage.id && (
-              <small role="alert" className="indexing-stage-errors">
+              <small
+                role="alert"
+                className="indexing-stage-errors"
+                style={stageErrorStyle}
+              >
                 {stageRetryError.message}
               </small>
             )}

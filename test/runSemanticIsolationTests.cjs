@@ -344,29 +344,38 @@ test("real child IPC preserves embedding APIs; native-style death rejects all pe
   assert.equal(indexer.clipRuntime, recovered);
 });
 
-test("90-second deadline kills a hung child, clears timers, and does not respawn", async (t) => {
+test("90-second slow-request warning preserves the pending request and worker", async (t) => {
   const { indexer, children, timers, diagnostics } = makeIndexer(t, {
     fakeTimers: true,
   });
   const runtime = await indexer.loadClipRuntime();
   assert.ok(timers[0].cleared);
-  const exited = once(children[0], "exit");
   const pending = indexer.requestWorkerEmbedding(
     "text",
     { text: "hold" },
     runtime.child,
   );
-  const rejected = assert.rejects(pending, /exceeded 90 seconds/);
+  const outcome = pending.then(
+    (values) => ({ values }),
+    (error) => ({ error }),
+  );
   timers[1].callback();
-  await rejected;
-  await exited;
-  assert.ok(timers.every((timer) => timer.cleared));
-  assert.equal(indexer.embeddingRequests.size, 0);
-  assert.equal(indexer.clipRuntimePromise, null);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(indexer.embeddingRequests.size, 1);
+  assert.equal(children[0].exitCode, null);
+  assert.equal(children[0].signalCode, null);
+  assert.equal(indexer.clipRuntime, runtime);
   assert.equal(children.length, 1);
   assert.ok(
-    diagnostics.some((entry) => entry.event === "semantic-worker-timeout"),
+    diagnostics.some((entry) => entry.event === "semantic-worker-slow-request"),
   );
+
+  children[0].send({ text: "release-held" });
+  const result = await outcome;
+  assert.equal(result.error, undefined);
+  assert.equal(result.values.length, 512);
+  assert.equal(indexer.embeddingRequests.size, 0);
+  assert.ok(timers.every((timer) => timer.cleared));
 });
 
 test("malformed vectors retire the child instead of corrupting the index", async (t) => {
