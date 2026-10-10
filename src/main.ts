@@ -11,6 +11,7 @@ import {
   shell,
 } from "electron";
 import { createHash, randomBytes } from "crypto";
+import * as https from "https";
 import { execFile, spawn } from "child_process";
 import { Readable, Transform } from "stream";
 import { pipeline } from "stream/promises";
@@ -243,6 +244,70 @@ const lifetimeRpcEndpoint =
 const lifetimePaymentRelayBaseUrl = (
   process.env.SILO_PAYMENT_RELAY_URL || "https://license.kolektivkrog.si"
 ).replace(/\/$/, "");
+
+async function requestLifetimeCardPurchase(
+  endpoint: URL,
+  installationId: string,
+): Promise<{
+  ok: boolean;
+  statusCode: number;
+  payload: Record<string, any>;
+}> {
+  const body = JSON.stringify({ installationId });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (
+      error?: Error,
+      result?: {
+        ok: boolean;
+        statusCode: number;
+        payload: Record<string, any>;
+      },
+    ) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(requestTimeout);
+      if (error) reject(error);
+      else resolve(result!);
+    };
+    const request = https.request(
+      endpoint,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer | string) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        response.on("error", (error) => finish(error));
+        response.on("end", () => {
+          let payload: Record<string, any> = {};
+          try {
+            const parsed: unknown = JSON.parse(
+              Buffer.concat(chunks).toString("utf8"),
+            );
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+              payload = parsed as Record<string, any>;
+          } catch {}
+          const statusCode = response.statusCode || 0;
+          finish(undefined, {
+            ok: statusCode >= 200 && statusCode < 300,
+            statusCode,
+            payload,
+          });
+        });
+      },
+    );
+    const requestTimeout = setTimeout(
+      () => request.destroy(new Error("The payment relay request timed out.")),
+      15000,
+    );
+    request.on("error", (error) => finish(error));
+    request.end(body);
+  });
+}
 
 async function requestLifetimeRpc(
   method: string,
@@ -9722,12 +9787,11 @@ ipcMain.handle("begin-lifetime-card-purchase", async () => {
     if (relayBase.protocol !== "https:" && relayBase.hostname !== "localhost")
       throw new Error("The card payment relay must use HTTPS.");
 
-    const response = await net.fetch(`${relayBase.origin}/api/purchase`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ installationId }),
-    });
-    const payload = await response.json().catch(() => ({}));
+    const response = await requestLifetimeCardPurchase(
+      new URL(`${relayBase.origin}/api/purchase`),
+      installationId,
+    );
+    const payload = response.payload;
     if (!response.ok)
       throw new Error(
         typeof payload.error === "string"
