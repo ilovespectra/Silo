@@ -32,6 +32,14 @@ const categoryLabels: Record<LibraryCategory, string> = {
   other: "Other files",
 };
 const categoryOrder: LibraryCategory[] = ["image", "video", "audio", "document", "archive", "other"];
+const categoryColors: Record<LibraryCategory, string> = {
+  image: "#f18943",
+  video: "#a58bf6",
+  audio: "#56b8a6",
+  document: "#72a6ee",
+  archive: "#dfb04d",
+  other: "#8c9299",
+};
 const activeIndexerStatuses = new Set(["scanning", "loading-model", "indexing", "generating", "clustering"]);
 
 function isLibraryDashboardSnapshot(value: unknown): value is LibraryDashboardSnapshot {
@@ -283,7 +291,25 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
       ),
       shelterClock,
     );
-  const maxCategoryFiles = Math.max(1, ...categoryOrder.map((category) => categories[category]?.files ?? 0));
+  const inventoryValues = categoryOrder.map((category) => ({
+    category,
+    files: Math.max(0, categories[category]?.files ?? 0),
+    bytes: categories[category]?.bytes ?? 0,
+  }));
+  const totalCategoryFiles = inventoryValues.reduce((total, item) => total + item.files, 0);
+  let pieAngle = 0;
+  const pieStops = inventoryValues
+    .filter((item) => item.files > 0 && totalCategoryFiles > 0)
+    .map(({ category, files }) => {
+      const start = pieAngle;
+      pieAngle += (files / totalCategoryFiles) * 360;
+      return `${categoryColors[category]} ${start}deg ${pieAngle}deg`;
+    });
+  const inventoryPieLabel = totalCategoryFiles > 0
+    ? `${totalCategoryFiles.toLocaleString()} files by category`
+    : snapshot
+      ? "No files in the inventory yet"
+      : "Inventory chart will appear when data loads";
 
   const toggleSource = (id: string) => setSelectedIds((current) => {
     const next = new Set(current);
@@ -373,15 +399,35 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
             <div className="stats-heading-icon"><FiDatabase /></div>
             <div><span className="stats-kicker">INVENTORY MIX</span><h2>Files by category</h2></div>
           </header>
-          <div className="stats-category-list">
-            {categoryOrder.map((category) => {
-              const value = categories[category] ?? { files: 0, bytes: 0 };
-              const percent = Math.round((value.files / maxCategoryFiles) * 100);
-              return <div className="stats-category-row" key={category}>
-                <div className="stats-category-title"><strong>{categoryLabels[category]}</strong><span>{snapshot ? `${value.files.toLocaleString()} files · ${formatBytes(value.bytes)}` : "Awaiting live inventory"}</span></div>
-                <div className="stats-category-track"><div style={{ width: `${percent}%` }} /></div>
-              </div>;
-            })}
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(128px, 0.8fr) minmax(0, 1.2fr)", alignItems: "center", gap: 18 }}>
+            <div
+              role="img"
+              aria-label={inventoryPieLabel}
+              style={{
+                width: "min(100%, 190px)",
+                aspectRatio: "1",
+                justifySelf: "center",
+                border: "1px solid var(--line)",
+                borderRadius: "50%",
+                background: pieStops.length ? `conic-gradient(${pieStops.join(", ")})` : "var(--raised)",
+              }}
+            />
+            <div style={{ display: "grid", gap: 9, minWidth: 0 }}>
+              {inventoryValues.map(({ category, files, bytes }) => {
+                const percent = totalCategoryFiles > 0
+                  ? Math.round((files / totalCategoryFiles) * 100)
+                  : 0;
+                return <div key={category} style={{ display: "grid", gridTemplateColumns: "10px minmax(0, 1fr)", alignItems: "start", gap: 8 }}>
+                  <span aria-hidden="true" style={{ width: 9, height: 9, marginTop: 3, borderRadius: 2, background: categoryColors[category] }} />
+                  <span style={{ minWidth: 0 }}>
+                    <strong style={{ display: "block", fontSize: 11 }}>{categoryLabels[category]}</strong>
+                    <small style={{ display: "block", color: "var(--muted)", fontSize: 10 }}>
+                      {snapshot ? `${files.toLocaleString()} files · ${formatBytes(bytes)} · ${percent}%` : "Awaiting live inventory"}
+                    </small>
+                  </span>
+                </div>;
+              })}
+            </div>
           </div>
           <small className="stats-footnote">Sizes are logical file lengths, not allocated disk blocks. Overlapping local roots are counted once in headline totals.</small>
         </section>
