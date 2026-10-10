@@ -159,16 +159,16 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Mobile devices and messages",
     keywords: "mobile phone device iphone android messages backup browse rename",
     answer:
-      "The Mobile tab puts the phone manager above message browsing/export. Scan for a device, review its status, then choose Browse or a backup action. Browseable snapshots retain dated copies of files exposed over USB. iPhone and iPad can also create encrypted, timestamped Apple restore archives; Android snapshots cover accessible shared files, not app data or settings. Review the device, password, destination, and restore scope before starting.",
+      "The Mobile tab shows phone backup status and its save destination above Messages, with device controls below. Scan for a device, then use Browse or Renew backup for a connected phone. Browseable snapshots retain dated copies of files exposed over USB. iPhone and iPad can also create encrypted, timestamped Apple restore archives; Android snapshots cover accessible shared files, not app data or settings.",
     section: "mobile",
     target: '[data-tour="mobile-devices"]',
   },
   {
     id: "mobile-device-actions",
     title: "Connect, browse, and name devices",
-    keywords: "mobile devices phone tablet scan connect browse rename disconnect unmount backup destination",
+    keywords: "mobile devices phone tablet scan connect browse rename disconnect unmount backup renew destination",
     answer:
-      "Scan devices refreshes discovery. Connect or unmount manages a live USB connection; Browse opens files accessible from a ready device; Rename changes Silo’s device label. Choose the browseable-copy destination separately. A saved phone snapshot can be browsed as a source while its destination is available.",
+      "Scan devices refreshes discovery. Renew backup updates a connected phone’s browseable snapshot in Silo without changing its files. Connect or unmount manages the live USB connection; Browse opens accessible files; Rename changes Silo’s device label. Choose the snapshot destination separately. A saved phone snapshot can be browsed as a source while its destination is available.",
     section: "mobile",
     target: '[data-tour="mobile-device-actions"]',
     fallbackTarget: '[data-tour="mobile-devices"]',
@@ -261,7 +261,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Memory story and export controls",
     keywords: "memories stories mood frame duration soundtrack music export download suggestion clear refresh",
     answer:
-      "Refresh updates the current cards; Generate or Find new memories searches the indexed archive when you choose. On a story, review its photos, mood, duration, and soundtrack before exporting. Choose location & export opens the destination flow. Remove suggestion and Clear suggestions remove cards only; original media is kept.",
+      "Refresh updates the current cards; Generate or Find new memories searches the indexed archive when you choose. On a story, review its photos, mood, duration, and soundtrack, then choose Save memory to make an MP4 copy at a location you choose. Saved cards stay in your collection; Remove suggestion and Clear suggestions remove cards only, while original media is kept.",
     section: "memories",
     target: '[data-tour="memory-controls"]',
     fallbackTarget: '[data-tour="memories-overview"]',

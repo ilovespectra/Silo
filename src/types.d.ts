@@ -1271,6 +1271,10 @@ interface Window {
       deviceId: string,
       platform: PhonePlatform,
     ): Promise<PhoneDevice | null>;
+    renewPhoneBackup(
+      deviceId: string,
+      platform: PhonePlatform,
+    ): Promise<PhoneBackupProgress>;
     disconnectPhone(deviceId: string, platform: PhonePlatform): Promise<void>;
     getMessageThreads(
       deviceId: string,

@@ -5777,7 +5777,7 @@ electron_1.ipcMain.handle("update-memory-settings", (_event, settings) => {
     if (!settings || typeof settings !== "object" || Array.isArray(settings))
         throw new Error("Invalid memory settings.");
     const update = {};
-    for (const key of ["showOnLaunch", "removeAfterDownload"]) {
+    for (const key of ["showOnLaunch"]) {
         const value = settings[key];
         if (value === undefined)
             continue;
@@ -8561,6 +8561,20 @@ electron_1.ipcMain.handle("get-access-identity", () => {
 // Phone connectivity
 electron_1.ipcMain.handle("get-phone-tooling", () => phoneManager.getTooling());
 electron_1.ipcMain.handle("get-phone-backup-states", () => phoneManager.getBackupStates());
+electron_1.ipcMain.handle("renew-phone-backup", async (_event, deviceId, platform) => {
+    if (typeof deviceId !== "string" ||
+        !deviceId ||
+        (platform !== "ios" && platform !== "android"))
+        throw new Error("Invalid phone backup request.");
+    scannedPhoneDevices = await phoneManager.listDevices();
+    const device = scannedPhoneDevices.find((candidate) => candidate.id === deviceId &&
+        candidate.platform === platform &&
+        candidate.status === "ready" &&
+        Boolean(candidate.rootPath));
+    if (!device)
+        throw new Error("Connect and trust the phone before renewing its backup.");
+    return phoneManager.backupDevice(device);
+});
 electron_1.ipcMain.handle("get-phone-restore-archives", () => phoneManager.getRestoreArchives());
 electron_1.ipcMain.handle("create-phone-restore-archive", async (_event, deviceId, platform, password) => {
     if (process.platform !== "darwin")

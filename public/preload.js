@@ -401,6 +401,8 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("reject-name-file", name, filePath),
   getPhoneTooling: () => ipcRenderer.invoke("get-phone-tooling"),
   getPhoneBackupStates: () => ipcRenderer.invoke("get-phone-backup-states"),
+  renewPhoneBackup: (deviceId, platform) =>
+    ipcRenderer.invoke("renew-phone-backup", deviceId, platform),
   getPhoneRestoreArchives: () =>
     ipcRenderer.invoke("get-phone-restore-archives"),
   createPhoneRestoreArchive: (deviceId, platform, password) =>

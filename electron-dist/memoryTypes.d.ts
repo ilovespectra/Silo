@@ -32,7 +32,6 @@ export interface MemorySoundtrack {
 }
 export interface MemorySettings {
     showOnLaunch: boolean;
-    removeAfterDownload: boolean;
     /** Folder for saved memory movies; null keeps them in Silo's app storage. */
     movieDirectory?: string | null;
 }

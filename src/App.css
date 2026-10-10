@@ -2185,11 +2185,11 @@ body {
 
 .phone-device {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) max-content;
-  align-items: center;
-  gap: 6px;
-  padding: 8px;
-  margin-bottom: 5px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 12px;
+  margin-bottom: 0;
   border: 1px solid var(--border-soft);
   border-radius: 4px;
   background: var(--surface-card);
@@ -2251,18 +2251,27 @@ body {
 }
 
 .phone-device-actions {
-  display: flex;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
 }
 
 .phone-device-actions button {
-  padding: 5px 9px;
+  display: inline-flex;
+  min-width: 0;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 8px;
   border: 1px solid var(--border-soft);
   border-radius: 4px;
   background: var(--surface-control);
   color: var(--text-secondary);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .phone-device-actions button:hover:not(:disabled) {
@@ -2275,9 +2284,20 @@ body {
   cursor: default;
 }
 
+.phone-device-actions .phone-renew-backup-button {
+  border-color: var(--orange);
+  background: color-mix(in srgb, var(--orange) 18%, var(--surface-control));
+  color: var(--orange-bright);
+  font-weight: 700;
+}
+
+.phone-device-actions .phone-renew-backup-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--orange) 28%, var(--surface-control));
+  color: var(--orange-bright);
+}
+
 .phone-backup-progress {
   display: grid;
-  grid-column: 1 / -1;
   gap: 4px;
   min-width: 0;
   padding-top: 6px;
@@ -7693,6 +7713,30 @@ input[type="range"]::-moz-range-progress {
   background: var(--surface);
 }
 
+.phone-backup-status-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 9px;
+}
+
+.phone-backup-status-list .phone-backup-progress {
+  align-content: start;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--surface-card);
+}
+
+.phone-management-panel {
+  display: grid;
+  gap: 14px;
+  margin: 0 clamp(12px, 2vw, 24px) 24px;
+  padding: 20px clamp(16px, 3vw, 34px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
 .mobile-section-heading,
 .mobile-messages-heading {
   position: sticky;
@@ -7748,7 +7792,6 @@ input[type="range"]::-moz-range-progress {
 
 .phone-device-list .phone-device {
   margin: 0;
-  padding: 12px;
 }
 
 .phone-tooling-notices {
@@ -7768,18 +7811,6 @@ input[type="range"]::-moz-range-progress {
   border: 1px dashed var(--line);
   border-radius: 6px;
   color: var(--muted);
-}
-
-.phone-restore-status {
-  display: grid;
-  gap: 4px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-warning);
-  border-radius: 5px;
-  background: var(--surface-warning);
-  color: var(--warning-text);
-  font-size: 11px;
-  line-height: 1.45;
 }
 
 .phone-restore-controls {
@@ -7884,6 +7915,11 @@ input[type="range"]::-moz-range-progress {
     height: 760px;
     min-height: 600px;
     margin: 12px;
+  }
+
+  .phone-management-panel {
+    margin: 0 12px 12px;
+    padding: 16px 12px;
   }
 
 }

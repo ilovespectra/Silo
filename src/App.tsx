@@ -90,7 +90,9 @@ import {
   useMagicRanks,
 } from "./utils/useMagicRanks";
 import MessageExportPanel from "./components/MessageExportPanel";
-import PhoneManagerPanel from "./components/PhoneManagerPanel";
+import PhoneManagerPanel, {
+  PhoneManagementPanel,
+} from "./components/PhoneManagerPanel";
 import AudioLibrary from "./components/AudioLibrary";
 import IndexingPanel from "./components/IndexingPanel";
 import SourceClonePanel from "./components/SourceClonePanel";
@@ -2219,6 +2221,34 @@ function App() {
       }
     },
     [browsePhone, electronAPI],
+  );
+
+  const renewPhoneBackup = useCallback(
+    async (device: PhoneDevice) => {
+      if (!electronAPI) return;
+      setPhoneBusyId(device.id);
+      setPhoneNotice(`Renewing ${device.name}’s browseable backup…`);
+      try {
+        const progress = await electronAPI.renewPhoneBackup(
+          device.id,
+          device.platform,
+        );
+        setPhoneNotice(
+          progress.status === "error"
+            ? progress.message
+            : `${device.name}’s browseable backup is up to date.`,
+        );
+      } catch (error) {
+        setPhoneNotice(
+          error instanceof Error
+            ? error.message
+            : `Could not renew ${device.name}’s browseable backup.`,
+        );
+      } finally {
+        setPhoneBusyId(null);
+      }
+    },
+    [electronAPI],
   );
 
   const disconnectPhone = useCallback(
@@ -6802,24 +6832,11 @@ function App() {
             devices={phoneDevices}
             tooling={phoneTooling}
             scanning={phoneScanning}
-            busyDeviceId={phoneBusyId}
-            activeDeviceKey={
-              connectedPhone
-                ? `${connectedPhone.platform}:${connectedPhone.id}`
-                : null
-            }
             notice={phoneNotice}
             backups={phoneBackups}
-            restoreArchives={phoneRestoreArchives}
             backupDestination={phoneBackupDestination}
-            onCreateRestoreArchive={createPhoneRestoreArchive}
-            onRestoreFromArchive={restorePhoneFromArchive}
             formatFileSize={formatFileSize}
             onScan={() => void scanForPhones()}
-            onBrowse={browsePhone}
-            onConnect={connectPhone}
-            onDisconnect={disconnectPhone}
-            onRename={renamePhone}
             onChooseBackupDestination={() =>
               void choosePhoneBackupDestination()
             }
@@ -6842,6 +6859,24 @@ function App() {
             </header>
             <MessageExportPanel />
           </section>
+          <PhoneManagementPanel
+            devices={phoneDevices}
+            tooling={phoneTooling}
+            busyDeviceId={phoneBusyId}
+            activeDeviceKey={
+              connectedPhone
+                ? `${connectedPhone.platform}:${connectedPhone.id}`
+                : null
+            }
+            restoreArchives={phoneRestoreArchives}
+            onBrowse={browsePhone}
+            onConnect={connectPhone}
+            onDisconnect={disconnectPhone}
+            onRename={renamePhone}
+            onRenewBackup={renewPhoneBackup}
+            onCreateRestoreArchive={createPhoneRestoreArchive}
+            onRestoreFromArchive={restorePhoneFromArchive}
+          />
         </main>
       ) : (
         <div

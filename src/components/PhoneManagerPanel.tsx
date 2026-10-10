@@ -5,20 +5,26 @@ interface PhoneManagerPanelProps {
   devices: PhoneDevice[];
   tooling: PhoneTooling | null;
   scanning: boolean;
-  busyDeviceId: string | null;
-  activeDeviceKey: string | null;
   notice: string;
   backups: Record<string, PhoneBackupProgress>;
-  restoreArchives: PhoneRestoreArchive[];
   backupDestination: string | null;
   formatFileSize: (bytes: number) => string;
   onScan: () => void;
+  onChooseBackupDestination: () => void;
+  onResetBackupDestination: () => void;
+}
+
+interface PhoneManagementPanelProps {
+  devices: PhoneDevice[];
+  tooling: PhoneTooling | null;
+  busyDeviceId: string | null;
+  activeDeviceKey: string | null;
+  restoreArchives: PhoneRestoreArchive[];
   onBrowse: (device: PhoneDevice) => void;
   onConnect: (device: PhoneDevice) => void;
   onDisconnect: (device: PhoneDevice) => void;
   onRename: (device: PhoneDevice) => void;
-  onChooseBackupDestination: () => void;
-  onResetBackupDestination: () => void;
+  onRenewBackup: (device: PhoneDevice) => void;
   onCreateRestoreArchive: (
     device: PhoneDevice,
     password: string,
@@ -34,14 +40,13 @@ interface PhoneDeviceCardProps {
   device: PhoneDevice;
   active: boolean;
   busyDeviceId: string | null;
-  backup?: PhoneBackupProgress;
   restoreArchives: PhoneRestoreArchive[];
   tooling: PhoneTooling | null;
-  formatFileSize: (bytes: number) => string;
   onBrowse: (device: PhoneDevice) => void;
   onConnect: (device: PhoneDevice) => void;
   onDisconnect: (device: PhoneDevice) => void;
   onRename: (device: PhoneDevice) => void;
+  onRenewBackup: (device: PhoneDevice) => void;
   onCreateRestoreArchive: (
     device: PhoneDevice,
     password: string,
@@ -57,14 +62,13 @@ function PhoneDeviceCard({
   device,
   active,
   busyDeviceId,
-  backup,
   restoreArchives,
   tooling,
-  formatFileSize,
   onBrowse,
   onConnect,
   onDisconnect,
   onRename,
+  onRenewBackup,
   onCreateRestoreArchive,
   onRestoreFromArchive,
 }: PhoneDeviceCardProps) {
@@ -74,12 +78,6 @@ function PhoneDeviceCard({
   const [restorePassword, setRestorePassword] = useState("");
   const [restoreBusy, setRestoreBusy] = useState(false);
   const [restoreNotice, setRestoreNotice] = useState("");
-  const backupPercent = backup?.totalBytes
-    ? Math.min(100, (backup.completedBytes / backup.totalBytes) * 100)
-    : backup?.totalFiles
-      ? Math.min(100, (backup.completedFiles / backup.totalFiles) * 100)
-      : 0;
-
   const createRestoreArchive = async () => {
     if (backupPassword.length < 8 || backupPassword !== confirmPassword) {
       setRestoreNotice("Enter a matching password with at least 8 characters.");
@@ -125,13 +123,13 @@ function PhoneDeviceCard({
           {device.message}
         </small>
       </div>
-      <div className="phone-device-actions" data-tour="mobile-device-actions" data-help="Rename a device, connect or browse it, or unmount an iPhone. Device actions affect the connection and saved source, not the contents of the phone by themselves.">
+      <div className="phone-device-actions" data-tour="mobile-device-actions" data-help="Rename, browse, connect, unmount, or renew a phone’s browseable backup. Renewing updates Silo’s saved copy without changing files on the phone.">
         <button
           onClick={() => onRename(device)}
           title={`SILO DATA WRITE — Rename ${device.name} in Silo only`}
           aria-label={`SILO DATA WRITE — Rename ${device.name} in Silo only`}
         >
-          <FiEdit3 />
+          <FiEdit3 /> Rename
         </button>
         {device.status === "ready" && device.rootPath ? (
           <>
@@ -143,6 +141,15 @@ function PhoneDeviceCard({
             >
               Browse
             </button>
+            <button
+              className="phone-renew-backup-button"
+              onClick={() => onRenewBackup(device)}
+              disabled={busyDeviceId === device.id}
+              title="DESTINATION WRITE — Renew this phone’s browseable snapshot in Silo; the phone’s files are unchanged"
+              data-help="DESTINATION WRITE: Scan this connected phone and update its browseable snapshot in Silo. This does not change files on the phone."
+            >
+              <FiRefreshCw /> {busyDeviceId === device.id ? "Renewing…" : "Renew backup"}
+            </button>
             {device.platform === "ios" && (
               <button
                 onClick={() => onDisconnect(device)}
@@ -150,7 +157,7 @@ function PhoneDeviceCard({
                 title="READ ONLY — Unmount device without changing its contents"
                 aria-label={`READ ONLY — Disconnect ${device.name}`}
               >
-                <FiX />
+                <FiX /> Disconnect
               </button>
             )}
           </>
@@ -165,36 +172,6 @@ function PhoneDeviceCard({
           </button>
         )}
       </div>
-      {backup && (
-        <div className={`phone-backup-progress ${backup.status}`}>
-          <div>
-            <span>
-              <strong>Browseable snapshot:</strong> {backup.message}
-            </span>
-            <strong>
-              {backup.status === "complete"
-                ? "100%"
-                : `${Math.round(backupPercent)}%`}
-            </strong>
-          </div>
-          <progress
-            value={backup.status === "complete" ? 100 : backupPercent}
-            max={100}
-          />
-          <small>
-            {backup.completedFiles.toLocaleString()} / {backup.totalFiles.toLocaleString()} files
-            {backup.totalBytes > 0 &&
-              ` · ${formatFileSize(backup.completedBytes)} / ${formatFileSize(backup.totalBytes)}`}
-            {backup.failedFiles > 0 &&
-              ` · ${backup.failedFiles.toLocaleString()} skipped`}
-            {backup.lastBackupAt &&
-              ` · ${new Date(backup.lastBackupAt).toLocaleString()}`}
-          </small>
-          {backup.currentFile && (
-            <small title={backup.currentFile}>{backup.currentFile}</small>
-          )}
-        </div>
-      )}
       {device.platform === "ios" && device.status === "ready" && (
         <div className="phone-restore-controls">
           <strong>Encrypted restore archives</strong>
@@ -282,26 +259,64 @@ function PhoneDeviceCard({
   );
 }
 
+function PhoneBackupStatus({
+  device,
+  backup,
+  formatFileSize,
+}: {
+  device: PhoneDevice;
+  backup: PhoneBackupProgress;
+  formatFileSize: (bytes: number) => string;
+}) {
+  const backupPercent = backup.totalBytes
+    ? Math.min(100, (backup.completedBytes / backup.totalBytes) * 100)
+    : backup.totalFiles
+      ? Math.min(100, (backup.completedFiles / backup.totalFiles) * 100)
+      : 0;
+
+  return (
+    <div className={`phone-backup-progress ${backup.status}`} role="group" aria-label={`${device.name} backup status`}>
+      <div>
+        <span>
+          <strong>{device.name}:</strong> {backup.message}
+        </span>
+        <strong>
+          {backup.status === "complete"
+            ? "100%"
+            : `${Math.round(backupPercent)}%`}
+        </strong>
+      </div>
+      <progress
+        value={backup.status === "complete" ? 100 : backupPercent}
+        max={100}
+      />
+      <small>
+        {backup.completedFiles.toLocaleString()} / {backup.totalFiles.toLocaleString()} files
+        {backup.totalBytes > 0 &&
+          ` · ${formatFileSize(backup.completedBytes)} / ${formatFileSize(backup.totalBytes)}`}
+        {backup.failedFiles > 0 &&
+          ` · ${backup.failedFiles.toLocaleString()} skipped`}
+        {backup.lastBackupAt &&
+          ` · ${new Date(backup.lastBackupAt).toLocaleString()}`}
+      </small>
+      {backup.currentFile && (
+        <small title={backup.currentFile}>{backup.currentFile}</small>
+      )}
+    </div>
+  );
+}
+
 function PhoneManagerPanel({
   devices,
   tooling,
   scanning,
-  busyDeviceId,
-  activeDeviceKey,
   notice,
   backups,
-  restoreArchives,
   backupDestination,
   formatFileSize,
   onScan,
-  onBrowse,
-  onConnect,
-  onDisconnect,
-  onRename,
   onChooseBackupDestination,
   onResetBackupDestination,
-  onCreateRestoreArchive,
-  onRestoreFromArchive,
 }: PhoneManagerPanelProps) {
   return (
     <section className="phone-manager-panel" aria-labelledby="phone-manager-title">
@@ -309,7 +324,7 @@ function PhoneManagerPanel({
         <div>
           <span className="sidebar-kicker">Phones and tablets</span>
           <h2 id="phone-manager-title">Phone manager</h2>
-          <p>Connect devices and manage Silo’s browseable file copies.</p>
+          <p>Check backup status and choose where Silo saves browseable copies.</p>
         </div>
         <button
           className="mobile-scan-button"
@@ -329,16 +344,6 @@ function PhoneManagerPanel({
           Android shared storage). Snapshots do not include protected app data
           or device settings. Messages are managed separately below.
         </small>
-        <div className="phone-restore-status" role="note">
-          <strong>Restore scope</strong>
-          <span>
-            iPhone and iPad can use encrypted, timestamped Apple restore
-            archives. These are not raw disk images and follow Apple’s backup
-            exclusions. Android snapshots cover accessible shared files only;
-            use the device maker or Android system restore for app data and
-            settings.
-          </span>
-        </div>
         <label>Browseable-copy destination</label>
         <div className="backup-dest-display">
           <small title={backupDestination || "Default (local storage)"}>
@@ -387,38 +392,77 @@ function PhoneManagerPanel({
         </div>
       )}
 
-      {devices.length > 0 ? (
-        <div className="phone-device-list">
+      {devices.some((device) => backups[`${device.platform}:${device.id}`]) && (
+        <div className="phone-backup-status-list" aria-label="Phone backup status">
           {devices.map((device) => {
-            const deviceKey = `${device.platform}:${device.id}`;
-            return (
-              <PhoneDeviceCard
-                key={deviceKey}
+            const backup = backups[`${device.platform}:${device.id}`];
+            return backup ? (
+              <PhoneBackupStatus
+                key={`${device.platform}:${device.id}`}
                 device={device}
-                active={activeDeviceKey === deviceKey}
-                busyDeviceId={busyDeviceId}
-                backup={backups[deviceKey]}
-                restoreArchives={restoreArchives}
-                tooling={tooling}
+                backup={backup}
                 formatFileSize={formatFileSize}
-                onBrowse={onBrowse}
-                onConnect={onConnect}
-                onDisconnect={onDisconnect}
-                onRename={onRename}
-                onCreateRestoreArchive={onCreateRestoreArchive}
-                onRestoreFromArchive={onRestoreFromArchive}
               />
-            );
+            ) : null;
           })}
-        </div>
-      ) : (
-        <div className="phone-device-empty">
-          <FiSmartphone aria-hidden="true" />
-          <span>Connect a phone or tablet to manage it here.</span>
         </div>
       )}
 
       {notice && <p className="phone-manager-notice" role="status">{notice}</p>}
+    </section>
+  );
+}
+
+export function PhoneManagementPanel({
+  devices,
+  tooling,
+  busyDeviceId,
+  activeDeviceKey,
+  restoreArchives,
+  onBrowse,
+  onConnect,
+  onDisconnect,
+  onRename,
+  onRenewBackup,
+  onCreateRestoreArchive,
+  onRestoreFromArchive,
+}: PhoneManagementPanelProps) {
+  return (
+    <section className="phone-management-panel" aria-labelledby="phone-management-title">
+      <header className="mobile-section-heading" data-tour="mobile-phone-management">
+        <div>
+          <span className="sidebar-kicker">Device controls</span>
+          <h2 id="phone-management-title">Manage phones</h2>
+          <p>Browse, renew backups, and manage connected devices.</p>
+        </div>
+      </header>
+
+      {devices.length > 0 ? (
+        <div className="phone-device-list">
+          {devices.map((device) => (
+            <PhoneDeviceCard
+              key={`${device.platform}:${device.id}`}
+              device={device}
+              active={activeDeviceKey === `${device.platform}:${device.id}`}
+              busyDeviceId={busyDeviceId}
+              restoreArchives={restoreArchives}
+              tooling={tooling}
+              onBrowse={onBrowse}
+              onConnect={onConnect}
+              onDisconnect={onDisconnect}
+              onRename={onRename}
+              onRenewBackup={onRenewBackup}
+              onCreateRestoreArchive={onCreateRestoreArchive}
+              onRestoreFromArchive={onRestoreFromArchive}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="phone-device-empty">
+          <FiSmartphone aria-hidden="true" />
+          <span>Scan for a connected phone or tablet to manage it here.</span>
+        </div>
+      )}
     </section>
   );
 }

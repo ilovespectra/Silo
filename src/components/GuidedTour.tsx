@@ -200,8 +200,8 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   },
   {
     id: "mobile-device-actions",
-    title: "Connect and browse a device",
-    body: "For a ready phone or tablet, Rename changes its label, Browse opens its accessible files, and Connect or unmount manages the live connection. Browsing a saved snapshot does not reconnect to or alter the device.",
+    title: "Manage a connected phone",
+    body: "Phone controls appear below Messages. For a ready phone or tablet, Renew backup updates its browseable snapshot in Silo, Browse opens accessible files, and Rename changes its label. Connecting or unmounting manages the live USB connection.",
     target: '[data-tour="mobile-device-actions"]',
     fallbackTarget: '[data-tour="mobile-devices"]',
     section: "mobile",
@@ -238,8 +238,8 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   },
   {
     id: "memory-controls",
-    title: "Review a story before exporting",
-    body: "Each card can preview a prepared movie, remove only its suggestion, or open story controls for photo count, duration, soundtrack, and original-audio level. Make a movie opens the export flow; check the destination before saving.",
+    title: "Save a memory movie",
+    body: "Each card can preview a prepared movie, remove only its suggestion, or open story controls for photo count, soundtrack, and original-audio level. Save memory opens a destination picker and shows progress as Silo creates your MP4. Saving keeps the card in your collection and leaves original media unchanged.",
     target: '[data-tour="memory-controls"]',
     fallbackTarget: '[data-tour="memories-overview"]',
     section: "memories",

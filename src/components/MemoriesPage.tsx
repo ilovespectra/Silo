@@ -230,7 +230,7 @@ function ExportDialog({ api, memory, options, onClose, onDownloaded }: {
       if (!result.ok) throw new Error(result.error || "The movie could not be exported. Try again or choose another soundtrack.");
       setSaved(true);
       setMoviePath(result.path || "");
-      setNotice("Movie saved. Your original photos and clips are unchanged.");
+      setNotice("Movie saved. This memory stays in your collection, and your original photos and clips are unchanged.");
       setProgress({ suggestionId: memory.id, phase: "complete", completed: 1, total: 1, message: "Movie saved" });
       try { await onDownloaded(); }
       catch (cause) { if (alive.current) setError(errorMessage(cause, "Movie saved, but the suggestions could not be refreshed.")); }
@@ -247,7 +247,7 @@ function ExportDialog({ api, memory, options, onClose, onDownloaded }: {
     catch (cause) { if (alive.current) { setError(errorMessage(cause, "Could not cancel the export.")); setCancelling(false); } }
   };
   const ratio = progress && progress.total > 0 ? Math.max(0, Math.min(1, progress.completed / progress.total)) : undefined;
-  return <MemoriesDialog title={`Export · ${memory.title}`} onClose={onClose} locked={running}>
+  return <MemoriesDialog title={`Save memory · ${memory.title}`} onClose={onClose} locked={running}>
     <div className="memories-modal-body">
       <p className="memories-hint">{options.count} photos / clips · {options.duration} seconds ({(options.duration / options.count).toFixed(1)}s each) · Landscape 16:9</p>
       {!moviePath && <MemoryCover memory={memory} />}
@@ -262,7 +262,7 @@ function ExportDialog({ api, memory, options, onClose, onDownloaded }: {
       <div className="memories-modal-actions">
         {running ? <button type="button" className="memories-button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel export"}</button> :
           <><button type="button" className="memories-button" onClick={onClose}>{notice ? "Done" : "Close"}</button>
-            {!saved && <button type="button" className="memories-button memories-primary" onClick={download}><FiDownload />Choose location & export</button>}</>}
+            {!saved && <button type="button" className="memories-button memories-primary" onClick={download}><FiDownload />Choose location & save movie</button>}</>}
       </div>
     </div>
   </MemoriesDialog>;
@@ -457,7 +457,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
   return <article className="memories-card">
     <button type="button" className="memories-cover-button" aria-label={playable ? `Watch memory: ${memory.title}` : `Preparing memory: ${memory.title}`} aria-disabled={!playable} disabled={disabled || maximum === 0} onClick={() => { if (playable) setViewing(true); else onBlockedView(); }}><MemoryCover memory={memory} />{playable ? <span className="memories-view-badge"><FiPlay />Watch memory</span> : <PreparingOverlay preview={preview!} />}</button>
     <div className="memories-card-body">
-      <div className="memories-card-heading"><span className={`memories-mood-label memories-mood-${memory.mood}`}>{memory.mood}</span>
+      <div className="memories-card-heading"><div className="memories-card-badges"><span className={`memories-mood-label memories-mood-${memory.mood}`}>{memory.mood}</span>{memory.downloadedAt && <span className="memories-saved-label" title={`Movie saved ${new Date(memory.downloadedAt).toLocaleString()}`}><FiCheck aria-hidden="true" />Saved</span>}</div>
         <button type="button" className="memories-icon-button" aria-label={`Remove suggestion: ${memory.title}`} title="Remove suggestion only; original files are kept" disabled={disabled} onClick={onDismiss}><FiTrash2 /></button>
       </div>
       <h2>{memory.title}</h2><p className="memories-description">{memory.description}</p>
@@ -483,7 +483,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
         <input id={`${fieldId}-audio`} type="range" min={0} max={0.6} step={0.01} value={originalAudio} disabled={disabled} onChange={(event) => setOriginalAudio(Number(event.target.value))} />
       </div>
       </details>
-      <button type="button" className="memories-button memories-primary memories-export-button" disabled={disabled || trackStatus === "loading" || maximum === 0} onClick={() => { void prepareExport(); }}><FiDownload aria-hidden="true" />Make a movie<FiArrowRight aria-hidden="true" /></button>
+      <button type="button" className="memories-button memories-primary memories-export-button" disabled={disabled || trackStatus === "loading" || maximum === 0} onClick={() => { void prepareExport(); }}><FiDownload aria-hidden="true" />Save memory<FiArrowRight aria-hidden="true" /></button>
     </div>
     {viewing && <MemoryViewDialog api={api} memory={memory} onClose={() => setViewing(false)} />}
     {browsing && <AudioBrowserDialog api={api} title={`Choose a song · ${memory.title}`} onClose={() => setBrowsing(false)} onPick={(file) => { void pickBrowsed(file); }} />}
@@ -607,7 +607,6 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     </form>
     <div className="memories-settings">
       <label><input type="checkbox" checked={state?.settings.showOnLaunch ?? false} disabled={busy || !state} data-help="Show the Memories page when Silo opens; it does not generate videos automatically." onChange={(event) => { const showOnLaunch = event.target.checked; void run("Saving settings", () => api.updateMemorySettings({ showOnLaunch })); }} />Show on launch</label>
-      <label><input type="checkbox" checked={state?.settings.removeAfterDownload ?? false} disabled={busy || !state} data-help="SILO DATA WRITE: Remove only the suggestion card after its movie is downloaded. Original media and saved movies remain." onChange={(event) => { const removeAfterDownload = event.target.checked; void run("Saving settings", () => api.updateMemorySettings({ removeAfterDownload })); }} />Remove suggestion after download</label>
       <span>Original files are always kept.</span>
       <button type="button" className="memories-text-button" disabled={busy || state?.generating || !state?.suggestions.length} onClick={() => setClearConfirm(true)} data-help="SILO DATA WRITE: Remove all suggestion cards after confirmation. Original photos, clips, and already-saved movies are kept."><FiTrash2 />Clear suggestions</button>
     </div>
@@ -617,7 +616,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     </p>}
     {state?.generating && <p className="memories-hint">This uses photos and clips already indexed. Anything indexed later will be available the next time you generate.</p>}
     {Boolean(state?.suggestions.length) && <p className="memories-collection-label">{state?.suggestions.length} stories to rediscover <span>New suggestions replace this collection.</span></p>}
-    <div className="memories-grid" data-tour="memory-controls" data-help="Each story card lets you preview its movie, remove only the suggestion, tune photos, duration and soundtrack, and choose the export destination.">
+    <div className="memories-grid" data-tour="memory-controls" data-help="Each story card lets you preview and save its movie, remove only the suggestion, tune photos, duration and soundtrack, and choose where the saved copy goes.">
       {state?.suggestions.filter((memory) => previews[memory.id]?.status !== "failed").map((memory) => <MemoryCard key={memory.id} api={api} memory={memory} disabled={busy || state.generating}
         preview={previews[memory.id]} onBlockedView={() => blockedView(memory)} onState={(next) => { if (mounted.current) setState(next); }}
         onDismiss={() => { void run("Removing suggestion", () => api.dismissMemory(memory.id)); }}

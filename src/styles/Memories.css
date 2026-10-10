@@ -65,6 +65,8 @@
 .memories-view-badge { position: absolute; z-index: 3; top: 14px; right: 14px; padding: 7px 10px; display: inline-flex; align-items: center; gap: 5px; background: #15100dbb; border: 1px solid #ffffff25; border-radius: 20px; font-size: 11px; }
 .memories-card-body { padding: 18px 21px 21px; }
 .memories-card-heading { display: flex; align-items: center; justify-content: space-between; }
+.memories-card-badges { display: flex; align-items: center; gap: 10px; }
+.memories-saved-label { display: inline-flex; align-items: center; gap: 4px; color: #83c9a0; font-size: 10px; }
 .memories-mood-label { color: var(--memories-orange); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
 .memories-mood-gentle.memories-mood-label { color: color-mix(in srgb, var(--memories-text) 78%, #d9c6a5); }
 .memories-mood-bright.memories-mood-label { color: color-mix(in srgb, var(--memories-text) 78%, #e49a27); }

@@ -56,7 +56,7 @@ const MOOD_WORDS = {
     energetic: ["energetic", "dance", "rock", "driving", "racing", "electronic", "beat"],
     dramatic: ["dramatic", "cinematic", "epic", "orchestral", "storm", "intense"],
 };
-const DEFAULT_SETTINGS = { showOnLaunch: true, removeAfterDownload: false, movieDirectory: null };
+const DEFAULT_SETTINGS = { showOnLaunch: true, movieDirectory: null };
 const MAX_CARDS = 5;
 /** Saved extras whose movies are pre-rendered, so they play while sources are offline. */
 const RESERVE_CARDS = 5;
@@ -591,7 +591,7 @@ class MemoryManager {
     applySettings(settings) {
         if (!settings || typeof settings !== "object")
             return;
-        for (const key of ["showOnLaunch", "removeAfterDownload"]) {
+        for (const key of ["showOnLaunch"]) {
             if (typeof settings[key] === "boolean")
                 this.state.settings[key] = settings[key];
         }
@@ -619,8 +619,6 @@ class MemoryManager {
         await this.initialize();
         const card = this.state.suggestions.find(item => item.id === id);
         if (card) {
-            if (this.state.settings.removeAfterDownload)
-                return this.dismiss(id);
             card.downloadedAt = Date.now();
             await this.persist();
         }

@@ -6776,7 +6776,7 @@ ipcMain.handle("update-memory-settings", (_event, settings: unknown) => {
   if (!settings || typeof settings !== "object" || Array.isArray(settings))
     throw new Error("Invalid memory settings.");
   const update: Partial<MemorySettings> = {};
-  for (const key of ["showOnLaunch", "removeAfterDownload"] as const) {
+  for (const key of ["showOnLaunch"] as const) {
     const value = (settings as Record<string, unknown>)[key];
     if (value === undefined) continue;
     if (typeof value !== "boolean") throw new Error("Invalid memory settings.");
@@ -10307,6 +10307,31 @@ ipcMain.handle("get-access-identity", () => {
 
 ipcMain.handle("get-phone-tooling", () => phoneManager.getTooling());
 ipcMain.handle("get-phone-backup-states", () => phoneManager.getBackupStates());
+
+ipcMain.handle(
+  "renew-phone-backup",
+  async (_event, deviceId: unknown, platform: unknown) => {
+    if (
+      typeof deviceId !== "string" ||
+      !deviceId ||
+      (platform !== "ios" && platform !== "android")
+    )
+      throw new Error("Invalid phone backup request.");
+
+    scannedPhoneDevices = await phoneManager.listDevices();
+    const device = scannedPhoneDevices.find(
+      (candidate) =>
+        candidate.id === deviceId &&
+        candidate.platform === platform &&
+        candidate.status === "ready" &&
+        Boolean(candidate.rootPath),
+    );
+    if (!device)
+      throw new Error("Connect and trust the phone before renewing its backup.");
+
+    return phoneManager.backupDevice(device);
+  },
+);
 
 ipcMain.handle("get-phone-restore-archives", () =>
   phoneManager.getRestoreArchives(),
