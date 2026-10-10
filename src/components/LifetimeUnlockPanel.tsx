@@ -33,6 +33,7 @@ type BeetleCue = {
 
 const SURVEY_FORM_URL =
   "https://docs.google.com/forms/d/e/1FAIpQLSdmJUIwdorndOfe6_45kXND8P2aSvgKid2iIoqQtz8WqVzdpQ/viewform?usp=publish-editor";
+const LIFETIME_PAYWALL_VIDEO_PLAYED_KEY = "silo.lifetimePaywallVideoPlayed";
 
 interface LifetimeUnlockPanelProps {
   license: LifetimeLicenseState;
@@ -93,6 +94,15 @@ export default function LifetimeUnlockPanel({
     BetaActivationResult["status"] | "idle"
   >("idle");
   const [activatingBeta, setActivatingBeta] = useState(false);
+  const [hasPlayedLifetimeVideo, setHasPlayedLifetimeVideo] = useState(() => {
+    try {
+      return (
+        window.localStorage.getItem(LIFETIME_PAYWALL_VIDEO_PLAYED_KEY) === "true"
+      );
+    } catch {
+      return false;
+    }
+  });
   const [videoTime, setVideoTime] = useState(0);
   const [surveyOpen, setSurveyOpen] = useState(false);
   const [surveyPosition, setSurveyPosition] = useState<{
@@ -467,8 +477,20 @@ export default function LifetimeUnlockPanel({
             <div className="lifetime-unlock-video-frame" ref={videoFrameRef}>
               <video
                 className="lifetime-unlock-video"
-                autoPlay
+                autoPlay={!hasPlayedLifetimeVideo}
                 controls
+                onPlay={() => {
+                  if (hasPlayedLifetimeVideo) return;
+                  setHasPlayedLifetimeVideo(true);
+                  try {
+                    window.localStorage.setItem(
+                      LIFETIME_PAYWALL_VIDEO_PLAYED_KEY,
+                      "true",
+                    );
+                  } catch {
+                    // Keep playback available if browser storage is unavailable.
+                  }
+                }}
                 preload="metadata"
                 playsInline
                 onLoadedMetadata={(event) => {

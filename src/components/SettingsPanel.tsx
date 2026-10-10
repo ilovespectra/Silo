@@ -29,6 +29,7 @@ interface SettingsPanelProps {
   onOpenBugReport: () => void;
   hideSettingsForScreenshot?: boolean;
   lifetimePromptRequest?: number;
+  onLifetimePromptHandled: () => void;
 }
 
 function formatSystemMemory(bytes: number) {
@@ -752,6 +753,7 @@ export default function SettingsPanel({
   onOpenBugReport,
   hideSettingsForScreenshot = false,
   lifetimePromptRequest = 0,
+  onLifetimePromptHandled,
 }: SettingsPanelProps) {
   const electronAPI = window.electron;
   const [password, setPassword] = useState("");
@@ -781,8 +783,10 @@ export default function SettingsPanel({
   });
 
   useEffect(() => {
-    if (lifetimePromptRequest > 0) setShowLifetimeUnlock(true);
-  }, [lifetimePromptRequest]);
+    if (lifetimePromptRequest <= 0) return;
+    setShowLifetimeUnlock(true);
+    onLifetimePromptHandled();
+  }, [lifetimePromptRequest, onLifetimePromptHandled]);
 
   useEffect(() => {
     let disposed = false;

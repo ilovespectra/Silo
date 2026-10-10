@@ -767,6 +767,9 @@ function App() {
   const [selectingBugReportScreenshot, setSelectingBugReportScreenshot] =
     useState(false);
   const [lifetimePromptRequest, setLifetimePromptRequest] = useState(0);
+  const acknowledgeLifetimePrompt = useCallback(() => {
+    setLifetimePromptRequest(0);
+  }, []);
   const [demoModeActive, setDemoModeActive] = useState<boolean | null>(null);
   const [showGuidedTour, setShowGuidedTour] = useState(false);
   const [showTourExitConfirm, setShowTourExitConfirm] = useState(false);
@@ -8228,6 +8231,7 @@ function App() {
           }}
           hideSettingsForScreenshot={selectingBugReportScreenshot}
           lifetimePromptRequest={lifetimePromptRequest}
+          onLifetimePromptHandled={acknowledgeLifetimePrompt}
         />
       )}
 
