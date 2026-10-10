@@ -734,7 +734,7 @@ interface AppUpdateState {
   version?: string;
   downloadUrl?: string;
   releaseUrl?: string;
-  installerLabel?: "Windows installer" | "Mac DMG";
+  installerLabel?: "EXE" | "Mac DMG";
   downloadPercent?: number;
   message?: string;
 }

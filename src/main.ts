@@ -1339,7 +1339,7 @@ async function getLatestPlatformRelease(): Promise<AppUpdateState> {
   }
   const expectedArchitecture = process.arch === "arm64" ? "arm64" : "x64";
   const isWindows = process.platform === "win32";
-  const installerLabel = isWindows ? "Windows installer" : "Mac DMG";
+  const installerLabel = isWindows ? "EXE" : "Mac DMG";
   const expectedAssetName = isWindows
     ? `Silo-${latest.version}-${expectedArchitecture}-Setup.exe`
     : `Silo-${latest.version}-${expectedArchitecture}.dmg`;
@@ -1742,7 +1742,7 @@ type AppUpdateState = {
   downloadDigest?: string;
   downloadSize?: number;
   releaseUrl?: string;
-  installerLabel?: "Windows installer" | "Mac DMG";
+  installerLabel?: "EXE" | "Mac DMG";
   downloadPercent?: number;
   message?: string;
 };
