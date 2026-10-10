@@ -310,7 +310,8 @@ export function BugReportDialog({
     setMessage(diagnosticReport.message);
     setFeature(
       diagnosticReport.reason === "indexing-error" ||
-        diagnosticReport.reason === "indexing-stalled"
+        diagnosticReport.reason === "indexing-stalled" ||
+        diagnosticReport.reason === "semantic-preload-failed"
         ? "Indexing"
         : "App crash",
     );

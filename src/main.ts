@@ -250,7 +250,11 @@ const lifetimePaymentRelayBaseUrl = (
 interface DiagnosticReport {
   id: string;
   createdAt: number;
-  reason: "indexing-error" | "indexing-stalled" | "app-crash";
+  reason:
+    | "indexing-error"
+    | "indexing-stalled"
+    | "semantic-preload-failed"
+    | "app-crash";
   message: string;
 }
 
@@ -743,15 +747,51 @@ function safeRuntimeDiagnosticText(value: unknown) {
   return compact.slice(0, 320);
 }
 
+function safeRuntimeDiagnosticStack(value: unknown) {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>)]*/g, (absolutePath) => {
+      const location = absolutePath.match(/:\d+(?::\d+)?$/)?.[0] ?? "";
+      const pathWithoutLocation = location
+        ? absolutePath.slice(0, -location.length)
+        : absolutePath;
+      const fileName = pathWithoutLocation.split(/[\\/]/).filter(Boolean).pop();
+      return `${fileName ? `[path]/${fileName}` : "[path]"}${location}`;
+    })
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1800);
+}
+
 function logIndexingDiagnostic(event: string, details: Record<string, unknown> = {}) {
   runtimeLog(event, details);
   if (!event.startsWith("semantic-worker-")) return;
+  if (
+    event === "semantic-worker-preload-phase" &&
+    details.requestType === "preload" &&
+    semanticRuntimeProgress.status === "loading-model"
+  ) {
+    const phase = typeof details.phase === "string" ? details.phase : "";
+    const status = typeof details.status === "string" ? details.status : "";
+    if (phase && status === "started")
+      semanticRuntimeProgress.message = `${phase}…`;
+    else if (phase && status === "failed")
+      semanticRuntimeProgress.message = `${phase} failed; recovery is queued.`;
+  }
 
   const safe: Record<string, string | number | boolean> = {
     event,
     at: new Date().toISOString(),
   };
-  for (const key of ["code", "signal", "requestType", "pendingCount"]) {
+  for (const key of [
+    "code",
+    "signal",
+    "requestType",
+    "pendingCount",
+    "phase",
+    "status",
+    "durationMs",
+  ]) {
     const value = details[key];
     if (typeof value === "string" || typeof value === "number") safe[key] = value;
   }
@@ -761,6 +801,8 @@ function logIndexingDiagnostic(event: string, details: Record<string, unknown> =
   if (safeMessage) safe.message = safeMessage;
   const safeFailureReason = safeRuntimeDiagnosticText(details.failureReason);
   if (safeFailureReason) safe.failureReason = safeFailureReason;
+  const safeStack = safeRuntimeDiagnosticStack(details.stack);
+  if (safeStack) safe.stack = safeStack;
   const requestTypes = details.requestTypes;
   if (Array.isArray(requestTypes))
     safe.requestTypes = requestTypes
@@ -796,9 +838,12 @@ function loadPendingDiagnosticReport() {
     if (
       typeof report.id === "string" &&
       typeof report.createdAt === "number" &&
-      ["indexing-error", "indexing-stalled", "app-crash"].includes(
-        String(report.reason),
-      ) &&
+      [
+        "indexing-error",
+        "indexing-stalled",
+        "semantic-preload-failed",
+        "app-crash",
+      ].includes(String(report.reason)) &&
       typeof report.message === "string"
     )
       pendingDiagnosticReport = report as DiagnosticReport;
@@ -811,6 +856,7 @@ function getRecentSafeRuntimeEvents() {
   const allowedFields = [
     "reason", "signal", "code", "exitCode", "status", "requestType",
     "requestTypes", "infrastructure", "pendingCount", "message", "failureReason",
+    "phase", "durationMs",
   ];
   try {
     const content = fs.readFileSync(diagnosticsPath, "utf8").slice(-512 * 1024);
@@ -904,6 +950,33 @@ ${workerEvents.join("\n")}`
     remaining: progress.remaining,
     errors: progress.errors,
   });
+}
+
+function createSemanticPreloadDiagnosticReport(attempts: number, message: string) {
+  const workerEvents = indexingDiagnosticEvents.slice(-12).map((entry) => {
+    const details = Object.entries(entry)
+      .filter(([key]) => key !== "at")
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join(" ");
+    return `- ${entry.at}: ${details}`;
+  });
+  const progress = semanticIndexer.getProgress();
+  return publishDiagnosticReport(
+    "semantic-preload-failed",
+    [
+      "Silo offline search model recovery report — please review before sending.",
+      `Trigger: semantic preload failed repeatedly (${attempts} attempts).`,
+      `Latest error: ${safeRuntimeDiagnosticText(message) || "Details withheld."}`,
+      `App version: ${app.getVersion()}`,
+      `System: ${process.platform} ${os.release()} (${process.arch})`,
+      `Index status: ${progress.status}; ${progress.indexed} indexed, ${progress.remaining} remaining, ${progress.errors} errors.`,
+      workerEvents.length
+        ? `Recent semantic worker phases and errors:\n${workerEvents.join("\n")}`
+        : "Recent semantic worker diagnostics: none recorded in this session.",
+      "Privacy: this local draft excludes filenames, folder paths, file contents, screenshots, and crash dumps. It is not sent automatically.",
+    ].join("\n\n"),
+    { attempts, status: progress.status },
+  );
 }
 
 function createAppCrashDiagnosticReport(
@@ -1699,6 +1772,22 @@ let searchIndexReadiness: SearchIndexReadiness = {
   records: 0,
   message: "Preparing the saved search index…",
 };
+type SemanticRuntimeStatus = "idle" | "loading-model" | "complete" | "error";
+let semanticRuntimeProgress: { status: SemanticRuntimeStatus; message: string } = {
+  status: "idle",
+  message: "Waiting for the offline search model.",
+};
+let semanticRuntimeReadyResolve: (() => void) | null = null;
+let semanticRuntimeReadyResolved = false;
+const semanticRuntimeReady = new Promise<void>((resolve) => {
+  semanticRuntimeReadyResolve = resolve;
+});
+function resolveSemanticRuntimeReady() {
+  if (semanticRuntimeReadyResolved) return;
+  semanticRuntimeReadyResolved = true;
+  semanticRuntimeReadyResolve?.();
+  semanticRuntimeReadyResolve = null;
+}
 function updateSearchIndexReadiness(status: SearchIndexReadiness) {
   searchIndexReadiness = status;
   // Keep terminal readiness updates ordered behind any throttled progress.
@@ -6418,7 +6507,7 @@ app.whenReady().then(async () => {
     reportStartupDetail("Warming the offline search model…");
     searchPreparationFailureMessage =
       "The offline search model could not be prepared.";
-    await semanticIndexer.preloadClipModel();
+    await semanticRuntimeReady;
     runtimeLog("search-model-preloaded", {
       elapsedMs: Date.now() - startupStartedAt,
       records: loadedSearchRecords,
@@ -6876,12 +6965,83 @@ app.whenReady().then(async () => {
     );
   indexRecovery = new IndexingRecovery([
     {
+      id: "semantic-runtime",
+      progress: () => ({
+        status: semanticRuntimeProgress.status,
+        message: semanticRuntimeProgress.message,
+      }),
+      ready: () => indexStorageAvailable && !indexStorageInitializationDeferred,
+      blockedReason: () =>
+        indexStorageUnavailableMessage ||
+        (indexStorageInitializationDeferred
+          ? "Waiting for index storage initialization."
+          : "") ||
+        "Waiting for index storage to become available.",
+      needsInitialCheck: true,
+      start: async () => {
+        const attempts = indexRecovery?.details("semantic-runtime").attempts ?? 1;
+        semanticRuntimeProgress = {
+          status: "loading-model",
+          message:
+            attempts > 1
+              ? `Retrying offline search model (attempt ${attempts})…`
+              : "Starting the offline search model…",
+        };
+        updateSearchIndexReadiness({
+          status: "preparing",
+          percentage: 20,
+          records: loadedSearchRecords,
+          message: semanticRuntimeProgress.message,
+        });
+        try {
+          await semanticIndexer.preloadClipModel();
+          semanticRuntimeProgress = {
+            status: "complete",
+            message: "Offline search model ready.",
+          };
+          runtimeLog("search-model-preloaded", {
+            elapsedMs: Date.now() - startupStartedAt,
+            records: loadedSearchRecords,
+            attempt: attempts,
+          });
+          resolveSemanticRuntimeReady();
+        } catch (error) {
+          const rawMessage =
+            error instanceof Error ? error.message : String(error);
+          const safeMessage =
+            safeRuntimeDiagnosticText(rawMessage) ||
+            "Offline search model preload failed.";
+          semanticRuntimeProgress = {
+            status: "error",
+            message: `Preload failed during ${safeMessage}. Silo will retry automatically.`,
+          };
+          updateSearchIndexReadiness({
+            status: "error",
+            percentage: 20,
+            records: loadedSearchRecords,
+            message: `Offline search model unavailable. Automatic retry is scheduled. ${safeMessage}`,
+          });
+          runtimeLog("semantic-preload-recovery-failed", {
+            attempt: attempts,
+            message: safeMessage,
+          });
+          if (attempts >= 3)
+            createSemanticPreloadDiagnosticReport(attempts, rawMessage);
+          throw error;
+        }
+      },
+    },
+    {
       id: "search",
       lane: "background",
-      blockedReason: analysisBlocker,
+      blockedReason: () =>
+        semanticRuntimeProgress.status !== "complete"
+          ? "Waiting for offline search model recovery."
+          : analysisBlocker(),
       progress: () => semanticIndexer.getProgress(),
       ready: () =>
         indexStorageAvailable &&
+        semanticRuntimeProgress.status === "complete" &&
         analysisIdle() &&
         (startupIndexReconciliationSettled || semanticIndexer.hasPendingIndexWork()),
       unresolvedWork: () => {
@@ -9419,6 +9579,16 @@ ipcMain.handle("get-indexing-overview", async () => {
         !audio.failedSources?.includes(id),
     ).length ?? 0;
   return [
+    {
+      id: "semantic-runtime",
+      label: "Offline search model",
+      status: semanticRuntimeProgress.status,
+      processed: semanticRuntimeProgress.status === "complete" ? 1 : 0,
+      total: 1,
+      unit: "model",
+      message: semanticRuntimeProgress.message,
+      detail: "Required before Silo can embed new files or run semantic search.",
+    },
     {
       id: "discovery",
       label: "Source discovery",

@@ -493,7 +493,11 @@ interface IndexProgress {
 interface DiagnosticReport {
   id: string;
   createdAt: number;
-  reason: "indexing-error" | "indexing-stalled" | "app-crash";
+  reason:
+    | "indexing-error"
+    | "indexing-stalled"
+    | "semantic-preload-failed"
+    | "app-crash";
   message: string;
 }
 

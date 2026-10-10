@@ -10,6 +10,16 @@ const { test } = require("node:test");
 const ts = require("typescript");
 
 const root = path.resolve(__dirname, "..");
+function waitForWorkerResponse(responses, id) {
+  return new Promise((resolve) => {
+    const onResponse = (response) => {
+      if (response?.id !== id) return;
+      responses.removeListener("response", onResponse);
+      resolve(response);
+    };
+    responses.on("response", onResponse);
+  });
+}
 function loadSource(name, overrides = {}, globals = {}) {
   const filename = path.join(root, "src", name);
   const sourceRequire = createRequire(filename);
@@ -710,13 +720,13 @@ test("worker labels constructor failures as infrastructure rather than file erro
       },
     },
   });
-  const response = once(responses, "response");
+  const response = waitForWorkerResponse(responses, 1);
   port.emit("message", {
     id: 1,
     type: "image",
     filePath: "/private/original.jpg",
   });
-  const failure = (await response)[0];
+  const failure = await response;
   assert.equal(failure.infrastructure, true);
   assert.match(failure.error, /initialization failed/);
 });
@@ -827,9 +837,9 @@ test("worker supports both transports, bounded raw decoding, and existing tokeni
     );
     const receiver = transport === "thread" ? port : fakeProcess;
     const send = async (request) => {
-      const response = once(responses, "response");
+      const response = waitForWorkerResponse(responses, request.id);
       receiver.emit("message", request);
-      return (await response)[0];
+      return response;
     };
     assert.equal((await send({ id: 1, type: "preload" })).values.length, 0);
     assert.equal(transformers.env.allowRemoteModels, false);
@@ -877,11 +887,17 @@ test("x64 macOS loads Transformers through WASM without the unavailable native b
     const Module = require("node:module");
     const runtime = require("onnxruntime-web/wasm");
     const originalLoad = Module._load;
+    const bundledSharp = require("sharp");
     let interceptedNativeRuntime = false;
+    let interceptedSharp = false;
     Module._load = function (request, parent, isMain) {
       if (request === "onnxruntime-node") {
         interceptedNativeRuntime = true;
         return {};
+      }
+      if (request === "sharp") {
+        interceptedSharp = true;
+        return bundledSharp;
       }
       return originalLoad.call(this, request, parent, isMain);
     };
@@ -890,6 +906,7 @@ test("x64 macOS loads Transformers through WASM without the unavailable native b
       const transformers = require("@huggingface/transformers");
       assert.equal(process.arch, "x64");
       assert.equal(interceptedNativeRuntime, true);
+      assert.equal(interceptedSharp, true);
       assert.equal(typeof transformers.AutoTokenizer.from_pretrained, "function");
       assert.equal(typeof transformers.RawImage, "function");
       assert.equal(typeof runtime.InferenceSession.create, "function");
@@ -1039,6 +1056,11 @@ test("Intel macOS uses local WASM sessions for compatible CLIP embeddings", asyn
           const nativeRuntimeStub = moduleLoader._load("onnxruntime-node");
           assert.equal(typeof nativeRuntimeStub, "object");
           assert.equal(Object.keys(nativeRuntimeStub).length, 0);
+          assert.equal(
+            moduleLoader._load("sharp"),
+            sharp,
+            "Transformers must reuse the app's top-level Sharp module",
+          );
         }
       },
       resolve: (moduleName) => {
@@ -1049,9 +1071,9 @@ test("Intel macOS uses local WASM sessions for compatible CLIP embeddings", asyn
     { process: fakeProcess, Error },
   );
   const send = async (request) => {
-    const response = once(responses, "response");
+    const response = waitForWorkerResponse(responses, request.id);
     port.emit("message", request);
-    return (await response)[0];
+    return response;
   };
 
   const preload = await send({ id: 1, type: "preload" });

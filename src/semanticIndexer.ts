@@ -224,6 +224,31 @@ type DiagnosticListener = (
   details?: Record<string, unknown>,
 ) => void;
 
+function sanitizeWorkerDiagnosticText(value: unknown, limit: number) {
+  if (typeof value !== "string") return undefined;
+  const sanitized = value
+    .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "[path]")
+    .trim()
+    .slice(0, limit);
+  return sanitized || undefined;
+}
+
+function sanitizeWorkerDiagnosticStack(value: unknown, limit: number) {
+  if (typeof value !== "string") return undefined;
+  const sanitized = value
+    .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>)]*/g, (absolutePath) => {
+      const location = absolutePath.match(/:\d+(?::\d+)?$/)?.[0] ?? "";
+      const pathWithoutLocation = location
+        ? absolutePath.slice(0, -location.length)
+        : absolutePath;
+      const fileName = pathWithoutLocation.split(/[\\/]/).filter(Boolean).pop();
+      return `${fileName ? `[path]/${fileName}` : "[path]"}${location}`;
+    })
+    .trim()
+    .slice(0, limit);
+  return sanitized || undefined;
+}
+
 const initialProgress: IndexProgress = {
   status: "idle",
   total: 0,
@@ -2937,31 +2962,50 @@ export class SemanticIndexer {
     });
     worker.on("spawn", () => this.onDiagnostic("semantic-worker-online"));
     worker.on("message", (message: any) => {
-      if (
-        this.embeddingWorker !== worker ||
-        !message ||
-        !Number.isInteger(message.id)
-      )
+      if (this.embeddingWorker !== worker || !message) return;
+      if (message.type === "diagnostic") {
+        if (
+          message.event === "semantic-worker-preload-phase" &&
+          ["preload", "text", "image"].includes(message.requestType) &&
+          typeof message.phase === "string" &&
+          ["started", "completed", "failed"].includes(message.status)
+        ) {
+          this.onDiagnostic("semantic-worker-preload-phase", {
+            requestType: message.requestType,
+            phase: message.phase.slice(0, 120),
+            status: message.status,
+            ...(Number.isFinite(message.durationMs)
+              ? { durationMs: Math.max(0, Math.min(600_000, message.durationMs)) }
+              : {}),
+          });
+        }
         return;
+      }
+      if (!Number.isInteger(message.id)) return;
       const request = this.embeddingRequests.get(message.id);
       if (!request) return;
       this.embeddingRequests.delete(message.id);
       if (request.timer) clearTimeout(request.timer);
       if (typeof message.error === "string") {
-        const diagnosticMessage = message.error
-          .replace(/(?:[A-Za-z]:\\|\/)[^\s"'<>]+/g, "[path]")
-          .slice(0, 1200);
+        const diagnosticMessage = sanitizeWorkerDiagnosticText(
+          message.error,
+          1200,
+        );
+        const phase = sanitizeWorkerDiagnosticText(message.phase, 120);
+        const stack = sanitizeWorkerDiagnosticStack(message.stack, 1800);
         this.onDiagnostic("semantic-worker-request-failed", {
           requestType: request.type,
           infrastructure: Boolean(message.infrastructure),
-          message: diagnosticMessage,
+          ...(diagnosticMessage ? { message: diagnosticMessage } : {}),
+          ...(phase ? { phase } : {}),
+          ...(stack ? { stack } : {}),
         });
         const error =
           message.infrastructure || request.type === "preload"
             ? new EmbeddingProcessError(
-                `Semantic model initialization failed: ${message.error}`,
+                `Semantic model initialization failed: ${diagnosticMessage ?? "Worker initialization failed."}`,
               )
-            : new Error(message.error);
+            : new Error(diagnosticMessage ?? "Semantic worker request failed.");
         request.reject(error);
         if (error instanceof EmbeddingProcessError)
           this.failEmbeddingWorker(worker, error);

@@ -18,6 +18,7 @@ const stageErrorStyle: React.CSSProperties = {
 
 const stageDescriptions: Record<string, string> = {
   startup: "Opening saved indexes",
+  "semantic-runtime": "Preparing the offline search model",
   discovery: "Finding files in connected sources",
   search: "Adding files to search",
   faces: "Grouping people in photos",
@@ -169,7 +170,10 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
             : total > 0
               ? Math.min(100, Math.round((processed / total) * 100))
               : 0;
-        const processDescription = stageDescriptions[stage.id] ?? "Indexing files";
+        const processDescription =
+          stage.id === "semantic-runtime"
+            ? stage.message
+            : stageDescriptions[stage.id] ?? "Indexing files";
         const showStageReason =
           (stage.status === "error" || stage.status === "paused") &&
           Boolean(stage.message?.trim());
@@ -212,6 +216,9 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
                 style={stageErrorStyle}
               >
                 Retry error: {stage.recoveryError}
+                {stage.retryAt && stage.retryAt > Date.now()
+                  ? ` Automatic retry in ${Math.ceil((stage.retryAt - Date.now()) / 1000)}s.`
+                  : " Automatic retry is queued."}
               </small>
             )}
             {stage.recoveryRunning && (
@@ -256,7 +263,9 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
                     stage.recoveryRunning
                   }
                   title={
-                    stage.id === "quality"
+                    stage.id === "semantic-runtime"
+                      ? "Retry the offline search model now"
+                      : stage.id === "quality"
                       ? "Refresh photo quality index"
                       : stage.resumeQueued
                       ? "Resume queued"
@@ -267,7 +276,9 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
                           : "Retry indexing"
                   }
                   aria-label={
-                    stage.id === "quality"
+                    stage.id === "semantic-runtime"
+                      ? "Retry offline search model now"
+                      : stage.id === "quality"
                       ? "Refresh photo quality index"
                       : `Retry or resume ${stage.label}`
                   }

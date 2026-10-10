@@ -110,7 +110,9 @@ function buildMac() {
   run("npm", ["run", "build"]);
   run("npm", ["run", "release:check"]);
 
-  const cacheRoot = path.join(projectRoot, "node_modules", ".cache");
+  const cacheRoot = process.env.SILO_TEMP_DIR
+    ? path.resolve(process.env.SILO_TEMP_DIR)
+    : path.join(projectRoot, "node_modules", ".cache");
   fs.mkdirSync(cacheRoot, { recursive: true });
   const stagingDirectory = fs.mkdtempSync(path.join(cacheRoot, "silo-ffmpeg-"));
   const stagedBinary = path.join(stagingDirectory, "ffmpeg");
