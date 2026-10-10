@@ -128,8 +128,8 @@ function PhoneDeviceCard({
       <div className="phone-device-actions" data-tour="mobile-device-actions" data-help="Rename a device, connect or browse it, or unmount an iPhone. Device actions affect the connection and saved source, not the contents of the phone by themselves.">
         <button
           onClick={() => onRename(device)}
-          title={`Rename ${device.name}`}
-          aria-label={`Rename ${device.name}`}
+          title={`SILO DATA WRITE — Rename ${device.name} in Silo only`}
+          aria-label={`SILO DATA WRITE — Rename ${device.name} in Silo only`}
         >
           <FiEdit3 />
         </button>
@@ -138,6 +138,8 @@ function PhoneDeviceCard({
             <button
               onClick={() => onBrowse(device)}
               disabled={busyDeviceId === device.id}
+              title="READ ONLY — Browse files exposed by this device"
+              data-help="READ ONLY: Browse accessible files without changing the connected device."
             >
               Browse
             </button>
@@ -145,8 +147,8 @@ function PhoneDeviceCard({
               <button
                 onClick={() => onDisconnect(device)}
                 disabled={busyDeviceId === device.id}
-                title="Unmount device"
-                aria-label={`Disconnect ${device.name}`}
+                title="READ ONLY — Unmount device without changing its contents"
+                aria-label={`READ ONLY — Disconnect ${device.name}`}
               >
                 <FiX />
               </button>
@@ -156,6 +158,8 @@ function PhoneDeviceCard({
           <button
             onClick={() => onConnect(device)}
             disabled={busyDeviceId === device.id}
+            title="DESTINATION WRITE — Connect and save a dated snapshot in Silo"
+            data-help="DESTINATION WRITE: Connecting starts or updates a dated local snapshot of accessible files. It does not change files on the device."
           >
             {busyDeviceId === device.id ? "Connecting…" : "Connect"}
           </button>
@@ -228,6 +232,8 @@ function PhoneDeviceCard({
               tooling.ios.missing.includes("idevicebackup2")
             }
             onClick={() => void createRestoreArchive()}
+            title="DESTINATION WRITE — Save an encrypted restore archive in Silo"
+            data-help="DESTINATION WRITE: Save an encrypted iPhone or iPad restore archive in Silo storage; this does not restore or change the device."
           >
             {restoreBusy ? "Working…" : "Create encrypted restore archive"}
           </button>
@@ -251,6 +257,8 @@ function PhoneDeviceCard({
                     archive.deviceModel !== device.model
                   }
                   onClick={() => void restoreArchive(archive)}
+                  title="DEVICE WRITE — Restore this archive to the connected iPhone or iPad; current contents may be replaced"
+                  data-help="DEVICE WRITE: Writes the archive to the connected device and can replace current content. Confirm the device and archive before continuing."
                 >
                   Restore this archive
                 </button>
@@ -314,7 +322,7 @@ function PhoneManagerPanel({
         </button>
       </header>
 
-      <div className="phone-backup-settings" data-tour="mobile-backup-settings" data-help="Choose the destination for dated browseable copies and review the different restore scopes for iOS archives and Android shared-file snapshots.">
+      <div className="phone-backup-settings" data-tour="mobile-backup-settings" data-help="DESTINATION WRITE: Connecting creates or updates dated browseable copies in local storage; source files on the phone are unchanged. DEVICE WRITE: Restoring an iOS archive writes to the connected device and may replace current content.">
         <small className="phone-backup-scope">
           <strong>Dated browseable snapshots</strong> — Silo saves each distinct
           version of files exposed over USB (iOS media/file-sharing areas or
@@ -337,15 +345,17 @@ function PhoneManagerPanel({
             {backupDestination || "Default (local storage)"}
           </small>
           <button className="small-button" onClick={onChooseBackupDestination}
-            data-help="Choose where dated, browseable copies of accessible device files are stored.">
+            title="SILO DATA WRITE — Set the destination for future phone snapshots"
+            data-help="SILO DATA WRITE: Save the destination preference in Silo. This only chooses where future phone snapshots are stored."
+          >
             {backupDestination ? "Change" : "Choose"} destination
           </button>
           {backupDestination && (
             <button
               className="small-button"
               onClick={onResetBackupDestination}
-              title="Reset to default"
-              aria-label="Reset backup destination to default"
+              title="SILO DATA WRITE — Reset phone snapshot destination to default"
+              aria-label="SILO DATA WRITE — Reset phone snapshot destination to default"
               data-help="Use Silo’s default local-storage folder for future browseable copies."
             >
               <FiX />

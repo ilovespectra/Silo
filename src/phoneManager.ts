@@ -656,6 +656,8 @@ export class PhoneManager {
     key: string,
     value: string,
   ): Promise<void> {
+    if (process.platform !== "darwin")
+      throw new Error("iPhone restore archives are currently supported on macOS only.");
     await execFileAsync(
       "/usr/bin/plutil",
       ["-replace", key, "-string", value, infoPlistPath],
@@ -684,6 +686,8 @@ export class PhoneManager {
     sourceDeviceId: string,
     targetDevice: PhoneDevice,
   ): Promise<void> {
+    if (process.platform !== "darwin")
+      throw new Error("iPhone restore archives are currently supported on macOS only.");
     const measureArchive = async (directory: string): Promise<number> => {
       let totalBytes = 0;
       const entries = await fsPromises.readdir(directory, { withFileTypes: true });
@@ -767,6 +771,8 @@ export class PhoneManager {
     device: PhoneDevice,
     password: string,
   ): Promise<PhoneRestoreArchive> {
+    if (process.platform !== "darwin")
+      throw new Error("iPhone restore archives are currently supported on macOS only.");
     if (device.platform !== "ios")
       throw new Error("Native restore archives are currently supported for iPhone and iPad only.");
     if (device.status !== "ready" || !device.rootPath)
@@ -889,6 +895,8 @@ export class PhoneManager {
     archiveId: string,
     password: string,
   ): Promise<void> {
+    if (process.platform !== "darwin")
+      throw new Error("iPhone restore archives are currently supported on macOS only.");
     if (device.platform !== "ios")
       throw new Error("This restore archive is for an iPhone or iPad.");
     if (device.status !== "ready" || !device.rootPath)

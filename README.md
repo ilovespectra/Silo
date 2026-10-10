@@ -30,11 +30,11 @@ A local-first file browser built with Electron, React, and TypeScript. Browse dr
 ### Connected sources
 
 - 📱 **Connect a Phone** — iPhone and Android, auto-detected
-- ☁️ **Google Drive** — browse, rename, trash, upload
+- ☁️ **Google Drive** — browse and preview in Files (read-only UI)
 - 🖼️ **Google Photos** — select photos through the official Picker
 - 👥 **Multiple Google accounts** — stay signed in to several at once and view every Drive and picked photo in one merged place
 
-Phone and cloud files behave like local files: thumbnails, preview, explode, digital folders, and save-to-device all work the same way.
+Phone and cloud sources support browsing, previews, Explode, Digital Folders, and saving separate copies to this device. Check each action label: source-changing controls depend on the source type.
 
 ## Prerequisites
 
@@ -187,8 +187,10 @@ If a required binary is missing, the app tells you exactly which one and the com
 
    | Scope                                                              | Purpose                    |
    | ------------------------------------------------------------------ | -------------------------- |
-   | `https://www.googleapis.com/auth/drive`                            | Read and write Drive files |
+   | `https://www.googleapis.com/auth/drive`                            | Broad Drive read/write scope requested by this source snapshot |
    | `https://www.googleapis.com/auth/photospicker.mediaitems.readonly` | Read photos the user picks |
+
+The scope above is broader than the current Files UI, which exposes no Google Drive write controls. The permission actually granted depends on the deployed OAuth project, consent configuration, and account; do not describe the OAuth grant itself as read-only based on the Files UI.
 
 4. On the **Test users** step, add your own Google account.
 
@@ -237,7 +239,7 @@ It prints the granted scopes and the live status of each API.
 
 ### What works, and what Google no longer allows
 
-**Google Drive** — full access. Browse folders, explode the whole tree, preview and stream files, rename, move to trash, create folders, and upload. Google Docs, Sheets, and Slides are exported to PDF or PNG on the fly so they can be previewed.
+**Google Drive** — the current Files interface supports read-only browsing, folder navigation, previews, and streaming. It has no Google Drive create-folder, rename, move-to-trash, or upload controls. Generic **Move** and **New folder** controls are local filesystem actions and are unavailable on Google virtual paths. Google Docs, Sheets, and Slides are exported to PDF or PNG on the fly so they can be previewed. The source still requests a broader Drive OAuth scope and retains backend write handlers that the current Files renderer does not call; actual consent depends on the OAuth project and account.
 
 **Google Photos** — read-only, and **only for photos the user explicitly picks**.
 

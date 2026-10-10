@@ -35,6 +35,7 @@ module.exports = {
       : false,
   },
   dmg: {
+    title: packageJson.build.productName,
     background: 'public/dmg-background.png',
     window: { width: 720, height: 500 },
     contents: [

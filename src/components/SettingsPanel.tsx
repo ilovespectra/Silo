@@ -90,9 +90,9 @@ function PerformanceSettingsSection() {
     if (!snapshot) return;
     const available = snapshot.machine.availableProcessors;
     setDraft({
-      searchThreads: available,
-      indexThreads: Math.max(1, Math.min(4, available - 1)),
-      backgroundWorkPercent: 55,
+      searchThreads: Math.max(1, Math.min(2, available - 1)),
+      indexThreads: 1,
+      backgroundWorkPercent: 5,
     });
     setMessage("");
     setError("");
@@ -196,30 +196,30 @@ function PerformanceSettingsSection() {
             </span>
             <input
               type="range"
-              min={20}
+              min={5}
               max={100}
               step={5}
               value={draft.backgroundWorkPercent}
               disabled={busy}
-              aria-label="Background semantic indexing work-time budget"
+              aria-label="Background indexing work-time budget"
               onChange={(event) => {
                 setDraft({ ...draft, backgroundWorkPercent: Number(event.target.value) });
                 setMessage("");
               }}
             />
             <small>
-              Sets the share of each background work interval Silo aims to spend
-              indexing. The operating system still schedules CPU use, so this is
-              not a whole-computer CPU percentage cap.
+              Sets the CPU work-time budget for source scans and background index
+              preparation. The operating system still schedules CPU use, so this
+              is not a whole-computer CPU percentage cap.
             </small>
           </label>
         </>
       )}
 
       <p className="settings-footnote">
-        Search gets priority over ongoing semantic file indexing. Thread limits
-        apply to Silo’s vector-search operations; other app work and the operating
-        system can affect total CPU use.
+        Search gets priority over source scans and background index preparation.
+        Thread limits apply to vector-search operations; other app work and the
+        operating system can affect total CPU use.
       </p>
       {error && <p className="settings-message error" role="alert">{error}</p>}
       {message && <p className="settings-message" role="status">{message}</p>}
@@ -1178,7 +1178,7 @@ export default function SettingsPanel({
               target="_blank"
               rel="noreferrer"
             >
-              Download DMG instead
+              {`Download ${appUpdate.installerLabel ?? "installer"} instead`}
             </a>
           )}
           {appUpdate.status === "available" &&
@@ -1597,7 +1597,7 @@ export default function SettingsPanel({
         <section
           className="settings-statistics-section"
           data-tour="library-statistics"
-          data-help="Open the full dashboard to review source inventory, indexing progress, and verified shelter-copy status. Refresh measurements or start a backup only after checking source selections and destinations."
+          data-help="Open the full dashboard to review source inventory, indexing progress, and verified Fallout Shelter status. Refresh measurements or start a backup only after checking source selections and destinations."
         >
           <div className="settings-section-title">
             <FiBarChart2 />

@@ -13,10 +13,10 @@ var shelterFreshness_1 = require("./shelterFreshness");
 Object.defineProperty(exports, "getShelterFreshness", { enumerable: true, get: function () { return shelterFreshness_1.getShelterFreshness; } });
 function normalizedRelativePath(value) {
     if (typeof value !== "string" || !value.trim() || value.includes("\0") || path_1.default.isAbsolute(value) || /^[a-zA-Z]:/.test(value))
-        throw new Error("The shelter manifest contains an unsafe file path.");
+        throw new Error("The Fallout Shelter manifest contains an unsafe file path.");
     const segments = value.split(/[\\/]+/).filter(Boolean);
     if (!segments.length || segments.some((segment) => segment === "." || segment === ".."))
-        throw new Error("The shelter manifest contains an unsafe file path.");
+        throw new Error("The Fallout Shelter manifest contains an unsafe file path.");
     return segments.join("/");
 }
 function hasSha256(value) {
@@ -44,9 +44,9 @@ async function readCloneManifest(clonePath) {
         ? await (0, cloneArchive_1.readCloneArchiveManifest)(clonePath)
         : JSON.parse(await promises_1.default.readFile(path_1.default.join(clonePath, "silo-clone-manifest.json"), "utf8"));
     if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || manifest.complete !== true)
-        throw new Error("The latest shelter clone is incomplete or has no supported manifest.");
+        throw new Error("The latest Fallout Shelter clone is incomplete or has no supported manifest.");
     if (!Array.isArray(manifest.files) || !Array.isArray(manifest.aliases))
-        throw new Error("The shelter clone manifest is missing its file inventory.");
+        throw new Error("The Fallout Shelter clone manifest is missing its file inventory.");
     return manifest;
 }
 async function readShelterCloneManifest(clonePath) {
@@ -98,37 +98,37 @@ async function verifyShelterCloneSource(clonePath, sourceId, sourceFiles) {
     let destinationIntegrity = true;
     for (const raw of manifest.files) {
         if (raw.error || !hasSha256(raw.sha256))
-            throw new Error("The shelter clone manifest contains an unverified file.");
+            throw new Error("The Fallout Shelter clone manifest contains an unverified file.");
         const relative = normalizedRelativePath(raw.path);
         if (records.has(relative))
-            throw new Error("The shelter clone manifest contains duplicate file paths.");
+            throw new Error("The Fallout Shelter clone manifest contains duplicate file paths.");
         records.set(relative, raw.sha256.toLowerCase());
         physicalFiles.set(relative, raw.sha256.toLowerCase());
         if (raw.sourceId === sourceId) {
             const sourceRelative = normalizedRelativePath(raw.sourceRelativePath ?? raw.path);
             if (sourceManifestFiles.has(sourceRelative))
-                throw new Error("The shelter manifest maps a source file more than once.");
+                throw new Error("The Fallout Shelter manifest maps a source file more than once.");
             sourceManifestFiles.set(sourceRelative, { digest: raw.sha256.toLowerCase(), storedPath: relative });
         }
     }
     const aliasRecords = new Map();
     for (const raw of manifest.aliases) {
         if (!hasSha256(raw.sha256))
-            throw new Error("The shelter clone manifest contains an invalid duplicate hash.");
+            throw new Error("The Fallout Shelter clone manifest contains an invalid duplicate hash.");
         const relative = normalizedRelativePath(raw.path);
         const canonicalPath = normalizedRelativePath(raw.canonicalPath);
         const canonicalDigest = records.get(canonicalPath);
         if (!canonicalDigest || canonicalDigest !== raw.sha256.toLowerCase())
-            throw new Error("A shelter duplicate does not point to its verified canonical file.");
+            throw new Error("A Fallout Shelter duplicate does not point to its verified canonical file.");
         if (records.has(relative) || aliasRecords.has(relative))
-            throw new Error("The shelter clone manifest contains duplicate file paths.");
+            throw new Error("The Fallout Shelter clone manifest contains duplicate file paths.");
         aliasRecords.set(relative, { digest: raw.sha256.toLowerCase(), canonicalPath });
         if (raw.materialized === true)
             physicalFiles.set(relative, raw.sha256.toLowerCase());
         if (raw.sourceId === sourceId) {
             const sourceRelative = normalizedRelativePath(raw.sourceRelativePath ?? raw.path);
             if (sourceManifestFiles.has(sourceRelative))
-                throw new Error("The shelter manifest maps a source file more than once.");
+                throw new Error("The Fallout Shelter manifest maps a source file more than once.");
             sourceManifestFiles.set(sourceRelative, { digest: raw.sha256.toLowerCase(), storedPath: canonicalPath });
         }
     }
@@ -142,7 +142,7 @@ async function verifyShelterCloneSource(clonePath, sourceId, sourceFiles) {
         }
         catch (error) {
             destinationIntegrity = false;
-            result.error = error instanceof Error ? error.message : "The shelter archive failed integrity verification.";
+            result.error = error instanceof Error ? error.message : "The Fallout Shelter archive failed integrity verification.";
         }
     }
     else {
@@ -169,7 +169,7 @@ async function verifyShelterCloneSource(clonePath, sourceId, sourceFiles) {
                 destinationIntegrity = false;
         }
         if (!destinationIntegrity && !result.error)
-            result.error = "One or more stored shelter files failed SHA-256 or presence checks.";
+            result.error = "One or more stored Fallout Shelter files failed SHA-256 or presence checks.";
     }
     const currentSourceFiles = new Map();
     for (const file of sourceFiles) {

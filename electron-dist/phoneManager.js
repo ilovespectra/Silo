@@ -437,6 +437,8 @@ class PhoneManager {
         return value;
     }
     async replaceRestoreArchivePlistString(infoPlistPath, key, value) {
+        if (process.platform !== "darwin")
+            throw new Error("iPhone restore archives are currently supported on macOS only.");
         await execFileAsync("/usr/bin/plutil", ["-replace", key, "-string", value, infoPlistPath], { timeout: 10000 });
     }
     compareProductVersions(first, second) {
@@ -456,6 +458,8 @@ class PhoneManager {
         return 0;
     }
     async cloneRestoreArchiveForDevice(sourceRoot, targetRoot, sourceDeviceId, targetDevice) {
+        if (process.platform !== "darwin")
+            throw new Error("iPhone restore archives are currently supported on macOS only.");
         const measureArchive = async (directory) => {
             let totalBytes = 0;
             const entries = await fsPromises.readdir(directory, { withFileTypes: true });
@@ -511,6 +515,8 @@ class PhoneManager {
         }
     }
     async createRestoreArchive(device, password) {
+        if (process.platform !== "darwin")
+            throw new Error("iPhone restore archives are currently supported on macOS only.");
         if (device.platform !== "ios")
             throw new Error("Native restore archives are currently supported for iPhone and iPad only.");
         if (device.status !== "ready" || !device.rootPath)
@@ -597,6 +603,8 @@ class PhoneManager {
         }
     }
     async restoreDeviceFromArchive(device, archiveId, password) {
+        if (process.platform !== "darwin")
+            throw new Error("iPhone restore archives are currently supported on macOS only.");
         if (device.platform !== "ios")
             throw new Error("This restore archive is for an iPhone or iPad.");
         if (device.status !== "ready" || !device.rootPath)

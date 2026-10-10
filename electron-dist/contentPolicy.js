@@ -43,16 +43,17 @@ const explicitTerms = [
     "pinup nude",
 ];
 const normalizedTerms = explicitTerms.map((term) => term.toLowerCase());
+const explicitTermPatterns = normalizedTerms.map((term) => {
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|\\b)${escaped}(?:\\b|$)`, "i");
+});
 function containsExplicitTerms(value) {
     const normalized = value
         .toLowerCase()
         .replace(/[_.\-/\\]+/g, " ")
         .replace(/\s+/g, " ")
         .trim();
-    return normalizedTerms.some((term) => {
-        const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        return new RegExp(`(?:^|\\b)${escaped}(?:\\b|$)`, "i").test(normalized);
-    });
+    return explicitTermPatterns.some((pattern) => pattern.test(normalized));
 }
 exports.containsExplicitTerms = containsExplicitTerms;
 function fileTextLooksExplicit(file, metadata) {

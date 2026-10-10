@@ -88,6 +88,7 @@ export interface BannedFace {
 type IndexedImagesProvider = () => IndexableFile[] | Promise<IndexableFile[]>;
 type ProgressListener = (progress: FaceIndexProgress) => void;
 export declare class FaceIndexer {
+    private readonly hasActiveInteractiveSearch;
     private readonly directory;
     private readonly recordsPath;
     private readonly statePath;
@@ -102,6 +103,7 @@ export declare class FaceIndexer {
     private readonly baseFaceBoxes;
     private readonly baseFaceCrops;
     private readonly processedSignatures;
+    private readonly centroidDescriptorCounts;
     private state;
     private progress;
     private runtime;
@@ -111,13 +113,18 @@ export declare class FaceIndexer {
     private recognitionChain;
     private recognitionListener;
     private stateWriteChain;
+    private recordWriteChain;
+    private faceRecordVersion;
+    private recoveryJournal;
     private undoStack;
     private redoStack;
     private missingPhotos;
     private hiddenPhoto;
     private peopleChangeListener;
     private photoPeopleCache;
-    constructor(userDataPath: string, modelPath: string, wasmPath: string, getIndexedImages: IndexedImagesProvider, onProgress: ProgressListener, indexStoragePath?: string);
+    private backgroundWorkPercent;
+    constructor(userDataPath: string, modelPath: string, wasmPath: string, getIndexedImages: IndexedImagesProvider, onProgress: ProgressListener, indexStoragePath?: string, backgroundWorkPercent?: number, hasActiveInteractiveSearch?: () => boolean);
+    setBackgroundWorkPercent(percent: number): void;
     initialize(): Promise<void>;
     setHiddenPhotoPredicate(predicate: (photoPath: string, ownerBanned: boolean) => boolean): void;
     setPeopleChangeListener(listener: () => void): void;
@@ -302,12 +309,14 @@ export declare class FaceIndexer {
     private refreshRecognition;
     private queueRecognition;
     private updateCentroid;
+    private addDescriptorToCentroid;
     private distance;
     private signature;
     private newId;
     private cropUrl;
     private rebaseCropPath;
     private requirePerson;
+    private paceBackgroundWork;
     private emitProgress;
     private updateProgress;
     private persistProgress;

@@ -172,15 +172,17 @@ interface ActiveTextSearch {
   lastPublishedAt: number;
 }
 
-function searchTerms(value: string): string[] {
-  return Array.from(
-    new Set(
-      value
-        .normalize("NFKC")
-        .toLocaleLowerCase()
-        .match(/[\p{L}\p{N}]+/gu) ?? [],
-    ),
+function searchTermSet(value: string): Set<string> {
+  return new Set(
+    value
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .match(/[\p{L}\p{N}]+/gu) ?? [],
   );
+}
+
+function searchTerms(value: string): string[] {
+  return Array.from(searchTermSet(value));
 }
 
 interface ClipRuntime {
@@ -244,7 +246,7 @@ export class SemanticIndexer {
   private readonly scanSource: ScanSource;
   private readonly onProgress: ProgressListener;
   private readonly onDiagnostic: DiagnosticListener;
-  private readonly latestRecords = new Map<string, IndexRecord>();
+  private latestRecords = new Map<string, IndexRecord>();
   private readonly latestRecordsByVectorKey = new Map<number, IndexRecord>();
   private persistedVectorIndex: PersistedVectorIndex | null = null;
   private vectorIndexBuildPromise: Promise<void> | null = null;
@@ -500,25 +502,88 @@ export class SemanticIndexer {
   ): Promise<void> {
     await this.loaded;
     if (this.vectorIndexBuildPromise) return this.vectorIndexBuildPromise;
-    const grouped = new Map<
-      string,
-      { sourcePath: string; kind: VectorSearchKind; keys: number[] }
-    >();
+    type GroupBuffer = {
+      sourcePath: string;
+      kind: VectorSearchKind;
+      count: number;
+      next: number;
+      keys: BigUint64Array;
+    };
+    const grouped = new Map<string, Map<VectorSearchKind, GroupBuffer>>();
+    const getGroup = (sourcePath: string, kind: VectorSearchKind) => {
+      let byKind = grouped.get(sourcePath);
+      if (!byKind) {
+        byKind = new Map();
+        grouped.set(sourcePath, byKind);
+      }
+      let group = byKind.get(kind);
+      if (!group) {
+        group = {
+          sourcePath,
+          kind,
+          count: 0,
+          next: 0,
+          keys: new BigUint64Array(0),
+        };
+        byKind.set(kind, group);
+      }
+      return group;
+    };
+    const backgroundYield = async (batchStartedAt: bigint) => {
+      const workMs = Number(process.hrtime.bigint() - batchStartedAt) / 1_000_000;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      let cooldownMs = Math.ceil(
+        workMs *
+          ((100 - this.performanceSettings.backgroundWorkPercent) /
+            this.performanceSettings.backgroundWorkPercent),
+      );
+      while (cooldownMs > 0 && this.activeSearchCount === 0) {
+        const sliceMs = Math.min(50, cooldownMs);
+        await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
+        cooldownMs -= sliceMs;
+      }
+      while (this.activeSearchCount > 0)
+        await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    };
+
+    // Count first, then allocate only the transferable typed arrays. Keeping a
+    // second full set of JS-number arrays here made large libraries spike RSS.
+    let processed = 0;
+    let batchStartedAt = process.hrtime.bigint();
     for (const [key, record] of this.latestRecordsByVectorKey) {
       const kind: VectorSearchKind = record.type === "image" ? "image" : "document";
-      const groupKey = `${record.sourcePath}\0${kind}`;
-      let group = grouped.get(groupKey);
-      if (!group) {
-        group = { sourcePath: record.sourcePath, kind, keys: [] };
-        grouped.set(groupKey, group);
+      getGroup(record.sourcePath, kind).count += 1;
+      processed += 1;
+      if (processed % 8192 === 0) {
+        await backgroundYield(batchStartedAt);
+        batchStartedAt = process.hrtime.bigint();
       }
-      group.keys.push(key);
     }
-    const groups: VectorSearchGroup[] = Array.from(grouped.values(), (group) => ({
-      sourcePath: group.sourcePath,
-      kind: group.kind,
-      keys: BigUint64Array.from(group.keys, (key) => BigInt(key)),
-    }));
+    for (const byKind of grouped.values())
+      for (const group of byKind.values())
+        group.keys = new BigUint64Array(group.count);
+
+    processed = 0;
+    batchStartedAt = process.hrtime.bigint();
+    for (const [key, record] of this.latestRecordsByVectorKey) {
+      const kind: VectorSearchKind = record.type === "image" ? "image" : "document";
+      const group = getGroup(record.sourcePath, kind);
+      group.keys[group.next++] = BigInt(key);
+      processed += 1;
+      if (processed % 8192 === 0) {
+        await backgroundYield(batchStartedAt);
+        batchStartedAt = process.hrtime.bigint();
+      }
+    }
+    const groups: VectorSearchGroup[] = [];
+    for (const byKind of grouped.values())
+      for (const group of byKind.values())
+        groups.push({
+          sourcePath: group.sourcePath,
+          kind: group.kind,
+          keys: group.keys,
+        });
+    grouped.clear();
     this.persistedVectorIndex = new PersistedVectorIndex(
       this.vectorsPath,
       path.join(this.indexDirectory, "ann"),
@@ -772,8 +837,10 @@ export class SemanticIndexer {
     if (counts.total <= 0) this.recordCountsBySource.delete(record.sourcePath);
   }
 
-  private setLatestRecord(record: IndexRecord) {
-    const previous = this.latestRecords.get(record.path);
+  private setLatestRecord(record: IndexRecord, replaceExisting = true) {
+    const previous = replaceExisting
+      ? this.latestRecords.get(record.path)
+      : undefined;
     if (previous) this.updateRecordCounts(previous, -1);
     this.latestRecords.set(record.path, record);
     this.updateRecordCounts(record, 1);
@@ -814,9 +881,10 @@ export class SemanticIndexer {
       this.textRecordTerms.push(new Set());
       this.textPostingTerms.push(new Set());
     }
-    const currentTerms = searchTerms(`${record.name} ${record.relativePath}`);
+    const currentTermSet = searchTermSet(`${record.name} ${record.relativePath}`);
     const indexedTerms = this.textPostingTerms[recordId];
-    const currentTermSet = new Set(currentTerms);
+    // Replace the current set before extending postings: unchanged records may
+    // share these sets, while postings retain terms from older path versions.
     this.textRecordTerms[recordId] = currentTermSet;
     for (const term of currentTermSet) {
       if (indexedTerms.has(term)) continue;
@@ -825,6 +893,15 @@ export class SemanticIndexer {
       posting.push(recordId);
       this.textPostings.set(term, posting);
     }
+    let termsUnchanged = currentTermSet.size === indexedTerms.size;
+    if (termsUnchanged)
+      for (const term of currentTermSet)
+        if (!indexedTerms.has(term)) {
+          termsUnchanged = false;
+          break;
+        }
+    if (termsUnchanged)
+      this.textRecordTerms[recordId] = indexedTerms;
     return recordId;
   }
 
@@ -3312,6 +3389,7 @@ export class SemanticIndexer {
     const canonicalRoots = new Map<string, string>();
     const excludedPaths = new Set<string>();
     let corruptLines = 0;
+    let journalRowsRead = 0;
     // Directory-level memo: per-file checks re-read marker files for every ancestor.
     const cloneChecks = new Map<string, Promise<boolean>>();
     const inClone = (directory: string, root: string): Promise<boolean> => {
@@ -3345,9 +3423,13 @@ export class SemanticIndexer {
       for await (const line of rl) {
         if (onLoadProgress && totalBytes && Date.now() - lastReport > 500) {
           lastReport = Date.now();
-          onLoadProgress(Math.min(1, fileStream.bytesRead / totalBytes), recordCount);
+          onLoadProgress(
+            Math.min(1, fileStream.bytesRead / totalBytes),
+            this.latestRecords.size,
+          );
         }
         if (!line.trim()) continue;
+        journalRowsRead += 1;
         try {
           let record: IndexRecord & { deleted?: boolean };
           try {
@@ -3360,21 +3442,43 @@ export class SemanticIndexer {
             record = JSON.parse(line.slice(glued));
           }
           if (record.deleted) {
-            this.deleteLatestRecord(record.path);
+            if (typeof record.path === "string")
+              this.latestRecords.delete(record.path);
             continue;
           }
           if (typeof record.path !== "string" || typeof record.sourcePath !== "string")
             continue;
-          // Legacy records from software trees stay on disk but are never held in memory.
-          if (isNonLibraryPath(record.path)) {
-            this.deleteLatestRecord(record.path);
-            continue;
-          }
+          // Collapse append-only history first. Validating paths, probing clone
+          // markers, and rebuilding text postings for every old version made
+          // large journals spend minutes doing work on records that are
+          // immediately superseded by a later row.
+          this.latestRecords.delete(record.path);
+          this.latestRecords.set(record.path, record);
+        } catch {
+          corruptLines += 1;
+        }
+      }
+
+      // Validate in place so startup does not allocate a second large Map.
+      const replayedRecords = this.latestRecords;
+      this.onDiagnostic("semantic-record-history-collapsed", {
+        journalRowsRead,
+        recordsToValidate: replayedRecords.size,
+      });
+      let lastValidationReport = Date.now();
+      for (const record of replayedRecords.values()) {
+        let accepted = false;
+        try {
+          // Legacy records from software trees stay on disk but are never held
+          // in memory. Check only their final version after history collapse.
+          if (isNonLibraryPath(record.path)) continue;
           let canonicalRoot = canonicalRoots.get(record.sourcePath);
           if (!canonicalRoot) {
             canonicalRoot = this.isRemotePath(record.sourcePath)
               ? record.sourcePath
-              : await fsPromises.realpath(record.sourcePath).catch(() => path.resolve(record.sourcePath));
+              : await fsPromises
+                  .realpath(record.sourcePath)
+                  .catch(() => path.resolve(record.sourcePath));
             canonicalRoots.set(record.sourcePath, canonicalRoot);
             this.canonicalSourcePaths.set(record.sourcePath, canonicalRoot);
           }
@@ -3387,7 +3491,6 @@ export class SemanticIndexer {
               this.canonicalUserDataPath,
             )
           ) {
-            this.deleteLatestRecord(record.path);
             excludedPaths.add(record.path);
             this.sourcesWithExcludedRecords.add(record.sourcePath);
             continue;
@@ -3396,7 +3499,6 @@ export class SemanticIndexer {
             !this.isRemotePath(record.sourcePath) &&
             await inClone(path.dirname(path.resolve(record.path)), record.sourcePath)
           ) {
-            this.deleteLatestRecord(record.path);
             excludedPaths.add(record.path);
             this.sourcesWithExcludedRecords.add(record.sourcePath);
             continue;
@@ -3411,7 +3513,8 @@ export class SemanticIndexer {
               this.deleteLatestRecord(previousOwner);
             offsetOwners.set(record.vectorOffset, record.path);
           }
-          this.setLatestRecord(record);
+          this.setLatestRecord(record, false);
+          accepted = true;
           recordCount += 1;
           typeCount[record.type] = (typeCount[record.type] || 0) + 1;
           if (record.vectorOffset >= 0)
@@ -3419,8 +3522,14 @@ export class SemanticIndexer {
               highestVectorEnd,
               record.vectorOffset + VECTOR_BYTES,
             );
+          if (onLoadProgress && Date.now() - lastValidationReport > 500) {
+            lastValidationReport = Date.now();
+            onLoadProgress(1, recordCount);
+          }
         } catch {
           corruptLines += 1;
+        } finally {
+          if (!accepted) replayedRecords.delete(record.path);
         }
       }
       cloneChecks.clear();

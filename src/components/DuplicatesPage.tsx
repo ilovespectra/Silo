@@ -418,9 +418,12 @@ export default function DuplicatesPage({
           }
           data-help={
             view === "duplicates" && totalSelectedCount > 0
-              ? "Stage selected duplicate copies in Review removed. The protected original stays in place."
-              : "Compare indexed file contents to find exact duplicate copies; review paths and keep the protected first copy before cleanup."
+              ? "SOURCE WRITE: Move selected duplicate copies to the recoverable Review removed area. The protected original stays in place."
+              : "READ ONLY: Compare indexed file contents to find exact duplicate copies; scanning does not change source files. Review paths and keep the protected first copy before any cleanup."
           }
+          title={view === "duplicates" && totalSelectedCount > 0
+            ? "SOURCE WRITE — Stage selected copies for review"
+            : "READ ONLY — Scan library for exact duplicates"}
         >
           {view === "duplicates" && totalSelectedCount > 0 ? (
             <>
@@ -462,7 +465,7 @@ export default function DuplicatesPage({
 
       {view === "duplicates" ? (
         <>
-          <div className="duplicate-toolbar" data-tour="duplicates-actions" data-help="Select duplicate copies and change how groups are displayed. Selected copies can be staged in the recoverable Review removed area.">
+          <div className="duplicate-toolbar" data-tour="duplicates-actions" data-help="READ ONLY: Scanning and selecting do not alter files. SOURCE WRITE: Staging selected duplicate copies moves them into recoverable Review removed; permanent deletion is a separate, irreversible source-file action. The protected original stays in place.">
             <div className="duplicate-toolbar-left">
               <span>
                 The first retained file is protected. Selectable duplicates can
@@ -953,7 +956,7 @@ export default function DuplicatesPage({
         </>
       ) : (
         <>
-          <div className="duplicate-toolbar" data-tour="duplicate-trash-actions" data-help="Restore selected items from review, or permanently delete selected/all reviewed items. Permanent deletion cannot be undone.">
+          <div className="duplicate-toolbar" data-tour="duplicate-trash-actions" data-help="SOURCE WRITE: Restore moves selected files back to their source paths. Delete selected/all permanently deletes those files and cannot be undone.">
             <button
               onClick={() =>
                 setSelectedTrash(
@@ -975,6 +978,7 @@ export default function DuplicatesPage({
             <button
               disabled={busy || selectedTrash.size === 0}
               onClick={() => void restore()}
+              title="SOURCE WRITE — Restore files to their original paths"
             >
               <FiRotateCcw /> Restore
             </button>
@@ -982,6 +986,7 @@ export default function DuplicatesPage({
               className="danger"
               disabled={busy || state.trash.length === 0}
               onClick={() => void clear()}
+              title="SOURCE DELETE — Permanently delete reviewed files"
             >
               <FiTrash2 />{" "}
               {selectedTrash.size

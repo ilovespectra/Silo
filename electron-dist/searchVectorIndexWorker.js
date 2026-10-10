@@ -27,12 +27,13 @@ const worker_threads_1 = require("worker_threads");
 const fsPromises = __importStar(require("fs/promises"));
 const path = __importStar(require("path"));
 const crypto = __importStar(require("crypto"));
+require("numkong");
 const usearch_1 = require("usearch");
 const contentSettings_1 = require("./contentSettings");
 const VECTOR_SIZE = 512;
 const VECTOR_BYTES = VECTOR_SIZE * Float32Array.BYTES_PER_ELEMENT;
-const MAX_VECTOR_WINDOW_BYTES = 8 * 1024 * 1024;
-const MAX_ADD_BATCH = 1024;
+const MAX_VECTOR_WINDOW_BYTES = 2 * 1024 * 1024;
+const MAX_ADD_BATCH = 128;
 const INDEX_LIMIT_PER_KIND = 500;
 const SAVE_DEBOUNCE_MS = 30000;
 const INDEX_VERSION = 1;
@@ -45,6 +46,7 @@ let saveTimer = null;
 let messageQueue = Promise.resolve();
 let paused = false;
 let performanceSettings = (0, contentSettings_1.defaultSearchPerformanceSettings)();
+let manifestDirty = false;
 const indexConfig = {
     dimensions: VECTOR_SIZE,
     metric: usearch_1.MetricKind.Cos,
@@ -84,7 +86,7 @@ async function waitIfPaused() {
         await new Promise((resolve) => setTimeout(resolve, 40));
 }
 async function paceBackgroundWork(workMs) {
-    const dutyPercent = Math.max(20, Math.min(100, performanceSettings.backgroundWorkPercent));
+    const dutyPercent = Math.max(5, Math.min(100, performanceSettings.backgroundWorkPercent));
     let remaining = Math.ceil(workMs * ((100 - dutyPercent) / dutyPercent));
     while (remaining > 0 && !closing) {
         await waitIfPaused();
@@ -150,6 +152,8 @@ async function saveAll() {
     await fsPromises.mkdir(cacheDirectory, { recursive: true });
     for (const partition of partitions.values())
         await atomicWriteIndex(partition);
+    if (!manifestDirty)
+        return;
     const manifest = {
         version: INDEX_VERSION,
         dimensions: VECTOR_SIZE,
@@ -169,6 +173,7 @@ async function saveAll() {
     await fsPromises.writeFile(temporaryPath, JSON.stringify(manifest));
     await fsPromises.rm(manifestPath, { force: true });
     await fsPromises.rename(temporaryPath, manifestPath);
+    manifestDirty = false;
 }
 function scheduleSave() {
     if (saveTimer)
@@ -205,24 +210,25 @@ async function initialize(message) {
     let total = 0;
     for (const group of groups) {
         const id = partitionId(group.sourcePath, group.kind);
-        const normalizedKeys = Array.from(group.keys, (key) => Number(key)).sort((first, second) => first - second);
+        const currentKeys = Array.from(group.keys, (key) => Number(key)).sort((first, second) => first - second);
         currentById.set(id, {
             sourcePath: group.sourcePath,
             kind: group.kind,
-            keys: BigUint64Array.from(normalizedKeys, (key) => BigInt(key)),
+            keys: currentKeys,
         });
-        total += normalizedKeys.length;
+        total += currentKeys.length;
     }
     reportProgress(0, total);
     const saved = await loadManifest();
     const savedById = new Map((saved?.partitions ?? []).map((entry) => [entry.id, entry]));
+    manifestDirty = saved === null || savedById.size !== currentById.size;
     let processed = 0;
     const vectorHandle = await fsPromises.open(vectorsPath, "r").catch(() => null);
     if (!vectorHandle && total > 0)
         throw new Error("The saved vector file is unavailable; the ANN index cannot be prepared.");
     try {
         for (const [id, group] of currentById) {
-            const currentKeys = Array.from(group.keys, (key) => Number(key));
+            const currentKeys = group.keys;
             const previous = savedById.get(id);
             let partition = createPartition(group.sourcePath, group.kind);
             if (previous && previous.sourcePath === group.sourcePath && previous.kind === group.kind) {
@@ -236,24 +242,25 @@ async function initialize(message) {
                 }
                 catch {
                     partition = createPartition(group.sourcePath, group.kind);
+                    manifestDirty = true;
                 }
             }
             const currentSet = new Set(currentKeys);
-            const retained = new Set();
             if (partition.keys.size) {
                 const removed = Array.from(partition.keys).filter((key) => !currentSet.has(key));
                 if (removed.length) {
                     partition.index.remove(BigUint64Array.from(removed, (key) => BigInt(key)));
                     partition.dirty = true;
+                    manifestDirty = true;
+                    for (const key of removed)
+                        partition.keys.delete(key);
                 }
-                for (const key of partition.keys)
-                    if (currentSet.has(key))
-                        retained.add(key);
             }
-            const additions = currentKeys.filter((key) => !retained.has(key));
-            partition.keys = retained;
+            const additions = currentKeys.filter((key) => !partition.keys.has(key));
+            if (additions.length)
+                manifestDirty = true;
             partitions.set(id, partition);
-            processed += retained.size;
+            processed += partition.keys.size;
             reportProgress(processed, total);
             if (additions.length && vectorHandle) {
                 const buildProgress = { processed, total };
@@ -267,6 +274,8 @@ async function initialize(message) {
     finally {
         await vectorHandle?.close();
     }
+    if (savedById.size)
+        manifestDirty = true;
     for (const stale of savedById.values())
         await fsPromises.rm(path.join(cacheDirectory, `${stale.id}.usearch`), { force: true });
     await saveAll();
@@ -369,6 +378,7 @@ async function applyUpsert(message) {
         partition.index.add(BigInt(key), new Float32Array(buffer.buffer, buffer.byteOffset, VECTOR_SIZE), performanceSettings.indexThreads);
         partition.keys.add(key);
         partition.dirty = true;
+        manifestDirty = true;
         scheduleSave();
     }
     finally {
@@ -385,6 +395,7 @@ function applyRemove(message) {
     if (partition.index.contains(BigInt(key)))
         partition.index.remove(BigInt(key));
     partition.dirty = true;
+    manifestDirty = true;
     scheduleSave();
 }
 async function handle(message) {

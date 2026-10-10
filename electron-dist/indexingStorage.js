@@ -57,6 +57,7 @@ async function assertLocalIndexStorageCapacity(storageRoot, additionalBytes = 0)
 exports.assertLocalIndexStorageCapacity = assertLocalIndexStorageCapacity;
 let activeIndexStorageRoot = "";
 let indexStorageExclusionRoots = [];
+let canonicalIndexStorageExclusionRoots = null;
 function canonicalizeStoragePath(storageRoot) {
     const resolved = path.resolve(storageRoot);
     try {
@@ -70,17 +71,22 @@ function setActiveIndexStorageRoot(storageRoot) {
     const resolved = path.resolve(storageRoot);
     activeIndexStorageRoot = canonicalizeStoragePath(resolved);
     indexStorageExclusionRoots = [resolved];
+    canonicalIndexStorageExclusionRoots = null;
 }
 exports.setActiveIndexStorageRoot = setActiveIndexStorageRoot;
 function setIndexStorageExclusionRoots(storageRoots) {
     indexStorageExclusionRoots = Array.from(new Set(storageRoots.map((storageRoot) => path.resolve(storageRoot))));
+    canonicalIndexStorageExclusionRoots = null;
 }
 exports.setIndexStorageExclusionRoots = setIndexStorageExclusionRoots;
 function getIndexStorageExclusionRoots() {
-    return Array.from(new Set(indexStorageExclusionRoots.flatMap((storageRoot) => [
+    if (canonicalIndexStorageExclusionRoots)
+        return canonicalIndexStorageExclusionRoots;
+    canonicalIndexStorageExclusionRoots = Array.from(new Set(indexStorageExclusionRoots.flatMap((storageRoot) => [
         storageRoot,
         canonicalizeStoragePath(storageRoot),
     ])));
+    return canonicalIndexStorageExclusionRoots;
 }
 exports.getIndexStorageExclusionRoots = getIndexStorageExclusionRoots;
 function getLocalFallbackIndexStorageRoot(userDataPath) {

@@ -39,7 +39,7 @@ export declare class SemanticIndexer {
     private readonly scanSource;
     private readonly onProgress;
     private readonly onDiagnostic;
-    private readonly latestRecords;
+    private latestRecords;
     private readonly latestRecordsByVectorKey;
     private persistedVectorIndex;
     private vectorIndexBuildPromise;

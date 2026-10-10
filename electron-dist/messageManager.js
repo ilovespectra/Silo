@@ -550,6 +550,8 @@ class MessageManager {
         await fsPromises.rename(temporary, destination);
     }
     async getIOSMessageThreads(deviceId, refresh) {
+        if (process.platform !== "darwin")
+            throw new Error("Reading iPhone Messages from device backups is currently supported on macOS only.");
         if (!this.userDataPath)
             throw new Error("Message backup directory is unavailable.");
         const backupRoot = path.join(this.backupDestinationPath || this.userDataPath, this.backupDestinationPath

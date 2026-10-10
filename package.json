@@ -1,6 +1,6 @@
 {
   "name": "silo",
-  "version": "2.0.2",
+  "version": "2.0.4",
   "description": "A local-first media library with semantic search, people, maps, messages, and duplicate management.",
   "main": "electron-dist/main.js",
   "homepage": "./",
@@ -58,6 +58,7 @@
     "highlight.js": "^11.12.0",
     "mammoth": "^1.13.0",
     "mime": "^3.0.0",
+    "numkong": "7.8.1",
     "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
     "pdf-parse": "^2.4.5",
     "pdfkit": "^0.13.0",
@@ -80,7 +81,7 @@
     "@types/react-dom": "^18.2.0",
     "@types/yauzl": "^3.4.0",
     "concurrently": "^8.2.0",
-    "electron": "^43.4.0",
+    "electron": "37.10.3",
     "electron-builder": "^24.6.0",
     "js-yaml": "^4.1.0",
     "react-scripts": "5.0.1",
@@ -106,6 +107,7 @@
     "mac": {
       "artifactName": "${productName}-${version}-${arch}.${ext}",
       "category": "public.app-category.utilities",
+      "minimumSystemVersion": "11.0",
       "extendInfo": {
         "CFBundleName": "Silo",
         "CFBundleDisplayName": "Silo",
@@ -147,7 +149,9 @@
       "node_modules/sharp/**/*",
       "node_modules/@img/**/*",
       "node_modules/ffmpeg-static/**/*",
-      "node_modules/usearch/prebuilds/**/*"
+      "node_modules/usearch/prebuilds/**/*",
+      "node_modules/numkong/**/*",
+      "node_modules/@numkong/**/*"
     ],
     "directories": {
       "buildResources": "public",

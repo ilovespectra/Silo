@@ -542,7 +542,7 @@ export const MessageExportPanel: React.FC = () => {
             loadingMessages
           }
           onClick={() => void loadMessages(true)}
-          title="Requires the phone to be connected and trusted"
+          title="SILO DATA WRITE — Read phone history and refresh its saved Silo copy; requires a trusted phone"
         >
           <FiRefreshCw /> {loadingMessages ? "Updating..." : "Update backup"}
         </button>
@@ -601,7 +601,7 @@ export const MessageExportPanel: React.FC = () => {
                       <button
                         onClick={() => void saveThreadName(thread)}
                         className="thread-action-save"
-                        title="Save"
+                        title="SILO DATA WRITE — Save this conversation name in Silo"
                       >
                         <FiSave />
                       </button>
@@ -650,8 +650,8 @@ export const MessageExportPanel: React.FC = () => {
                           setEditingThreadName(thread.displayName || "");
                         }}
                         className="thread-action-edit"
-                        title="Rename conversation"
-                        aria-label="Rename conversation"
+                        title="SILO DATA WRITE — Rename conversation in Silo"
+                        aria-label="SILO DATA WRITE — Rename conversation in Silo"
                       >
                         <FiEdit2 />
                       </button>
@@ -816,7 +816,9 @@ export const MessageExportPanel: React.FC = () => {
               : "Select a conversation to export it."}
           </p>
           <button onClick={() => void chooseDestination()}
-            data-help="Choose the folder where the selected conversation export will be saved.">
+            title="SILO DATA WRITE — Set the export destination in Silo"
+            data-help="SILO DATA WRITE: Choose and save the export destination in Silo. No conversation file is written until you export."
+          >
             <FiDownload /> Choose destination
           </button>
           <span className="export-path" title={outputDir}>
@@ -835,7 +837,8 @@ export const MessageExportPanel: React.FC = () => {
             className="primary"
             disabled={!selectedThread || !outputDir || exporting}
             onClick={() => void exportMessages()}
-            data-help="Save the selected conversation to the chosen folder in the selected format."
+            title="DESTINATION WRITE — Save the selected conversation to the chosen folder"
+            data-help="DESTINATION WRITE: Write an export copy of the selected conversation to the chosen folder. The phone's message history is unchanged."
           >
             <FiDownload /> {exporting ? "Saving..." : "Save conversation"}
           </button>

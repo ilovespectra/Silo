@@ -121,11 +121,11 @@ assert.strictEqual(sparseTypeSelection.size, DEMO_LIMITS.files);
 assert(sparseTypeSelection.has("/docs/only.pdf"));
 
 const mapPhotos = [
-  { path: "/map/b.jpg", locationLabel: "Piran", latitude: 45.5, longitude: 13.6 },
-  { path: "/map/a.jpg", locationLabel: "Piran", latitude: 45.5, longitude: 13.6 },
-  { path: "/map/c.jpg", locationLabel: "Sistiana", latitude: 45.7, longitude: 13.6 },
+  { path: "/map/b.jpg", locationLabel: "Sample Location A", latitude: 0, longitude: 0 },
+  { path: "/map/a.jpg", locationLabel: "Sample Location A", latitude: 0, longitude: 0 },
+  { path: "/map/c.jpg", locationLabel: "Sample Location B", latitude: 0, longitude: 0 },
 ];
-assert.strictEqual(getDemoDestinationKey(mapPhotos[0]), "piran");
+assert.strictEqual(getDemoDestinationKey(mapPhotos[0]), "Sample Location A");
 assert.deepStrictEqual(
   selectDemoMapPhotos(mapPhotos, false, 2, 1).map((photo) => photo.path),
   ["/map/a.jpg", "/map/b.jpg"],

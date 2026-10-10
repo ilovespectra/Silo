@@ -99,7 +99,7 @@ async function checkFaceInferenceThreadLimit() {
     await (indexer as any).loadRuntime();
     assert.deepStrictEqual(calls.slice(0, 5), [
       "sharp:1",
-      "threads:2",
+      "threads:1",
       "wasm-paths",
       "backend:wasm",
       "ready",
@@ -109,8 +109,69 @@ async function checkFaceInferenceThreadLimit() {
   }
 }
 
+async function checkFaceJournalRecovery() {
+  const { directory } = await setup();
+  try {
+    const faceDirectory = path.join(directory, "face-index");
+    const statePath = path.join(faceDirectory, "people.json");
+    const recordsPath = path.join(faceDirectory, "faces.jsonl");
+    const recoveredFace = face(
+      "recovered-face",
+      "/photos/recovered.jpg",
+      descriptor(1, 0),
+    );
+    recoveredFace.personIds = ["recovered-person"];
+    const newPerson = cluster(
+      "recovered-person",
+      [],
+      descriptor(1, 0),
+      false,
+      "Person 17",
+    );
+
+    await fsPromises.appendFile(
+      recordsPath,
+      `${JSON.stringify({
+        imagePath: recoveredFace.imagePath,
+        signature: recoveredFace.signature,
+        faces: [recoveredFace],
+        createdPeople: [newPerson],
+      })}\n`,
+    );
+
+    const recoveredIndexer = new FaceIndexer(
+      directory,
+      directory,
+      directory,
+      () => [],
+      () => undefined,
+    );
+    await recoveredIndexer.initialize();
+    const recoveredState = JSON.parse(await fsPromises.readFile(statePath, "utf8"));
+    assert.equal(recoveredState.faceRecordVersion, 1);
+    assert.equal(recoveredState.people.length, 1);
+    assert.equal(recoveredState.people[0].name, "Person 17");
+    assert.deepStrictEqual(recoveredState.people[0].faceIds, ["recovered-face"]);
+
+    const reopenedIndexer = new FaceIndexer(
+      directory,
+      directory,
+      directory,
+      () => [],
+      () => undefined,
+    );
+    await reopenedIndexer.initialize();
+    const reopenedState = (reopenedIndexer as any).state;
+    assert.equal(reopenedState.people.length, 1);
+    assert.deepStrictEqual(reopenedState.people[0].faceIds, ["recovered-face"]);
+  } finally {
+    await fsPromises.rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function run() {
   await checkFaceInferenceThreadLimit();
+  await checkFaceJournalRecovery();
   const { directory, indexer } = await setup();
   try {
     const closeA = descriptor(1, 0);

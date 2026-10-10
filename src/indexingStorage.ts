@@ -50,6 +50,7 @@ export async function assertLocalIndexStorageCapacity(
 
 let activeIndexStorageRoot = "";
 let indexStorageExclusionRoots: string[] = [];
+let canonicalIndexStorageExclusionRoots: string[] | null = null;
 
 function canonicalizeStoragePath(storageRoot: string) {
   const resolved = path.resolve(storageRoot);
@@ -64,16 +65,19 @@ export function setActiveIndexStorageRoot(storageRoot: string) {
   const resolved = path.resolve(storageRoot);
   activeIndexStorageRoot = canonicalizeStoragePath(resolved);
   indexStorageExclusionRoots = [resolved];
+  canonicalIndexStorageExclusionRoots = null;
 }
 
 export function setIndexStorageExclusionRoots(storageRoots: readonly string[]) {
   indexStorageExclusionRoots = Array.from(
     new Set(storageRoots.map((storageRoot) => path.resolve(storageRoot))),
   );
+  canonicalIndexStorageExclusionRoots = null;
 }
 
 export function getIndexStorageExclusionRoots() {
-  return Array.from(
+  if (canonicalIndexStorageExclusionRoots) return canonicalIndexStorageExclusionRoots;
+  canonicalIndexStorageExclusionRoots = Array.from(
     new Set(
       indexStorageExclusionRoots.flatMap((storageRoot) => [
         storageRoot,
@@ -81,6 +85,7 @@ export function getIndexStorageExclusionRoots() {
       ]),
     ),
   );
+  return canonicalIndexStorageExclusionRoots;
 }
 
 export function getLocalFallbackIndexStorageRoot(userDataPath: string) {

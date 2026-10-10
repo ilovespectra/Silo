@@ -34,7 +34,8 @@ const COMBINE_CLUSTER_DISTANCE = 0.4;
 // Stricter than auto-clustering: a suggestion must sit close to an actual confirmed face.
 const TRAINED_MATCH_DISTANCE = 0.42;
 const MAX_EXEMPLARS = 64;
-const FACE_WASM_THREAD_LIMIT = 2;
+const FACE_WASM_THREAD_LIMIT = 1;
+const FACE_STATE_CHECKPOINT_INTERVAL = 1000;
 const MAX_EDIT_HISTORY = 100;
 const initialProgress = {
     status: "idle",
@@ -48,12 +49,14 @@ const initialProgress = {
     message: "Waiting for indexed photos.",
 };
 class FaceIndexer {
-    constructor(userDataPath, modelPath, wasmPath, getIndexedImages, onProgress, indexStoragePath = userDataPath) {
+    constructor(userDataPath, modelPath, wasmPath, getIndexedImages, onProgress, indexStoragePath = userDataPath, backgroundWorkPercent = 5, hasActiveInteractiveSearch = () => false) {
+        this.hasActiveInteractiveSearch = hasActiveInteractiveSearch;
         this.faces = new Map();
         this.facesByImage = new Map();
         this.baseFaceBoxes = new Map();
         this.baseFaceCrops = new Map();
         this.processedSignatures = new Map();
+        this.centroidDescriptorCounts = new Map();
         this.state = { version: 1, people: [], bannedFaces: {} };
         this.progress = { ...initialProgress };
         this.runtime = null;
@@ -63,6 +66,9 @@ class FaceIndexer {
         this.recognitionChain = Promise.resolve();
         this.recognitionListener = () => undefined;
         this.stateWriteChain = Promise.resolve();
+        this.recordWriteChain = Promise.resolve();
+        this.faceRecordVersion = 0;
+        this.recoveryJournal = [];
         this.undoStack = [];
         this.redoStack = [];
         this.missingPhotos = new Set();
@@ -70,6 +76,7 @@ class FaceIndexer {
         this.hiddenPhoto = () => false;
         this.peopleChangeListener = () => undefined;
         this.photoPeopleCache = null;
+        this.backgroundWorkPercent = 5;
         this.directory = path.join(indexStoragePath, "face-index");
         this.recordsPath = path.join(this.directory, "faces.jsonl");
         this.statePath = path.join(this.directory, "people.json");
@@ -79,16 +86,29 @@ class FaceIndexer {
         this.wasmPath = wasmPath;
         this.getIndexedImages = getIndexedImages;
         this.onProgress = onProgress;
+        this.setBackgroundWorkPercent(backgroundWorkPercent);
+    }
+    setBackgroundWorkPercent(percent) {
+        if (!Number.isFinite(percent))
+            return;
+        this.backgroundWorkPercent = Math.max(5, Math.min(100, Math.round(percent)));
     }
     async initialize() {
         await fsPromises.mkdir(this.cropsDirectory, { recursive: true });
-        await this.loadRecords();
+        let savedFaceRecordVersion = null;
+        let hasJournalVersion = false;
         try {
             this.state = JSON.parse(await fsPromises.readFile(this.statePath, "utf8"));
+            const storedVersion = this.state.faceRecordVersion;
+            if (Number.isSafeInteger(storedVersion) && storedVersion >= 0) {
+                savedFaceRecordVersion = storedVersion;
+                hasJournalVersion = true;
+            }
         }
         catch {
-            await this.persistState();
+            this.state = { version: 1, people: [], bannedFaces: {} };
         }
+        await this.loadRecords(savedFaceRecordVersion);
         try {
             this.progress = {
                 ...initialProgress,
@@ -103,11 +123,20 @@ class FaceIndexer {
         catch {
             await this.persistProgress();
         }
+        const recoveredJournal = this.recoveryJournal.length > 0;
         this.reconcilePeople();
+        if (!hasJournalVersion || recoveredJournal)
+            await this.persistState();
         this.bannedPhotoPaths = new Set(this.state.bannedPhotoPaths ?? []);
         this.missingPhotos = new Set(this.state.missingPhotoPaths ?? []);
-        void this.recheckMissingPhotos();
-        void this.refreshRecognition();
+        const recognitionNeedsRefresh = !hasJournalVersion || recoveredJournal;
+        void this.recheckMissingPhotos().then((restoredPhotos) => {
+            // Stored suggestions are already current on a clean launch. Matching every
+            // cached face against every trained person on each open burned CPU without
+            // changing anything; refresh only after journal recovery or photo restore.
+            if (recognitionNeedsRefresh || restoredPhotos)
+                void this.refreshRecognition();
+        });
     }
     setHiddenPhotoPredicate(predicate) {
         this.hiddenPhoto = predicate;
@@ -136,10 +165,11 @@ class FaceIndexer {
                 restored.push(photoPath);
         }
         if (restored.length === 0)
-            return;
+            return false;
         restored.forEach((photoPath) => this.missingPhotos.delete(photoPath));
         this.state.missingPhotoPaths = Array.from(this.missingPhotos);
         await this.persistState();
+        return true;
     }
     /** Called when the set of photos hidden by banned people changes. */
     setRecognitionListener(listener) {
@@ -295,8 +325,12 @@ class FaceIndexer {
     }
     async pause() {
         this.pauseRequested = true;
-        if (!this.runPromise)
+        if (this.runPromise) {
+            await this.runPromise;
+        }
+        else {
             await this.updateProgress({ status: "paused", message: "Face indexing paused." }, true);
+        }
     }
     getPeople() {
         return this.state.people
@@ -951,7 +985,9 @@ class FaceIndexer {
             const runtime = await this.loadRuntime();
             await this.updateProgress({ status: "indexing", message: "Detecting and clustering faces..." }, true);
             for (let index = 0; index < pending.length; index += 1) {
+                const workStartedAt = Date.now();
                 if (this.pauseRequested) {
+                    await this.persistState();
                     await this.updateProgress({
                         status: "paused",
                         currentFile: null,
@@ -963,7 +999,6 @@ class FaceIndexer {
                 await this.updateProgress({ currentFile: image.name }, false);
                 try {
                     await this.processImage(image, runtime);
-                    await this.persistState();
                 }
                 catch {
                     this.progress.errors += 1;
@@ -971,11 +1006,18 @@ class FaceIndexer {
                 this.progress.processed += 1;
                 this.progress.remaining = Math.max(0, this.progress.remaining - 1);
                 this.progress.faces = this.faces.size;
-                this.progress.people = this.getPeople().length;
+                // Summarizing every person's full face/photo set for each image made
+                // progress accounting grow with the entire library. Refresh this label
+                // at the same 25-photo cadence used by the People UI.
+                if (this.progress.processed % 25 === 0 || this.progress.remaining === 0)
+                    this.progress.people = this.getPeople().length;
                 this.emitProgress();
                 if (index % 10 === 9)
                     await this.persistProgress();
-                await new Promise((resolve) => setTimeout(resolve, 0));
+                if ((index + 1) % FACE_STATE_CHECKPOINT_INTERVAL === 0)
+                    await this.persistState();
+                await new Promise((resolve) => setImmediate(resolve));
+                await this.paceBackgroundWork(Date.now() - workStartedAt);
             }
             await this.updateProgress({ message: "Bundling similar face clusters..." }, true);
             const combined = await this.combineSimilarClusters();
@@ -1029,6 +1071,7 @@ class FaceIndexer {
             tensor.dispose();
         }
         const records = [];
+        const createdPeople = [];
         for (let index = 0; index < detections.length; index += 1) {
             const detection = detections[index];
             const box = detection.detection.box;
@@ -1048,7 +1091,7 @@ class FaceIndexer {
                 .jpeg({ quality: 78 })
                 .toFile(cropPath);
             const descriptor = Array.from(detection.descriptor);
-            const person = this.findOrCreateCluster(descriptor);
+            const person = this.findOrCreateCluster(descriptor, createdPeople);
             const record = {
                 id: faceId,
                 imagePath: image.path,
@@ -1067,20 +1110,40 @@ class FaceIndexer {
             records.push(record);
             this.indexFace(record);
             person.faceIds.push(faceId);
-            this.updateCentroid(person);
+            this.addDescriptorToCentroid(person, descriptor);
         }
-        await this.appendProcessed(image, records);
+        await this.appendProcessed(image, records, true, createdPeople);
     }
-    findOrCreateCluster(descriptor) {
+    findOrCreateCluster(descriptor, createdPeople = []) {
         let best = null;
         let bestDistance = Infinity;
         for (const person of this.state.people) {
             if (!person.centroid.length || person.manual)
                 continue;
-            const distance = this.distance(descriptor, person.centroid);
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                best = person;
+            // The current best match (or the acceptance threshold) bounds how far
+            // each exact Euclidean comparison needs to proceed. Most unrelated faces
+            // are rejected after only a few dimensions instead of all 128.
+            const maximumDistance = best
+                ? bestDistance
+                : AUTO_CLUSTER_DISTANCE;
+            const maximumSquared = maximumDistance * maximumDistance;
+            let sum = 0;
+            let rejected = false;
+            for (let index = 0; index < descriptor.length; index += 1) {
+                const difference = descriptor[index] - person.centroid[index];
+                sum += difference * difference;
+                if (sum > maximumSquared + 1e-12) {
+                    rejected = true;
+                    break;
+                }
+            }
+            if (!rejected) {
+                const distance = Math.sqrt(sum);
+                if (distance <= AUTO_CLUSTER_DISTANCE &&
+                    (!best || distance < bestDistance)) {
+                    bestDistance = distance;
+                    best = person;
+                }
             }
         }
         if (best && bestDistance <= AUTO_CLUSTER_DISTANCE)
@@ -1097,6 +1160,8 @@ class FaceIndexer {
             manual: false,
         };
         this.state.people.push(person);
+        this.centroidDescriptorCounts.set(person.id, 0);
+        createdPeople.push({ ...person, centroid: [...person.centroid] });
         return person;
     }
     async loadRuntime() {
@@ -1120,7 +1185,7 @@ class FaceIndexer {
         this.runtime = { faceapi, sharp };
         return this.runtime;
     }
-    async appendProcessed(image, records, markProcessed = true) {
+    async appendProcessed(image, records, markProcessed = true, createdPeople = []) {
         const manualFaces = (this.facesByImage.get(image.path) ?? []).filter((face) => face.manual && !records.some((record) => record.id === face.id));
         const updatedRecords = [...records, ...manualFaces];
         const entry = {
@@ -1129,12 +1194,18 @@ class FaceIndexer {
                 ? this.signature(image)
                 : `manual:${this.signature(image)}`,
             faces: updatedRecords,
+            ...(createdPeople.length > 0 ? { createdPeople } : {}),
         };
         this.replaceImageFaces(image.path, updatedRecords);
-        await fsPromises.appendFile(this.recordsPath, `${JSON.stringify(entry)}\n`);
+        const write = this.recordWriteChain.then(async () => {
+            await fsPromises.appendFile(this.recordsPath, `${JSON.stringify(entry)}\n`);
+            this.faceRecordVersion += 1;
+        });
+        this.recordWriteChain = write.catch(() => undefined);
+        await write;
         this.processedSignatures.set(image.path, entry.signature);
     }
-    async loadRecords() {
+    async loadRecords(savedVersion) {
         try {
             await fsPromises.access(this.recordsPath);
         }
@@ -1152,8 +1223,12 @@ class FaceIndexer {
                 continue;
             try {
                 const entry = JSON.parse(line);
+                this.faceRecordVersion += 1;
                 this.processedSignatures.set(entry.imagePath, entry.signature);
-                this.replaceImageFaces(entry.imagePath, entry.faces);
+                this.replaceImageFaces(entry.imagePath, entry.faces, false);
+                if (savedVersion !== null &&
+                    this.faceRecordVersion > savedVersion)
+                    this.recoveryJournal.push(entry);
             }
             catch {
                 lines.close();
@@ -1162,10 +1237,72 @@ class FaceIndexer {
         }
     }
     reconcilePeople() {
+        const peopleById = new Map(this.state.people.map((person) => [person.id, person]));
+        const replayedFaceIds = new Set();
+        const recoveredPeople = new Set();
+        for (const entry of this.recoveryJournal) {
+            for (const seed of entry.createdPeople ?? []) {
+                if (!seed?.id || peopleById.has(seed.id))
+                    continue;
+                const person = {
+                    ...seed,
+                    faceIds: [],
+                    manualPhotoPaths: [...(seed.manualPhotoPaths ?? [])],
+                    confirmedPhotoPaths: [...(seed.confirmedPhotoPaths ?? [])],
+                    rejectedPhotoPaths: [...(seed.rejectedPhotoPaths ?? [])],
+                    centroid: [...(seed.centroid ?? [])],
+                };
+                this.state.people.push(person);
+                peopleById.set(person.id, person);
+                recoveredPeople.add(person.id);
+            }
+            for (const face of entry.faces ?? [])
+                replayedFaceIds.add(face.id);
+        }
         for (const person of this.state.people) {
-            person.faceIds = person.faceIds.filter((id) => this.faces.has(id));
+            person.faceIds = Array.from(new Set(person.faceIds.filter((id) => this.faces.has(id) && !replayedFaceIds.has(id))));
+        }
+        for (const faceId of replayedFaceIds) {
+            const face = this.faces.get(faceId);
+            if (!face)
+                continue;
+            for (const personId of face.personIds) {
+                let person = peopleById.get(personId);
+                if (!person) {
+                    person = {
+                        id: personId,
+                        name: `Person ${this.state.people.length + 1}`,
+                        faceIds: [],
+                        manualPhotoPaths: [],
+                        confirmedPhotoPaths: [],
+                        rejectedPhotoPaths: [],
+                        centroid: [],
+                        createdAt: Date.now(),
+                        manual: false,
+                    };
+                    this.state.people.push(person);
+                    peopleById.set(person.id, person);
+                    recoveredPeople.add(person.id);
+                }
+                if (!person.faceIds.includes(faceId))
+                    person.faceIds.push(faceId);
+            }
+        }
+        this.state.people = this.state.people.filter((person) => {
+            const keep = !recoveredPeople.has(person.id) ||
+                person.faceIds.length > 0 ||
+                person.manualPhotoPaths.length > 0 ||
+                person.confirmedPhotoPaths.length > 0 ||
+                person.rejectedPhotoPaths.length > 0 ||
+                Boolean(person.status);
+            if (!keep)
+                this.centroidDescriptorCounts.delete(person.id);
+            return keep;
+        });
+        for (const person of this.state.people) {
             this.updateCentroid(person);
         }
+        this.recoveryJournal = [];
     }
     async combineSimilarClusters() {
         let combined = 0;
@@ -1258,6 +1395,7 @@ class FaceIndexer {
             ]));
         }
         this.state.people = this.state.people.filter((person) => person.id !== absorbed.id);
+        this.centroidDescriptorCounts.delete(absorbed.id);
         this.updateCentroid(survivor);
     }
     normalized(values) {
@@ -1359,7 +1497,7 @@ class FaceIndexer {
         list.push(face);
         this.facesByImage.set(face.imagePath, list);
     }
-    replaceImageFaces(imagePath, records) {
+    replaceImageFaces(imagePath, records, updatePeople = true) {
         const nextIds = new Set(records.map((face) => face.id));
         for (const oldFace of this.facesByImage.get(imagePath) ?? []) {
             if (nextIds.has(oldFace.id))
@@ -1367,10 +1505,12 @@ class FaceIndexer {
             this.faces.delete(oldFace.id);
             this.baseFaceBoxes.delete(oldFace.id);
             this.baseFaceCrops.delete(oldFace.id);
-            for (const person of this.state.people) {
-                person.faceIds = person.faceIds.filter((id) => id !== oldFace.id);
-                person.suggestedFaceIds = (person.suggestedFaceIds ?? []).filter((id) => id !== oldFace.id);
-                this.updateCentroid(person);
+            if (updatePeople) {
+                for (const person of this.state.people) {
+                    person.faceIds = person.faceIds.filter((id) => id !== oldFace.id);
+                    person.suggestedFaceIds = (person.suggestedFaceIds ?? []).filter((id) => id !== oldFace.id);
+                    this.updateCentroid(person);
+                }
             }
         }
         this.facesByImage.set(imagePath, []);
@@ -1496,6 +1636,7 @@ class FaceIndexer {
         if (!descriptors.length) {
             if (!person.manual)
                 person.centroid = [];
+            this.centroidDescriptorCounts.set(person.id, 0);
             return;
         }
         person.centroid = new Array(descriptors[0].length).fill(0);
@@ -1505,6 +1646,21 @@ class FaceIndexer {
         }
         for (let index = 0; index < person.centroid.length; index += 1)
             person.centroid[index] /= descriptors.length;
+        this.centroidDescriptorCounts.set(person.id, descriptors.length);
+    }
+    addDescriptorToCentroid(person, descriptor) {
+        const count = this.centroidDescriptorCounts.get(person.id) ?? 0;
+        if (count === 0 || person.centroid.length !== descriptor.length) {
+            person.centroid = [...descriptor];
+            this.centroidDescriptorCounts.set(person.id, 1);
+            return;
+        }
+        const nextCount = count + 1;
+        for (let index = 0; index < descriptor.length; index += 1) {
+            person.centroid[index] +=
+                (descriptor[index] - person.centroid[index]) / nextCount;
+        }
+        this.centroidDescriptorCounts.set(person.id, nextCount);
     }
     distance(first, second) {
         let sum = 0;
@@ -1537,6 +1693,20 @@ class FaceIndexer {
             throw new Error("Person not found.");
         return person;
     }
+    async paceBackgroundWork(workMs) {
+        const dutyPercent = this.backgroundWorkPercent;
+        let cooldownRemaining = Math.ceil(Math.max(1, workMs) * ((100 - dutyPercent) / dutyPercent));
+        while (cooldownRemaining > 0 &&
+            !this.pauseRequested &&
+            !this.hasActiveInteractiveSearch()) {
+            const sliceMs = Math.min(50, cooldownRemaining);
+            await new Promise((resolve) => setTimeout(resolve, sliceMs));
+            cooldownRemaining -= sliceMs;
+        }
+        // Let an active search take priority before beginning another face image.
+        while (this.hasActiveInteractiveSearch() && !this.pauseRequested)
+            await new Promise((resolve) => setTimeout(resolve, 40));
+    }
     emitProgress() {
         this.onProgress({ ...this.progress });
     }
@@ -1551,9 +1721,15 @@ class FaceIndexer {
         await fsPromises.writeFile(temporary, JSON.stringify(this.progress, null, 2));
         await fsPromises.rename(temporary, this.progressPath);
     }
-    persistState() {
+    async persistState() {
+        // A state checkpoint must never claim to include journal records that have
+        // not reached disk yet. Waiting here also makes user edits a safe checkpoint.
+        await this.recordWriteChain;
         this.photoPeopleCache = null;
-        const data = JSON.stringify(this.state);
+        const data = JSON.stringify({
+            ...this.state,
+            faceRecordVersion: this.faceRecordVersion,
+        });
         const write = this.stateWriteChain.then(async () => {
             const temporary = `${this.statePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
             try {

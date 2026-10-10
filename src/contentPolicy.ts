@@ -41,6 +41,10 @@ const explicitTerms = [
 ];
 
 const normalizedTerms = explicitTerms.map((term) => term.toLowerCase());
+const explicitTermPatterns = normalizedTerms.map((term) => {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|\\b)${escaped}(?:\\b|$)`, "i");
+});
 
 export function containsExplicitTerms(value: string) {
   const normalized = value
@@ -48,10 +52,7 @@ export function containsExplicitTerms(value: string) {
     .replace(/[_.\-/\\]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return normalizedTerms.some((term) => {
-    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(?:^|\\b)${escaped}(?:\\b|$)`, "i").test(normalized);
-  });
+  return explicitTermPatterns.some((pattern) => pattern.test(normalized));
 }
 
 export function fileTextLooksExplicit(

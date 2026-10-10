@@ -77,7 +77,7 @@ function shelterLabel(source: LibraryDashboardSource) {
     case "checking": return "Checking source currency…";
     case "offline": return "Last verified · source or shelter offline";
     case "unknown": return "Full hash verification required";
-    default: return "No verified shelter copy";
+    default: return "No verified Fallout Shelter copy";
   }
 }
 
@@ -391,10 +391,10 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
             <div className="stats-heading-icon vault"><FiShield /></div>
             <div><span className="stats-kicker">FALLOUT SHELTER</span><h2>Backup readiness</h2></div>
           </header>
-          <p className="stats-shelter-copy">Re-verify compares every selected source file hash with the latest complete clone, and checks for missing, changed, or unexpected destination files. The timestamp records the last full SHA-256 match.</p>
+          <p className="stats-shelter-copy">Re-verify compares every selected source file hash with the latest complete Fallout Shelter clone, and checks for missing, changed, or unexpected destination files. The timestamp records the last full SHA-256 match.</p>
           <div className="stats-destination-box">
             <FiHardDrive />
-            <div><span>PRIMARY DESTINATION</span><strong title={snapshot?.shelter.destination ?? "Not configured"}>{snapshot?.shelter.destination ?? "No shelter folder configured"}</strong><small className={`stats-destination-status ${snapshot?.shelter.destinationAvailable ? "online" : "offline"}`}>{snapshot?.shelter.destinationAvailable ? "Connected and readable" : "Unavailable · connect this drive to verify"}</small></div>
+            <div><span>FALLOUT SHELTER · PRIMARY DESTINATION</span><strong title={snapshot?.shelter.destination ?? "Not configured"}>{snapshot?.shelter.destination ?? "No Fallout Shelter destination configured"}</strong><small className={`stats-destination-status ${snapshot?.shelter.destinationAvailable ? "online" : "offline"}`}>{snapshot?.shelter.destinationAvailable ? "Connected and readable" : "Unavailable · connect this drive to verify"}</small></div>
             {!snapshot?.shelter.destination && <button onClick={async () => {
               try {
                 const destination = await api.selectShelterDestination();
@@ -431,7 +431,7 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
           <div className="stats-source-actions">
             <button className="stats-text-button" onClick={toggleAll} disabled={availableSources.length === 0}>{selectedIds.size === availableSources.length && availableSources.length ? "Clear selection" : "Select available"}</button>
             <button className="stats-button small" onClick={() => void verifyShelterSources(selectedSources.map((source) => source.id))} disabled={!selectedSources.length || !snapshot?.shelter.destinationAvailable || verifyingShelter} title={!snapshot?.shelter.destinationAvailable ? "Connect the selected Fallout Shelter drive first" : "Compare all source and shelter SHA-256 hashes"}><FiRefreshCw className={verifyingShelter ? "stats-spin" : ""} /> {verifyingShelter ? "Hash-verifying…" : "Verify selected"}</button>
-            <button className="stats-button small" onClick={() => setShowClone(true)} disabled={!selectedSources.length || !snapshot?.shelter.destination || !snapshot.shelter.destinationAvailable || verifyingShelter} title={!snapshot?.shelter.destination ? "Set a primary shelter folder first" : !snapshot.shelter.destinationAvailable ? "Connect the selected Fallout Shelter drive first" : selectedSourcesNeedRefresh ? "Create and SHA-256-verify an updated shelter copy for the selected sources" : "Preflight space, then copy and verify"}>{selectedSourcesNeedRefresh ? <FiRefreshCw /> : <FiShield />} {selectedSourcesNeedRefresh ? "Refresh backup" : "Back up selected"}</button>
+            <button className="stats-button small" onClick={() => setShowClone(true)} disabled={!selectedSources.length || !snapshot?.shelter.destination || !snapshot.shelter.destinationAvailable || verifyingShelter} title={!snapshot?.shelter.destination ? "Set the primary Fallout Shelter destination first" : !snapshot.shelter.destinationAvailable ? "Connect the selected Fallout Shelter drive first" : selectedSourcesNeedRefresh ? "DESTINATION WRITE — Create and SHA-256-verify an updated Fallout Shelter copy for the selected sources" : "DESTINATION WRITE — Preflight space, then create and verify a Fallout Shelter copy"}>{selectedSourcesNeedRefresh ? <FiRefreshCw /> : <FiShield />} {selectedSourcesNeedRefresh ? "Refresh Fallout Shelter" : "Back up to Fallout Shelter"}</button>
           </div>
         </header>
         <div className="stats-source-table-wrap">
@@ -460,7 +460,7 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
                     return <div className={`stats-shelter-backup stats-freshness-${backup.lastResult === "verified" ? freshness : "red"}`} key={backup.destination} title={`${backup.destination}${backup.clonePath ? ` · ${backup.clonePath}` : ""}`} aria-label={`${driveName}: ${resultLabel}; ${freshness} freshness`}>
                       {icon}<span><strong>{driveName}</strong><small>{resultLabel}</small></span>
                     </div>;
-                  })}</div>}{source.cloneDestination && <small className="stats-destination-path" title={source.cloneDestination}>At {source.cloneDestination}</small>}{source.shelterAuditMessage && <small className="stats-source-error">{source.shelterAuditMessage}</small>}{source.shelterState === "changed" && <small className="stats-source-error">Select this source and choose Refresh backup to create and verify an updated shelter copy.</small>}</td>
+                  })}</div>}{source.cloneDestination && <small className="stats-destination-path" title={source.cloneDestination}>At {source.cloneDestination}</small>}{source.shelterAuditMessage && <small className="stats-source-error">{source.shelterAuditMessage}</small>}{source.shelterState === "changed" && <small className="stats-source-error">Select this source and choose Refresh Fallout Shelter to create and verify an updated copy.</small>}</td>
                 </tr>;
               })}
               {(snapshot?.sources.length ?? 0) === 0 && <tr><td colSpan={4} className="stats-empty-row">{snapshot ? "No sources have been added yet." : "Waiting for the desktop source registry…"}</td></tr>}

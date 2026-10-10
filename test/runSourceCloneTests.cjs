@@ -44,15 +44,15 @@ const sourceRoot = path.join(root, "source");
 const userData = path.join(sourceRoot, ".silo-user-data");
 const secondSourceRoot = path.join(root, "camera");
 const machineFixtureRoot = path.join(root, "machine-source");
-const machineMountRoot = path.join(machineFixtureRoot, "Users", "tanny", "mounted-volume");
+const machineMountRoot = path.join(machineFixtureRoot, "Users", "test-user", "mounted-volume");
 const destinations = [path.join(root, "backup-a"), path.join(root, "backup-b")];
 const partialDestinations = [path.join(root, "backup-c"), path.join(root, "backup-later-disconnects")];
 const replicaDestination = path.join(root, "replica-volume");
 fs.mkdirSync(path.join(sourceRoot, "nested"), { recursive: true });
 fs.mkdirSync(secondSourceRoot, { recursive: true });
-fs.mkdirSync(path.join(machineFixtureRoot, "Users", "tanny", "visible"), { recursive: true });
-fs.mkdirSync(path.join(machineFixtureRoot, "Users", "tanny", "Library", "Caches"), { recursive: true });
-fs.mkdirSync(path.join(machineFixtureRoot, "Users", "tanny", "Library", "Cache"), { recursive: true });
+fs.mkdirSync(path.join(machineFixtureRoot, "Users", "test-user", "visible"), { recursive: true });
+fs.mkdirSync(path.join(machineFixtureRoot, "Users", "test-user", "Library", "Caches"), { recursive: true });
+fs.mkdirSync(path.join(machineFixtureRoot, "Users", "test-user", "Library", "Cache"), { recursive: true });
 fs.mkdirSync(path.join(machineFixtureRoot, "System"), { recursive: true });
 fs.mkdirSync(path.join(machineFixtureRoot, "Systematic"), { recursive: true });
 fs.mkdirSync(path.join(machineFixtureRoot, "private", "tmp"), { recursive: true });
@@ -67,16 +67,16 @@ fs.writeFileSync(path.join(sourceRoot, "first.txt"), "first payload");
 fs.writeFileSync(path.join(sourceRoot, "nested", "second.txt"), "second payload");
 fs.writeFileSync(path.join(secondSourceRoot, "same-first.txt"), "first payload");
 fs.writeFileSync(path.join(secondSourceRoot, "third.txt"), "third payload");
-fs.writeFileSync(path.join(machineFixtureRoot, "Users", "tanny", "visible", "keep.txt"), "internal volume");
-fs.writeFileSync(path.join(machineFixtureRoot, "Users", "tanny", "Library", "Caches", "skip.txt"), "cache");
-fs.writeFileSync(path.join(machineFixtureRoot, "Users", "tanny", "Library", "Cache", "keep.txt"), "not the Caches directory");
+fs.writeFileSync(path.join(machineFixtureRoot, "Users", "test-user", "visible", "keep.txt"), "internal volume");
+fs.writeFileSync(path.join(machineFixtureRoot, "Users", "test-user", "Library", "Caches", "skip.txt"), "cache");
+fs.writeFileSync(path.join(machineFixtureRoot, "Users", "test-user", "Library", "Cache", "keep.txt"), "not the Caches directory");
 fs.writeFileSync(path.join(machineFixtureRoot, "System", "skip.txt"), "excluded system tree");
 fs.writeFileSync(path.join(machineFixtureRoot, "Systematic", "keep.txt"), "boundary lookalike");
 fs.writeFileSync(path.join(machineFixtureRoot, "private", "tmp", "skip.txt"), "excluded temporary tree");
 fs.writeFileSync(path.join(machineMountRoot, "skip.txt"), "different device");
 const machineSymlinkTarget = path.join(root, "machine-symlink-target.txt");
 fs.writeFileSync(machineSymlinkTarget, "outside source");
-fs.symlinkSync(machineSymlinkTarget, path.join(machineFixtureRoot, "Users", "tanny", "visible", "outside-link.txt"));
+fs.symlinkSync(machineSymlinkTarget, path.join(machineFixtureRoot, "Users", "test-user", "visible", "outside-link.txt"));
 
 const progress = [];
 let failHardLinks = false;
@@ -201,8 +201,8 @@ async function run() {
       ".DocumentRevisions-V100",
       "private/var/folders",
       "private/tmp/item",
-      "Users/tanny/Library/Caches/item",
-      "Users/tanny/Library/Logs/item",
+      "Users/test-user/Library/Caches/item",
+      "Users/test-user/Library/Logs/item",
     ]) {
       assert.equal(
         isMacDataVolumePathExcluded(path.join(MAC_DATA_VOLUME_ROOT, relativePath), MAC_DATA_VOLUME_ROOT),
@@ -212,8 +212,8 @@ async function run() {
     }
     for (const candidatePath of [
       `${MAC_DATA_VOLUME_ROOT}-archive/System/Library`,
-      path.join(MAC_DATA_VOLUME_ROOT, "Users", "tanny", "Library", "Cache", "item"),
-      path.join(MAC_DATA_VOLUME_ROOT, "Users", "tanny", "Library", "NotCaches", "item"),
+      path.join(MAC_DATA_VOLUME_ROOT, "Users", "test-user", "Library", "Cache", "item"),
+      path.join(MAC_DATA_VOLUME_ROOT, "Users", "test-user", "Library", "NotCaches", "item"),
     ]) {
       assert.equal(
         isMacDataVolumePathExcluded(candidatePath, MAC_DATA_VOLUME_ROOT),
@@ -236,7 +236,7 @@ async function run() {
       return originalIsMachinePathExcluded(path.join(MAC_DATA_VOLUME_ROOT, relativePath), MAC_DATA_VOLUME_ROOT);
     };
 
-    const scanErrorRoot = path.join(machineFixtureRoot, "Users", "tanny", "scan-errors");
+    const scanErrorRoot = path.join(machineFixtureRoot, "Users", "test-user", "scan-errors");
     const permissionDirectory = path.join(scanErrorRoot, "permission-denied");
     const unreadableDirectory = path.join(scanErrorRoot, "unreadable");
     const deniedStatFile = path.join(scanErrorRoot, "denied-stat.txt");
@@ -265,9 +265,9 @@ async function run() {
     const machineReadFiles = await context.readFiles(machineFixtureRoot, true, machineReadDiagnostics, undefined, machineFixtureRoot);
     const machineReadFilePaths = Array.from(machineReadFiles).filter((entry) => !entry.isDirectory).map((entry) => entry.relativePath).sort();
     const expectedMachineReadFilePaths = [
-      path.join("Users", "tanny", "Library", "Cache", "keep.txt"),
+      path.join("Users", "test-user", "Library", "Cache", "keep.txt"),
       path.join("Systematic", "keep.txt"),
-      path.join("Users", "tanny", "visible", "keep.txt"),
+      path.join("Users", "test-user", "visible", "keep.txt"),
     ].sort();
     assert.deepEqual(machineReadFilePaths, expectedMachineReadFilePaths, `readFiles applies machine exclusions, device checks, and symlink skipping to the index scan: ${JSON.stringify(machineReadFilePaths)}`);
     assert.deepEqual(machineReadDiagnostics, { denied: 0, unreadable: 0, isTimeMachine: false });
@@ -288,14 +288,14 @@ async function run() {
     await context.listLocalCloneEntries(machineFixtureRoot, "machine-walker-edge-cases", (entry) => machineEntries.push(entry));
     const machineFiles = machineEntries.filter((entry) => !entry.isDirectory).map((entry) => entry.destinationRelativePath).sort();
     assert.deepEqual(machineFiles, [
-      path.join("Users", "tanny", "Library", "Cache", "keep.txt"),
+      path.join("Users", "test-user", "Library", "Cache", "keep.txt"),
       path.join("Systematic", "keep.txt"),
-      path.join("Users", "tanny", "visible", "keep.txt"),
+      path.join("Users", "test-user", "visible", "keep.txt"),
     ].sort(), "machine traversal skips excluded roots, cross-device mounts, and symlinks while retaining boundary lookalikes");
     context.sourceCloneOperations.delete("machine-walker-edge-cases");
 
     const machineSource = { id: machineFixtureRoot, rootPath: machineFixtureRoot, label: "This Mac", kind: "machine", enabled: true, available: true };
-    const insideMachineDestination = path.join(machineFixtureRoot, "Users", "tanny", "visible");
+    const insideMachineDestination = path.join(machineFixtureRoot, "Users", "test-user", "visible");
     context.sourceCloneOperations.delete("machine-destination-inside-test");
     await assert.rejects(
       context.prepareSourceClone([machineSource.id], [insideMachineDestination], "machine-destination-inside-test", [machineSource], { includeConfig: false }),

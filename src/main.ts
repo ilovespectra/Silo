@@ -11,7 +11,7 @@ import {
   shell,
 } from "electron";
 import { createHash, randomBytes } from "crypto";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { Readable, Transform } from "stream";
 import { pipeline } from "stream/promises";
 import { promisify } from "util";
@@ -858,7 +858,7 @@ function isTrustedReleaseUrl(value: unknown, tag: string): value is string {
   }
 }
 
-async function getLatestDmgRelease(): Promise<AppUpdateState> {
+async function getLatestPlatformRelease(): Promise<AppUpdateState> {
   const currentVersion = app.getVersion();
   const response = await net.fetch(
     "https://api.github.com/repos/ilovespectra/silo-downloads/releases?per_page=30",
@@ -901,28 +901,55 @@ async function getLatestDmgRelease(): Promise<AppUpdateState> {
     )
       ? latest.release.html_url
       : `https://github.com/ilovespectra/silo-downloads/releases/tag/${encodeURIComponent(tag)}`;
+  if (process.platform !== "win32" && process.platform !== "darwin") {
+    return {
+      status: "unsupported",
+      currentVersion,
+      message: "Silo updates are available for installed Windows and macOS builds.",
+    };
+  }
   const expectedArchitecture = process.arch === "arm64" ? "arm64" : "x64";
+  const isWindows = process.platform === "win32";
+  const installerLabel = isWindows ? "Windows installer" : "Mac DMG";
+  const expectedAssetName = isWindows
+    ? `Silo-${latest.version}-${expectedArchitecture}-Setup.exe`
+    : `Silo-${latest.version}-${expectedArchitecture}.dmg`;
   const assets = Array.isArray(latest.release.assets)
     ? (latest.release.assets as GitHubReleaseAsset[])
     : [];
   const matchingAsset = assets.find(
     (asset) =>
-      asset.name === `Silo-${latest.version}-${expectedArchitecture}.dmg` &&
+      asset.name === expectedAssetName &&
       isTrustedReleaseUrl(asset.browser_download_url, tag),
   );
   const candidateDownloadUrl = matchingAsset?.browser_download_url;
   const downloadUrl = isTrustedReleaseUrl(candidateDownloadUrl, tag)
     ? candidateDownloadUrl
     : undefined;
+  const downloadDigest =
+    typeof matchingAsset?.digest === "string" &&
+    /^sha256:[a-f0-9]{64}$/i.test(matchingAsset.digest)
+      ? matchingAsset.digest
+      : undefined;
+  const downloadSize =
+    typeof matchingAsset?.size === "number" &&
+    Number.isSafeInteger(matchingAsset.size) &&
+    matchingAsset.size > 0
+      ? matchingAsset.size
+      : undefined;
   return {
     status: "available",
     currentVersion,
     version: latest.version,
+    releaseTag: tag,
     downloadUrl,
+    downloadDigest,
+    downloadSize,
     releaseUrl,
+    installerLabel,
     message: downloadUrl
       ? undefined
-      : `Version ${latest.version} is available, but this release has no ${expectedArchitecture} DMG yet.`,
+      : `Version ${latest.version} is available, but this release has no ${expectedArchitecture} ${installerLabel} yet.`,
   };
 }
 
@@ -944,14 +971,16 @@ async function checkForAppUpdates(): Promise<AppUpdateState> {
       currentVersion: app.getVersion(),
     });
     try {
-      try {
-        await autoUpdater.checkForUpdates();
-      } catch (error) {
-        runtimeLog("updater-metadata-unavailable", {
-          message: error instanceof Error ? error.message : String(error),
-        });
+      if (process.platform === "darwin") {
+        try {
+          await autoUpdater.checkForUpdates();
+        } catch (error) {
+          runtimeLog("updater-metadata-unavailable", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
-      const state = await getLatestDmgRelease();
+      const state = await getLatestPlatformRelease();
       publishAppUpdateState(state);
       return state;
     } catch (error) {
@@ -1011,6 +1040,92 @@ async function downloadAndInstallAppUpdate(): Promise<AppUpdateState> {
     });
 
     try {
+      if (process.platform === "win32") {
+        const releaseTag = announcedUpdate.releaseTag;
+        const downloadUrl = announcedUpdate.downloadUrl;
+        const expectedArchitecture = process.arch === "arm64" ? "arm64" : "x64";
+        const expectedInstallerName =
+          `Silo-${version}-${expectedArchitecture}-Setup.exe`;
+        if (
+          !releaseTag ||
+          !isTrustedReleaseUrl(downloadUrl, releaseTag) ||
+          decodeURIComponent(new URL(downloadUrl).pathname.split("/").pop() ?? "") !==
+            expectedInstallerName
+        ) {
+          throw new Error("The Windows update does not point to this release's matching installer.");
+        }
+
+        const installerDirectory = await fsPromises.mkdtemp(
+          path.join(os.tmpdir(), "silo-windows-update-"),
+        );
+        const installerPath = path.join(installerDirectory, expectedInstallerName);
+        const response = await net.fetch(downloadUrl, {
+          signal: AbortSignal.timeout(15 * 60 * 1000),
+        });
+        if (!response.ok || !response.body)
+          throw new Error(`Windows installer download returned HTTP ${response.status}.`);
+
+        const expectedSize = announcedUpdate.downloadSize;
+        const expectedDigest = announcedUpdate.downloadDigest;
+        const hasher = createHash("sha256");
+        let downloadedBytes = 0;
+        const progress = new Transform({
+          transform(chunk, _encoding, callback) {
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            downloadedBytes += bytes.length;
+            hasher.update(bytes);
+            const downloadPercent = expectedSize
+              ? Math.min(100, Math.round((downloadedBytes / expectedSize) * 100))
+              : undefined;
+            publishAppUpdateState({
+              ...announcedUpdate,
+              status: "downloading",
+              currentVersion,
+              ...(downloadPercent === undefined ? {} : { downloadPercent }),
+              message: downloadPercent === undefined
+                ? `Downloading Silo ${version} Windows installer…`
+                : `Downloading Silo ${version} Windows installer… ${downloadPercent}%`,
+            });
+            callback(null, bytes);
+          },
+        });
+
+        await pipeline(
+          Readable.from(response.body as any),
+          progress,
+          fs.createWriteStream(installerPath, { flags: "wx" }),
+        );
+
+        const installerStats = await fsPromises.stat(installerPath);
+        if (!installerStats.isFile() || installerStats.size === 0)
+          throw new Error("The Windows installer download is empty.");
+        if (expectedSize && installerStats.size !== expectedSize)
+          throw new Error("The Windows installer size does not match GitHub's release record.");
+        const actualDigest = `sha256:${hasher.digest("hex")}`;
+        if (expectedDigest && actualDigest.toLowerCase() !== expectedDigest.toLowerCase())
+          throw new Error("The Windows installer SHA-256 does not match GitHub's release record.");
+
+        const installerProcess = spawn(installerPath, ["--updated"], {
+          detached: true,
+          stdio: "ignore",
+        });
+        await new Promise<void>((resolve, reject) => {
+          installerProcess.once("error", reject);
+          installerProcess.once("spawn", resolve);
+        });
+        installerProcess.unref();
+
+        const state: AppUpdateState = {
+          ...announcedUpdate,
+          status: "installing",
+          currentVersion,
+          message: `Silo ${version} is installing. The app will close while the Windows installer finishes.`,
+        };
+        publishAppUpdateState(state);
+        setTimeout(() => app.quit(), 300);
+        return state;
+      }
+
       const updateCheck = await autoUpdater.checkForUpdates();
       if (
         !updateCheck?.isUpdateAvailable ||
@@ -1063,7 +1178,7 @@ async function downloadAndInstallAppUpdate(): Promise<AppUpdateState> {
         version,
         downloadUrl: announcedUpdate.downloadUrl,
         releaseUrl: announcedUpdate.releaseUrl,
-        message: "Automatic installation failed. Download the DMG instead or try again later.",
+        message: `Automatic installation failed. Download the ${announcedUpdate.installerLabel ?? "platform installer"} instead or try again later.`,
       };
       publishAppUpdateState(state);
       return state;
@@ -1093,7 +1208,7 @@ function configureAppUpdater() {
       downloadPercent: Math.max(0, Math.min(100, Math.round(progress.percent))),
     });
   });
-  if (app.isPackaged && !isDev) {
+  if (process.platform === "darwin" && app.isPackaged && !isDev) {
     autoUpdater.setFeedURL({
       provider: "github",
       owner: "ilovespectra",
@@ -1105,8 +1220,9 @@ function configureAppUpdater() {
 const sendIndexProgress = createProgressThrottle((progress) =>
   sendToRenderer("index-progress", progress),
 );
-const sendFaceIndexProgress = createProgressThrottle((progress) =>
-  sendToRenderer("face-index-progress", progress),
+const sendFaceIndexProgress = createProgressThrottle(
+  (progress) => sendToRenderer("face-index-progress", progress),
+  5000,
 );
 const sendSearchIndexReadiness = createProgressThrottle(
   (status: SearchIndexReadiness) =>
@@ -1135,7 +1251,7 @@ function reportStartup(label: string, ready = false) {
 
 /** Updates what the current step is doing without advancing the step count. */
 function reportStartupDetail(label: string) {
-  if (startupState.ready) return;
+  if (startupState.ready || startupState.label === label) return;
   startupState = { ...startupState, label };
   sendToRenderer("startup-progress", startupState);
 }
@@ -1192,14 +1308,20 @@ type AppUpdateState = {
     | "unsupported";
   currentVersion: string;
   version?: string;
+  releaseTag?: string;
   downloadUrl?: string;
+  downloadDigest?: string;
+  downloadSize?: number;
   releaseUrl?: string;
+  installerLabel?: "Windows installer" | "Mac DMG";
   downloadPercent?: number;
   message?: string;
 };
 type GitHubReleaseAsset = {
   name?: unknown;
   browser_download_url?: unknown;
+  digest?: unknown;
+  size?: unknown;
 };
 type GitHubRelease = {
   tag_name?: unknown;
@@ -3056,7 +3178,7 @@ async function getShelterDestination(): Promise<string | null> {
 
 async function setShelterDestination(destination: unknown): Promise<string | null> {
   if (destination !== null && (typeof destination !== "string" || !path.isAbsolute(destination)))
-    throw new Error("Choose a valid absolute shelter folder.");
+    throw new Error("Choose a valid absolute Fallout Shelter destination folder.");
   const resolved = typeof destination === "string"
     ? await fsPromises.realpath(destination)
     : null;
@@ -3064,7 +3186,7 @@ async function setShelterDestination(destination: unknown): Promise<string | nul
     await fsPromises.access(resolved, fs.constants.R_OK | fs.constants.W_OK);
     const stats = await fsPromises.stat(resolved);
     if (!stats.isDirectory())
-      throw new Error("The shelter destination must be a folder.");
+      throw new Error("The Fallout Shelter destination must be a folder.");
   }
   const temporaryPath = `${shelterDestinationPath}.tmp`;
   await fsPromises.mkdir(path.dirname(shelterDestinationPath), { recursive: true });
@@ -3250,16 +3372,17 @@ async function readFiles(
     return results;
   }
   const pendingDirectories = [rootPath];
+  let nextPendingDirectory = 0;
   const timeMachine = await isTimeMachineDirectory(rootPath);
   if (diagnostics) diagnostics.isTimeMachine = timeMachine;
 
   let lastProgressEmit = Date.now();
   let lastProgressCount = 0;
-  const PROGRESS_BATCH_SIZE = 500;
-  const PROGRESS_INTERVAL_MS = 250;
+  const PROGRESS_BATCH_SIZE = 1000;
+  const PROGRESS_INTERVAL_MS = 1000;
 
-  while (pendingDirectories.length > 0) {
-    const directoryPath = pendingDirectories.shift()!;
+  while (nextPendingDirectory < pendingDirectories.length) {
+    const directoryPath = pendingDirectories[nextPendingDirectory++];
     if (isSiloAppData(directoryPath) || isNonLibraryPath(directoryPath) ||
         (sourceRootPath && isMacDataVolumePathExcluded(directoryPath, sourceRootPath))) continue;
     if (machineDevice !== null) {
@@ -3280,7 +3403,7 @@ async function readFiles(
       continue;
     }
 
-    const ENTRY_BATCH_SIZE = 128;
+    const ENTRY_BATCH_SIZE = 32;
     for (let offset = 0; offset < entries.length; offset += ENTRY_BATCH_SIZE) {
       const entryBatch = entries.slice(offset, offset + ENTRY_BATCH_SIZE);
       const entryResults = await Promise.all(
@@ -3634,7 +3757,9 @@ async function readSourceFiles(
   exploded: boolean,
   onProgress?: (fileDeltas: FileInfo[], scanned: number, audioFound: number) => void,
 ): Promise<FileInfo[]> {
-  const reportedFiles = new Map<string, { file: FileInfo; signature: string }>();
+  const annotatedFiles: FileInfo[] = [];
+  let reportedCount = 0;
+  let audioFound = 0;
   const annotate = (file: FileInfo): FileInfo => ({
     ...file,
     sourceId: source.id,
@@ -3642,26 +3767,20 @@ async function readSourceFiles(
     ...(source.snapshotAt ? { sourceSnapshotAt: source.snapshotAt } : {}),
   });
   const reportNewFiles = (files: FileInfo[], scanned: number) => {
-    if (!onProgress) return;
-    const delta: FileInfo[] = [];
-    for (const file of files) {
-      const previous = reportedFiles.get(file.path);
-      if (previous?.file === file) continue;
-      const annotated = annotate(file);
-      const signature = JSON.stringify(annotated);
-      if (previous?.signature === signature) {
-        reportedFiles.set(file.path, { file, signature });
-        continue;
-      }
-      reportedFiles.set(file.path, { file, signature });
-      delta.push(annotated);
+    if (files.length < reportedCount) {
+      reportedCount = 0;
+      audioFound = 0;
+      annotatedFiles.length = 0;
     }
-    if (delta.length)
-      onProgress(
-        delta,
-        scanned,
-        files.filter((file) => file.type === "audio").length,
-      );
+    const appended = files.slice(reportedCount);
+    reportedCount = files.length;
+    const delta = appended.map((file) => {
+      if (file.type === "audio") audioFound += 1;
+      const annotated = annotate(file);
+      annotatedFiles.push(annotated);
+      return annotated;
+    });
+    if (delta.length) onProgress?.(delta, scanned, audioFound);
   };
 
   let files: FileInfo[];
@@ -3684,7 +3803,7 @@ async function readSourceFiles(
     );
 
   reportNewFiles(files, files.length);
-  return files.map(annotate);
+  return annotatedFiles;
 }
 
 /** The aggregate root lists enabled sources as folders, or discovers each recursive source in parallel. */
@@ -4063,7 +4182,7 @@ async function prepareSourceClone(
         const canonicalPath = path.resolve(selected[0].rootPath, alias.canonicalPath);
         const relative = path.relative(path.resolve(selected[0].rootPath), canonicalPath);
         if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
-          throw new Error("Shelter manifest contains an unsafe duplicate alias.");
+          throw new Error("Fallout Shelter manifest contains an unsafe duplicate alias.");
         const stats = await fsPromises.stat(canonicalPath);
         entries.push({
           sourcePath: canonicalPath,
@@ -4097,12 +4216,12 @@ async function prepareSourceClone(
       entry.modified = stats.mtimeMs;
       const digest = await hashFile(localPath);
       if (entry.sha256 && entry.sha256 !== digest)
-        throw new Error(`Shelter alias no longer matches its verified source: ${entry.destinationRelativePath}`);
+        throw new Error(`Fallout Shelter alias no longer matches its verified source: ${entry.destinationRelativePath}`);
       entry.sha256 = digest;
       if (entry.duplicateOf) {
         const canonical = entries.find((candidate) => candidate.destinationRelativePath === entry.duplicateOf);
         if (!canonical || canonical.sha256 !== entry.sha256)
-          throw new Error(`Shelter alias target is missing or has changed: ${entry.destinationRelativePath}`);
+          throw new Error(`Fallout Shelter alias target is missing or has changed: ${entry.destinationRelativePath}`);
         continue;
       }
       const canonical = canonicalByDigest.get(entry.sha256);
@@ -4203,7 +4322,7 @@ async function prepareShelterReplica(destinations: string[], operationId: string
     const resolved = await fsPromises.realpath(destination);
     const relative = path.relative(path.resolve(await getShelterDestination() ?? ""), resolved);
     if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative)))
-      throw new Error("The shelter replica must be outside the primary Fallout Shelter folder.");
+      throw new Error("The Fallout Shelter replica must be outside the primary Fallout Shelter destination.");
     const destinationStats = await fsPromises.stat(resolved);
     if (destinationStats.dev === sourceStats.dev)
       throw new Error("Choose a replica destination on a different physical volume for 3-2-1 protection.");
@@ -4212,7 +4331,7 @@ async function prepareShelterReplica(destinations: string[], operationId: string
     id: `shelter-replica:${snapshot.rootPath}`,
     kind: "local",
     label: "Fallout Shelter snapshot",
-    detail: "Latest fully verified shelter snapshot",
+    detail: "Latest fully verified Fallout Shelter snapshot",
     rootPath: snapshot.rootPath,
     enabled: true,
     available: true,
@@ -4640,6 +4759,8 @@ async function createWindow() {
   const inventoryOwner = mainWindow.webContents.id;
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (
+      url === "https://repo-ilovespectras-projects.vercel.app" ||
+      url.startsWith("https://repo-ilovespectras-projects.vercel.app/") ||
       url.startsWith(
         "https://github.com/ilovespectra/silo-downloads/releases/download/",
       ) ||
@@ -4855,7 +4976,6 @@ async function getEnabledIndexSources(): Promise<string[]> {
     .map((source) => source.rootPath)));
   enabledSourcePathCache = new Set(uniquePaths);
   enabledSourceCacheReady = true;
-  console.log("[getEnabledIndexSources] Found sources:", uniquePaths);
   return uniquePaths;
 }
 
@@ -4968,20 +5088,23 @@ async function createUnifiedScanSource() {
     if (await isSiloCloneDirectory(sourcePath)) return;
     const results: any[] = [];
     const pendingDirectories = [sourcePath];
+    let nextPendingDirectory = 0;
     const timeMachine = await isTimeMachineDirectory(sourcePath);
     const DISCOVERY_COOLDOWN_EVERY_ENTRIES = 256;
-    const DISCOVERY_COOLDOWN_MAX_MS = 500;
     let entriesSinceCooldown = 0;
-    let cooldownWindowStartedAt = Date.now();
+    let discoveryCpuBaseline = process.cpuUsage();
     const waitForSearchIdle = async () => {
       while (!isCancelled() && shouldPauseForSearch())
         await new Promise<void>((resolve) => setTimeout(resolve, 75));
       return !isCancelled();
     };
 
-    while (pendingDirectories.length > 0 && !isCancelled()) {
+    while (
+      nextPendingDirectory < pendingDirectories.length &&
+      !isCancelled()
+    ) {
       if (!(await waitForSearchIdle())) return;
-      const directoryPath = pendingDirectories.shift()!;
+      const directoryPath = pendingDirectories[nextPendingDirectory++];
       if (isMacDataVolumePathExcluded(directoryPath, sourcePath)) continue;
       if (machineDevice !== null) {
         const directoryStats = await fsPromises.stat(directoryPath).catch(() => null);
@@ -5063,15 +5186,33 @@ async function createUnifiedScanSource() {
             }
           }
           if (entriesSinceCooldown >= DISCOVERY_COOLDOWN_EVERY_ENTRIES) {
-            const workMs = Math.max(0, Date.now() - cooldownWindowStartedAt);
-            const cooldownMs = Math.min(
-              DISCOVERY_COOLDOWN_MAX_MS,
-              Math.max(20, Math.round(workMs * 1.5)),
+            const cpuSinceLastBatch = process.cpuUsage(discoveryCpuBaseline);
+            discoveryCpuBaseline = process.cpuUsage();
+            const cpuWorkMs = (cpuSinceLastBatch.user + cpuSinceLastBatch.system) / 1000;
+            const workBudgetPercent = Math.max(
+              5,
+              Math.min(
+                100,
+                contentSettingsStore?.getSearchPerformanceSnapshot().settings
+                  .backgroundWorkPercent ?? 5,
+              ),
             );
-            await new Promise<void>((resolve) => setTimeout(resolve, cooldownMs));
+            let cooldownRemaining = Math.ceil(
+              cpuWorkMs * ((100 - workBudgetPercent) / workBudgetPercent),
+            );
+            while (cooldownRemaining > 0 && !isCancelled()) {
+              if (shouldPauseForSearch()) {
+                if (!(await waitForSearchIdle())) return;
+                discoveryCpuBaseline = process.cpuUsage();
+                continue;
+              }
+              const sliceMs = Math.min(50, cooldownRemaining);
+              await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
+              cooldownRemaining -= sliceMs;
+            }
             await new Promise<void>((resolve) => setImmediate(resolve));
+            discoveryCpuBaseline = process.cpuUsage();
             entriesSinceCooldown = 0;
-            cooldownWindowStartedAt = Date.now();
           }
         }
       }
@@ -5774,6 +5915,7 @@ app.whenReady().then(async () => {
     fullAccessEnabled() ? null : DEMO_LIMITS.files,
   );
   let loadedSearchRecords = 0;
+  let lastSavedRecordPercentage = -1;
   let searchPreparationFailureMessage = "Search index could not be opened.";
   const semanticLoad = indexStorageInitializationDeferred
     ? Promise.resolve().then(() => {
@@ -5785,14 +5927,16 @@ app.whenReady().then(async () => {
         });
       })
     : semanticIndexer.initialize((fraction, records) => {
-        loadedSearchRecords = records;
-        const percentage = Math.min(20, Math.round(fraction * 20));
-        updateSearchIndexReadiness({
-          status: "preparing",
-          percentage,
-          records,
-          message: `Reading saved search records · ${percentage}%`,
-        });
+      loadedSearchRecords = records;
+      const percentage = Math.min(20, Math.round(fraction * 20));
+      if (percentage === lastSavedRecordPercentage) return;
+      lastSavedRecordPercentage = percentage;
+      updateSearchIndexReadiness({
+        status: "preparing",
+        percentage,
+        records,
+        message: `Reading saved search records · ${percentage}%`,
+      });
         reportStartupDetail(
           `Opening saved search records… ${percentage}% (${records.toLocaleString()} files)`,
         );
@@ -5860,6 +6004,9 @@ app.whenReady().then(async () => {
         scheduleThumbnailPregeneration(progress.status === "indexing");
     },
     indexStorageRoot,
+    contentSettingsStore.getSearchPerformanceSnapshot().settings
+      .backgroundWorkPercent,
+    () => activeInteractiveSearches > 0,
   );
   faceIndexer.setRecognitionListener(({ added, removed }) => {
     const showBanned = Boolean(
@@ -6564,6 +6711,7 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   quitFlushed = true;
   const flush = Promise.all([
+    faceIndexer?.pause(),
     semanticIndexer.flushWrites(),
     semanticIndexer.flushVectorSearch(),
   ]);
@@ -6821,7 +6969,7 @@ ipcMain.handle("prepare-shelter-replica", async (_event, destinations: unknown, 
     ? destinations.filter((item): item is string => typeof item === "string")
     : [];
   if (typeof operationId !== "string" || !operationId)
-    return { ok: false, error: "Invalid shelter replica operation." };
+    return { ok: false, error: "Invalid Fallout Shelter replica operation." };
   try {
     const plan = await prepareShelterReplica(cleanDestinations, operationId);
     return { ok: true, plan };
@@ -6990,6 +7138,9 @@ ipcMain.handle(
       if (!exploded || typeof requestId !== "number") return;
       const enabledPaths = await getEnabledIndexSources();
       const availableSources = await listSources();
+      const sourcesBySpecificity = [...availableSources].sort(
+        (first, second) => second.rootPath.length - first.rootPath.length,
+      );
       const indexed = filterForContentSafety(
         semanticIndexer
           .getIndexedFiles(enabledPaths)
@@ -7000,16 +7151,11 @@ ipcMain.handle(
               file.path.startsWith(`${dirPath}${path.sep}`),
           )
           .map((file) => {
-            const source = availableSources
-              .filter(
-                (candidate) =>
-                  file.path === candidate.rootPath ||
-                  file.path.startsWith(`${candidate.rootPath}/`),
-              )
-              .sort(
-                (first, second) =>
-                  second.rootPath.length - first.rootPath.length,
-              )[0];
+            const source = sourcesBySpecificity.find(
+              (candidate) =>
+                file.path === candidate.rootPath ||
+                file.path.startsWith(`${candidate.rootPath}${path.sep}`),
+            );
             return {
               ...file,
               sourceId: source?.id,
@@ -7017,7 +7163,8 @@ ipcMain.handle(
             };
           }),
       );
-      indexed.sort((first, second) => {
+      const preview = indexed.slice(0, 500);
+      preview.sort((first, second) => {
         const direction = scanOptions?.sortAscending === false ? -1 : 1;
         const field = scanOptions?.sortField ?? "name";
         if (field === "source") {
@@ -7046,7 +7193,7 @@ ipcMain.handle(
         // Send the cached inventory once, not just its first 500 entries.
         // The renderer paginates the DOM; filtering stays client-side so changing
         // file types does not require waiting for this scan to finish.
-        files: indexed.slice(0, 500),
+        files: preview,
         inventory: mainWindow
           ? inventoryTransfers.create(indexed, mainWindow.webContents.id)
           : undefined,
@@ -7613,6 +7760,7 @@ ipcMain.handle(
   async (_event, update: unknown) => {
     const snapshot = await contentSettingsStore.updateSearchPerformanceSettings(update);
     semanticIndexer?.setPerformanceSettings(snapshot.settings);
+    faceIndexer?.setBackgroundWorkPercent(snapshot.settings.backgroundWorkPercent);
     return snapshot;
   },
 );
@@ -10167,6 +10315,8 @@ ipcMain.handle("get-phone-restore-archives", () =>
 ipcMain.handle(
   "create-phone-restore-archive",
   async (_event, deviceId: unknown, platform: unknown, password: unknown) => {
+    if (process.platform !== "darwin")
+      throw new Error("iPhone restore archives are currently supported on macOS only.");
     if (
       typeof deviceId !== "string" ||
       !deviceId ||
@@ -10185,7 +10335,7 @@ ipcMain.handle(
       throw new Error("The app window is unavailable to confirm this device backup.");
     const confirmation = await dialog.showMessageBox(mainWindow, {
       type: "warning",
-      title: "Enable encrypted device backups?",
+      title: "DESTINATION WRITE — Enable encrypted device backups?",
       message: `Create an encrypted restore archive for ${device.name}?`,
       detail:
         "Silo will enable encrypted iPhone backups if needed. The password is never saved by Silo; if you forget it, this archive cannot be restored. Keep the device connected and powered during the backup.",
@@ -10206,6 +10356,8 @@ ipcMain.handle(
 ipcMain.handle(
   "restore-phone-from-archive",
   async (_event, deviceId: unknown, platform: unknown, archiveId: unknown, password: unknown) => {
+    if (process.platform !== "darwin")
+      throw new Error("iPhone restore archives are currently supported on macOS only.");
     if (
       typeof deviceId !== "string" ||
       !deviceId ||
@@ -10232,10 +10384,10 @@ ipcMain.handle(
       throw new Error("The app window is unavailable to confirm this device restore.");
     const confirmation = await dialog.showMessageBox(mainWindow, {
       type: "warning",
-      title: "Restore iPhone or iPad?",
+      title: "DEVICE WRITE — Restore iPhone or iPad?",
       message: `Restore ${device.name} from ${archive.deviceName}’s ${new Date(archive.createdAt).toLocaleString()} archive?`,
       detail:
-        "Restoring writes the saved data and settings to the connected device and can replace current content. Keep it connected and powered, and do not interrupt the restore.",
+        "DEVICE WRITE: Restoring writes the saved data and settings to the connected device and can replace current content. Keep it connected and powered, and do not interrupt the restore.",
       buttons: ["Cancel", "Restore device"],
       defaultId: 0,
       cancelId: 0,

@@ -563,7 +563,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     });
   };
   const busy = !ready || loading || Boolean(action) || Boolean(exporting);
-  return <section className="memories-page" aria-label="Memories" data-help="Review local suggestions, adjust a story’s photo count, duration, soundtrack, and original-audio level, then export only when ready. Removing suggestion cards never deletes source media.">
+  return <section className="memories-page" aria-label="Memories" data-help="READ ONLY: Review local suggestions and previews. SILO DATA WRITE: Removing suggestions changes the Silo list only. DESTINATION WRITE: Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
       <div><span className="memories-eyebrow">silo / little time capsules</span><h1>Your life, in motion<span>.</span></h1>
         <p>Small stories from your library. Made by you, kept by you.</p></div>
@@ -607,9 +607,9 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     </form>
     <div className="memories-settings">
       <label><input type="checkbox" checked={state?.settings.showOnLaunch ?? false} disabled={busy || !state} data-help="Show the Memories page when Silo opens; it does not generate videos automatically." onChange={(event) => { const showOnLaunch = event.target.checked; void run("Saving settings", () => api.updateMemorySettings({ showOnLaunch })); }} />Show on launch</label>
-      <label><input type="checkbox" checked={state?.settings.removeAfterDownload ?? false} disabled={busy || !state} data-help="Remove a suggestion card after its movie is downloaded; original media and saved movies remain." onChange={(event) => { const removeAfterDownload = event.target.checked; void run("Saving settings", () => api.updateMemorySettings({ removeAfterDownload })); }} />Remove suggestion after download</label>
+      <label><input type="checkbox" checked={state?.settings.removeAfterDownload ?? false} disabled={busy || !state} data-help="SILO DATA WRITE: Remove only the suggestion card after its movie is downloaded. Original media and saved movies remain." onChange={(event) => { const removeAfterDownload = event.target.checked; void run("Saving settings", () => api.updateMemorySettings({ removeAfterDownload })); }} />Remove suggestion after download</label>
       <span>Original files are always kept.</span>
-      <button type="button" className="memories-text-button" disabled={busy || state?.generating || !state?.suggestions.length} onClick={() => setClearConfirm(true)} data-help="Remove all suggestion cards after a confirmation. Original photos, clips, and already-saved movies are kept."><FiTrash2 />Clear suggestions</button>
+      <button type="button" className="memories-text-button" disabled={busy || state?.generating || !state?.suggestions.length} onClick={() => setClearConfirm(true)} data-help="SILO DATA WRITE: Remove all suggestion cards after confirmation. Original photos, clips, and already-saved movies are kept."><FiTrash2 />Clear suggestions</button>
     </div>
     {error && <p className="memories-error memories-page-notice" role="alert">{error}</p>}
     {(!ready || loading || action || state?.generating || state?.message) && <p className="memories-page-notice" role="status" aria-live="polite">

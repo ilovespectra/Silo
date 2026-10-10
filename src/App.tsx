@@ -576,7 +576,10 @@ function cachedImagePreview(file: FileInfo): FilePreview | null {
 }
 
 const FAST_FILE_SEARCH_RESULT_LIMIT = 5000;
-const FAST_FILE_SEARCH_CHUNK_SIZE = 4000;
+const FAST_FILE_SEARCH_CHUNK_SIZE = 512;
+const FAST_FILE_SEARCH_CHUNK_DELAY_MS = 24;
+const SEARCH_INDEX_PREPARING_HINT =
+  "Search works now. Results may be slower while Silo prepares the saved library index; they should be much faster once it is ready.";
 
 function getFileTextMatchPriority(
   file: FileInfo,
@@ -883,7 +886,8 @@ function App() {
         if (priority === null || matches.has(file.path)) continue;
         if (matches.size >= FAST_FILE_SEARCH_RESULT_LIMIT) {
           capped = true;
-          continue;
+          offset = candidates.length;
+          break;
         }
         matches.set(file.path, asFastFileSearchResult(file, priority));
         changed = true;
@@ -898,7 +902,8 @@ function App() {
         setFastFileSearchResults(Array.from(matches.values()));
       }
       if (capped) setFastFileSearchCapped(true);
-      if (offset < candidates.length) window.setTimeout(scanChunk, 0);
+      if (offset < candidates.length)
+        window.setTimeout(scanChunk, FAST_FILE_SEARCH_CHUNK_DELAY_MS);
     };
     scanChunk();
   };
@@ -1871,7 +1876,11 @@ function App() {
           persistedPath && (persistedPath === aggregatePath || pathIsAvailable)
             ? persistedPath
             : aggregatePath;
-        const nextExploded = state.ui.exploded;
+        const nextExploded =
+          state.ui.exploded && pathToLoad !== aggregatePath;
+        // Restoring an exploded All Sources view triggers a full recursive walk
+        // of every library during startup. Open the source roots first so search
+        // hydration and normal app use do not compete with that walk.
         setExploded(nextExploded);
         setCurrentPath(pathToLoad);
         setNavigationHistory([{ type: "path", value: pathToLoad }]);
@@ -1894,9 +1903,38 @@ function App() {
 
   useEffect(() => {
     if (!electronAPI) return;
-    return electronAPI.onFileScanProgress((progress) => {
+    let pendingRequestId: number | null = null;
+    let pendingDeltas = new Map<string, FileInfo>();
+    let flushTimer: number | null = null;
+    let lastProgressUiUpdateAt = 0;
+    const flushDeltas = () => {
+      if (flushTimer !== null) window.clearTimeout(flushTimer);
+      flushTimer = null;
+      const requestId = pendingRequestId;
+      if (requestId === null) return;
+      const deltas = Array.from(pendingDeltas.values());
+      pendingRequestId = null;
+      pendingDeltas = new Map();
+      if (
+        deltas.length === 0 ||
+        requestId !== scanRequestRef.current ||
+        settledScanRef.current === requestId ||
+        preserveScanRequestRef.current === requestId
+      )
+        return;
+      setFiles((current) => {
+        const merged = new Map(current.map((file) => [file.path, file]));
+        for (const file of deltas) merged.set(file.path, file);
+        return Array.from(merged.values());
+      });
+    };
+    const removeProgressListener = electronAPI.onFileScanProgress((progress) => {
       if (progress.requestId !== scanRequestRef.current) return;
-      setFileScanProgress(progress);
+      const now = performance.now();
+      if (progress.done || now - lastProgressUiUpdateAt >= 2500) {
+        lastProgressUiUpdateAt = now;
+        setFileScanProgress(progress);
+      }
       const query = searchQueryRef.current.trim().toLocaleLowerCase();
       if (query && progress.fileDeltas?.length)
         scheduleFastFileMatchesRef.current(
@@ -1964,13 +2002,24 @@ function App() {
         settledScanRef.current !== progress.requestId &&
         preserveScanRequestRef.current !== progress.requestId
       ) {
-        setFiles((current) => {
-          const merged = new Map(current.map((file) => [file.path, file]));
-          for (const file of progress.fileDeltas!) merged.set(file.path, file);
-          return Array.from(merged.values());
-        });
+        if (pendingRequestId !== progress.requestId) {
+          if (flushTimer !== null) window.clearTimeout(flushTimer);
+          flushTimer = null;
+          pendingRequestId = progress.requestId;
+          pendingDeltas.clear();
+        }
+        for (const file of progress.fileDeltas)
+          pendingDeltas.set(file.path, file);
+        if (pendingDeltas.size >= 10000) flushDeltas();
+        else if (flushTimer === null)
+          flushTimer = window.setTimeout(flushDeltas, 5000);
       }
+      if (progress.done) flushDeltas();
     });
+    return () => {
+      if (flushTimer !== null) window.clearTimeout(flushTimer);
+      removeProgressListener();
+    };
   }, [electronAPI]);
 
   useEffect(() => {
@@ -3163,8 +3212,27 @@ function App() {
     [audioOnlySelected, currentPath, loadDirectory],
   );
 
+  const isGoogleCloudContext = Boolean(
+    currentPath?.startsWith("/__cloud__/") ||
+      selectedFile?.path.startsWith("/__cloud__/"),
+  );
+  const canCreateSourceFolder = Boolean(
+    currentPath && currentPath !== allSourcesPath && !isGoogleCloudContext,
+  );
+  const canMoveSelectedSourceFile = Boolean(
+    currentPath &&
+      selectedFile &&
+      !selectedFile.isDirectory &&
+      !selectedFile.path.startsWith("/__cloud__/"),
+  );
+
   const createFolder = useCallback(async () => {
-    if (!currentPath || !electronAPI) return;
+    if (
+      !currentPath ||
+      currentPath === allSourcesPath ||
+      currentPath.startsWith("/__cloud__/") ||
+      !electronAPI
+    ) return;
     openDialog({
       mode: "text",
       title: "New folder",
@@ -3178,12 +3246,13 @@ function App() {
         await loadDirectory(currentPath);
       },
     });
-  }, [currentPath, electronAPI, loadDirectory, openDialog]);
+  }, [allSourcesPath, currentPath, electronAPI, loadDirectory, openDialog]);
 
   const moveSelectedFile = useCallback(async () => {
     if (
       !selectedFile ||
       selectedFile.isDirectory ||
+      selectedFile.path.startsWith("/__cloud__/") ||
       !electronAPI ||
       !currentPath
     )
@@ -3240,7 +3309,7 @@ function App() {
     if (!electronAPI) return;
     openDialog({
       mode: "text",
-      title: "New digital folder",
+      title: "SILO DATA WRITE — New digital folder",
       message:
         "Digital folders contain references only. Source files are never moved or changed.",
       placeholder: "Digital folder name",
@@ -4272,8 +4341,9 @@ function App() {
     searchResults,
   ]);
   const contentFiles = useMemo(
-    () =>
-      rawContentFiles.map((file) => {
+    () => {
+      if (Object.keys(fileMetadata).length === 0) return rawContentFiles;
+      return rawContentFiles.map((file) => {
         const metadata = fileMetadata[file.path];
         if (!metadata?.displayName && metadata?.year === undefined) return file;
         return {
@@ -4281,7 +4351,8 @@ function App() {
           name: metadata.displayName || file.name,
           year: metadata.year,
         };
-      }),
+      });
+    },
     [fileMetadata, rawContentFiles],
   );
 
@@ -4421,6 +4492,11 @@ function App() {
     [searchResultOrder],
   );
 
+  const deferBrowseSort =
+    loading &&
+    currentPath === allSourcesPath &&
+    exploded &&
+    !searchQuery.trim();
   const filteredAndSortedFiles = useMemo(() => {
     const filtered = contentFiles.filter((file) => {
       if (file.isDirectory)
@@ -4454,7 +4530,7 @@ function App() {
       return file.size >= filters.sizeMin && file.size <= filters.sizeMax;
     });
 
-    filtered.sort((first, second) => {
+    if (!deferBrowseSort) filtered.sort((first, second) => {
       if (
         searchQuery.trim() &&
         freezeSearchResultOrder &&
@@ -4494,12 +4570,14 @@ function App() {
     allSourcesPath,
     contentFiles,
     currentPath,
+    deferBrowseSort,
     exploded,
     filters,
     magicState.ranks,
     searchQuery,
     sortIndicators,
     freezeSearchResultOrder,
+    loading,
     searchResultPositions,
     peopleFilter,
     locationFilter,
@@ -4508,9 +4586,15 @@ function App() {
     yearFilter,
   ]);
 
+  const hasSelectableFiles = useMemo(
+    () => filteredAndSortedFiles.some((file) => !file.isDirectory),
+    [filteredAndSortedFiles],
+  );
+
   const yearOptions = useMemo(
-    () =>
-      Array.from(
+    () => {
+      if (!showFilters) return [];
+      return Array.from(
         new Set([
           ...contentFiles.filter((file) => !file.isDirectory).map(modifiedYear),
           ...(audioOnlySelected ? audioYearOptions : []),
@@ -4520,11 +4604,13 @@ function App() {
         if (second === "Unknown year") return -1;
         const direction = sort.field === "modified" && sort.ascending ? 1 : -1;
         return (Number(first) - Number(second)) * direction;
-      }),
+      });
+    },
     [
       audioOnlySelected,
       audioYearOptions,
       contentFiles,
+      showFilters,
       sort.ascending,
       sort.field,
     ],
@@ -4532,10 +4618,12 @@ function App() {
 
   const viewerImages = useMemo(
     () =>
-      (viewerScopeFiles ?? filteredAndSortedFiles).filter(
-        (file) => file.type === "image" || file.type === "video",
-      ),
-    [filteredAndSortedFiles, viewerScopeFiles],
+      viewerOpen
+        ? (viewerScopeFiles ?? filteredAndSortedFiles).filter(
+            (file) => file.type === "image" || file.type === "video",
+          )
+        : [],
+    [filteredAndSortedFiles, viewerOpen, viewerScopeFiles],
   );
 
   const selectAllFiles = useCallback(() => {
@@ -4800,12 +4888,13 @@ function App() {
   useEffect(() => {
     if (appSection !== "files" || preserveSelectionRequestRef.current !== null)
       return;
-    const availablePaths = new Set(
-      filteredAndSortedFiles
-        .filter((file) => !file.isDirectory)
-        .map((file) => file.path),
-    );
     setSelectedFilePaths((current) => {
+      if (current.size === 0) return current;
+      const availablePaths = new Set(
+        filteredAndSortedFiles
+          .filter((file) => !file.isDirectory)
+          .map((file) => file.path),
+      );
       const next = new Set(
         Array.from(current).filter((filePath) => availablePaths.has(filePath)),
       );
@@ -5070,7 +5159,30 @@ function App() {
           </div>
           {appSection === "files" ? (
             <div className="header-search-group">
-              <div className="semantic-search" data-tour="semantic-search">
+              <div
+                className={`semantic-search ${
+                  searchIndexReadiness.status === "preparing"
+                    ? "is-preparing"
+                    : searchIndexReadiness.status === "ready"
+                      ? "is-ready"
+                      : ""
+                }`}
+                style={
+                  {
+                    "--search-index-progress": `${
+                      searchIndexReadiness.status === "ready"
+                        ? 100
+                        : searchIndexReadiness.status === "preparing"
+                          ? Math.max(
+                              0,
+                              Math.min(100, searchIndexReadiness.percentage),
+                            )
+                          : 0
+                    }%`,
+                  } as React.CSSProperties
+                }
+                data-tour="semantic-search"
+              >
                 <FiSearch />
                 <input
                   value={searchQuery}
@@ -5106,18 +5218,46 @@ function App() {
                   placeholder={
                     searchIndexReadiness.status === "ready"
                       ? "Search names, folders, and by meaning"
-                      : "Search becomes available when the index is ready"
+                      : searchIndexReadiness.status === "preparing"
+                        ? "Search while the library index prepares"
+                        : "Search index unavailable"
+                  }
+                  title={
+                    searchIndexReadiness.status === "preparing"
+                      ? SEARCH_INDEX_PREPARING_HINT
+                      : undefined
+                  }
+                  aria-describedby={
+                    searchIndexReadiness.status === "preparing"
+                      ? "search-index-preparing-help"
+                      : undefined
                   }
                   aria-label="Semantic search"
                   data-help="Describe what you remember in ordinary language to find matching indexed photos and documents locally."
                 />
+                {searchIndexReadiness.status === "preparing" && (
+                  <span
+                    id="search-index-preparing-help"
+                    className="search-readiness-description"
+                  >
+                    {SEARCH_INDEX_PREPARING_HINT}
+                  </span>
+                )}
                 <span className="semantic-search-status" role="status" aria-live="polite">
                   {searchIndexReadiness.status === "preparing" ? (
-                    <span className="search-index-meter" title={searchIndexReadiness.message}>
-                      <span>Index {searchIndexReadiness.percentage}%</span>
-                      <span className="search-index-meter-track" aria-hidden="true">
-                        <span style={{ width: `${searchIndexReadiness.percentage}%` }} />
-                      </span>
+                    <span
+                      className="search-index-meter"
+                      role="progressbar"
+                      aria-label="Search readiness preparation"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={Math.max(
+                        0,
+                        Math.min(100, searchIndexReadiness.percentage),
+                      )}
+                      title={searchIndexReadiness.message}
+                    >
+                      <span>Preparing {searchIndexReadiness.percentage}%</span>
                     </span>
                   ) : searchIndexReadiness.status === "ready" ? (
                     searchQuery.trim() && searchTiming ? (
@@ -5249,7 +5389,8 @@ function App() {
             {appSection === "files" && (
               <>
                 <button className="btn btn-primary" onClick={selectDirectory}
-                  data-help="Choose a folder on this Mac and add it to Files as a source for browsing and indexing.">
+                  title="SILO DATA WRITE — Add this folder to Silo's source list"
+                  data-help="SILO DATA WRITE: Add a folder to Silo's source list for browsing and indexing. The source files are not changed.">
                   <FiDownload /> Open Directory
                 </button>
                 {(currentPath || activeDigitalFolderId) && (
@@ -5292,7 +5433,7 @@ function App() {
                           : activeDigitalFolderId &&
                             navigateToDigitalFolder(activeDigitalFolderId, false)
                       }
-                      title="Refresh"
+                      title="READ ONLY — Refresh current source"
                       aria-label="Refresh current folder"
                       data-help="Reload the current directory or digital-folder contents from its source."
                     >
@@ -5306,27 +5447,30 @@ function App() {
           <div
             className="header-right"
             data-tour={appSection === "files" ? "file-actions" : undefined}
-            data-help={appSection === "files" ? "These actions change the current file view or apply to selected files. Move and New folder affect real files; Set virtual name only changes Silo’s label." : undefined}
           >
             {appSection === "files" ? (
               <>
                 <button
                   className="btn btn-icon header-tool-item"
                   onClick={createFolder}
-                  disabled={!currentPath}
-                  title="New folder"
-                  aria-label="New folder"
-                  data-help="Create a real folder inside the currently open source directory."
+                  disabled={!canCreateSourceFolder}
+                  title={isGoogleCloudContext ? "READ ONLY — Google source" : canCreateSourceFolder ? "SOURCE WRITE — New folder" : "Choose a local source folder first"}
+                  aria-label={isGoogleCloudContext ? "Google source is read only" : "New folder (writes to source)"}
+                  data-help={isGoogleCloudContext
+                    ? "READ ONLY: Google Drive and Google Photos items cannot be changed here. This control only creates folders on local disk paths."
+                    : "SOURCE WRITE: Create a real folder inside the currently open local source directory."}
                 >
                   <FiFolderPlus />
                 </button>
                 <button
                   className="btn btn-icon header-tool-item"
                   onClick={moveSelectedFile}
-                  disabled={!selectedFile || selectedFile.isDirectory}
-                  title="Move selected file"
-                  aria-label="Move selected file"
-                  data-help="Choose a destination and move the selected file on disk. Review the destination before confirming."
+                  disabled={!canMoveSelectedSourceFile}
+                  title={isGoogleCloudContext ? "READ ONLY — Google source" : "SOURCE WRITE — Move selected file"}
+                  aria-label={isGoogleCloudContext ? "Google Drive item is read only" : "Move selected file (writes to source)"}
+                  data-help={isGoogleCloudContext
+                    ? "READ ONLY: Google Drive and Google Photos items cannot be moved by this Files control."
+                    : "SOURCE WRITE: Choose a destination to move this local file on disk. Review the destination before confirming."}
                 >
                   <FiMove />
                 </button>
@@ -5334,9 +5478,9 @@ function App() {
                   className="btn btn-icon header-tool-item"
                   onClick={editVirtualName}
                   disabled={metadataTargets.length !== 1}
-                  title="Set virtual name"
-                  aria-label="Set virtual name"
-                  data-help="Change the name Silo displays and searches for this file without renaming the file on disk."
+                  title="SILO DATA WRITE — Set virtual name"
+                  aria-label="Set virtual name (writes Silo metadata only)"
+                  data-help="SILO DATA WRITE: Change Silo's display and search label. The source filename and file contents stay unchanged."
                 >
                   <FiEdit3 />
                 </button>
@@ -5344,16 +5488,16 @@ function App() {
                   className="btn btn-icon header-tool-item"
                   onClick={editKeywords}
                   disabled={metadataTargets.length === 0}
-                  title="Edit search keywords"
-                  aria-label="Edit search keywords"
-                  data-help="Add or edit local keywords that help Silo find the selected files."
+                  title="SILO DATA WRITE — Edit search keywords"
+                  aria-label="Edit search keywords (writes Silo metadata only)"
+                  data-help="SILO DATA WRITE: Save local keywords for search. The source files stay unchanged."
                 >
                   <FiTag />
                 </button>
                 <button
                   className={`btn btn-icon header-tool-view ${viewMode === "list" ? "active" : ""}`}
                   onClick={() => setViewMode("list")}
-                  title="List view"
+                  title="READ ONLY — List view"
                   aria-label="List view"
                   data-help="Show files as rows with additional columns and details."
                 >
@@ -5362,7 +5506,7 @@ function App() {
                 <button
                   className={`btn btn-icon header-tool-view ${viewMode === "grid" ? "active" : ""}`}
                   onClick={() => setViewMode("grid")}
-                  title="Grid view"
+                  title="READ ONLY — Grid view"
                   aria-label="Grid view"
                   data-help="Show files as a visual thumbnail grid."
                 >
@@ -5371,7 +5515,7 @@ function App() {
                 <button
                   className={`btn btn-icon header-tool-filter ${showFilters ? "active" : ""}`}
                   onClick={() => setShowFilters(!showFilters)}
-                  title="Sort and filter files"
+                  title="READ ONLY — Sort and filter files"
                   aria-label="Sort and filter files"
                   data-help="Choose a sort order and filter by type, year, people, or location. These controls work in both List and Grid views."
                 >
@@ -5382,10 +5526,7 @@ function App() {
                     <button
                       className="btn btn-icon header-tool-selection"
                       onClick={selectAllFiles}
-                      disabled={
-                        filteredAndSortedFiles.filter((f) => !f.isDirectory)
-                        .length === 0
-                      }
+                      disabled={!hasSelectableFiles}
                       title="Select all files (Cmd+A)"
                       aria-label="Select all files"
                       data-help="Select every currently visible file in this view."
@@ -5410,13 +5551,15 @@ function App() {
                 className="btn btn-primary"
                 onClick={createPerson}
                 data-tour="new-person"
+                title="SILO DATA WRITE — Create a People profile in Silo"
+                data-help="SILO DATA WRITE: Create a People profile in Silo. This does not change source photos."
               >
                 <FiUserPlus /> New Person
               </button>
-            ) : null}
+              ) : null}
+            </div>
           </div>
-        </div>
-      </header>
+        </header>
 
 
       {appSection === "files" && scanIssues && (
@@ -5478,7 +5621,7 @@ function App() {
             <button
               onClick={() => editYear()}
               className="bulk-action-btn"
-              title="Edit the library year for selected files"
+              title="SILO DATA WRITE — Edit the library year for selected files"
             >
               <FiEdit3 /> Year
             </button>
@@ -5499,21 +5642,21 @@ function App() {
                   personMediaPaths.has(filePath),
                 )
               }
-              title="Add the selected photos or videos to a person in People"
+              title="SILO DATA WRITE — Add selected media to a People profile"
             >
               <FiUserPlus /> Add to Person
             </button>
             <button
               onClick={() => setShowFolderSelector(true)}
               className="bulk-action-btn add-to-folder"
-              title="Add selected files to a digital folder"
+              title="SILO DATA WRITE — Add references to a Digital Folder"
             >
               <FiPlus /> Add to Folder
             </button>
             <button
               onClick={() => saveSelectedFileToDevice()}
               className="bulk-action-btn save-to-device"
-              title="Save selected files to device"
+              title="DESTINATION WRITE — Save separate copies to this device"
             >
               <FiDownload /> Save to Device
             </button>
@@ -5521,13 +5664,14 @@ function App() {
               onClick={() => setShowLocationPicker((current) => !current)}
               className="bulk-action-btn"
               disabled={locationTargetFiles.length === 0}
-              title="Assign a verified map location"
+              title="SILO DATA WRITE — Assign a location in Silo metadata"
             >
               <FiMap /> Location
             </button>
             <button
               onClick={() => setSelectedFilePaths(new Set())}
               className="bulk-action-btn clear"
+              title="READ ONLY — Clear the current selection"
             >
               Clear Selection
             </button>
@@ -5603,7 +5747,7 @@ function App() {
           <span className="file-count">
             {searchQuery.trim()
               ? searchIndexReadiness.status === "preparing"
-                ? `${filteredAndSortedFiles.length.toLocaleString()} matches · preparing semantic index ${searchIndexReadiness.percentage}%`
+                ? `${filteredAndSortedFiles.length.toLocaleString()} matches · preparing saved search index ${searchIndexReadiness.percentage}%`
                 : searching && searchProgress.total === 0
                 ? `${filteredAndSortedFiles.length.toLocaleString()} matches · finding first results`
                 : searching && searchProgress.mode === "ann"
@@ -5810,7 +5954,8 @@ function App() {
       ) : appSection === "stats" ? (
         electronAPI ? <StatsDashboard api={electronAPI} /> : <main className="viewer-status">Stats services are unavailable.</main>
       ) : appSection === "people" ? (
-        <main className="people-page" data-tour="people-page" data-help="Use People to start or pause optional offline face indexing, review clusters, name profiles, correct individual assignments, confirm matches, and merge or ban a person.">
+        <main className="people-page" data-tour="people-page" data-help="READ ONLY: Review photos and face groups. SILO DATA WRITE: Naming people, correcting assignments, merging profiles and changing visibility save People records only; source photos are unchanged."
+        >
           <section className="face-index-status" data-tour="people-index" data-help="This independent offline index detects and groups faces. It does not move or rename source files.">
             <div>
               <span className="sidebar-kicker">Secondary offline index</span>
@@ -5893,7 +6038,7 @@ function App() {
                     {personDetail.faceCount} detected faces
                   </p>
                 </div>
-                <div className="person-actions" data-tour="person-actions" data-help="These actions apply to the selected person or face cluster. Rename changes the profile label; Merge combines profiles after confirmation and can be undone.">
+                <div className="person-actions" data-tour="person-actions" data-help="SILO DATA WRITE: These actions change person/profile records and assignments only. Rename changes the profile label; Merge combines profiles after confirmation and can be undone. Source photos are unchanged.">
                   <select
                     className="merge-dropdown person-sort-select"
                     value={sortValue}
@@ -5979,7 +6124,7 @@ function App() {
                       Merge into…
                     </button>
                   )}
-                  <button onClick={deletePerson} title="Delete person">
+                  <button onClick={deletePerson} title="SILO DATA WRITE — Delete person profile and Silo references only">
                     <FiTrash2 />
                   </button>
                 </div>
@@ -6736,10 +6881,10 @@ function App() {
                 <button
                   onClick={() => setShowSourceClone(true)}
                   disabled={cloneableSources.length === 0}
-                  title="Clone all enabled sources without modifying originals"
-                  aria-label="Create a verified shelter copy"
+                  title="DESTINATION WRITE — Create a separate Fallout Shelter copy without modifying originals"
+                  aria-label="Create a verified Fallout Shelter copy"
                   data-tour="source-clone"
-                  data-help="Create and verify a shelter copy of enabled sources without changing the originals."
+                  data-help="DESTINATION WRITE: Create a Fallout Shelter copy of enabled sources and verify it with SHA-256. Original files are not modified or removed."
                 >
                   <FiCopy />
                 </button>
@@ -6984,7 +7129,7 @@ function App() {
             <section
               className="sidebar-section digital-folders"
               data-tour="digital-folders"
-              data-help="Create virtual collections of file references. Adding or removing a reference does not move or delete its original file."
+              data-help="SILO DATA WRITE: Create or change local collections of file references. Adding, removing, renaming, reordering or deleting a Digital Folder does not move, rename or delete the original files."
             >
               <div className="sidebar-heading">
                 <div>
@@ -6993,7 +7138,7 @@ function App() {
                 </div>
                 <button
                   onClick={createDigitalFolder}
-                  title="New digital folder"
+                  title="SILO DATA WRITE — New Digital Folder"
                 >
                   <FiPlus />
                 </button>
@@ -7070,8 +7215,8 @@ function App() {
                       className="folder-drag-handle"
                       draggable={!folderOrderBusy}
                       disabled={folderOrderBusy}
-                      aria-label={`Reorder ${folder.name}`}
-                      title="Drag to reorder folder"
+                      aria-label={`SILO DATA WRITE — Reorder ${folder.name}`}
+                      title="SILO DATA WRITE — Reorder Digital Folder"
                       onDragStart={(event) => {
                         draggedFolder.current = folder.id;
                         event.dataTransfer.effectAllowed = "move";
@@ -7090,7 +7235,7 @@ function App() {
                     <button
                       className="digital-folder-name"
                       onClick={() => openDigitalFolder(folder.id)}
-                      title={folder.name}
+                      title={`READ ONLY — Open ${folder.name}`}
                     >
                       {folder.id === FAVORITES_FOLDER_ID ? (
                         <FiHeart />
@@ -7104,8 +7249,8 @@ function App() {
                     </button>
                     <button
                       onClick={() => renameDigitalFolder(folder)}
-                      title={`Rename ${folder.name}`}
-                      aria-label={`Rename ${folder.name}`}
+                      title={`SILO DATA WRITE — Rename ${folder.name}`}
+                      aria-label={`SILO DATA WRITE — Rename ${folder.name}`}
                     >
                       <FiEdit3 />
                     </button>
@@ -7114,17 +7259,17 @@ function App() {
                       disabled={folder.id === REFUSE_FOLDER_ID}
                       title={
                         folder.id === REFUSE_FOLDER_ID
-                          ? "Refuse always hides its contents"
+                          ? "SILO DATA WRITE — Refuse always hides its contents"
                           : folder.hidden
-                            ? "Show folder contents across Silo"
-                            : "Hide folder contents across Silo"
+                            ? "SILO DATA WRITE — Show folder contents across Silo"
+                            : "SILO DATA WRITE — Hide folder contents across Silo"
                       }
                       aria-label={
                         folder.id === REFUSE_FOLDER_ID
-                          ? "Refuse always hides its contents"
+                          ? "SILO DATA WRITE — Refuse always hides its contents in Silo"
                           : folder.hidden
-                            ? `Show ${folder.name} contents`
-                            : `Hide ${folder.name} contents`
+                            ? `SILO DATA WRITE — Show ${folder.name} contents across Silo`
+                            : `SILO DATA WRITE — Hide ${folder.name} contents across Silo`
                       }
                     >
                       {folder.hidden ? <FiEyeOff /> : <FiEye />}
@@ -7135,14 +7280,16 @@ function App() {
                         selectedFilePaths.size === 0 &&
                         (!selectedFile || selectedFile.isDirectory)
                       }
-                      title={`Add selected file${selectedFilePaths.size === 1 ? "" : "s"} to ${folder.name}`}
+                      title={`SILO DATA WRITE — Add selected file${selectedFilePaths.size === 1 ? "" : "s"} to ${folder.name} (reference only)`}
+                      aria-label={`SILO DATA WRITE — Add selected items to ${folder.name} as references only`}
                     >
                       <FiPlus />
                     </button>
                     <button
                       onClick={() => downloadDigitalFolder(folder.id)}
                       disabled={folder.filePaths.length === 0}
-                      title="Save folder files to device"
+                      title="DESTINATION WRITE — Save copies to this device"
+                      aria-label="DESTINATION WRITE — Save copies in this Digital Folder to this device"
                     >
                       <FiDownload />
                     </button>
@@ -7150,7 +7297,8 @@ function App() {
                       folder.id !== REFUSE_FOLDER_ID && (
                         <button
                           onClick={() => deleteDigitalFolder(folder.id)}
-                          title="Delete digital folder"
+                          title="SILO DATA WRITE — Delete Digital Folder only"
+                          aria-label={`SILO DATA WRITE — Delete ${folder.name} from Silo only`}
                         >
                           <FiTrash2 />
                         </button>
@@ -7162,6 +7310,7 @@ function App() {
                 <button
                   className="remove-reference"
                   onClick={removeSelectedFromDigitalFolder}
+                  title="SILO DATA WRITE — Remove this reference only"
                 >
                   Remove selected reference
                 </button>
@@ -7293,20 +7442,16 @@ function App() {
                 <div>
                   {searchQuery.trim()
                     ? searchIndexReadiness.status === "preparing"
-                      ? `Preparing semantic index · ${searchIndexReadiness.percentage}%`
+                      ? `Preparing saved search index · ${searchIndexReadiness.percentage}%`
                       : "Finding first results…"
                     : "Scanning files..."}
                 </div>
                 {searchQuery.trim() && searchIndexReadiness.status === "preparing" && (
-                  <div className="loading-progress">
-                    <div className="progress-bar">
-                      <div
-                        className="progress-fill"
-                        style={{ width: `${searchIndexReadiness.percentage}%` }}
-                      />
-                    </div>
-                    <p>{searchIndexReadiness.records.toLocaleString()} index records prepared</p>
-                  </div>
+                  <p className="search-index-preparing-copy">
+                    Search works now. Results may take longer while Silo prepares
+                    the saved library index. {searchIndexReadiness.records.toLocaleString()} records
+                    prepared so far.
+                  </p>
                 )}
                 {!searchQuery.trim() && loading && filteredAndSortedFiles.length === 0 && (
                   <div className="loading-progress">
@@ -8588,8 +8733,8 @@ function App() {
                         className="face-assignment-delete"
                         type="button"
                         disabled={faceAssignmentBusy}
-                        aria-label="Delete detected face"
-                        title="Delete this detected face"
+                        aria-label="SILO DATA WRITE — Delete detected face record only"
+                        title="SILO DATA WRITE — Delete detected face record only"
                         onPointerDown={(event) => event.stopPropagation()}
                         onClick={(event) => {
                           event.stopPropagation();

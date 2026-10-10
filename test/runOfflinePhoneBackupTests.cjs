@@ -38,7 +38,7 @@ async function run() {
         "/__phone__/ios/device-1/Documents/missing.docx": "50:4000",
       },
       progress: {
-        deviceId: "device-1", platform: "ios", deviceName: "Tanny phone",
+        deviceId: "device-1", platform: "ios", deviceName: "Example Test Phone",
         status: "complete", totalFiles: 4, completedFiles: 4, totalBytes: 165,
         completedBytes: 165, copiedFiles: 4, failedFiles: 0, currentFile: null,
         message: "Complete", lastBackupAt: 123456,

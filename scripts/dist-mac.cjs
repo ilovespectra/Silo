@@ -1,10 +1,12 @@
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const packageJson = require("../package.json");
 
 const projectRoot = path.resolve(__dirname, "..");
 const architecture = process.argv[2];
 const supportedArchitectures = new Set(["x64", "arm64"]);
+const cpuTypes = { x64: 0x01000007, arm64: 0x0100000c };
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -18,30 +20,82 @@ function run(command, args, options = {}) {
   }
 }
 
-function assertMachOArchitecture(binary, expectedArchitecture) {
-  const cpuTypes = { x64: 0x01000007, arm64: 0x0100000c };
+function readMachOArchitectures(binary) {
+  if (binary.length < 8) return [];
+  const magic = binary.readUInt32BE(0);
+  if (magic === 0xcafebabe || magic === 0xcafebabf) {
+    const entrySize = magic === 0xcafebabf ? 32 : 20;
+    const count = binary.readUInt32BE(4);
+    if (count > 32 || binary.length < 8 + count * entrySize) return [];
+    const architectures = [];
+    for (let index = 0; index < count; index += 1)
+      architectures.push(binary.readUInt32BE(8 + index * entrySize));
+    return architectures;
+  }
+  return binary.readUInt32LE(0) === 0xfeedfacf
+    ? [binary.readUInt32LE(4)]
+    : [];
+}
+
+function assertMachOArchitecture(binary, expectedArchitecture, label = "Binary") {
   if (!Object.hasOwn(cpuTypes, expectedArchitecture)) {
-    throw new Error(`Unsupported macOS FFmpeg architecture: ${expectedArchitecture}`);
+    throw new Error(`Unsupported macOS architecture: ${expectedArchitecture}`);
   }
-  if (binary.length < 8 || binary.readUInt32LE(0) !== 0xfeedfacf) {
-    throw new Error("The staged FFmpeg is not a 64-bit macOS Mach-O executable.");
+  const architectures = readMachOArchitectures(binary);
+  if (!architectures.length) {
+    throw new Error(`${label} is not a supported 64-bit macOS Mach-O executable.`);
   }
-  if (binary.readUInt32LE(4) !== cpuTypes[expectedArchitecture]) {
-    throw new Error(`The staged FFmpeg is not a ${expectedArchitecture} executable.`);
+  if (!architectures.includes(cpuTypes[expectedArchitecture])) {
+    throw new Error(`${label} does not contain the ${expectedArchitecture} architecture.`);
   }
 }
 
-function withTemporaryFfmpegBinary(originalPath, stagedPath, backupDirectory, build) {
-  const backupPath = path.join(backupDirectory, "ffmpeg-original");
+function withTemporaryFfmpegBinary(originalPath, stagedPath, build) {
+  const backupPath = path.join(path.dirname(originalPath), `.ffmpeg-silo-backup-${process.pid}`);
   const originalMode = fs.statSync(originalPath).mode & 0o777;
-  fs.copyFileSync(originalPath, backupPath);
+  fs.renameSync(originalPath, backupPath);
   try {
     fs.copyFileSync(stagedPath, originalPath);
     fs.chmodSync(originalPath, 0o755);
     return build();
   } finally {
-    fs.copyFileSync(backupPath, originalPath);
+    fs.rmSync(originalPath, { force: true });
+    fs.renameSync(backupPath, originalPath);
     fs.chmodSync(originalPath, originalMode);
+  }
+}
+
+function assertPackagedMacApp(appPath, expectedArchitecture) {
+  const productName = packageJson.build.productName;
+  const executablePath = path.join(appPath, "Contents", "MacOS", productName);
+  assertMachOArchitecture(
+    fs.readFileSync(executablePath),
+    expectedArchitecture,
+    `Packaged ${productName} executable`,
+  );
+
+  const infoPlistPath = path.join(appPath, "Contents", "Info.plist");
+  const plist = spawnSync(
+    "/usr/bin/plutil",
+    ["-convert", "json", "-o", "-", infoPlistPath],
+    { encoding: "utf8" },
+  );
+  if (plist.error) throw plist.error;
+  if (plist.status !== 0) {
+    throw new Error(`Could not inspect packaged Info.plist: ${plist.stderr.trim()}`);
+  }
+  const info = JSON.parse(plist.stdout);
+  for (const key of ["CFBundleName", "CFBundleDisplayName"]) {
+    if (info[key] !== productName) {
+      throw new Error(`Packaged ${key} must be "${productName}", received "${info[key]}".`);
+    }
+  }
+  const minimumVersion = packageJson.build.mac.minimumSystemVersion;
+  if (info.LSMinimumSystemVersion !== minimumVersion) {
+    throw new Error(
+      `Packaged LSMinimumSystemVersion must be ${minimumVersion}, ` +
+        `received ${info.LSMinimumSystemVersion}.`,
+    );
   }
 }
 
@@ -70,7 +124,11 @@ function buildMac() {
 
   try {
     run(process.execPath, [installer], { env: environment });
-    assertMachOArchitecture(fs.readFileSync(stagedBinary), architecture);
+    assertMachOArchitecture(
+      fs.readFileSync(stagedBinary),
+      architecture,
+      "Staged FFmpeg",
+    );
 
     const installedBinary = path.join(
       projectRoot,
@@ -78,8 +136,14 @@ function buildMac() {
       "ffmpeg-static",
       "ffmpeg",
     );
-    withTemporaryFfmpegBinary(installedBinary, stagedBinary, stagingDirectory, () => {
-      const buildArguments = ["electron-builder", "--mac", `--${architecture}`];
+    withTemporaryFfmpegBinary(installedBinary, stagedBinary, () => {
+      const buildArguments = [
+        "electron-builder",
+        "--config",
+        "electron-builder.config.cjs",
+        "--mac",
+        `--${architecture}`,
+      ];
       if (process.env.SILO_TEST_DIR_ONLY === "1") {
         buildArguments.push("--dir");
       }
@@ -92,6 +156,15 @@ function buildMac() {
         `--config.directories.output=${outputDirectory}`,
       );
       run("npx", buildArguments);
+      const architectureDirectory = architecture === "x64" ? "mac" : "mac-arm64";
+      assertPackagedMacApp(
+        path.join(
+          outputDirectory,
+          architectureDirectory,
+          `${packageJson.build.productName}.app`,
+        ),
+        architecture,
+      );
     });
   } finally {
     fs.rmSync(stagingDirectory, { recursive: true, force: true });
@@ -109,5 +182,7 @@ if (require.main === module) {
 
 module.exports = {
   assertMachOArchitecture,
+  assertPackagedMacApp,
+  readMachOArchitectures,
   withTemporaryFfmpegBinary,
 };

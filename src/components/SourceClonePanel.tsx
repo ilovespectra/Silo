@@ -185,8 +185,8 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
         <header>
           <div className="source-clone-icon"><FiCopy /></div>
           <div>
-            <span className="sidebar-kicker">{mode === "shelter-replica" ? "VERIFIED SHELTER REPLICA" : "READ-ONLY SOURCE COPY"}</span>
-            <h2 id="source-clone-title">{mode === "shelter-replica" ? "Clone Fallout Shelter" : "Clone selected sources"}</h2>
+            <span className="sidebar-kicker">{mode === "shelter-replica" ? "VERIFIED FALLOUT SHELTER REPLICA" : "FALLOUT SHELTER · SOURCE COPY"}</span>
+            <h2 id="source-clone-title">{mode === "shelter-replica" ? "Clone Fallout Shelter" : "Create Fallout Shelter"}</h2>
           </div>
           {!busy && <button className="source-clone-close" onClick={onClose} aria-label="Close"><FiX /></button>}
         </header>
@@ -198,9 +198,9 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
 
         <div className="source-clone-safety">
           <FiShield />
-          <p><strong>Originals are read-only.</strong> {mode === "shelter-replica"
-            ? "Silo copies the latest completed shelter snapshot to a different physical volume and verifies each unique file by SHA-256."
-            : "Silo reads selected sources and writes one physical copy per unique SHA-256; duplicate source paths become hard links where supported, or manifest aliases. Originals are not changed."}</p>
+          <p><strong>READ ONLY SOURCE · DESTINATION WRITE.</strong> {mode === "shelter-replica"
+            ? "Silo copies the latest completed Fallout Shelter snapshot to a different physical volume and verifies each unique file by SHA-256."
+            : "Fallout Shelter writes a separate destination copy, then verifies matching SHA-256 hashes. Original files are not modified or removed."}</p>
         </div>
 
         {supportsTimeMachine && !plan && (
@@ -289,7 +289,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               <div className="source-clone-actions">
                 <button onClick={() => void addDestination()}><FiHardDrive /> Add destination</button>
                 <button onClick={() => void extractArchive()} data-help="Restore a compressed Silo clone (.zip). Every file is checked against its SHA-256 before it is written into a new folder."><FiArchive /> Extract a .zip clone…</button>
-                <button className="source-clone-primary" onClick={() => void prepare()} disabled={sources.length === 0 || destinations.length === 0}>{mode === "shelter-replica" ? "Scan shelter & check space" : "Scan sources & check space"}</button>
+                <button className="source-clone-primary" onClick={() => void prepare()} disabled={sources.length === 0 || destinations.length === 0} title="READ ONLY — Scan sources and check destination space">{mode === "shelter-replica" ? "Scan Fallout Shelter & check space" : "Scan sources & check space"}</button>
               </div>
             )}
           </div>
@@ -352,7 +352,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               ) : progress?.phase === "complete" ? (
                 <button className="source-clone-primary" onClick={onClose}>Done</button>
               ) : (
-                <button className="source-clone-primary" onClick={() => void startClone()} disabled={!acknowledged || hasShortfall}>
+                <button className="source-clone-primary" onClick={() => void startClone()} disabled={!acknowledged || hasShortfall} title="DESTINATION WRITE — Create and verify a separate copy; leave source unchanged">
                   {createAppleCompatibleBackup && timeMachineMode === "as-well"
                     ? <><FiCopy /> Clone, verify &amp; start Time Machine</>
                     : compress ? <><FiArchive /> Compress &amp; verify</> : <><FiCopy /> Clone &amp; verify</>}

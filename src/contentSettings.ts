@@ -61,10 +61,10 @@ export function defaultSearchPerformanceSettings(
 ): SearchPerformanceSettings {
   const cores = Math.max(1, Math.floor(availableProcessors));
   return {
-    searchThreads: cores,
-    // Reserve one logical processor for the OS/UI and keep ANN preparation bounded.
-    indexThreads: Math.max(1, Math.min(4, cores - 1)),
-    backgroundWorkPercent: 55,
+    // Keep interactive work responsive on small machines and cap large hosts.
+    searchThreads: Math.max(1, Math.min(2, cores - 1)),
+    indexThreads: 1,
+    backgroundWorkPercent: 5,
   };
 }
 
@@ -83,7 +83,7 @@ function normalizeSearchPerformanceSettings(
     indexThreads: normalizeThreads(value?.indexThreads, defaults.indexThreads),
     backgroundWorkPercent:
       typeof backgroundCandidate === "number" && Number.isFinite(backgroundCandidate)
-        ? Math.max(20, Math.min(100, Math.round(backgroundCandidate)))
+        ? Math.max(5, Math.min(100, Math.round(backgroundCandidate)))
         : defaults.backgroundWorkPercent,
   };
 }
@@ -91,6 +91,7 @@ function normalizeSearchPerformanceSettings(
 interface StoredContentSettings {
   preferences: ContentPreferences;
   performance: SearchPerformanceSettings;
+  performanceSettingsVersion: number;
   passwordSalt: string | null;
   passwordHash: string | null;
 }
@@ -105,6 +106,7 @@ const defaults: StoredContentSettings = {
     showBannedPeople: false,
   },
   performance: defaultSearchPerformanceSettings(),
+  performanceSettingsVersion: 2,
   passwordSalt: null,
   passwordHash: null,
 };
@@ -123,15 +125,23 @@ export class ContentSettingsStore {
       const stored = JSON.parse(
         await fsPromises.readFile(this.filePath, "utf8"),
       ) as Partial<StoredContentSettings>;
+      const previousPerformance = stored.performance;
+      const migrateLowBackgroundDefault =
+        stored.performanceSettingsVersion !== 2 &&
+        previousPerformance?.backgroundWorkPercent === 10;
       this.settings = {
         ...structuredClone(defaults),
         ...stored,
         preferences: { ...defaults.preferences, ...stored.preferences },
         performance: normalizeSearchPerformanceSettings(
-          stored.performance,
+          migrateLowBackgroundDefault
+            ? { ...previousPerformance, backgroundWorkPercent: 5 }
+            : previousPerformance,
           getSearchPerformanceMachineInfo().availableProcessors,
         ),
+        performanceSettingsVersion: 2,
       };
+      if (migrateLowBackgroundDefault) await this.persist();
     } catch {
       await this.persist();
     }
@@ -174,7 +184,7 @@ export class ContentSettingsStore {
       (candidate.searchThreads as number) > machine.availableProcessors ||
       (candidate.indexThreads as number) < 1 ||
       (candidate.indexThreads as number) > machine.availableProcessors ||
-      (candidate.backgroundWorkPercent as number) < 20 ||
+      (candidate.backgroundWorkPercent as number) < 5 ||
       (candidate.backgroundWorkPercent as number) > 100
     )
       throw new Error("Performance settings are outside this computer’s supported range.");

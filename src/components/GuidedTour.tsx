@@ -85,7 +85,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "file-actions",
     title: "Manage files carefully",
-    body: "Grid is the default thumbnail view; choose List for detailed rows. Sort & Filter opens file-type, year, people, and location filters plus sort order, and works in either view. Select a file to enable its actions. Move changes the file’s real location; New folder creates a real folder. Set virtual name changes Silo’s display/search label, not the filename on disk.",
+    body: "READ ONLY: Grid, List and Sort & Filter change the view only. SILO DATA WRITE: Set virtual name and search keywords save Silo metadata without changing source files. SOURCE WRITE: Move and New folder change local files. Google Drive and Photos sources are read-only here; those source-write controls are unavailable for them.",
     target: '[data-tour="file-actions"]',
     section: "files",
   },
@@ -316,8 +316,8 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   },
   {
     id: "fallout-shelter-replica",
-    title: "Replicate the verified shelter",
-    body: "After a complete primary shelter exists, use Replicate shelter to another volume to prepare a verified copy on a different physical volume. Review the destination and space preflight before copying; Silo verifies the replica by SHA-256. Replication is optional.",
+    title: "Replicate Fallout Shelter",
+    body: "After a complete primary Fallout Shelter exists, replicate it to another volume to prepare a verified copy on a different physical volume. Review the destination and space preflight before copying; Silo verifies the replica by SHA-256. Replication is optional.",
     target: '[data-tour="shelter-replica"]',
     fallbackTarget: '[data-tour="fallout-shelter"]',
     section: "stats",

@@ -38,7 +38,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Include, browse, refresh, and copy sources",
     keywords: "source include exclude enable disable select all none browse refresh clone copy shelter destination source sort",
     answer:
-      "In Files → Sources, use Select all/Select none to set the library scope, the check button on an available source to include or exclude it, and the arrow to browse it. Refresh updates availability. Clone opens the shelter-copy flow, which preserves originals and verifies the copied data. Use Sort sources to organize the source list.",
+      "In Files → Sources, use Select all/Select none to set the library scope, the check button on an available source to include or exclude it, and the arrow to browse it. Refresh updates availability. Create Fallout Shelter opens the clone flow, which preserves originals and verifies the copied data with SHA-256. Use Sort sources to organize the source list.",
     section: "files",
     target: '[data-tour="source-controls"]',
     fallbackTarget: '[data-tour="sources-add"]',
@@ -66,7 +66,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Rename and move files",
     keywords: "file rename move new folder physical virtual name disk",
     answer:
-      "Select a file in Files to enable its toolbar actions. Move opens a destination chooser and changes the file’s real location. The pencil action is Set virtual name: it changes Silo’s display and search label, not the filename on disk. New folder creates a real folder in the current source. Review each destination before confirming.",
+      "Files labels actions by effect. READ ONLY controls browse, refresh, sort or filter without changing source files. SILO DATA WRITE controls such as Set virtual name, keywords and Digital Folders save organization metadata only. SOURCE WRITE controls Move and New folder change local files; Google Drive and Photos sources are read-only in Files, so those controls are unavailable there. Fallout Shelter is DESTINATION WRITE: it creates and SHA-256 verifies a separate copy while leaving originals in place.",
     section: "files",
     target: '[data-tour="file-actions"]',
   },
@@ -123,7 +123,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Library statistics",
     keywords: "stats statistics inventory sources coverage indexing backup health",
     answer:
-      "Open Settings and select Open statistics dashboard to view inventory totals, per-source availability, indexed-file counts, running stages, and shelter-copy status. You can refresh inventory measurements, choose sources for backup, create and verify a primary shelter copy, and verify a replica on another volume. Review the destination and verification status before starting a copy.",
+      "Open Settings and select Open statistics dashboard to view inventory totals, per-source availability, indexed-file counts, running stages, and Fallout Shelter copy status. You can refresh inventory measurements, choose sources for backup, create and verify a primary Fallout Shelter copy, and verify a replica on another volume. Review the destination and verification status before starting a copy.",
     section: "settings",
     target: '[data-tour="library-statistics"]',
   },
