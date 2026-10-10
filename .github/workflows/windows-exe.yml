@@ -22,7 +22,10 @@ permissions:
 jobs:
   build-windows-x64:
     name: Build unsigned Windows x64 installer
-    runs-on: windows-latest
+    # numkong's install step uses npm's node-gyp 11.5, which cannot yet detect
+    # the VS 2026 toolchain on windows-latest. Keep native dependency builds on
+    # the supported VS 2022 image until the dependency toolchain is upgraded.
+    runs-on: windows-2022
     timeout-minutes: 60
     steps:
       - name: Check out requested ref
