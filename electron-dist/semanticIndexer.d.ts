@@ -78,6 +78,7 @@ export declare class SemanticIndexer {
     private inferenceSequence;
     private inferenceActive;
     private activeSearchCount;
+    private vectorIndexWaiterCount;
     private searchChain;
     private runPromise;
     private queuedSourcePaths;
@@ -274,6 +275,7 @@ export declare class SemanticIndexer {
         }>;
     }>>;
     private runSearch;
+    private waitForVectorIndexReady;
     private preservePendingFiles;
     private run;
     private loadClipRuntime;

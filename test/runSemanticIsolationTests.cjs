@@ -1114,6 +1114,36 @@ test("confidence slider maps higher settings to stricter match thresholds", (t) 
   assert.equal(confidenceSettingToMinimumThreshold(Number.NaN), 23);
 });
 
+test("semantic search marks vector readiness waits so construction can proceed", async (t) => {
+  const { indexer } = makeIndexer(t);
+  let resolveVectorIndex;
+  indexer.loaded = Promise.resolve();
+  indexer.vectorIndexReady = new Promise((resolve) => {
+    resolveVectorIndex = resolve;
+  });
+  indexer.loadClipRuntime = async () => ({});
+  indexer.embedText = async () => new Float32Array(512);
+  indexer.persistedVectorIndex = {
+    search: async () => [],
+    shutdown: async () => {},
+  };
+
+  const search = indexer.search("cat", 0, ["/photos"]);
+  await new Promise(setImmediate);
+  assert.equal(indexer.activeSearchCount, 1);
+  assert.equal(indexer.vectorIndexWaiterCount, 1);
+  assert.equal(
+    indexer.activeSearchCount,
+    indexer.vectorIndexWaiterCount,
+    "vector construction does not wait on searches blocked by vector readiness",
+  );
+
+  resolveVectorIndex();
+  assert.equal((await search).length, 0);
+  assert.equal(indexer.activeSearchCount, 0);
+  assert.equal(indexer.vectorIndexWaiterCount, 0);
+});
+
 test("semantic search applies confidence and excludes unfinished or inactive records", async (t) => {
   const { indexer } = makeIndexer(t);
   const vectorBytes = 512 * Float32Array.BYTES_PER_ELEMENT;

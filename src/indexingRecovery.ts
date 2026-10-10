@@ -118,7 +118,7 @@ export class IndexingRecovery {
     const stage = this.stages.find((item) => item.id === id);
     const blocker =
       this.externalBlockReason ||
-      (this.interactiveSearchActive
+      (this.interactiveSearchActive && stage?.id !== "semantic-runtime"
         ? "Waiting for interactive search to finish."
         : "") ||
       (stage && !stage.ready()
@@ -323,7 +323,6 @@ export class IndexingRecovery {
     if (
       this.stopped ||
       this.externalBlockReason ||
-      this.interactiveSearchActive ||
       this.tickRunning
     )
       return;
@@ -339,7 +338,7 @@ export class IndexingRecovery {
         if (
           this.stopped ||
           this.externalBlockReason ||
-          this.interactiveSearchActive ||
+          (this.interactiveSearchActive && stage.id !== "semantic-runtime") ||
           !stage.ready()
         )
           continue;

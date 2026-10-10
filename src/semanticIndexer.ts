@@ -348,6 +348,7 @@ export class SemanticIndexer {
   private inferenceSequence = 0;
   private inferenceActive = false;
   private activeSearchCount = 0;
+  private vectorIndexWaiterCount = 0;
   private searchChain: Promise<void> = Promise.resolve();
   private runPromise: Promise<void> | null = null;
   private queuedSourcePaths: string[] | null = null;
@@ -568,7 +569,7 @@ export class SemanticIndexer {
         await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
         cooldownMs -= sliceMs;
       }
-      while (this.activeSearchCount > 0)
+      while (this.activeSearchCount > this.vectorIndexWaiterCount)
         await new Promise<void>((resolve) => setTimeout(resolve, 40));
     };
 
@@ -1659,8 +1660,9 @@ export class SemanticIndexer {
       ? Math.max(0, Math.min(100, minimumConfidence))
       : 0;
     await this.loaded;
-    // Searches use the saved index immediately and temporarily take priority
-    // between background embeddings while the results are being ranked.
+    // Searches temporarily take priority between background embeddings while
+    // results are ranked. Searches waiting for vector readiness are tracked
+    // separately so vector-index construction can finish.
     this.activeSearchCount += 1;
     try {
       return await this.runSearch(
@@ -1976,8 +1978,7 @@ export class SemanticIndexer {
     }
     if (isCancelled()) return [];
 
-    await this.vectorIndexReady;
-    if (isCancelled()) return [];
+    if (!(await this.waitForVectorIndexReady(isCancelled))) return [];
     const indexedRecordCount = this.latestRecordsByVectorKey.size;
     onSearchProgress?.([], 0, indexedRecordCount, "ann");
     const hits = await this.persistedVectorIndex!.search(
@@ -2014,6 +2015,22 @@ export class SemanticIndexer {
     if (!isCancelled())
       onSearchProgress?.(results, hits.length, indexedRecordCount, "ann");
     return isCancelled() ? [] : results;
+  }
+
+  private async waitForVectorIndexReady(
+    isCancelled: () => boolean,
+  ): Promise<boolean> {
+    if (isCancelled()) return false;
+    this.vectorIndexWaiterCount += 1;
+    try {
+      await this.vectorIndexReady;
+      return !isCancelled();
+    } finally {
+      this.vectorIndexWaiterCount = Math.max(
+        0,
+        this.vectorIndexWaiterCount - 1,
+      );
+    }
   }
 
   private preservePendingFiles(

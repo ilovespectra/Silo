@@ -404,6 +404,44 @@ async function run() {
   await settle();
   assert.equal(partialCalls, 2, "partial failures retry after backoff");
   assert.equal(partialRecovery.details("thumbnails").recoveryError, "");
+
+  let runtimeCalls = 0;
+  let backgroundCalls = 0;
+  const searchAwareRecovery = new IndexingRecovery([
+    {
+      id: "semantic-runtime",
+      needsInitialCheck: true,
+      progress: () => ({ status: "idle", message: "" }),
+      ready: () => true,
+      start: async () => {
+        runtimeCalls += 1;
+      },
+    },
+    {
+      id: "search",
+      needsInitialCheck: true,
+      progress: () => ({ status: "idle", message: "" }),
+      ready: () => true,
+      start: async () => {
+        backgroundCalls += 1;
+      },
+    },
+  ]);
+  await searchAwareRecovery.setSearchActive(true);
+  await searchAwareRecovery.tick();
+  await settle();
+  assert.equal(runtimeCalls, 1, "semantic runtime recovers during interactive search");
+  assert.equal(backgroundCalls, 0, "background recovery yields to interactive search");
+  assert.equal(
+    searchAwareRecovery.details("semantic-runtime").blockedReason,
+    "",
+    "runtime recovery does not report interactive search as a blocker",
+  );
+  await searchAwareRecovery.setSearchActive(false);
+  await searchAwareRecovery.tick();
+  await settle();
+  assert.equal(backgroundCalls, 1, "background recovery resumes after search");
+
   fs.rmSync(recoveryDirectory, { recursive: true, force: true });
   console.log(
     "Recovery scheduling tests passed: restart-safe cooldowns, partial-failure retries, interrupted resume, manual bypass, intentional pauses, parallel lanes, single-flight, and shutdown.",
