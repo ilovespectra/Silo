@@ -2725,8 +2725,16 @@ class SemanticIndexer {
         try {
             // Stream the file instead of loading it all into memory to avoid OOM with large indexes
             const readline = require("readline");
+            let recordsStats = await fsPromises.stat(this.recordsPath).catch(() => null);
+            if (!recordsStats) {
+                // Establish the journal before creating a stream. Starting a read stream
+                // for a missing file can emit ENOENT before readline has attached its
+                // error listener during a fresh profile's first startup.
+                await fsPromises.writeFile(this.recordsPath, "", { flag: "a" });
+                recordsStats = await fsPromises.stat(this.recordsPath);
+            }
+            const totalBytes = recordsStats.size;
             const fileStream = fs.createReadStream(this.recordsPath);
-            const totalBytes = (await fsPromises.stat(this.recordsPath).catch(() => null))?.size ?? 0;
             let lastReport = 0;
             const rl = readline.createInterface({
                 input: fileStream,
