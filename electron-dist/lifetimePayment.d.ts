@@ -5,7 +5,7 @@ export declare const LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = 23750000n;
 export declare function encodeSolanaPayReference(bytes: Uint8Array): string;
 export declare function isSolanaPayReference(value: string): boolean;
 export declare function createLifetimeSolanaPayUri(reference: string): string;
-export type LifetimePaymentStatus = "verified" | "pending" | "invalid" | "error" | "already-licensed";
+export type LifetimePaymentStatus = "verified" | "pending" | "invalid" | "error" | "expired" | "already-licensed";
 export interface LifetimeLicenseState {
     isLicensed: boolean;
     licenseType?: "purchase" | "beta";

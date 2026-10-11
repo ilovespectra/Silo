@@ -31,6 +31,7 @@ export declare class SemanticIndexer {
     private readonly userDataPath;
     private canonicalUserDataPath;
     private readonly canonicalSourcePaths;
+    private readonly indexStorageRoot;
     private readonly indexDirectory;
     private readonly recordsPath;
     private readonly vectorsPath;
@@ -46,7 +47,7 @@ export declare class SemanticIndexer {
     private performanceSettings;
     private vectorIndexReady;
     private resolveVectorIndexReady;
-    private rejectVectorIndexReady;
+    private vectorIndexReadyState;
     private readonly textRecordIds;
     private readonly textRecordPaths;
     private readonly textRecordTerms;
@@ -140,6 +141,8 @@ export declare class SemanticIndexer {
     isLoaded(): boolean;
     whenLoaded(): Promise<void>;
     prepareVectorSearch(onProgress: (fraction: number, records: number) => void): Promise<void>;
+    private resetVectorIndexReady;
+    private buildVectorSearch;
     flushVectorSearch(): Promise<void>;
     private beginInteractiveSearch;
     private endInteractiveSearch;

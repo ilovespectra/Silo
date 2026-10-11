@@ -60,6 +60,7 @@ const betaLicense_1 = require("./betaLicense");
 const betaLicensePublicKey_1 = require("./betaLicensePublicKey");
 const documentPreview_1 = require("./documentPreview");
 const indexingRecovery_1 = require("./indexingRecovery");
+const legacyLicenseRejection_1 = require("./legacyLicenseRejection");
 const appAssets_1 = require("./appAssets");
 const inventoryTransfer_1 = require("./inventoryTransfer");
 const rendererRecovery_1 = require("./rendererRecovery");
@@ -112,9 +113,9 @@ let indexStorageRoot = electron_1.app.getPath("userData");
 const indexStoragePath = (0, indexingStorage_1.createIndexStoragePathResolver)(() => indexStorageRoot);
 const diagnosticsDirectory = path.join(electron_1.app.getPath("userData"), "diagnostics");
 const lifetimeLicensePath = path.join(electron_1.app.getPath("userData"), "lifetime-license.json");
+const lifetimeLicenseRejectionPath = path.join(electron_1.app.getPath("userData"), "lifetime-license-rejection.json");
 const betaLicensePath = path.join(electron_1.app.getPath("userData"), "beta-license.json");
 const betaInstallationIdPath = path.join(electron_1.app.getPath("userData"), "beta-installation-id");
-const lifetimeRpcEndpoint = "https://optimistic-daisy-fast-mainnet.helius-rpc.com";
 const lifetimePaymentRelayBaseUrl = (process.env.SILO_PAYMENT_RELAY_URL || "https://license.kolektivkrog.si").replace(/\/$/, "");
 async function requestRelayJson(endpoint, options) {
     const isLocalHttp = endpoint.protocol === "http:" &&
@@ -184,37 +185,13 @@ async function requestRelayJson(endpoint, options) {
             request.end(body);
     });
 }
-async function requestLifetimeCardPurchase(endpoint, installationId) {
+async function requestLifetimeCardPurchase(endpoint, installationId, paymentMethod = "card", reference) {
     return requestRelayJson(endpoint, {
         method: "POST",
-        body: { installationId },
+        body: { installationId, paymentMethod, ...(reference ? { reference } : {}) },
         timeoutMs: 15000,
         timeoutMessage: "The payment relay request timed out.",
     });
-}
-async function requestLifetimeRpc(method, params) {
-    const abortController = new AbortController();
-    const requestTimeout = setTimeout(() => abortController.abort(), 15000);
-    try {
-        const response = await electron_1.net.fetch(lifetimeRpcEndpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                jsonrpc: "2.0",
-                id: "silo-lifetime-license",
-                method,
-                params,
-            }),
-            signal: abortController.signal,
-        });
-        return {
-            ok: response.ok,
-            result: response.ok ? await response.json() : undefined,
-        };
-    }
-    finally {
-        clearTimeout(requestTimeout);
-    }
 }
 const demoUsagePath = path.join(electron_1.app.getPath("userData"), "demo-usage.json");
 const demoTestingModePath = path.join(electron_1.app.getPath("userData"), "demo-testing-mode.json");
@@ -400,20 +377,38 @@ async function writeBetaLicense(activationCode) {
 async function readLifetimeLicense() {
     try {
         const stored = JSON.parse(await fsPromises.readFile(lifetimeLicensePath, "utf8"));
-        if (stored.version === 1 &&
-            stored.network === "solana-mainnet" &&
+        const validReceipt = stored.network === "solana-mainnet" &&
             stored.paymentAddress === lifetimePayment_1.LIFETIME_PAYMENT_ADDRESS &&
             stored.usdcMint === lifetimePayment_1.LIFETIME_USDC_MINT &&
             typeof stored.signature === "string" &&
             (0, lifetimePayment_1.isSolanaTransactionSignature)(stored.signature) &&
             typeof stored.verifiedAt === "number" &&
-            Number.isFinite(stored.verifiedAt))
-            return {
-                isLicensed: true,
-                licenseType: "purchase",
-                signature: stored.signature,
-                verifiedAt: stored.verifiedAt,
-            };
+            Number.isFinite(stored.verifiedAt);
+        if (stored.version === 2 && validReceipt) {
+            const installationId = await getBetaInstallationId();
+            if (stored.installationId === installationId)
+                return {
+                    isLicensed: true,
+                    licenseType: "purchase",
+                    signature: stored.signature,
+                    verifiedAt: stored.verifiedAt,
+                };
+            runtimeLog("lifetime-license-installation-mismatch", {});
+        }
+        else if (stored.version === 1 &&
+            validReceipt &&
+            typeof stored.signature === "string") {
+            // Existing buyers remain available offline while the relay binds their
+            // already-verified payment to this installation in the background.
+            if (!(await (0, legacyLicenseRejection_1.isLegacyLicenseRejected)(lifetimeLicenseRejectionPath, stored.signature)))
+                return {
+                    isLicensed: true,
+                    licenseType: "purchase",
+                    signature: stored.signature,
+                    verifiedAt: stored.verifiedAt,
+                };
+            runtimeLog("legacy-lifetime-license-rejected", {});
+        }
     }
     catch { }
     try {
@@ -432,14 +427,15 @@ async function readLifetimeLicense() {
     catch { }
     return { isLicensed: false };
 }
-async function writeLifetimeLicense(signature, verifiedAt) {
+async function writeLifetimeLicense(signature, verifiedAt, installationId) {
     const record = {
-        version: 1,
+        version: 2,
         network: "solana-mainnet",
         paymentAddress: lifetimePayment_1.LIFETIME_PAYMENT_ADDRESS,
         usdcMint: lifetimePayment_1.LIFETIME_USDC_MINT,
         signature,
         verifiedAt,
+        installationId,
     };
     await fsPromises.mkdir(path.dirname(lifetimeLicensePath), {
         recursive: true,
@@ -447,6 +443,58 @@ async function writeLifetimeLicense(signature, verifiedAt) {
     const temporaryPath = `${lifetimeLicensePath}.${process.pid}.tmp`;
     await fsPromises.writeFile(temporaryPath, JSON.stringify(record, null, 2), { encoding: "utf8", mode: 0o600 });
     await fsPromises.rename(temporaryPath, lifetimeLicensePath);
+}
+async function migrateLegacyLifetimeLicense() {
+    let legacy;
+    try {
+        legacy = JSON.parse(await fsPromises.readFile(lifetimeLicensePath, "utf8"));
+    }
+    catch {
+        return;
+    }
+    if (legacy.version !== 1 ||
+        legacy.network !== "solana-mainnet" ||
+        legacy.paymentAddress !== lifetimePayment_1.LIFETIME_PAYMENT_ADDRESS ||
+        legacy.usdcMint !== lifetimePayment_1.LIFETIME_USDC_MINT ||
+        typeof legacy.signature !== "string" ||
+        !(0, lifetimePayment_1.isSolanaTransactionSignature)(legacy.signature) ||
+        typeof legacy.verifiedAt !== "number" ||
+        !Number.isFinite(legacy.verifiedAt))
+        return;
+    try {
+        const installationId = await getBetaInstallationId();
+        const relayBase = new URL(lifetimePaymentRelayBaseUrl);
+        const response = await requestRelayJson(new URL(`${relayBase.origin}/api/license/claim-legacy`), {
+            method: "POST",
+            body: { installationId, signature: legacy.signature },
+            timeoutMs: 15000,
+            timeoutMessage: "The existing license check timed out.",
+        });
+        if (response.statusCode === 409 &&
+            response.payload.status === "claimed-elsewhere") {
+            try {
+                await (0, legacyLicenseRejection_1.persistLegacyLicenseRejection)(lifetimeLicenseRejectionPath, legacy.signature);
+            }
+            catch (error) {
+                runtimeLog("legacy-lifetime-license-rejection-save-error", {
+                    message: String(error),
+                });
+            }
+            disableLifetimeFeatures();
+            runtimeLog("legacy-lifetime-license-already-bound", {});
+            return;
+        }
+        if (response.ok &&
+            response.payload.status === "verified" &&
+            response.payload.installationId === installationId &&
+            typeof response.payload.verifiedAt === "number") {
+            await writeLifetimeLicense(legacy.signature, response.payload.verifiedAt, installationId);
+            runtimeLog("legacy-lifetime-license-bound", {});
+        }
+    }
+    catch {
+        // Preserve offline access for an existing local license; retry on next launch.
+    }
 }
 // Two instances on one userData interleave index writes; the newcomer hands off and exits.
 if (!electron_1.app.requestSingleInstanceLock())
@@ -2212,7 +2260,21 @@ function queueSemanticIndexWork(work, relatedStages = []) {
             return;
     }
     semanticChangesPending = true;
-    requestIndexRecoveryStages(["search", ...relatedStages]);
+    if (indexRecovery) {
+        void indexRecovery
+            .requestWithPriority("search", ["faces"])
+            .then(() => {
+            if (relatedStages.length)
+                requestIndexRecoveryStages(relatedStages);
+        })
+            .catch((error) => runtimeLog("index-recovery-priority-error", {
+            stage: "search",
+            message: error instanceof Error ? error.message : String(error),
+        }));
+    }
+    else {
+        requestIndexRecoveryStages(["search", ...relatedStages]);
+    }
 }
 function queueIndexRecoveryStages(stageIds) {
     stageIds.forEach((id) => queuedRecoveryStageIds.add(id));
@@ -3392,6 +3454,19 @@ function enableLifetimeFeatures() {
         requestIndexRecoveryStages(ALL_INDEX_RECOVERY_STAGES);
     }
 }
+function disableLifetimeFeatures() {
+    lifetimeLicensed = false;
+    demoTestingModeEnabled = false;
+    sourceListCache = null;
+    sourceListCacheAt = 0;
+    sourceListPromise = null;
+    applyAccessBranding();
+    if (!semanticIndexer)
+        return;
+    semanticIndexer.setDemoFileLimit(demoLimits_1.DEMO_LIMITS.files);
+    indexStorageDeviceId = null;
+    publishIndexStorageStatus();
+}
 async function listSources() {
     if (sourceListCache && Date.now() - sourceListCacheAt < 1000)
         return sourceListCache.map((source) => ({ ...source }));
@@ -4448,7 +4523,21 @@ async function createWindow() {
     });
     const inventoryOwner = mainWindow.webContents.id;
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-        if (url === "https://repo-ilovespectras-projects.vercel.app" ||
+        let isOfficialGuideUrl = false;
+        try {
+            const parsedUrl = new URL(url);
+            isOfficialGuideUrl =
+                parsedUrl.origin === "https://repo-six-inky-51.vercel.app" &&
+                    parsedUrl.protocol === "https:" &&
+                    !parsedUrl.username &&
+                    !parsedUrl.password &&
+                    /^\/(?:|guide\/[a-z0-9-]+\/?$)/i.test(parsedUrl.pathname);
+        }
+        catch {
+            // Ignore malformed external URLs.
+        }
+        if (isOfficialGuideUrl ||
+            url === "https://repo-ilovespectras-projects.vercel.app" ||
             url.startsWith("https://repo-ilovespectras-projects.vercel.app/") ||
             url.startsWith("https://github.com/ilovespectra/silo-downloads/releases/download/") ||
             url.startsWith("https://github.com/ilovespectra/silo-downloads/releases/tag/"))
@@ -4570,17 +4659,23 @@ async function sourceIncludesSiloAppData(sourcePath) {
         (0, indexingPathPolicy_1.isPathWithin)(appDataPath, sourcePath) ||
         (0, indexingPathPolicy_1.isPathWithin)(canonicalAppDataPath, canonicalSourcePath));
 }
-async function isSiloAppDataRoot(sourcePath) {
+async function isSiloInternalRoot(sourcePath) {
     if (isRemotePath(sourcePath))
         return false;
     const appDataPath = path.resolve(electron_1.app.getPath("userData"));
+    const indexDataPath = path.resolve(indexStorageRoot);
     const canonicalAppDataPath = await fsPromises
         .realpath(appDataPath)
         .catch(() => appDataPath);
+    const canonicalIndexDataPath = await fsPromises
+        .realpath(indexDataPath)
+        .catch(() => indexDataPath);
     const canonicalSourcePath = await fsPromises
         .realpath(sourcePath)
         .catch(() => path.resolve(sourcePath));
-    return (0, indexingPathPolicy_1.isAppDataPath)(sourcePath, sourcePath, canonicalSourcePath, appDataPath, canonicalAppDataPath);
+    return ((0, indexingPathPolicy_1.isAppDataPath)(sourcePath, sourcePath, canonicalSourcePath, appDataPath, canonicalAppDataPath) ||
+        (0, indexingPathPolicy_1.isPathWithin)(path.resolve(sourcePath), indexDataPath) ||
+        (0, indexingPathPolicy_1.isPathWithin)(canonicalSourcePath, canonicalIndexDataPath));
 }
 /** Background coverage ignores result-visibility checkboxes. Keep configured
  * local roots even when offline; scanners handle accessibility. Remote roots
@@ -4604,7 +4699,7 @@ async function getIndexableRootsFromSources(sources) {
     }
     const safeRoots = [];
     for (const source of candidates) {
-        if (!(await isSiloAppDataRoot(source.rootPath)))
+        if (!(await isSiloInternalRoot(source.rootPath)))
             safeRoots.push(source.rootPath);
     }
     // Keep live phone roots out when their local copy is already under an indexed
@@ -4667,6 +4762,10 @@ async function createUnifiedScanSource() {
     const canonicalAppDataPath = await fsPromises
         .realpath(appDataPath)
         .catch(() => appDataPath);
+    const indexDataPath = path.resolve(indexStorageRoot);
+    const canonicalIndexDataPath = await fsPromises
+        .realpath(indexDataPath)
+        .catch(() => indexDataPath);
     return async (sourcePath, onFile, isCancelled, shouldPauseForSearch = () => false) => {
         // Detect source type and delegate to appropriate scanner
         if (phoneManager.isPhonePath(sourcePath)) {
@@ -4695,10 +4794,17 @@ async function createUnifiedScanSource() {
         if (machineRoot && machineDevice === null)
             return;
         const isSiloAppData = (candidatePath) => (0, indexingPathPolicy_1.isAppDataPath)(candidatePath, sourcePath, canonicalSourcePath, appDataPath, canonicalAppDataPath);
+        const isSiloIndexData = (candidatePath) => {
+            const resolvedPath = path.resolve(candidatePath);
+            const canonicalPath = path.join(canonicalSourcePath, path.relative(sourcePath, candidatePath));
+            return ((0, indexingPathPolicy_1.isPathWithin)(resolvedPath, indexDataPath) ||
+                (0, indexingPathPolicy_1.isPathWithin)(canonicalPath, canonicalIndexDataPath));
+        };
+        const isSiloPrivatePath = (candidatePath) => isSiloAppData(candidatePath) || isSiloIndexData(candidatePath);
         // A user may add a broad parent such as Home or an external volume. Never
         // treat Silo's private storage as source material; phone snapshots remain
         // indexable via the virtual /__phone__ scanner above.
-        if (isSiloAppData(sourcePath) || (0, indexingPathPolicy_1.isNonLibraryPath)(sourcePath))
+        if (isSiloPrivatePath(sourcePath) || (0, indexingPathPolicy_1.isNonLibraryPath)(sourcePath))
             return;
         if (await (0, indexingPathPolicy_1.isSiloCloneDirectory)(sourcePath))
             return;
@@ -4726,7 +4832,7 @@ async function createUnifiedScanSource() {
                 if (!directoryStats || directoryStats.dev !== machineDevice)
                     continue;
             }
-            if (isSiloAppData(directoryPath))
+            if (isSiloPrivatePath(directoryPath))
                 continue;
             if (await (0, indexingPathPolicy_1.isSiloCloneDirectory)(directoryPath))
                 continue;
@@ -4753,7 +4859,7 @@ async function createUnifiedScanSource() {
                     const fullPath = path.join(directoryPath, entry.name);
                     if ((0, indexingPathPolicy_1.isMacDataVolumePathExcluded)(fullPath, sourcePath))
                         return null;
-                    if (isSiloAppData(fullPath))
+                    if (isSiloPrivatePath(fullPath))
                         return null;
                     try {
                         let stats;
@@ -5403,6 +5509,8 @@ electron_1.app.whenReady().then(async () => {
     await contentSettingsStore.initialize();
     registerMediaProtocols();
     await createWindow();
+    if (lifetimeLicensed)
+        void migrateLegacyLifetimeLicense();
     if (electron_1.app.isPackaged && !electron_is_dev_1.default)
         void checkForAppUpdates();
     reportStartup("Loading content filters…");
@@ -5814,6 +5922,7 @@ electron_1.app.whenReady().then(async () => {
     });
     memoryProfileScheduler.notify();
     const sources = await getAllIndexSources();
+    recoverySearchSourcePaths = sources;
     if (sources.length > 0) {
         void semanticIndexer.startWatching(sources);
         // Reconcile only changed/new files after the initial UI load; never restart a full library scan at launch.
@@ -5830,11 +5939,6 @@ electron_1.app.whenReady().then(async () => {
                     if (!pausedByUser && lifetimeFullScanPending) {
                         lifetimeFullScanPending = false;
                         queueSemanticIndexWork({ fullScanAll: true, force: true }, ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"]);
-                    }
-                    else if (!pausedByUser && !lifetimeLicensed) {
-                        queueSemanticIndexWork({ fullScanAll: true }, [
-                            "faces", "locations", "duplicates", "thumbnails", "audio", "quality",
-                        ]);
                     }
                     else if (!pausedByUser) {
                         queueSemanticIndexWork({
@@ -5860,10 +5964,23 @@ electron_1.app.whenReady().then(async () => {
         startupIndexReconciliationSettled = true;
         scheduleThumbnailPregeneration(true);
     }
-    const searchSettled = () => startupIndexReconciliationSettled &&
-        !PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) &&
-        !indexRecovery?.details("search").recoveryRunning &&
-        !indexRecovery?.details("search").resumeQueued;
+    const searchSettled = () => {
+        const localRoots = recoverySearchSourcePaths.filter((root) => !isRemotePath(root));
+        const coverage = semanticIndexer.getSourceCoverageProgress(localRoots);
+        const recovery = indexRecovery?.details("search");
+        return (startupIndexReconciliationSettled &&
+            semanticRuntimeProgress.status === "complete" &&
+            !PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) &&
+            !semanticIndexer.hasPendingIndexWork() &&
+            semanticIndexer.getRetryableErrorCount(recoverySearchSourcePaths) === 0 &&
+            coverage.pending === 0 &&
+            coverage.scanning === 0 &&
+            coverage.errors === 0 &&
+            !recovery?.recoveryRunning &&
+            !recovery?.resumeQueued &&
+            !recovery?.userPaused &&
+            !recovery?.recoveryError);
+    };
     const analysisBlocker = () => {
         const discovery = semanticIndexer.getReconciliationProgress();
         if (!startupIndexReconciliationSettled)
@@ -6837,7 +6954,7 @@ async function getVisibleAudioSnapshot(snapshot) {
     const availableSources = (await listSources()).filter((source) => source.available && source.rootPath.trim());
     const allSources = [];
     for (const source of availableSources) {
-        if (!(await isSiloAppDataRoot(source.rootPath)))
+        if (!(await isSiloInternalRoot(source.rootPath)))
             allSources.push(source);
     }
     const activeSources = allSources.filter((source) => source.enabled && source.available);
@@ -6873,7 +6990,7 @@ async function refreshAudioInventory(requestId, force = false) {
     const availableSources = (await listSources()).filter((source) => source.available && source.rootPath.trim());
     const sources = [];
     for (const source of availableSources) {
-        if (!(await isSiloAppDataRoot(source.rootPath)))
+        if (!(await isSiloInternalRoot(source.rootPath)))
             sources.push(source);
     }
     if (requestId === -1 && !force) {
@@ -7928,7 +8045,7 @@ async function getLibraryDashboardSnapshot() {
     const eligibleRoots = [];
     for (const source of registeredSources) {
         if (source.available && source.rootPath.trim() &&
-            !(await isSiloAppDataRoot(source.rootPath)))
+            !(await isSiloInternalRoot(source.rootPath)))
             eligibleRoots.push(source.rootPath);
     }
     const globalIndex = semanticIndexer?.getIndexSummary(eligibleRoots);
@@ -8638,24 +8755,34 @@ electron_1.ipcMain.handle("reject-name-file", async (_event, name, filePath) => 
 });
 // Handle isDev check for client
 electron_1.ipcMain.handle("get-lifetime-license", () => readLifetimeLicense());
+async function createLifetimePurchase(paymentMethod, reference) {
+    const installationId = await getBetaInstallationId();
+    const relayBase = new URL(lifetimePaymentRelayBaseUrl);
+    if (relayBase.protocol !== "https:" && relayBase.hostname !== "localhost")
+        throw new Error("The payment relay must use HTTPS.");
+    const response = await requestLifetimeCardPurchase(new URL(`${relayBase.origin}/api/purchase`), installationId, paymentMethod, reference);
+    const payload = response.payload;
+    if (!response.ok)
+        throw new Error(typeof payload.error === "string"
+            ? payload.error
+            : "A secure payment request could not be started.");
+    if (typeof payload.purchaseId !== "string" ||
+        !/^[0-9a-f-]{36}$/i.test(payload.purchaseId) ||
+        typeof payload.claimToken !== "string" ||
+        payload.claimToken.length < 40 ||
+        payload.claimToken.length > 100)
+        throw new Error("The payment relay returned an invalid purchase reference.");
+    return { relayBase, payload };
+}
 electron_1.ipcMain.handle("begin-lifetime-card-purchase", async () => {
     try {
-        const installationId = await getBetaInstallationId();
-        const relayBase = new URL(lifetimePaymentRelayBaseUrl);
-        if (relayBase.protocol !== "https:" && relayBase.hostname !== "localhost")
-            throw new Error("The card payment relay must use HTTPS.");
-        const response = await requestLifetimeCardPurchase(new URL(`${relayBase.origin}/api/purchase`), installationId);
-        const payload = response.payload;
-        if (!response.ok)
-            throw new Error(typeof payload.error === "string"
-                ? payload.error
-                : "Card checkout could not be started.");
+        if ((await readLifetimeLicense()).isLicensed)
+            throw new Error("Silo already has a lifetime license on this computer.");
+        const { relayBase, payload } = await createLifetimePurchase("card");
         const checkoutUrl = new URL(payload.checkoutUrl);
         if (checkoutUrl.protocol !== "https:" ||
             checkoutUrl.origin !== relayBase.origin ||
-            checkoutUrl.pathname !== "/checkout.html" ||
-            typeof payload.purchaseId !== "string" ||
-            typeof payload.claimToken !== "string")
+            checkoutUrl.pathname !== "/checkout.html")
             throw new Error("The payment relay returned an invalid checkout link.");
         await electron_1.shell.openExternal(checkoutUrl.toString());
         return {
@@ -8673,22 +8800,48 @@ electron_1.ipcMain.handle("begin-lifetime-card-purchase", async () => {
         };
     }
 });
-electron_1.ipcMain.handle("check-lifetime-card-purchase", async (_event, purchaseIdValue, claimTokenValue) => {
+electron_1.ipcMain.handle("begin-lifetime-wallet-purchase", async (_event, referenceValue) => {
+    if (typeof referenceValue !== "string" || !(0, lifetimePayment_1.isSolanaPayReference)(referenceValue))
+        return { ok: false, error: "The Solana Pay reference is invalid." };
+    try {
+        if ((await readLifetimeLicense()).isLicensed)
+            throw new Error("Silo already has a lifetime license on this computer.");
+        const { payload } = await createLifetimePurchase("solana-pay", referenceValue);
+        if (payload.reference !== referenceValue)
+            throw new Error("The payment relay did not register this wallet request.");
+        return {
+            ok: true,
+            purchaseId: payload.purchaseId,
+            claimToken: payload.claimToken,
+        };
+    }
+    catch (error) {
+        return {
+            ok: false,
+            error: error instanceof Error
+                ? error.message
+                : "The wallet payment request could not be started.",
+        };
+    }
+});
+electron_1.ipcMain.handle("check-lifetime-purchase", async (_event, purchaseIdValue, claimTokenValue) => {
     if (typeof purchaseIdValue !== "string" ||
         !/^[0-9a-f-]{36}$/i.test(purchaseIdValue) ||
         typeof claimTokenValue !== "string" ||
         claimTokenValue.length < 40 ||
         claimTokenValue.length > 100)
-        return { status: "error", message: "The checkout reference is invalid." };
+        return { status: "error", message: "The purchase reference is invalid." };
     try {
+        const installationId = await getBetaInstallationId();
         const relayBase = new URL(lifetimePaymentRelayBaseUrl);
-        if (relayBase.protocol !== "https:")
-            throw new Error("The card payment relay must use HTTPS.");
         const response = await requestRelayJson(new URL(`${relayBase.origin}/api/purchase/${encodeURIComponent(purchaseIdValue)}`), {
             method: "GET",
-            headers: { "x-silo-claim-token": claimTokenValue },
+            headers: {
+                "x-silo-claim-token": claimTokenValue,
+                "x-silo-installation-id": installationId,
+            },
             timeoutMs: 15000,
-            timeoutMessage: "The payment status request timed out.",
+            timeoutMessage: "The purchase status request timed out.",
         });
         const payload = response.payload;
         if (!response.ok) {
@@ -8699,24 +8852,41 @@ electron_1.ipcMain.handle("check-lifetime-card-purchase", async (_event, purchas
                 status: response.statusCode,
                 message: message.slice(0, 500),
             });
-            return {
-                status: "error",
-                message: `${message} (HTTP ${response.statusCode})`,
-            };
+            return { status: "error", message: `${message} (HTTP ${response.statusCode})` };
         }
-        if (payload.status === "verified" && typeof payload.signature === "string")
+        if (payload.status === "verified") {
+            if (typeof payload.signature !== "string" ||
+                !(0, lifetimePayment_1.isSolanaTransactionSignature)(payload.signature) ||
+                payload.installationId !== installationId ||
+                typeof payload.verifiedAt !== "number" ||
+                !Number.isFinite(payload.verifiedAt))
+                return {
+                    status: "error",
+                    message: "The verified payment is not bound to this Silo installation.",
+                };
+            await writeLifetimeLicense(payload.signature, payload.verifiedAt, installationId);
+            enableLifetimeFeatures();
+            const license = await readLifetimeLicense();
             return {
                 status: "verified",
-                signature: payload.signature,
-                message: "Card payment verified. Saving your Silo license…",
+                message: "Payment verified. Your lifetime license is active on this computer.",
+                license,
             };
+        }
         if (payload.status === "expired")
-            return { status: "expired", message: "This checkout expired. Start a new card payment." };
+            return { status: "expired", message: "This payment request expired. Start a new one." };
+        if (payload.status === "invalid")
+            return {
+                status: "invalid",
+                message: typeof payload.message === "string"
+                    ? payload.message
+                    : "The transaction did not meet Silo's payment requirements.",
+            };
         return {
             status: "pending",
             message: typeof payload.message === "string"
                 ? payload.message
-                : "Waiting for Solana to finalize the card payment.",
+                : "Waiting for finalized payment confirmation.",
         };
     }
     catch (error) {
@@ -8979,146 +9149,82 @@ electron_1.ipcMain.handle("activate-beta-license", async (_event, activationCode
         };
     }
 });
-async function verifyAndSaveLifetimePayment(signatureValue, minimumPaymentMicroUsdc) {
-    if (typeof signatureValue !== "string")
+async function verifyAndSaveLifetimePayment(signatureValue) {
+    if (typeof signatureValue !== "string" || !(0, lifetimePayment_1.isSolanaTransactionSignature)(signatureValue))
         return {
             status: "invalid",
             message: "Paste the transaction signature shown by your Solana wallet.",
         };
-    if (!(0, lifetimePayment_1.isSolanaTransactionSignature)(signatureValue))
-        return (0, lifetimePayment_1.verifyParsedLifetimePayment)(signatureValue, {}, minimumPaymentMicroUsdc);
     const existingLicense = await readLifetimeLicense();
     if (existingLicense.isLicensed)
         return {
             status: "already-licensed",
-            message: "Silo already has a lifetime license saved on this Mac.",
+            message: "Silo already has a lifetime license saved on this computer.",
             license: existingLicense,
         };
     try {
-        const rpcResponse = await requestLifetimeRpc("getTransaction", [
-            signatureValue,
-            {
-                commitment: "finalized",
-                encoding: "jsonParsed",
-                maxSupportedTransactionVersion: 1,
+        const { relayBase, payload: purchase } = await createLifetimePurchase("manual");
+        const installationId = await getBetaInstallationId();
+        const response = await requestRelayJson(new URL(`${relayBase.origin}/api/purchase/${encodeURIComponent(purchase.purchaseId)}`), {
+            method: "POST",
+            headers: {
+                "x-silo-claim-token": purchase.claimToken,
+                "x-silo-installation-id": installationId,
             },
-        ]);
-        if (!rpcResponse.ok)
+            body: { signature: signatureValue },
+            timeoutMs: 20000,
+            timeoutMessage: "The transaction verification request timed out.",
+        });
+        const result = response.payload;
+        if (result.status === "verified") {
+            if (!response.ok ||
+                result.installationId !== installationId ||
+                result.signature !== signatureValue ||
+                typeof result.verifiedAt !== "number" ||
+                !Number.isFinite(result.verifiedAt))
+                return {
+                    status: "error",
+                    message: "The relay did not bind this verified payment to this computer.",
+                };
+            await writeLifetimeLicense(signatureValue, result.verifiedAt, installationId);
+            enableLifetimeFeatures();
             return {
-                status: "error",
-                message: "Helius could not be reached or is rate-limiting requests. Please try again shortly.",
+                status: "verified",
+                message: "Payment verified. Your lifetime license is active on this computer.",
+                license: await readLifetimeLicense(),
             };
-        const verification = (0, lifetimePayment_1.verifyParsedLifetimePayment)(signatureValue, rpcResponse.result, minimumPaymentMicroUsdc);
-        if (verification.status !== "verified")
-            return verification;
-        const verifiedAt = Date.now();
-        await writeLifetimeLicense(signatureValue, verifiedAt);
-        enableLifetimeFeatures();
+        }
+        if (result.status === "pending")
+            return {
+                status: "pending",
+                message: typeof result.message === "string"
+                    ? result.message
+                    : "Waiting for Solana to finalize this payment.",
+            };
+        if (result.status === "invalid" || response.statusCode === 409)
+            return {
+                status: "invalid",
+                message: typeof result.message === "string"
+                    ? result.message
+                    : typeof result.error === "string"
+                        ? result.error
+                        : "This payment has already been claimed or did not meet Silo's requirements.",
+            };
         return {
-            ...verification,
-            license: {
-                isLicensed: true,
-                licenseType: "purchase",
-                signature: signatureValue,
-                verifiedAt,
-            },
+            status: "error",
+            message: typeof result.error === "string"
+                ? result.error
+                : "The license relay could not verify this transaction.",
         };
     }
     catch {
         return {
             status: "error",
-            message: "Could not verify with Solana right now. Check your connection and try again; no license status was changed.",
+            message: "Could not reach the license relay. No license status was changed.",
         };
     }
 }
-electron_1.ipcMain.handle("verify-lifetime-payment", async (_event, signatureValue) => verifyAndSaveLifetimePayment(signatureValue, 25000000n));
-electron_1.ipcMain.handle("verify-lifetime-card-payment", async (_event, signatureValue) => verifyAndSaveLifetimePayment(signatureValue, lifetimePayment_1.LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC));
-electron_1.ipcMain.handle("check-lifetime-payment-reference", async (_event, referenceValue) => {
-    if (typeof referenceValue !== "string" ||
-        !(0, lifetimePayment_1.isSolanaPayReference)(referenceValue))
-        return {
-            status: "invalid",
-            message: "This Solana Pay request is invalid. Create a new payment request.",
-        };
-    const existingLicense = await readLifetimeLicense();
-    if (existingLicense.isLicensed)
-        return {
-            status: "already-licensed",
-            message: "Silo already has a lifetime license saved on this Mac.",
-            license: existingLicense,
-        };
-    try {
-        const signaturesResponse = await requestLifetimeRpc("getSignaturesForAddress", [referenceValue, { commitment: "finalized", limit: 5 }]);
-        if (!signaturesResponse.ok)
-            return {
-                status: "error",
-                message: "Helius could not be reached or is rate-limiting requests. Silo will keep checking.",
-            };
-        const rpcBody = signaturesResponse.result;
-        if (typeof rpcBody !== "object" || rpcBody === null)
-            return {
-                status: "error",
-                message: "Solana returned an unreadable payment status.",
-            };
-        if ("error" in rpcBody && rpcBody.error)
-            return {
-                status: "error",
-                message: "Solana could not check this payment request. Silo will retry.",
-            };
-        const signatureItems = "result" in rpcBody ? rpcBody.result : undefined;
-        if (!Array.isArray(signatureItems))
-            return {
-                status: "error",
-                message: "Solana returned an incomplete payment status.",
-            };
-        for (const item of signatureItems) {
-            if (typeof item !== "object" || item === null || !("signature" in item))
-                continue;
-            const signatureValue = item.signature;
-            if (typeof signatureValue !== "string" ||
-                !(0, lifetimePayment_1.isSolanaTransactionSignature)(signatureValue))
-                continue;
-            const transactionResponse = await requestLifetimeRpc("getTransaction", [
-                signatureValue,
-                {
-                    commitment: "finalized",
-                    encoding: "jsonParsed",
-                    maxSupportedTransactionVersion: 1,
-                },
-            ]);
-            if (!transactionResponse.ok)
-                return {
-                    status: "error",
-                    message: "Helius could not finish verifying this payment. Silo will keep checking.",
-                };
-            const verification = (0, lifetimePayment_1.verifyParsedLifetimePayment)(signatureValue, transactionResponse.result);
-            if (verification.status !== "verified")
-                continue;
-            const verifiedAt = Date.now();
-            await writeLifetimeLicense(signatureValue, verifiedAt);
-            enableLifetimeFeatures();
-            return {
-                ...verification,
-                license: {
-                    isLicensed: true,
-                    licenseType: "purchase",
-                    signature: signatureValue,
-                    verifiedAt,
-                },
-            };
-        }
-        return {
-            status: "pending",
-            message: "Waiting for a finalized $25 USDC payment from this request. Keep this window open; Silo will activate it automatically.",
-        };
-    }
-    catch {
-        return {
-            status: "error",
-            message: "Could not check Solana right now. Silo will keep checking; no license status was changed.",
-        };
-    }
-});
+electron_1.ipcMain.handle("verify-lifetime-payment", async (_event, signatureValue) => verifyAndSaveLifetimePayment(signatureValue));
 electron_1.ipcMain.handle("is-dev", () => electron_is_dev_1.default);
 electron_1.ipcMain.handle("get-app-update-state", () => appUpdateState);
 electron_1.ipcMain.handle("check-app-updates", () => checkForAppUpdates());

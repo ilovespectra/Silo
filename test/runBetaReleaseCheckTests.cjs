@@ -2,6 +2,7 @@ const assert = require("assert");
 const crypto = require("crypto");
 const {
   assertNoPrivateKeyMaterial,
+  assertRequiredLicenseHandlers,
   containsPrivateKeyMaterial,
   isPrivateKeyFileName,
   normalizeBetaPublicKey,
@@ -33,6 +34,15 @@ assert.strictEqual(
 assert.strictEqual(isPrivateKeyFileName("/release/betaLicensePublicKey.js"), false);
 assert.doesNotThrow(() =>
   assertNoPrivateKeyMaterial([require.resolve("../src/betaLicensePublicKey.ts")]),
+);
+assert.doesNotThrow(() =>
+  assertRequiredLicenseHandlers(
+    '"get-beta-activation-info" "activate-beta-license" "verify-lifetime-payment"',
+  ),
+);
+assert.throws(
+  () => assertRequiredLicenseHandlers('"get-beta-activation-info" "activate-beta-license"'),
+  /missing beta or payment handlers/,
 );
 
 console.log("Beta release-check tests passed.");

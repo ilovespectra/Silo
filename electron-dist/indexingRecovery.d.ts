@@ -26,6 +26,7 @@ export declare class IndexingRecovery {
     private externalBlockReason;
     private interactiveSearchActive;
     private searchPausedStages;
+    private priorityPausedStages;
     private searchTransition;
     constructor(stages: RecoveryStage[], now?: () => number, statePath?: string | undefined);
     private restore;
@@ -47,6 +48,7 @@ export declare class IndexingRecovery {
     private pauseActiveStages;
     pause(id: string): void;
     clearUserPause(id: string): void;
+    requestWithPriority(id: string, pauseIds?: string[]): Promise<void>;
     request(id: string): void;
     queue(id: string): void;
     retry(id: string): Promise<void>;

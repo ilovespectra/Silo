@@ -40,6 +40,7 @@ class IndexingRecovery {
         this.externalBlockReason = "";
         this.interactiveSearchActive = false;
         this.searchPausedStages = new Set();
+        this.priorityPausedStages = new Set();
         this.searchTransition = Promise.resolve();
         this.restore();
     }
@@ -254,6 +255,53 @@ class IndexingRecovery {
         this.requested.delete(id);
         this.persist();
     }
+    async requestWithPriority(id, pauseIds = []) {
+        if (this.stopped)
+            throw new Error("Silo is shutting down. Reopen it to resume indexing.");
+        if (!this.stages.some((item) => item.id === id))
+            throw new Error("This index does not support recovery.");
+        const target = this.records.get(id);
+        if (target?.userPaused)
+            return;
+        const stagesToPause = [];
+        for (const pauseId of pauseIds) {
+            const stage = this.stages.find((item) => item.id === pauseId);
+            const record = this.records.get(pauseId);
+            if (!stage?.pause || record?.userPaused)
+                continue;
+            if (this.priorityPausedStages.has(pauseId))
+                continue;
+            if (!["scanning", "indexing", "loading-model", "clustering", "generating"].includes(stage.progress().status))
+                continue;
+            const priorityRecord = record ?? {
+                attempts: 0,
+                error: "",
+                retryAt: 0,
+                running: false,
+                checked: false,
+                userPaused: false,
+            };
+            priorityRecord.checked = false;
+            priorityRecord.error = "";
+            priorityRecord.retryAt = 0;
+            this.records.set(pauseId, priorityRecord);
+            this.priorityPausedStages.add(pauseId);
+            stagesToPause.push(stage);
+        }
+        this.persist();
+        // Queue the priority work while the current stage still owns its lane.
+        // Once pause() lets that run drain, the scheduler starts search first.
+        this.request(id);
+        await Promise.all(stagesToPause.map(async (stage) => {
+            try {
+                await stage.pause?.();
+            }
+            catch (error) {
+                this.priorityPausedStages.delete(stage.id);
+                console.error(`[IndexingRecovery] Could not yield ${stage.id} to ${id}`, error);
+            }
+        }));
+    }
     request(id) {
         const stage = this.stages.find((item) => item.id === id);
         if (!stage)
@@ -376,6 +424,15 @@ class IndexingRecovery {
             if (progress.status === "error")
                 throw new Error(progress.message);
             if (progress.status === "paused") {
+                const priorityPaused = this.priorityPausedStages.delete(stage.id);
+                if (priorityPaused && !record.userPaused) {
+                    record.checked = false;
+                    record.error = "";
+                    record.retryAt = 0;
+                    this.requested.add(stage.id);
+                    this.persist();
+                    return;
+                }
                 if (!record.userPaused)
                     if (this.externalBlockReason ||
                         this.interactiveSearchActive ||
@@ -410,6 +467,7 @@ class IndexingRecovery {
                     (record.attempts >= 3 ? 5 * 60000 : 10000 * 2 ** (record.attempts - 1));
         }
         finally {
+            this.priorityPausedStages.delete(stage.id);
             record.running = false;
             if (stage.lane)
                 this.activeLanes.delete(stage.lane);

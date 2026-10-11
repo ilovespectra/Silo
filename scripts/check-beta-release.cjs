@@ -32,6 +32,16 @@ function containsPrivateKeyMaterial(text) {
   return /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(text);
 }
 
+function assertRequiredLicenseHandlers(electronMain) {
+  const requiredHandlers = [
+    "get-beta-activation-info",
+    "activate-beta-license",
+    "verify-lifetime-payment",
+  ];
+  if (requiredHandlers.some((handler) => !electronMain.includes(handler)))
+    throw new Error("The compiled main process is missing beta or payment handlers.");
+}
+
 function isPrivateKeyFileName(filePath) {
   return /(?:beta-license-private|private[-_].*key|signing[-_].*key).*\.pem$/i.test(
     filePath,
@@ -99,12 +109,7 @@ function checkRelease(projectRoot) {
   if (!fs.existsSync(electronMainPath))
     throw new Error("The compiled Electron main process is missing.");
   const electronMain = fs.readFileSync(electronMainPath, "utf8");
-  if (
-    !electronMain.includes("get-beta-activation-info") ||
-    !electronMain.includes("activate-beta-license") ||
-    !electronMain.includes("check-lifetime-payment-reference")
-  )
-    throw new Error("The compiled main process is missing beta or payment handlers.");
+  assertRequiredLicenseHandlers(electronMain);
 
   const rendererDirectory = path.join(projectRoot, "build", "static", "js");
   const rendererFiles = packagedTextFiles(rendererDirectory).filter((filePath) =>
@@ -144,6 +149,7 @@ if (require.main === module) {
 
 module.exports = {
   assertNoPrivateKeyMaterial,
+  assertRequiredLicenseHandlers,
   containsPrivateKeyMaterial,
   isPrivateKeyFileName,
   normalizeBetaPublicKey,
