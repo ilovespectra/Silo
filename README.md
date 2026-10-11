@@ -5,6 +5,7 @@ A local-first file browser built with Electron, React, and TypeScript. Browse dr
 ## Silo links
 
 - [Try Silo website](https://trysilo-seven.vercel.app/)
+- [Silo Downloads](https://github.com/ilovespectra/silo-downloads/releases)
 - [Silo user guide](https://repo-six-inky-51.vercel.app/)
 - [Silo source on GitHub](https://github.com/ilovespectra/Silo)
 
@@ -20,9 +21,9 @@ A local-first file browser built with Electron, React, and TypeScript. Browse dr
 - 🖼️ Full-screen viewer with zoom, plus **audio and video playback**
 - 🗂️ **Digital folders** — group files by reference without moving anything on disk
 
-### Search and indexing (all offline)
+### On-device search and indexing
 
-- 🧠 Semantic search over images and documents via a local CLIP model
+- 🧠 Semantic search over images and documents via a local CLIP model (model files may need to download before first use)
 - 👤 Face detection and clustering into named people
 - 🐾 Pet photo clustering
 - 🎚️ Confidence threshold control
@@ -34,7 +35,7 @@ A local-first file browser built with Electron, React, and TypeScript. Browse dr
 - 🖼️ **Google Photos** — select photos through the official Picker
 - 👥 **Multiple Google accounts** — stay signed in to several at once and view every Drive and picked photo in one merged place
 
-Phone and cloud sources support browsing, previews, Explode, Digital Folders, and saving separate copies to this device. Check each action label: source-changing controls depend on the source type.
+Phone and cloud sources support browsing, previews, Explode, Digital Folders, and saving separate copies to this device. Check each action label: source-changing controls depend on the source type. Connected sources need a device or network connection; search and face analysis run locally after their model files are available.
 
 ## Prerequisites
 
@@ -50,7 +51,7 @@ npm install
 
 ### Opening Silo the first time
 
-Preview builds are not Developer ID signed or notarized, so macOS may say it cannot verify Silo. Continue only if you downloaded Silo from the official release page and its published SHA-256 checksum matches.
+Preview builds are ad-hoc signed, not Developer ID signed or notarized, so macOS may say it cannot verify Silo. Continue only if you downloaded Silo from the official release page and its published SHA-256 checksum matches.
 
 On recent versions of macOS:
 
@@ -59,6 +60,12 @@ On recent versions of macOS:
 3. Confirm **Open** (enter your Mac password if asked). This exception applies only to Silo.
 
 If macOS says Silo **is damaged** or **will damage your computer**, stop and do not bypass that alert. Re-download from the official release page, verify the checksum, and contact Silo support if it persists.
+
+## Preview release and license status
+
+Silo 2.0.4 is an early testing release, not the finished demo. Its $25 lifetime license is intended for **one computer**; each computer needs its own purchase. Configuration export/import can transfer settings and indexes, but it excludes paid and beta licenses and the installation ID. Treat configuration exports as sensitive because they can contain account credentials.
+
+As of October 11, 2026, the payment relay health check reports ready, but that only confirms service availability. No real 2.0.4 payment, activation, or one-computer enforcement test has been completed on the release machines. Card and Solana payment verification remain unverified until those real-machine tests pass.
 
 ## Development
 
@@ -75,6 +82,48 @@ npm run build   # compile renderer + main
 npm start       # run the built app
 npm run dist    # package into release/
 ```
+
+## Optional CLIP-index image generator
+
+The standalone [Python generator](scripts/generate_from_silo_clip_index.py) reads
+Silo's `semantic-index/records.jsonl` journal and normalized 512-dimensional
+float32 vectors in `vectors.bin`. It never modifies the index. The entire journal
+is replayed before selection so deleted, failed, and superseded entries are excluded.
+Large journals can take time and memory to replay; close Silo first for a stable snapshot.
+
+Use a separate Python 3.11+ environment:
+
+```bash
+python3.11 -m venv ~/.venvs/clipgen
+source ~/.venvs/clipgen/bin/activate
+pip install torch diffusers transformers accelerate safetensors pillow
+python scripts/generate_from_silo_clip_index.py --mode caption --output ~/Desktop/generated.png
+```
+
+By default, the script reads the destination in Silo's `index-storage.json`
+under its `file-browser-electron` app-data directory (or `FILE_BROWSER_USER_DATA_DIR`).
+Use `--index-dir "/path/to/semantic-index"` for an explicit index, a local fallback,
+or a cache in migration; it does not automatically choose between multiple caches.
+
+- `--mode img2img` (default): generate a variation of a random available indexed
+  image, using filename metadata as the prompt or your `--prompt`.
+- `--mode caption`: locally caption an available image with BLIP, then generate a
+  new image from the caption. This does not condition diffusion on the source image.
+- `--mode retrieve`: read one stored image vector and retrieve the closest prompt
+  from a candidate pool using `openai/clip-vit-base-patch32`, the unquantized
+  counterpart of Silo's `Xenova/clip-vit-base-patch32`. Similarities can differ
+  from Silo's quantized encoder. This does not decode the vector into a caption
+  and does not read the original image. Use `--prompt-pool prompts.txt` for a larger
+  pool (one nonempty prompt per line); the built-in pool is deliberately small.
+
+All modes accept `--seed`, `--steps`, `--model-id` (also `--model`), and
+`--device auto|cpu|cuda|mps`. Img2img also accepts `--strength`.
+Use `--record-path` to select a specific live indexed path. An explicit `--prompt`
+skips index access in caption/retrieve modes. Each generated image gets a
+`.png.txt` prompt sidecar (or the equivalent for your chosen output extension).
+CUDA and Apple Silicon MPS are detected automatically; CPU is much slower.
+Model weights may download on first use, but images and index data stay local.
+The diffusion model's safety checker remains enabled.
 
 ---
 
