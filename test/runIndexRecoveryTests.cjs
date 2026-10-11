@@ -21,6 +21,67 @@ recoveryModule._compile(
 const { IndexingRecovery } = recoveryModule.exports;
 const settle = () => new Promise(setImmediate);
 async function run() {
+  const startupStateDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-runtime-startup-recovery-"),
+  );
+  try {
+    const statePath = path.join(startupStateDirectory, "recovery.json");
+    const savedState = (userPaused = false) => ({
+      version: 1,
+      records: {
+        "semantic-runtime": {
+          attempts: 0,
+          error: "",
+          retryAt: 0,
+          running: false,
+          checked: true,
+          userPaused,
+        },
+      },
+      requested: [],
+    });
+    fs.writeFileSync(statePath, JSON.stringify(savedState()));
+    let startupCalls = 0;
+    let runtimeProgress = { status: "idle", message: "" };
+    const runtimeStage = {
+      id: "semantic-runtime",
+      needsInitialCheck: true,
+      checkOnStartup: true,
+      progress: () => runtimeProgress,
+      ready: () => true,
+      start: async () => {
+        startupCalls++;
+        runtimeProgress = { status: "complete", message: "ready" };
+      },
+    };
+    const firstLaunch = new IndexingRecovery([runtimeStage], Date.now, statePath);
+    await firstLaunch.tick();
+    await settle();
+    assert.equal(startupCalls, 1, "restored checked startup stages run again");
+
+    const secondLaunch = new IndexingRecovery([runtimeStage], Date.now, statePath);
+    await secondLaunch.tick();
+    await settle();
+    assert.equal(startupCalls, 2, "startup stages are checked in every process");
+
+    secondLaunch.pause("semantic-runtime");
+    fs.writeFileSync(statePath, JSON.stringify(savedState(true)));
+    const pausedLaunch = new IndexingRecovery([runtimeStage], Date.now, statePath);
+    await pausedLaunch.tick();
+    await settle();
+    assert.equal(startupCalls, 2, "an explicit user pause remains respected");
+    assert.equal(
+      pausedLaunch.details("semantic-runtime").userPaused,
+      true,
+      "a persisted user pause remains visible to the startup status",
+    );
+    await pausedLaunch.retry("semantic-runtime");
+    await settle();
+    assert.equal(startupCalls, 3, "retry resumes the paused startup stage");
+  } finally {
+    fs.rmSync(startupStateDirectory, { recursive: true, force: true });
+  }
+
   let time = 0,
     calls = 0;
   let progress = {

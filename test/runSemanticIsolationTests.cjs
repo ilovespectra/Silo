@@ -1144,6 +1144,95 @@ test("semantic search marks vector readiness waits so construction can proceed",
   assert.equal(indexer.vectorIndexWaiterCount, 0);
 });
 
+test("demo dashboard summaries reuse the bounded selection cache", async (t) => {
+  const { indexer } = makeIndexer(t);
+  const sourcePath = "/__demo-cache-fixture__";
+  indexer.setDemoFileLimit(2);
+  const records = [
+    { path: `${sourcePath}/a.jpg`, vectorOffset: 0 },
+    { path: `${sourcePath}/b.jpg`, vectorOffset: -1, error: "bad metadata" },
+    { path: `${sourcePath}/c.jpg`, vectorOffset: -1 },
+    { path: "/__unrelated-fixture__/other.jpg", vectorOffset: 0 },
+  ];
+  for (const record of records)
+    indexer.setLatestRecord({
+      name: path.basename(record.path),
+      path: record.path,
+      sourcePath: path.dirname(record.path),
+      relativePath: path.basename(record.path),
+      size: 1,
+      modified: 1,
+      type: "image",
+      extension: ".jpg",
+      signature: "fixture",
+      ...record,
+    });
+
+  let indexabilityChecks = 0;
+  const originalIsIndexable = indexer.isIndexable.bind(indexer);
+  indexer.isIndexable = (record, root) => {
+    indexabilityChecks++;
+    return originalIsIndexable(record, root);
+  };
+  const firstSelection = indexer.demoFilePaths([sourcePath]);
+  assert.deepEqual(
+    Array.from(firstSelection).sort(),
+    [`${sourcePath}/a.jpg`, `${sourcePath}/b.jpg`],
+  );
+  assert.equal(indexabilityChecks, 3);
+  assert.strictEqual(indexer.demoFilePaths([sourcePath]), firstSelection);
+  assert.deepEqual({ ...indexer.getIndexSummary([sourcePath]) }, {
+    indexed: 1,
+    errors: 1,
+    total: 2,
+    discoveredTotal: 2,
+    remaining: 0,
+  });
+  assert.equal(
+    indexabilityChecks,
+    3,
+    "repeated dashboard snapshots reuse the selection for an unchanged revision",
+  );
+
+  indexer.setLatestRecord({
+    name: "0.jpg",
+    path: `${sourcePath}/0.jpg`,
+    sourcePath,
+    relativePath: "0.jpg",
+    size: 1,
+    modified: 1,
+    type: "image",
+    extension: ".jpg",
+    signature: "new-fixture",
+    vectorOffset: 8192,
+  });
+  const updatedSelection = indexer.demoFilePaths([sourcePath]);
+  assert.deepEqual(
+    Array.from(updatedSelection).sort(),
+    [`${sourcePath}/0.jpg`, `${sourcePath}/a.jpg`],
+  );
+  assert.equal(indexabilityChecks, 7, "a record revision refreshes the selection");
+  assert.deepEqual({ ...indexer.getIndexSummary([sourcePath]) }, {
+    indexed: 2,
+    errors: 0,
+    total: 2,
+    discoveredTotal: 2,
+    remaining: 0,
+  });
+  assert.equal(
+    indexabilityChecks,
+    7,
+    "summaries count selected paths without rescanning all records",
+  );
+
+  indexer.setDemoFileLimit(1);
+  assert.deepEqual(
+    Array.from(indexer.demoFilePaths([sourcePath])),
+    [`${sourcePath}/0.jpg`],
+  );
+  assert.equal(indexabilityChecks, 11, "changing the demo limit refreshes the cache");
+});
+
 test("semantic search applies confidence and excludes unfinished or inactive records", async (t) => {
   const { indexer } = makeIndexer(t);
   const vectorBytes = 512 * Float32Array.BYTES_PER_ELEMENT;

@@ -7185,6 +7185,7 @@ app.whenReady().then(async () => {
           : "") ||
         "Waiting for index storage to become available.",
       needsInitialCheck: true,
+      checkOnStartup: true,
       start: async () => {
         const attempts = indexRecovery?.details("semantic-runtime").attempts ?? 1;
         semanticRuntimeProgress = {
@@ -7440,6 +7441,18 @@ app.whenReady().then(async () => {
       resume: () => aestheticScorer.setBackgroundPaused(false),
     },
   ], Date.now, path.join(app.getPath("userData"), "indexing-recovery.json"));
+  const semanticRuntimeRecovery = indexRecovery.details("semantic-runtime");
+  if (semanticRuntimeRecovery.userPaused) {
+    const message =
+      "Offline search model startup is paused. Retry this stage to enable search.";
+    semanticRuntimeProgress = { status: "error", message };
+    updateSearchIndexReadiness({
+      status: "error",
+      percentage: 20,
+      records: loadedSearchRecords,
+      message,
+    });
+  }
   if (activeInteractiveSearches > 0)
     await indexRecovery.setSearchActive(true);
   await monitorIndexStorageAvailability();

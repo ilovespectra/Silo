@@ -8,6 +8,8 @@ export interface RecoveryStage {
     ready: () => boolean;
     unresolvedWork?: () => string | null;
     needsInitialCheck?: boolean;
+    /** Recheck a transient startup stage once for each new process. */
+    checkOnStartup?: boolean;
     lane?: "analysis" | "disk" | "light" | "background";
     blockedReason?: () => string;
     pause?: () => Promise<unknown> | unknown;

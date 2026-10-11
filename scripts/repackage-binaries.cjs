@@ -14,11 +14,22 @@ const branch = 'main';
 const version = packageJson.version;
 const product = packageJson.build.productName;
 const outputFolder = path.join(projectRoot, 'release');
+const stageParent = process.env.SILO_RELEASE_STAGE_DIR
+  ? path.resolve(process.env.SILO_RELEASE_STAGE_DIR)
+  : outputFolder;
+const suppliedWindowsInstaller = process.env.SILO_WINDOWS_SETUP_EXE
+  ? path.resolve(process.env.SILO_WINDOWS_SETUP_EXE)
+  : '';
+const suppliedWindowsBuildSha = process.env.SILO_WINDOWS_BUILD_SHA || '';
 const destination = process.env.SILO_RELEASE_DEST
   ? path.resolve(process.env.SILO_RELEASE_DEST)
   : path.join(os.homedir(), 'Downloads', 'SILO 2.0.4 REAL');
 const preservedUntracked = new Set([
   'claudetest.txt',
+  'electron-dist/paidLicense.d.ts',
+  'electron-dist/paidLicense.js',
+  'electron-dist/paidLicensePublicKey.d.ts',
+  'electron-dist/paidLicensePublicKey.js',
   'scripts/generate_from_silo_clip_index.py',
   'test/test_silo_clip_generator.py',
 ]);
@@ -150,13 +161,25 @@ async function repackage() {
   }
 
   assertCleanReleaseInputs();
-  run('gh', ['auth', 'status', '--hostname', 'github.com'], { stdio: 'ignore' });
-  const remoteSha = capture('gh', [
-    'api', `repos/${repository}/commits/${branch}`, '--jq', '.sha',
-  ]);
   const localSha = capture('git', ['rev-parse', 'HEAD']);
-  if (remoteSha !== localSha) {
-    throw new Error(`Local ${branch} must match GitHub ${branch} before packaging.`);
+  if (suppliedWindowsInstaller) {
+    if (!fs.existsSync(suppliedWindowsInstaller) ||
+        !fs.statSync(suppliedWindowsInstaller).isFile() ||
+        fs.statSync(suppliedWindowsInstaller).size === 0 ||
+        path.basename(suppliedWindowsInstaller) !== `${product}-${version}-x64-Setup.exe`) {
+      throw new Error('SILO_WINDOWS_SETUP_EXE must name a non-empty Windows x64 installer from the current build.');
+    }
+    if (suppliedWindowsBuildSha !== localSha) {
+      throw new Error('SILO_WINDOWS_BUILD_SHA must match the exact local main commit used by the Windows build.');
+    }
+  } else {
+    run('gh', ['auth', 'status', '--hostname', 'github.com'], { stdio: 'ignore' });
+    const remoteSha = capture('gh', [
+      'api', `repos/${repository}/commits/${branch}`, '--jq', '.sha',
+    ]);
+    if (remoteSha !== localSha) {
+      throw new Error(`Local ${branch} must match GitHub ${branch} before packaging.`);
+    }
   }
 
   const expected = [
@@ -164,7 +187,8 @@ async function repackage() {
     `${product}-${version}-arm64.dmg`,
     `${product}-${version}-x64-Setup.exe`,
   ];
-  const stageRoot = fs.mkdtempSync(path.join(outputFolder, '.repackage-binaries-'));
+  fs.mkdirSync(stageParent, { recursive: true });
+  const stageRoot = fs.mkdtempSync(path.join(stageParent, '.repackage-binaries-'));
   const stagedFiles = [];
   const pendingInstalls = [];
   let completed = false;
@@ -178,23 +202,27 @@ async function repackage() {
       stagedFiles.push(findOne(buildOutput, `${product}-${version}-${architecture}.dmg`));
     }
 
-    const previousRunText = capture('gh', [
-      'run', 'list', '--repo', repository, '--workflow', workflow,
-      '--limit', '1', '--json', 'databaseId', '--jq', '.[0].databaseId // ""',
-    ]);
-    const previousRunId = previousRunText ? Number(previousRunText) : null;
-    const startedAt = Date.now();
-    run('gh', ['workflow', 'run', workflow, '--repo', repository, '--ref', branch]);
-    const workflowRun = await waitForWorkflowRun(previousRunId, remoteSha, startedAt);
-    run('gh', ['run', 'watch', String(workflowRun.databaseId), '--repo', repository, '--exit-status']);
+    if (suppliedWindowsInstaller) {
+      stagedFiles.push(suppliedWindowsInstaller);
+    } else {
+      const previousRunText = capture('gh', [
+        'run', 'list', '--repo', repository, '--workflow', workflow,
+        '--limit', '1', '--json', 'databaseId', '--jq', '.[0].databaseId // ""',
+      ]);
+      const previousRunId = previousRunText ? Number(previousRunText) : null;
+      const startedAt = Date.now();
+      run('gh', ['workflow', 'run', workflow, '--repo', repository, '--ref', branch]);
+      const workflowRun = await waitForWorkflowRun(previousRunId, localSha, startedAt);
+      run('gh', ['run', 'watch', String(workflowRun.databaseId), '--repo', repository, '--exit-status']);
 
-    const windowsDownload = path.join(stageRoot, 'windows-ci');
-    fs.mkdirSync(windowsDownload);
-    run('gh', [
-      'run', 'download', String(workflowRun.databaseId), '--repo', repository,
-      '--name', 'silo-windows-x64', '--dir', windowsDownload,
-    ]);
-    stagedFiles.push(findOne(windowsDownload, `${product}-${version}-x64-Setup.exe`));
+      const windowsDownload = path.join(stageRoot, 'windows-ci');
+      fs.mkdirSync(windowsDownload);
+      run('gh', [
+        'run', 'download', String(workflowRun.databaseId), '--repo', repository,
+        '--name', 'silo-windows-x64', '--dir', windowsDownload,
+      ]);
+      stagedFiles.push(findOne(windowsDownload, `${product}-${version}-x64-Setup.exe`));
+    }
 
     if (stagedFiles.length !== expected.length) {
       throw new Error(`Expected ${expected.length} release files; staged ${stagedFiles.length}.`);

@@ -304,6 +304,10 @@ export class SemanticIndexer {
   } | null = null;
   private readonly processingPaths = new Set<string>();
   private demoFileLimit: number | null = null;
+  private readonly demoFilePathCache = new Map<
+    string,
+    { revision: number; limit: number; paths: Set<string> }
+  >();
   private readonly recordCountsBySource = new Map<
     string,
     { total: number; indexed: number; errors: number }
@@ -758,7 +762,9 @@ export class SemanticIndexer {
   }
 
   setDemoFileLimit(limit: number | null): void {
+    if (this.demoFileLimit === limit) return;
     this.demoFileLimit = limit;
+    this.demoFilePathCache.clear();
   }
 
   private demoFilePaths(sourcePaths: string[]): Set<string> | null {
@@ -768,12 +774,34 @@ export class SemanticIndexer {
         ? [...this.watchedSources, ...sourcePaths]
         : sourcePaths,
     );
+    const sourceKey = Array.from(activeSources).sort().join("\0");
+    const cached = this.demoFilePathCache.get(sourceKey);
+    if (
+      cached?.revision === this.revision &&
+      cached.limit === this.demoFileLimit
+    ) {
+      this.demoFilePathCache.delete(sourceKey);
+      this.demoFilePathCache.set(sourceKey, cached);
+      return cached.paths;
+    }
     const eligible = Array.from(this.latestRecords.values()).filter(
       (record) =>
         activeSources.has(record.sourcePath) &&
         this.isIndexable(record, record.sourcePath),
     );
-    return selectDemoFilePaths(eligible, Array.from(activeSources), this.demoFileLimit);
+    const paths = selectDemoFilePaths(
+      eligible,
+      Array.from(activeSources),
+      this.demoFileLimit,
+    );
+    this.demoFilePathCache.set(sourceKey, {
+      revision: this.revision,
+      limit: this.demoFileLimit,
+      paths,
+    });
+    while (this.demoFilePathCache.size > 8)
+      this.demoFilePathCache.delete(this.demoFilePathCache.keys().next().value!);
+    return paths;
   }
 
   /** Cumulative counts from all current records, not just the active indexing batch. */
@@ -781,9 +809,9 @@ export class SemanticIndexer {
     if (this.demoFileLimit !== null) {
       const roots = sourcePaths ?? Array.from(this.recordCountsBySource.keys());
       const allowedPaths = this.demoFilePaths(roots) ?? new Set<string>();
-      const records = Array.from(this.latestRecords.values()).filter((record) =>
-        allowedPaths.has(record.path),
-      );
+      const records = Array.from(allowedPaths, (filePath) =>
+        this.latestRecords.get(filePath),
+      ).filter((record): record is IndexRecord => Boolean(record));
       let discoveredTotal = 0;
       const activeRoots = new Set(roots);
       for (const [sourcePath, count] of this.discoveredTotalsBySource)

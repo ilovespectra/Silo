@@ -237,6 +237,7 @@ class SemanticIndexer {
         this.indexedSearchSnapshotCache = null;
         this.processingPaths = new Set();
         this.demoFileLimit = null;
+        this.demoFilePathCache = new Map();
         this.recordCountsBySource = new Map();
         this.discoveredTotalsBySource = new Map();
         this.workerFailures = new Map();
@@ -541,7 +542,10 @@ class SemanticIndexer {
         return this.activeSearchCount > 0;
     }
     setDemoFileLimit(limit) {
+        if (this.demoFileLimit === limit)
+            return;
         this.demoFileLimit = limit;
+        this.demoFilePathCache.clear();
     }
     demoFilePaths(sourcePaths) {
         if (this.demoFileLimit === null)
@@ -549,16 +553,32 @@ class SemanticIndexer {
         const activeSources = new Set(this.watchedSources.size > 0
             ? [...this.watchedSources, ...sourcePaths]
             : sourcePaths);
+        const sourceKey = Array.from(activeSources).sort().join("\0");
+        const cached = this.demoFilePathCache.get(sourceKey);
+        if (cached?.revision === this.revision &&
+            cached.limit === this.demoFileLimit) {
+            this.demoFilePathCache.delete(sourceKey);
+            this.demoFilePathCache.set(sourceKey, cached);
+            return cached.paths;
+        }
         const eligible = Array.from(this.latestRecords.values()).filter((record) => activeSources.has(record.sourcePath) &&
             this.isIndexable(record, record.sourcePath));
-        return (0, demoLimits_1.selectDemoFilePaths)(eligible, Array.from(activeSources), this.demoFileLimit);
+        const paths = (0, demoLimits_1.selectDemoFilePaths)(eligible, Array.from(activeSources), this.demoFileLimit);
+        this.demoFilePathCache.set(sourceKey, {
+            revision: this.revision,
+            limit: this.demoFileLimit,
+            paths,
+        });
+        while (this.demoFilePathCache.size > 8)
+            this.demoFilePathCache.delete(this.demoFilePathCache.keys().next().value);
+        return paths;
     }
     /** Cumulative counts from all current records, not just the active indexing batch. */
     getIndexSummary(sourcePaths) {
         if (this.demoFileLimit !== null) {
             const roots = sourcePaths ?? Array.from(this.recordCountsBySource.keys());
             const allowedPaths = this.demoFilePaths(roots) ?? new Set();
-            const records = Array.from(this.latestRecords.values()).filter((record) => allowedPaths.has(record.path));
+            const records = Array.from(allowedPaths, (filePath) => this.latestRecords.get(filePath)).filter((record) => Boolean(record));
             let discoveredTotal = 0;
             const activeRoots = new Set(roots);
             for (const [sourcePath, count] of this.discoveredTotalsBySource)

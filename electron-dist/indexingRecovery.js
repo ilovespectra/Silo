@@ -82,6 +82,16 @@ class IndexingRecovery {
                 }
                 this.records.set(id, restored);
             }
+            for (const stage of this.stages) {
+                if (!stage.checkOnStartup)
+                    continue;
+                const record = this.records.get(stage.id);
+                if (!record || record.userPaused)
+                    continue;
+                record.checked = false;
+                record.error = "";
+                record.retryAt = 0;
+            }
             for (const id of Array.isArray(saved.requested) ? saved.requested : [])
                 if (typeof id === "string" && stageIds.has(id)) {
                     if (!this.records.get(id)?.userPaused)

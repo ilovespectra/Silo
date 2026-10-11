@@ -60,6 +60,7 @@ export declare class SemanticIndexer {
     private indexedSearchSnapshotCache;
     private readonly processingPaths;
     private demoFileLimit;
+    private readonly demoFilePathCache;
     private readonly recordCountsBySource;
     private readonly discoveredTotalsBySource;
     private readonly workerFailures;

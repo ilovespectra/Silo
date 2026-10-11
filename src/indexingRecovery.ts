@@ -8,6 +8,8 @@ export interface RecoveryStage {
   ready: () => boolean;
   unresolvedWork?: () => string | null;
   needsInitialCheck?: boolean;
+  /** Recheck a transient startup stage once for each new process. */
+  checkOnStartup?: boolean;
   lane?: "analysis" | "disk" | "light" | "background";
   blockedReason?: () => string;
   pause?: () => Promise<unknown> | unknown;
@@ -80,6 +82,14 @@ export class IndexingRecovery {
           }
         }
         this.records.set(id, restored);
+      }
+      for (const stage of this.stages) {
+        if (!stage.checkOnStartup) continue;
+        const record = this.records.get(stage.id);
+        if (!record || record.userPaused) continue;
+        record.checked = false;
+        record.error = "";
+        record.retryAt = 0;
       }
       for (const id of Array.isArray(saved.requested) ? saved.requested : [])
         if (typeof id === "string" && stageIds.has(id)) {

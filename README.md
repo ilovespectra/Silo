@@ -92,16 +92,24 @@ On the release Mac, after the release changes are committed and pushed to GitHub
 npm run repackage_binaries
 ```
 
-This builds both Mac DMGs locally, dispatches the Windows installer workflow for
-the same `main` commit, downloads its CI installer artifact, and then replaces
-the three matching installers in `~/Downloads/SILO 2.0.4 REAL/`. The script
-stages all three first and prints their SHA-256 hashes after copying. It requires
-Node/npm dependencies and the GitHub CLI (`gh`) authenticated with permission to
-run this repository's Actions workflow. It refuses a non-`main` branch, tracked
-uncommitted changes, unexpected untracked files, or a local commit that does not
-match GitHub `main`. Set `SILO_RELEASE_DEST` to use a different existing output
-folder. It does not publish the GitHub release draft; Mac builds remain ad-hoc
-signed and are not notarized.
+The script builds both Mac DMGs locally and stages all three installers before
+copying them to the selected destination. By default, it dispatches the Windows
+installer workflow for the same `main` commit, downloads that run's artifact,
+and replaces only the three matching installer names in
+`~/Downloads/SILO 2.0.4 REAL/` after every build succeeds.
+
+If the Windows installer was obtained through another authenticated route, set
+both `SILO_WINDOWS_SETUP_EXE` to that non-empty installer file and
+`SILO_WINDOWS_BUILD_SHA` to the exact pushed `main` commit used to build it. The
+script rejects a mismatched commit. Without those two variables, GitHub CLI
+(`gh`) must be installed and authenticated with permission to run this
+repository's Actions workflow. `SILO_RELEASE_STAGE_DIR` selects the temporary
+staging parent, and `SILO_RELEASE_DEST` selects an existing destination folder;
+the default destination is the Downloads folder above. The script refuses a
+non-`main` branch, tracked or staged changes, unexpected untracked files, or a
+local commit that does not match GitHub `main`. It prints SHA-256 hashes after
+copying. It does not publish the GitHub release draft; Mac builds remain
+ad-hoc signed and are not notarized.
 
 ## Optional CLIP-index image generator
 
