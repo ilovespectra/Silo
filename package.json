@@ -16,7 +16,7 @@
     "test:face-clustering": "node test/runFaceClusteringTests.cjs",
     "test:message-coverage": "node test/runMessageCoverageTests.cjs",
     "test:beta-license": "node test/runBetaLicenseTests.cjs && node test/runBetaReleaseCheckTests.cjs && node --check scripts/beta-license.cjs && node --check scripts/check-beta-release.cjs",
-    "test:lifetime-payment": "node test/runLifetimePaymentTests.cjs",
+    "test:lifetime-payment": "node test/runLifetimePaymentTests.cjs && node test/runLegacyLicenseRejectionTests.cjs",
     "release:check": "npm run test:beta-license && npm run test:lifetime-payment && node scripts/check-beta-release.cjs",
     "react-eject": "react-scripts eject",
     "electron-start": "wait-on http://localhost:8787 && electron .",

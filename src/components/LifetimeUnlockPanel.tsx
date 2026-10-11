@@ -63,6 +63,10 @@ export default function LifetimeUnlockPanel({
     "idle" | "copied" | "error"
   >("idle");
   const [paymentNotice, setPaymentNotice] = useState("");
+  const [walletPurchase, setWalletPurchase] = useState<{
+    purchaseId: string;
+    claimToken: string;
+  } | null>(null);
   const [cardPurchase, setCardPurchase] = useState<{
     purchaseId: string;
     claimToken: string;
@@ -189,24 +193,56 @@ export default function LifetimeUnlockPanel({
 
     const electron = window.electron;
     let disposed = false;
+    setPaymentNotice("Preparing a payment request for this computer…");
+    void electron
+      .beginLifetimeWalletPurchase(paymentRequest.reference)
+      .then((result) => {
+        if (disposed) return;
+        if (!result.ok) {
+          setPaymentStatus("error");
+          setPaymentNotice(result.error);
+          return;
+        }
+        setWalletPurchase({
+          purchaseId: result.purchaseId,
+          claimToken: result.claimToken,
+        });
+        setPaymentStatus("pending");
+        setPaymentNotice("Ready. Approve the $25 USDC transfer in your Solana wallet.");
+      })
+      .catch(() => {
+        if (disposed) return;
+        setPaymentStatus("error");
+        setPaymentNotice("The license relay could not prepare this wallet payment.");
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [license.isLicensed, paymentRequest]);
+
+  useEffect(() => {
+    if (license.isLicensed || !walletPurchase || !window.electron) return;
+
+    const electron = window.electron;
+    let disposed = false;
     let checking = false;
     const checkPayment = async () => {
       if (disposed || checking) return;
       checking = true;
       try {
-        const result = await electron.checkLifetimePaymentReference(
-          paymentRequest.reference,
+        const result = await electron.checkLifetimePurchase(
+          walletPurchase.purchaseId,
+          walletPurchase.claimToken,
         );
         if (disposed) return;
         setPaymentStatus(result.status);
-        setPaymentNotice(result.message);
+        setPaymentNotice(result.message || "Waiting for finalized payment confirmation.");
         if (result.license?.isLicensed) onVerified(result.license);
       } catch {
         if (disposed) return;
         setPaymentStatus("error");
-        setPaymentNotice(
-          "Could not check Solana right now. Silo will keep checking.",
-        );
+        setPaymentNotice("Could not check the license relay. Silo will keep checking.");
       } finally {
         checking = false;
       }
@@ -218,7 +254,7 @@ export default function LifetimeUnlockPanel({
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [license.isLicensed, onVerified, paymentRequest]);
+  }, [license.isLicensed, onVerified, walletPurchase]);
 
   useEffect(() => {
     if (license.isLicensed || !cardPurchase || !window.electron) return;
@@ -230,24 +266,16 @@ export default function LifetimeUnlockPanel({
       if (disposed || checking) return;
       checking = true;
       try {
-        const result = await electron.checkLifetimeCardPurchase(
+        const result = await electron.checkLifetimePurchase(
           cardPurchase.purchaseId,
           cardPurchase.claimToken,
         );
         if (disposed) return;
         setCardNotice(result.message || "Waiting for payment verification…");
-        if (result.status === "verified" && result.signature) {
-          const localVerification = await electron.verifyLifetimeCardPayment(
-            result.signature,
-          );
-          if (disposed) return;
-          setCardStatus(localVerification.status === "verified" ? "verified" : "error");
-          setCardNotice(localVerification.message);
-          if (localVerification.license?.isLicensed)
-            onVerified(localVerification.license);
-        } else if (result.status === "error") {
-          setCardStatus("error");
-        } else if (result.status === "expired") {
+        if (result.status === "verified" && result.license?.isLicensed) {
+          setCardStatus("verified");
+          onVerified(result.license);
+        } else if (result.status === "error" || result.status === "invalid" || result.status === "expired") {
           setCardStatus("error");
         } else {
           setCardStatus("pending");
@@ -288,7 +316,7 @@ export default function LifetimeUnlockPanel({
   };
 
   const copyPaymentLink = async () => {
-    if (!paymentRequest) return;
+    if (!paymentRequest || !walletPurchase) return;
     try {
       await navigator.clipboard.writeText(paymentRequest.uri);
       setPaymentLinkCopyState("copied");
@@ -625,7 +653,7 @@ export default function LifetimeUnlockPanel({
                 </div>
               </div>
               <div className="lifetime-solana-qr">
-                {paymentRequest ? (
+                {paymentRequest && walletPurchase ? (
                   <QRCodeSVG
                     value={paymentRequest.uri}
                     size={190}
@@ -634,6 +662,8 @@ export default function LifetimeUnlockPanel({
                     role="img"
                     aria-label="Solana Pay request for 25 USDC"
                   />
+                ) : paymentRequest ? (
+                  <p>Preparing your computer-bound payment request…</p>
                 ) : (
                   <p role="alert">Silo could not create a secure payment request.</p>
                 )}
@@ -643,7 +673,7 @@ export default function LifetimeUnlockPanel({
                 another network, bridge it to Solana first; Silo never moves or
                 bridges funds.
               </p>
-              {paymentRequest && (
+              {paymentRequest && walletPurchase && (
                 <button
                   className="lifetime-solana-copy-link"
                   type="button"
@@ -678,7 +708,8 @@ export default function LifetimeUnlockPanel({
                       <strong>Send at least $25 USDC on Solana</strong>
                       <p>
                         Send USDC to this address, then paste the transaction
-                        signature below. Silo checks for final confirmation.
+                        signature below. The license relay verifies the finalized
+                        payment and binds it to this computer.
                       </p>
                     </div>
                   </div>
@@ -935,12 +966,13 @@ export default function LifetimeUnlockPanel({
               </button>
             </header>
             <p className="lifetime-action-payment-intro">
-              Send $25 USDC with the Solana Pay request, or use an installed
-              wallet or card in your browser. Silo verifies the finalized
-              payment before activation.
+              Each $25 lifetime license unlocks one computer. Send USDC with
+              Solana Pay, or use an installed wallet or card in your browser.
+              Config exports do not include the license; another computer
+              needs its own purchase.
             </p>
             <div className="lifetime-solana-qr">
-              {paymentRequest ? (
+              {paymentRequest && walletPurchase ? (
                 <QRCodeSVG
                   value={paymentRequest.uri}
                   size={190}
@@ -949,11 +981,13 @@ export default function LifetimeUnlockPanel({
                   role="img"
                   aria-label="Solana Pay request for 25 USDC"
                 />
+              ) : paymentRequest ? (
+                <p>Preparing your computer-bound payment request…</p>
               ) : (
                 <p role="alert">Silo could not create a secure payment request.</p>
               )}
             </div>
-            {paymentRequest && (
+            {paymentRequest && walletPurchase && (
               <button
                 className="lifetime-solana-copy-link"
                 type="button"

@@ -159,12 +159,10 @@ contextBridge.exposeInMainWorld("electron", {
   getLifetimeLicense: () => ipcRenderer.invoke("get-lifetime-license"),
   beginLifetimeCardPurchase: () =>
     ipcRenderer.invoke("begin-lifetime-card-purchase"),
-  checkLifetimeCardPurchase: (purchaseId, claimToken) =>
-    ipcRenderer.invoke(
-      "check-lifetime-card-purchase",
-      purchaseId,
-      claimToken,
-    ),
+  beginLifetimeWalletPurchase: (reference) =>
+    ipcRenderer.invoke("begin-lifetime-wallet-purchase", reference),
+  checkLifetimePurchase: (purchaseId, claimToken) =>
+    ipcRenderer.invoke("check-lifetime-purchase", purchaseId, claimToken),
   getDemoTestingMode: () => ipcRenderer.invoke("get-demo-testing-mode"),
   setDemoTestingMode: (enabled) =>
     ipcRenderer.invoke("set-demo-testing-mode", enabled),
@@ -175,10 +173,6 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("activate-beta-license", activationCode),
   verifyLifetimePayment: (signature) =>
     ipcRenderer.invoke("verify-lifetime-payment", signature),
-  verifyLifetimeCardPayment: (signature) =>
-    ipcRenderer.invoke("verify-lifetime-card-payment", signature),
-  checkLifetimePaymentReference: (reference) =>
-    ipcRenderer.invoke("check-lifetime-payment-reference", reference),
   getContentSettings: () => ipcRenderer.invoke("get-content-settings"),
   getSearchPerformanceSettings: () =>
     ipcRenderer.invoke("get-search-performance-settings"),

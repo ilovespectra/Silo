@@ -146,11 +146,19 @@
   color: var(--orange);
 }
 
-.local-help-show-control {
+.local-help-answer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.local-help-show-control,
+.local-help-read-more {
   display: inline-flex;
   align-items: center;
   min-height: 32px;
-  margin-top: 12px;
   padding: 6px 10px;
   border: 1px solid var(--orange);
   border-radius: 6px;
@@ -160,6 +168,76 @@
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
+  text-decoration: none;
+}
+
+.local-help-read-more {
+  gap: 6px;
+}
+
+.local-help-read-more:hover {
+  background: var(--surface-active);
+}
+
+.local-help-guide-results {
+  display: grid;
+  gap: 9px;
+  margin-top: 14px;
+}
+
+.local-help-guide-results > h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 2px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.local-help-guide-results > h3 svg {
+  flex: 0 0 auto;
+  color: var(--orange);
+}
+
+.local-help-guide-result {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-card);
+}
+
+.local-help-guide-result h4 {
+  margin: 0 0 3px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.local-help-guide-result > span {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.local-help-guide-result p {
+  margin: 8px 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.local-help-guide-result a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--orange-bright);
+  font-size: 11px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.local-help-guide-result a:hover {
+  text-decoration: underline;
 }
 
 .local-help-related {
@@ -200,6 +278,7 @@
 }
 
 .local-help-panel button:focus-visible,
+.local-help-panel a:focus-visible,
 .local-help-question input:focus-visible {
   outline: 2px solid var(--orange-bright);
   outline-offset: 2px;

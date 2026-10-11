@@ -1177,6 +1177,7 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
     return queryVector;
   };
   indexer.vectorIndexReady = Promise.resolve();
+  indexer.vectorIndexReadyState = true;
   indexer.persistedVectorIndex = {
     search: async () => [
       { key: 0, confidence: 60 },

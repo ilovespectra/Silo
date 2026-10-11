@@ -263,6 +263,7 @@ export class SemanticIndexer {
   private readonly userDataPath: string;
   private canonicalUserDataPath: string;
   private readonly canonicalSourcePaths = new Map<string, string>();
+  private readonly indexStorageRoot: string;
   private readonly indexDirectory: string;
   private readonly recordsPath: string;
   private readonly vectorsPath: string;
@@ -277,9 +278,9 @@ export class SemanticIndexer {
   private vectorIndexBuildPromise: Promise<void> | null = null;
   private performanceSettings: SearchPerformanceSettings =
     defaultSearchPerformanceSettings();
-  private vectorIndexReady: Promise<void>;
+  private vectorIndexReady!: Promise<void>;
   private resolveVectorIndexReady!: () => void;
-  private rejectVectorIndexReady!: (error: Error) => void;
+  private vectorIndexReadyState = false;
   private readonly textRecordIds = new Map<string, number>();
   private readonly textRecordPaths: string[] = [];
   private readonly textRecordTerms: Array<Set<string>> = [];
@@ -479,7 +480,8 @@ export class SemanticIndexer {
   ) {
     this.userDataPath = path.resolve(userDataPath);
     this.canonicalUserDataPath = this.userDataPath;
-    this.indexDirectory = path.join(indexStoragePath, "semantic-index");
+    this.indexStorageRoot = path.resolve(indexStoragePath);
+    this.indexDirectory = path.join(this.indexStorageRoot, "semantic-index");
     this.recordsPath = path.join(this.indexDirectory, "records.jsonl");
     this.vectorsPath = path.join(this.indexDirectory, "vectors.bin");
     this.progressPath = path.join(this.indexDirectory, "progress.json");
@@ -487,10 +489,7 @@ export class SemanticIndexer {
     this.scanSource = scanSource;
     this.onProgress = onProgress;
     this.onDiagnostic = onDiagnostic;
-    this.vectorIndexReady = new Promise<void>((resolve, reject) => {
-      this.resolveVectorIndexReady = resolve;
-      this.rejectVectorIndexReady = reject;
-    });
+    this.resetVectorIndexReady();
   }
 
   setBackgroundIndexWorkListener(
@@ -529,6 +528,27 @@ export class SemanticIndexer {
   ): Promise<void> {
     await this.loaded;
     if (this.vectorIndexBuildPromise) return this.vectorIndexBuildPromise;
+    const build = this.buildVectorSearch(onProgress);
+    this.vectorIndexBuildPromise = build;
+    try {
+      await build;
+    } catch (error) {
+      if (this.vectorIndexBuildPromise === build)
+        this.vectorIndexBuildPromise = null;
+      throw error;
+    }
+  }
+
+  private resetVectorIndexReady() {
+    this.vectorIndexReadyState = false;
+    this.vectorIndexReady = new Promise<void>((resolve) => {
+      this.resolveVectorIndexReady = resolve;
+    });
+  }
+
+  private async buildVectorSearch(
+    onProgress: (fraction: number, records: number) => void,
+  ): Promise<void> {
     type GroupBuffer = {
       sourcePath: string;
       kind: VectorSearchKind;
@@ -618,17 +638,19 @@ export class SemanticIndexer {
       (error) => this.onDiagnostic("semantic-ann-index-error", { message: error.message }),
       this.performanceSettings,
     );
-    this.vectorIndexBuildPromise = this.persistedVectorIndex
-      .initialize(groups)
-      .then(() => {
-        this.resolveVectorIndexReady();
-      })
-      .catch((error) => {
-        const normalized = error instanceof Error ? error : new Error(String(error));
-        this.rejectVectorIndexReady(normalized);
-        throw normalized;
-      });
-    return this.vectorIndexBuildPromise;
+    const failedIndex = this.persistedVectorIndex;
+    try {
+      await failedIndex.initialize(groups);
+      this.vectorIndexReadyState = true;
+      this.resolveVectorIndexReady();
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.persistedVectorIndex = null;
+      this.resolveVectorIndexReady();
+      this.resetVectorIndexReady();
+      await failedIndex.shutdown(1000).catch(() => undefined);
+      throw normalized;
+    }
   }
 
   async flushVectorSearch(): Promise<void> {
@@ -2024,7 +2046,11 @@ export class SemanticIndexer {
     this.vectorIndexWaiterCount += 1;
     try {
       await this.vectorIndexReady;
-      return !isCancelled();
+      return (
+        !isCancelled() &&
+        this.vectorIndexReadyState &&
+        this.persistedVectorIndex !== null
+      );
     } finally {
       this.vectorIndexWaiterCount = Math.max(
         0,
@@ -3209,6 +3235,7 @@ export class SemanticIndexer {
     file: Pick<IndexableFile, "path" | "type" | "extension"> & { isDirectory?: boolean },
     sourcePath = "",
   ) {
+    if (isPathWithin(file.path, this.indexStorageRoot)) return false;
     if (
       sourcePath &&
       isAppDataPath(
@@ -3495,6 +3522,8 @@ export class SemanticIndexer {
         recordsStats = await fsPromises.stat(this.recordsPath);
       }
       const totalBytes = recordsStats.size;
+      const journalReadProgressShare = 0.7;
+      onLoadProgress?.(0, this.latestRecords.size);
       const fileStream = fs.createReadStream(this.recordsPath);
       let lastReport = 0;
       const rl = readline.createInterface({
@@ -3506,7 +3535,10 @@ export class SemanticIndexer {
         if (onLoadProgress && totalBytes && Date.now() - lastReport > 500) {
           lastReport = Date.now();
           onLoadProgress(
-            Math.min(1, fileStream.bytesRead / totalBytes),
+            Math.min(
+              journalReadProgressShare,
+              (fileStream.bytesRead / totalBytes) * journalReadProgressShare,
+            ),
             this.latestRecords.size,
           );
         }
@@ -3541,6 +3573,9 @@ export class SemanticIndexer {
         }
       }
 
+      if (totalBytes > 0)
+        onLoadProgress?.(journalReadProgressShare, this.latestRecords.size);
+
       // Validate in place so startup does not allocate a second large Map.
       const replayedRecords = this.latestRecords;
       this.onDiagnostic("semantic-record-history-collapsed", {
@@ -3548,6 +3583,8 @@ export class SemanticIndexer {
         recordsToValidate: replayedRecords.size,
       });
       let lastValidationReport = Date.now();
+      let validatedRows = 0;
+      const recordsToValidate = replayedRecords.size;
       for (const record of replayedRecords.values()) {
         let accepted = false;
         try {
@@ -3604,16 +3641,31 @@ export class SemanticIndexer {
               highestVectorEnd,
               record.vectorOffset + VECTOR_BYTES,
             );
-          if (onLoadProgress && Date.now() - lastValidationReport > 500) {
-            lastValidationReport = Date.now();
-            onLoadProgress(1, recordCount);
-          }
         } catch {
           corruptLines += 1;
         } finally {
           if (!accepted) replayedRecords.delete(record.path);
+          validatedRows += 1;
+          if (validatedRows % 256 === 0)
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          if (
+            onLoadProgress &&
+            (Date.now() - lastValidationReport > 500 ||
+              validatedRows === recordsToValidate)
+          ) {
+            lastValidationReport = Date.now();
+            const validationFraction = recordsToValidate
+              ? validatedRows / recordsToValidate
+              : 1;
+            onLoadProgress(
+              journalReadProgressShare +
+                (1 - journalReadProgressShare) * validationFraction,
+              recordCount,
+            );
+          }
         }
       }
+      onLoadProgress?.(1, recordCount);
       cloneChecks.clear();
       offsetOwners.clear();
       console.log(`[INDEXER] Loaded ${recordCount} records:`, typeCount);

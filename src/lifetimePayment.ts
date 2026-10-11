@@ -62,6 +62,7 @@ export type LifetimePaymentStatus =
   | "pending"
   | "invalid"
   | "error"
+  | "expired"
   | "already-licensed";
 
 export interface LifetimeLicenseState {

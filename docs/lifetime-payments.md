@@ -1,5 +1,13 @@
 # Lifetime payments
 
+Each $25 lifetime purchase unlocks Silo on one computer. Every additional
+computer needs its own $25 license. Silo config export and import can transfer
+settings and selected indexes, but they exclude paid and beta licenses and the
+installation ID, so restoring a config on another computer does not unlock it.
+Existing paid licenses are bound to the first Silo installation that completes
+the relay check after this update; a payment already bound to another
+installation cannot be reused.
+
 The lifetime unlock accepts a one-time payment of 25 USDC on Solana. The
 primary flow displays a Solana Pay transfer-request QR in Silo; the customer
 scans and approves it in their wallet. Silo never receives a seed phrase or

@@ -18,36 +18,66 @@ require.extensions[".ts"] = (module, filename) => {
   }).outputText, filename);
 };
 
-const { isAppDataPath, isPathWithin, isNonLibraryPath } = require("../src/indexingPathPolicy.ts");
+const {
+  getMacDataVolumeDeviceId,
+  isAppDataPath,
+  isMacDataVolumePathExcluded,
+  isMacDataVolumeSourceRoot,
+  isPathWithin,
+  isNonLibraryPath,
+} = require("../src/indexingPathPolicy.ts");
 const { isSiloCloneDirectory, invalidateSiloCloneDirectoryCache } = require("../src/indexingPathPolicy.ts");
+const { setActiveIndexStorageRoot } = require("../src/indexingStorage.ts");
 const { AudioLibraryCache } = require("../src/audioLibraryCache.ts");
 
-async function makeMainScanner(userDataPath) {
+async function makeMainScanner(userDataPath, indexStorageRoot) {
   const source = fs.readFileSync(path.join(__dirname, "../src/main.ts"), "utf8");
   const ast = ts.createSourceFile("main.ts", source, ts.ScriptTarget.Latest, true);
   let declaration;
   let readFilesDeclaration;
+  let internalRootDeclaration;
   function visit(node) {
     if (ts.isFunctionDeclaration(node) && node.name?.text === "createUnifiedScanSource")
       declaration = node.getText(ast);
     if (ts.isFunctionDeclaration(node) && node.name?.text === "readFiles")
       readFilesDeclaration = node.getText(ast);
+    if (ts.isFunctionDeclaration(node) && node.name?.text === "isSiloInternalRoot")
+      internalRootDeclaration = node.getText(ast);
     ts.forEachChild(node, visit);
   }
   visit(ast);
   assert.ok(declaration, "production unified scanner was found");
+  assert.ok(internalRootDeclaration, "production internal-source guard was found");
   const compiled = ts.transpileModule(declaration, {
     compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
   }).outputText;
   const phoneCalls = [];
+  const directoryReads = [];
   let scannerYields = 0;
   const context = vm.createContext({
     app: { getPath: () => userDataPath },
-    fsPromises: fsp,
+    process,
+    indexStorageRoot,
+    contentSettingsStore: {
+      getSearchPerformanceSnapshot: () => ({ settings: { backgroundWorkPercent: 100 } }),
+    },
+    isRemotePath: () => false,
+    fsPromises: {
+      ...fsp,
+      readdir: async (directory, options) => {
+        directoryReads.push(path.resolve(directory));
+        return fsp.readdir(directory, options);
+      },
+    },
     path,
     isAppDataPath,
+    getMacDataVolumeDeviceId,
+    isMacDataVolumePathExcluded,
+    isMacDataVolumeSourceRoot,
     isNonLibraryPath,
+    isPathWithin,
     isSiloCloneDirectory,
+    setTimeout,
     setImmediate: (callback) => {
       scannerYields += 1;
       return setImmediate(callback);
@@ -74,7 +104,18 @@ async function makeMainScanner(userDataPath) {
     compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
   }).outputText;
   const readFiles = vm.runInContext(`(${readFilesCompiled})`, context);
-  return { scan: await create(), phoneCalls, readFiles, getScannerYields: () => scannerYields };
+  const internalRootCompiled = ts.transpileModule(internalRootDeclaration, {
+    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  const isSiloInternalRoot = vm.runInContext(`(${internalRootCompiled})`, context);
+  return {
+    scan: await create(),
+    isSiloInternalRoot,
+    phoneCalls,
+    readFiles,
+    directoryReads,
+    getScannerYields: () => scannerYields,
+  };
 }
 
 async function run() {
@@ -86,6 +127,12 @@ async function run() {
     await fsp.mkdir(path.join(root, "silo-data", "semantic-index"), { recursive: true });
     await fsp.mkdir(path.join(root, "silo-data", "phone-cache", "ios"), { recursive: true });
     await fsp.mkdir(path.join(root, "silo-data-sibling"), { recursive: true });
+    const externalIndexRoot = path.join(root, "SiloCache");
+    await fsp.mkdir(path.join(externalIndexRoot, "semantic-index", "deep"), { recursive: true });
+    await fsp.mkdir(path.join(externalIndexRoot, "unindexed-files", "deep"), { recursive: true });
+    await fsp.writeFile(path.join(externalIndexRoot, "semantic-index", "deep", "records.jsonl"), "derived records");
+    await fsp.writeFile(path.join(externalIndexRoot, "unindexed-files", "deep", "photo.jpg"), "cached source");
+    setActiveIndexStorageRoot(externalIndexRoot);
     const cloneRoot = path.join(root, "Silo Source Clone test");
     await fsp.mkdir(cloneRoot, { recursive: true });
     await fsp.writeFile(path.join(cloneRoot, ".silo-clone-in-progress.json"), JSON.stringify({ format: "silo-source-clone", version: 1 }));
@@ -109,7 +156,17 @@ async function run() {
     const canonicalRoot = await fsp.realpath(root);
     assert.equal(isAppDataPath(userData, root, canonicalRoot, userData, await fsp.realpath(userData)), true);
 
-    const { scan, phoneCalls, readFiles, getScannerYields } = await makeMainScanner(userData);
+    const {
+      scan,
+      isSiloInternalRoot,
+      phoneCalls,
+      readFiles,
+      directoryReads,
+      getScannerYields,
+    } = await makeMainScanner(userData, externalIndexRoot);
+    assert.equal(await isSiloInternalRoot(root), false, "a broad source remains indexable when the cache is nested beneath it");
+    assert.equal(await isSiloInternalRoot(externalIndexRoot), true, "the cache root itself is protected");
+    assert.equal(await isSiloInternalRoot(path.join(externalIndexRoot, "semantic-index")), true, "cache descendants are protected");
     const bulkDirectory = path.join(root, "Bulk");
     await fsp.mkdir(bulkDirectory, { recursive: true });
     await Promise.all(Array.from({ length: 270 }, (_, index) =>
@@ -128,10 +185,15 @@ async function run() {
     assert(discoveredPaths.includes(path.join(root, "Photos", "original.jpg")));
     assert(discoveredPaths.includes(path.join(root, "silo-data-sibling", "keep.jpg")));
     assert(!discoveredPaths.some((candidate) => candidate.startsWith(`${userData}${path.sep}`)), "unified scans prune all app-owned data");
+    assert(!discoveredPaths.some((candidate) => candidate.startsWith(`${externalIndexRoot}${path.sep}`)), "unified scans omit the configured index root");
+    assert(!directoryReads.includes(externalIndexRoot), "the indexing scanner does not enumerate the configured index cache");
     assert(!discoveredPaths.some((candidate) => candidate.startsWith(`${cloneRoot}${path.sep}`)), "in-progress shelter copy content is not indexed");
     assert(!discoveredPaths.includes(userData), "the protected app-data root itself is not emitted");
+    directoryReads.length = 0;
     const browsedFiles = await readFiles(root, true);
     assert(!browsedFiles.some((file) => file.path.startsWith(`${userData}${path.sep}`)), "all recursive inventory consumers skip app data");
+    assert(!browsedFiles.some((file) => file.path.startsWith(`${externalIndexRoot}${path.sep}`)), "recursive file browsing also excludes the configured index root");
+    assert(!directoryReads.includes(externalIndexRoot), "recursive browsing does not enumerate index-cache descendants");
     const appDataRootEntries = [];
     await scan(userData, (file) => appDataRootEntries.push(file.path), () => false);
     assert.deepEqual(appDataRootEntries, [], "a source rooted inside app data is completely excluded");

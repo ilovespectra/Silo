@@ -3,12 +3,15 @@ const crypto = require("crypto");
 const fs = require("fs");
 const fsPromises = require("fs/promises");
 const Module = require("module");
+const os = require("os");
 const path = require("path");
 const ts = require("typescript");
 
 const repoRoot = path.resolve(__dirname, "..");
-const workspaceRoot = path.resolve(__dirname, "../../..");
-const tempRoot = path.join(workspaceRoot, "tmp", `canonical-portable-storage-${process.pid}`);
+const tempRoot = path.join(
+  process.env.SILO_TEST_TMP_DIR || os.tmpdir(),
+  `canonical-portable-storage-${process.pid}`,
+);
 const moduleCache = new Map();
 
 function loadTypeScript(filePath) {

@@ -2,7 +2,23 @@ const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { IndexingRecovery } = require("../electron-dist/indexingRecovery");
+const Module = require("module");
+const ts = require("typescript");
+const recoveryPath = path.resolve(__dirname, "../src/indexingRecovery.ts");
+const recoveryModule = new Module(recoveryPath, module);
+recoveryModule.filename = recoveryPath;
+recoveryModule.paths = Module._nodeModulePaths(path.dirname(recoveryPath));
+recoveryModule._compile(
+  ts.transpileModule(fs.readFileSync(recoveryPath, "utf8"), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+      esModuleInterop: true,
+    },
+  }).outputText,
+  recoveryPath,
+);
+const { IndexingRecovery } = recoveryModule.exports;
 const settle = () => new Promise(setImmediate);
 async function run() {
   let time = 0,
@@ -441,6 +457,71 @@ async function run() {
   await searchAwareRecovery.tick();
   await settle();
   assert.equal(backgroundCalls, 1, "background recovery resumes after search");
+
+  let faceProgress = { status: "idle", message: "" };
+  let searchProgress = { status: "idle", message: "" };
+  let finishFaceYield;
+  let finishPrioritySearch;
+  let faceStarts = 0;
+  let prioritySearchStarts = 0;
+  const priorityOrder = [];
+  const priorityRecovery = new IndexingRecovery([
+    {
+      id: "search",
+      lane: "background",
+      progress: () => searchProgress,
+      ready: () => faceProgress.status !== "indexing",
+      start: () => {
+        prioritySearchStarts += 1;
+        priorityOrder.push("search");
+        searchProgress = { status: "indexing", message: "Search embeddings are running." };
+        return new Promise((resolve) => {
+          finishPrioritySearch = () => {
+            searchProgress = { status: "complete", message: "Search is complete." };
+            resolve();
+          };
+        });
+      },
+    },
+    {
+      id: "faces",
+      lane: "background",
+      progress: () => faceProgress,
+      ready: () => searchProgress.status !== "indexing",
+      start: () => {
+        faceStarts += 1;
+        priorityOrder.push("faces");
+        if (faceStarts === 1) {
+          faceProgress = { status: "indexing", message: "Face analysis is running." };
+          return new Promise((resolve) => {
+            finishFaceYield = () => {
+              faceProgress = { status: "paused", message: "Face indexing paused." };
+              resolve();
+            };
+          });
+        }
+        faceProgress = { status: "complete", message: "Face analysis is complete." };
+      },
+      pause: () => {
+        priorityOrder.push("pause-faces");
+        finishFaceYield();
+      },
+    },
+  ]);
+  await priorityRecovery.retry("faces");
+  await settle();
+  assert.equal(faceStarts, 1, "face indexing begins before the priority search request");
+  await priorityRecovery.requestWithPriority("search", ["faces"]);
+  await settle();
+  assert.equal(prioritySearchStarts, 1, "semantic indexing starts after the active face item yields");
+  assert.equal(faceStarts, 1, "face processing stays paused for the priority search run");
+  assert.deepEqual(priorityOrder, ["faces", "pause-faces", "search"]);
+  finishPrioritySearch();
+  for (let attempt = 0; attempt < 5 && faceStarts < 2; attempt += 1)
+    await settle();
+  assert.equal(faceStarts, 2, "face indexing resumes after semantic indexing settles");
+  assert.deepEqual(priorityOrder, ["faces", "pause-faces", "search", "faces"]);
+  priorityRecovery.stop();
 
   fs.rmSync(recoveryDirectory, { recursive: true, force: true });
   console.log(

@@ -762,13 +762,17 @@ interface Window {
       | { ok: true; purchaseId: string; claimToken: string }
       | { ok: false; error: string }
     >;
-    checkLifetimeCardPurchase(
+    beginLifetimeWalletPurchase(reference: string): Promise<
+      | { ok: true; purchaseId: string; claimToken: string }
+      | { ok: false; error: string }
+    >;
+    checkLifetimePurchase(
       purchaseId: string,
       claimToken: string,
     ): Promise<{
-      status: "pending" | "verified" | "expired" | "error";
-      signature?: string;
+      status: "pending" | "verified" | "expired" | "invalid" | "error";
       message?: string;
+      license?: import("./lifetimePayment").LifetimeLicenseState;
     }>;
     getDemoTestingMode(): Promise<{ available: boolean; enabled: boolean }>;
     setDemoTestingMode(enabled: boolean): Promise<{
@@ -789,12 +793,6 @@ interface Window {
     ): () => void;
     verifyLifetimePayment(
       signature: string,
-    ): Promise<import("./lifetimePayment").LifetimePaymentVerification>;
-    verifyLifetimeCardPayment(
-      signature: string,
-    ): Promise<import("./lifetimePayment").LifetimePaymentVerification>;
-    checkLifetimePaymentReference(
-      reference: string,
     ): Promise<import("./lifetimePayment").LifetimePaymentVerification>;
     getMemories: import("./memoryTypes").MemoriesAPI["getMemories"];
     generateMemories: import("./memoryTypes").MemoriesAPI["generateMemories"];

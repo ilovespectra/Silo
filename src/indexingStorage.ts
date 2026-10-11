@@ -585,7 +585,7 @@ export async function migrateIndexStorageRoots(
     if (currentNodes.length !== nodes.length ||
         currentNodes.some((node) => !originalKeys.has(migrationNodeKey(node))))
       throw new Error("Index storage sources changed during migration; all originals were preserved.");
-    for (const node of nodes) {
+    for (const node of stagedNodes) {
       if (node.kind !== "file") continue;
       const stats = await fsPromises.stat(node.source);
       if (stats.size !== node.size || await hashFile(node.source) !== node.hash)

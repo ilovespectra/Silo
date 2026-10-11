@@ -2,12 +2,15 @@ const assert = require("assert");
 const fs = require("fs");
 const fsPromises = require("fs/promises");
 const Module = require("module");
+const os = require("os");
 const path = require("path");
 const ts = require("typescript");
 
 const repoRoot = path.resolve(__dirname, "..");
-const workspaceRoot = path.resolve(__dirname, "../../..");
-const tempRoot = path.join(workspaceRoot, "tmp", `silo-config-restore-${process.pid}`);
+const tempRoot = path.join(
+  process.env.SILO_TEST_TMP_DIR || os.tmpdir(),
+  `silo-config-restore-${process.pid}`,
+);
 
 function loadTypeScript(filePath) {
   const resolved = `${filePath}.ts`;
@@ -44,7 +47,58 @@ function seedReadyImport(userData, entries) {
 async function main() {
   fs.rmSync(tempRoot, { recursive: true, force: true });
   fs.mkdirSync(tempRoot, { recursive: true });
-  const { applyPendingImport } = loadTypeScript(path.join(repoRoot, "src/configBundle"));
+  const {
+    applyPendingImport,
+    commitStagedImport,
+    exportConfig,
+    stageConfigImport,
+  } = loadTypeScript(path.join(repoRoot, "src/configBundle"));
+
+  const exportSourceUserData = path.join(tempRoot, "config-source-user-data");
+  const exportSourceIndex = path.join(tempRoot, "config-source-index");
+  const importTargetUserData = path.join(tempRoot, "config-target-user-data");
+  const importTargetIndex = path.join(tempRoot, "config-target-index");
+  const configArchive = path.join(tempRoot, "portable-config.tar.gz");
+  for (const root of [exportSourceUserData, exportSourceIndex, importTargetUserData, importTargetIndex])
+    fs.mkdirSync(root, { recursive: true });
+  writeFile(exportSourceUserData, "browser-state.json", '{"sources":["source"]}');
+  writeFile(exportSourceIndex, "semantic-index/records.jsonl", "source records\n");
+  writeFile(exportSourceUserData, "lifetime-license.json", "source paid license");
+  writeFile(exportSourceUserData, "beta-license.json", "source beta license");
+  writeFile(exportSourceUserData, "beta-installation-id", "source-installation-id");
+  writeFile(exportSourceUserData, "lifetime-license-rejection.json", "source rejection");
+  const destinationEntitlements = {
+    "lifetime-license.json": "destination paid license",
+    "beta-license.json": "destination beta license",
+    "beta-installation-id": "destination-installation-id",
+    "lifetime-license-rejection.json": "destination rejection",
+  };
+  for (const [relativePath, contents] of Object.entries(destinationEntitlements))
+    writeFile(importTargetUserData, relativePath, contents);
+  const exportResult = await exportConfig(
+    exportSourceUserData,
+    configArchive,
+    "test",
+    {},
+    exportSourceIndex,
+  );
+  for (const entitlement of Object.keys(destinationEntitlements))
+    assert.equal(exportResult.entries.includes(entitlement), false, `${entitlement} is excluded from config export`);
+  await stageConfigImport(importTargetUserData, configArchive);
+  await commitStagedImport(importTargetUserData);
+  assert.equal(await applyPendingImport(importTargetUserData, importTargetIndex), true);
+  for (const [relativePath, contents] of Object.entries(destinationEntitlements))
+    assert.equal(
+      fs.readFileSync(path.join(importTargetUserData, relativePath), "utf8"),
+      contents,
+      `${relativePath} remains owned by the destination computer`,
+    );
+  assert.equal(
+    fs.readFileSync(path.join(importTargetIndex, "semantic-index/records.jsonl"), "utf8"),
+    "source records\n",
+    "configuration and selected indexes transfer independently from the destination license",
+  );
+
   const userData = path.join(tempRoot, "user-data");
   const indexRoot = path.join(tempRoot, "external-index");
   const importStage = seedReadyImport(userData, {
