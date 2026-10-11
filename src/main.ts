@@ -84,6 +84,12 @@ import {
   verifyBetaActivationCode,
 } from "./betaLicense";
 import { BETA_LICENSE_PUBLIC_KEY } from "./betaLicensePublicKey";
+import { PAID_LICENSE_PUBLIC_KEY } from "./paidLicensePublicKey";
+import {
+  createDeviceBindingId,
+  isDeviceBindingId,
+  verifyPaidLicenseToken,
+} from "./paidLicense";
 import {
   getDocumentPreview,
   isDocumentPreviewFile,
@@ -354,7 +360,7 @@ async function requestRelayJson(
 
 async function requestLifetimeCardPurchase(
   endpoint: URL,
-  installationId: string,
+  deviceId: string,
   paymentMethod: "card" | "solana-pay" | "manual" = "card",
   reference?: string,
 ): Promise<{
@@ -364,7 +370,7 @@ async function requestLifetimeCardPurchase(
 }> {
   return requestRelayJson(endpoint, {
     method: "POST",
-    body: { installationId, paymentMethod, ...(reference ? { reference } : {}) },
+    body: { installationId: deviceId, paymentMethod, ...(reference ? { reference } : {}) },
     timeoutMs: 15000,
     timeoutMessage: "The payment relay request timed out.",
   });
@@ -386,6 +392,7 @@ interface PersistedDemoUsage {
 let lifetimeLicensed = false;
 let demoTestingModeEnabled = false;
 let betaInstallationIdPromise: Promise<string> | null = null;
+let deviceBindingIdPromise: Promise<string> | null = null;
 let cachedDemoUsage: PersistedDemoUsage | null = null;
 let demoUsageWriteQueue: Promise<void> = Promise.resolve();
 let demoDuplicateDeleteQueue: Promise<void> = Promise.resolve();
@@ -566,13 +573,9 @@ function requireDemoPersonTarget(
 }
 
 interface StoredLifetimeLicense {
-  version: 2;
-  network: "solana-mainnet";
-  paymentAddress: string;
-  usdcMint: string;
-  signature: string;
-  verifiedAt: number;
-  installationId: string;
+  version: 3;
+  deviceId: string;
+  licenseToken: string;
 }
 
 async function getBetaInstallationId(): Promise<string> {
@@ -602,6 +605,46 @@ async function getBetaInstallationId(): Promise<string> {
   return betaInstallationIdPromise;
 }
 
+async function getDeviceBindingId(): Promise<string> {
+  if (deviceBindingIdPromise) return deviceBindingIdPromise;
+  const pending = (async () => {
+    let machineUuid = "";
+    if (process.platform === "darwin") {
+      const { stdout } = await execFileAsync(
+        "/usr/sbin/ioreg",
+        ["-rd1", "-c", "IOPlatformExpertDevice"],
+        { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 },
+      );
+      machineUuid = /\"IOPlatformUUID\"\s*=\s*\"([A-Fa-f0-9-]+)\"/.exec(
+        stdout,
+      )?.[1] ?? "";
+    } else if (process.platform === "win32") {
+      const { stdout } = await execFileAsync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "(Get-CimInstance -ClassName Win32_ComputerSystemProduct).UUID",
+        ],
+        {
+          encoding: "utf8",
+          timeout: 8000,
+          maxBuffer: 64 * 1024,
+          windowsHide: true,
+        },
+      );
+      machineUuid = stdout.trim();
+    }
+    return createDeviceBindingId(process.platform, machineUuid);
+  })();
+  deviceBindingIdPromise = pending.catch((error) => {
+    deviceBindingIdPromise = null;
+    throw error;
+  });
+  return deviceBindingIdPromise;
+}
+
 async function writeBetaLicense(activationCode: string): Promise<void> {
   await fsPromises.mkdir(path.dirname(betaLicensePath), { recursive: true });
   const temporaryPath = `${betaLicensePath}.${process.pid}.tmp`;
@@ -617,45 +660,28 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
   try {
     const stored = JSON.parse(
       await fsPromises.readFile(lifetimeLicensePath, "utf8"),
-    ) as Omit<Partial<StoredLifetimeLicense>, "version"> & { version?: number };
-    const validReceipt =
-      stored.network === "solana-mainnet" &&
-      stored.paymentAddress === LIFETIME_PAYMENT_ADDRESS &&
-      stored.usdcMint === LIFETIME_USDC_MINT &&
-      typeof stored.signature === "string" &&
-      isSolanaTransactionSignature(stored.signature) &&
-      typeof stored.verifiedAt === "number" &&
-      Number.isFinite(stored.verifiedAt);
-    if (stored.version === 2 && validReceipt) {
-      const installationId = await getBetaInstallationId();
-      if (stored.installationId === installationId)
-        return {
-          isLicensed: true,
-          licenseType: "purchase",
-          signature: stored.signature,
-          verifiedAt: stored.verifiedAt,
-        };
-      runtimeLog("lifetime-license-installation-mismatch", {});
-    } else if (
-      stored.version === 1 &&
-      validReceipt &&
-      typeof stored.signature === "string"
+    ) as Record<string, unknown>;
+    if (
+      stored.version === 3 &&
+      isDeviceBindingId(stored.deviceId) &&
+      typeof stored.licenseToken === "string"
     ) {
-      // Existing buyers remain available offline while the relay binds their
-      // already-verified payment to this installation in the background.
-      if (
-        !(await isLegacyLicenseRejected(
-          lifetimeLicenseRejectionPath,
-          stored.signature,
-        ))
-      )
+      const deviceId = await getDeviceBindingId();
+      const payload = verifyPaidLicenseToken(
+        stored.licenseToken,
+        deviceId,
+        PAID_LICENSE_PUBLIC_KEY,
+      );
+      if (stored.deviceId === deviceId && payload)
         return {
           isLicensed: true,
           licenseType: "purchase",
-          signature: stored.signature,
-          verifiedAt: stored.verifiedAt,
+          signature: payload.paymentSignature,
+          verifiedAt: payload.verifiedAt,
         };
-      runtimeLog("legacy-lifetime-license-rejected", {});
+      runtimeLog("lifetime-license-device-or-signature-mismatch", {});
+    } else if (stored.version === 1 || stored.version === 2) {
+      runtimeLog("legacy-lifetime-license-needs-online-migration", {});
     }
   } catch {}
 
@@ -680,18 +706,20 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
 }
 
 async function writeLifetimeLicense(
-  signature: string,
-  verifiedAt: number,
-  installationId: string,
-) {
+  licenseToken: string,
+  deviceId: string,
+): Promise<void> {
+  const payload = verifyPaidLicenseToken(
+    licenseToken,
+    deviceId,
+    PAID_LICENSE_PUBLIC_KEY,
+  );
+  if (!payload)
+    throw new Error("The signed lifetime license is invalid for this computer.");
   const record: StoredLifetimeLicense = {
-    version: 2,
-    network: "solana-mainnet",
-    paymentAddress: LIFETIME_PAYMENT_ADDRESS,
-    usdcMint: LIFETIME_USDC_MINT,
-    signature,
-    verifiedAt,
-    installationId,
+    version: 3,
+    deviceId,
+    licenseToken,
   };
   await fsPromises.mkdir(path.dirname(lifetimeLicensePath), {
     recursive: true,
@@ -706,34 +734,53 @@ async function writeLifetimeLicense(
 }
 
 async function migrateLegacyLifetimeLicense(): Promise<void> {
-  let legacy: Omit<Partial<StoredLifetimeLicense>, "version"> & { version?: number };
+  let legacy: Record<string, unknown>;
   try {
     legacy = JSON.parse(
       await fsPromises.readFile(lifetimeLicensePath, "utf8"),
-    ) as Omit<Partial<StoredLifetimeLicense>, "version"> & { version?: number };
+    ) as Record<string, unknown>;
   } catch {
     return;
   }
+  const legacyVersion = legacy.version;
+  const legacySignature = legacy.signature;
+  const legacyInstallationId = legacy.installationId;
   if (
-    legacy.version !== 1 ||
+    (legacyVersion !== 1 && legacyVersion !== 2) ||
     legacy.network !== "solana-mainnet" ||
     legacy.paymentAddress !== LIFETIME_PAYMENT_ADDRESS ||
     legacy.usdcMint !== LIFETIME_USDC_MINT ||
-    typeof legacy.signature !== "string" ||
-    !isSolanaTransactionSignature(legacy.signature) ||
+    typeof legacySignature !== "string" ||
+    !isSolanaTransactionSignature(legacySignature) ||
     typeof legacy.verifiedAt !== "number" ||
-    !Number.isFinite(legacy.verifiedAt)
+    !Number.isFinite(legacy.verifiedAt) ||
+    (legacyVersion === 2 &&
+      (typeof legacyInstallationId !== "string" ||
+        !/^[a-f0-9]{32}$/.test(legacyInstallationId)))
   )
     return;
 
   try {
-    const installationId = await getBetaInstallationId();
+    if (
+      await isLegacyLicenseRejected(
+        lifetimeLicenseRejectionPath,
+        legacySignature,
+      )
+    )
+      return;
+    const deviceId = await getDeviceBindingId();
     const relayBase = new URL(lifetimePaymentRelayBaseUrl);
     const response = await requestRelayJson(
       new URL(`${relayBase.origin}/api/license/claim-legacy`),
       {
         method: "POST",
-        body: { installationId, signature: legacy.signature },
+        body: {
+          installationId: deviceId,
+          ...(typeof legacyInstallationId === "string"
+            ? { legacyInstallationId }
+            : {}),
+          signature: legacySignature,
+        },
         timeoutMs: 15000,
         timeoutMessage: "The existing license check timed out.",
       },
@@ -745,7 +792,7 @@ async function migrateLegacyLifetimeLicense(): Promise<void> {
       try {
         await persistLegacyLicenseRejection(
           lifetimeLicenseRejectionPath,
-          legacy.signature,
+          legacySignature,
         );
       } catch (error) {
         runtimeLog("legacy-lifetime-license-rejection-save-error", {
@@ -759,20 +806,25 @@ async function migrateLegacyLifetimeLicense(): Promise<void> {
     if (
       response.ok &&
       response.payload.status === "verified" &&
-      response.payload.installationId === installationId &&
-      typeof response.payload.verifiedAt === "number"
+      response.payload.installationId === deviceId &&
+      typeof response.payload.licenseToken === "string"
     ) {
-      await writeLifetimeLicense(
-        legacy.signature,
-        response.payload.verifiedAt,
-        installationId,
-      );
-      runtimeLog("legacy-lifetime-license-bound", {});
+      await writeLifetimeLicense(response.payload.licenseToken, deviceId);
+      runtimeLog("legacy-lifetime-license-bound-to-device", {});
+    } else {
+      runtimeLog("legacy-lifetime-license-migration-pending", {
+        status: response.statusCode,
+      });
     }
-  } catch {
-    // Preserve offline access for an existing local license; retry on next launch.
+  } catch (error) {
+    // Existing unsigned receipts stay on disk; paid access remains locked until
+    // the relay can convert the receipt into a signed, device-bound token.
+    runtimeLog("legacy-lifetime-license-migration-unavailable", {
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
 }
+
 // Two instances on one userData interleave index writes; the newcomer hands off and exits.
 if (!app.requestSingleInstanceLock()) app.exit(0);
 app.on("second-instance", () => {
@@ -6513,6 +6565,7 @@ app.whenReady().then(async () => {
   }
   stateStore = new StateStore(app.getPath("userData"));
   await stateStore.initialize();
+  await migrateLegacyLifetimeLicense();
   lifetimeLicensed = (await readLifetimeLicense()).isLicensed;
   demoTestingModeEnabled = lifetimeLicensed && (await readDemoTestingMode());
   app.setName(accessDisplayName());
@@ -6521,7 +6574,6 @@ app.whenReady().then(async () => {
   await contentSettingsStore.initialize();
   registerMediaProtocols();
   await createWindow();
-  if (lifetimeLicensed) void migrateLegacyLifetimeLicense();
 
   if (app.isPackaged && !isDev) void checkForAppUpdates();
   reportStartup("Loading content filters…");
@@ -10537,7 +10589,7 @@ async function createLifetimePurchase(
   paymentMethod: "card" | "solana-pay" | "manual",
   reference?: string,
 ) {
-  const installationId = await getBetaInstallationId();
+  const installationId = await getDeviceBindingId();
   const relayBase = new URL(lifetimePaymentRelayBaseUrl);
   if (relayBase.protocol !== "https:" && relayBase.hostname !== "localhost")
     throw new Error("The payment relay must use HTTPS.");
@@ -10638,7 +10690,7 @@ ipcMain.handle(
       return { status: "error" as const, message: "The purchase reference is invalid." };
 
     try {
-      const installationId = await getBetaInstallationId();
+      const installationId = await getDeviceBindingId();
       const relayBase = new URL(lifetimePaymentRelayBaseUrl);
       const response = await requestRelayJson(
         new URL(
@@ -10671,6 +10723,7 @@ ipcMain.handle(
           typeof payload.signature !== "string" ||
           !isSolanaTransactionSignature(payload.signature) ||
           payload.installationId !== installationId ||
+          typeof payload.licenseToken !== "string" ||
           typeof payload.verifiedAt !== "number" ||
           !Number.isFinite(payload.verifiedAt)
         )
@@ -10679,8 +10732,7 @@ ipcMain.handle(
             message: "The verified payment is not bound to this Silo installation.",
           };
         await writeLifetimeLicense(
-          payload.signature,
-          payload.verifiedAt,
+          payload.licenseToken,
           installationId,
         );
         enableLifetimeFeatures();
@@ -11027,7 +11079,7 @@ async function verifyAndSaveLifetimePayment(
 
   try {
     const { relayBase, payload: purchase } = await createLifetimePurchase("manual");
-    const installationId = await getBetaInstallationId();
+    const installationId = await getDeviceBindingId();
     const response = await requestRelayJson(
       new URL(
         `${relayBase.origin}/api/purchase/${encodeURIComponent(purchase.purchaseId)}`,
@@ -11049,6 +11101,7 @@ async function verifyAndSaveLifetimePayment(
         !response.ok ||
         result.installationId !== installationId ||
         result.signature !== signatureValue ||
+        typeof result.licenseToken !== "string" ||
         typeof result.verifiedAt !== "number" ||
         !Number.isFinite(result.verifiedAt)
       )
@@ -11056,7 +11109,7 @@ async function verifyAndSaveLifetimePayment(
           status: "error",
           message: "The relay did not bind this verified payment to this computer.",
         };
-      await writeLifetimeLicense(signatureValue, result.verifiedAt, installationId);
+      await writeLifetimeLicense(result.licenseToken, installationId);
       enableLifetimeFeatures();
       return {
         status: "verified",
@@ -11093,7 +11146,7 @@ async function verifyAndSaveLifetimePayment(
     return {
       status: "error",
       message:
-        "Could not reach the license relay. No license status was changed.",
+        "Silo could not verify this computer or reach the license relay. No license status was changed.",
     };
   }
 }
