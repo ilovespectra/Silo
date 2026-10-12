@@ -4,6 +4,11 @@ const base = require('./electron-builder.config.cjs');
 
 module.exports = {
   ...base,
+  files: [
+    ...(base.files || []),
+    'node_modules/sharp/**/*',
+    'node_modules/@img/sharp-win32-x64/**/*',
+  ],
   win: {
     ...base.win,
     target: [{ target: 'nsis', arch: ['x64'] }],
