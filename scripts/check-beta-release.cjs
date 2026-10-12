@@ -35,11 +35,11 @@ function containsPrivateKeyMaterial(text) {
 function assertRequiredLicenseHandlers(electronMain) {
   const requiredHandlers = [
     "get-beta-activation-info",
-    "activate-beta-license",
+    "silo://beta-activate",
     "verify-lifetime-payment",
   ];
   if (requiredHandlers.some((handler) => !electronMain.includes(handler)))
-    throw new Error("The compiled main process is missing beta or payment handlers.");
+    throw new Error("The compiled main process is missing beta activation or payment handling.");
 }
 
 function isPrivateKeyFileName(filePath) {
@@ -121,7 +121,14 @@ function checkRelease(projectRoot) {
     .map((filePath) => fs.readFileSync(filePath, "utf8"))
     .join("\n");
   if (!rendererText.includes("Beta tester access"))
-    throw new Error("The built renderer is missing the beta activation panel.");
+    throw new Error("The built renderer is missing the beta request panel.");
+  if (
+    rendererText.includes("Enter your activation code") ||
+    rendererText.includes("lifetime-beta-activation-code")
+  )
+    throw new Error("The built renderer must not expose beta-code paste activation.");
+  if (!rendererText.includes("Send beta access request"))
+    throw new Error("The built renderer is missing the beta request action.");
   if (!rendererText.includes("Scan to pay with your Solana wallet"))
     throw new Error("The built renderer is missing the Solana Pay QR panel.");
 

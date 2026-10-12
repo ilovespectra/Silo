@@ -6,12 +6,12 @@ export interface BetaActivationPayload {
     issuedAt: number;
 }
 export interface BetaActivationInfo {
-    requestCode: string;
     requestEmail: string;
     available: boolean;
 }
 export interface BetaActivationRequestPayload {
     requestCode: string;
+    installationId: string;
     appVersion: string;
     platform: string;
     createdAt: string;
@@ -28,6 +28,8 @@ export interface BetaActivationResult {
 }
 export declare function createBetaRequestCode(installationId: string): string;
 export declare function createBetaActivationRequestPayload(installationId: string, appVersion: string, platform: string, createdAt?: string): BetaActivationRequestPayload;
+export declare function createBetaActivationUrl(activationCode: string): string;
+export declare function parseBetaActivationUrl(value: string): string | null;
 export declare function parseBetaRequestCode(requestCode: string): string | null;
 export declare const BETA_ACTIVATION_REQUEST_EMAIL = "tani@kolektivkrog.si";
 export declare function createBetaActivationCode(requestCode: string, privateKeyPem: string, issuedAt?: number): string;

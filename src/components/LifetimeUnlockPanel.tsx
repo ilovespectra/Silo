@@ -17,10 +17,7 @@ import {
   encodeSolanaPayReference,
   LIFETIME_PAYMENT_ADDRESS,
 } from "../lifetimePayment";
-import type {
-  BetaActivationInfo,
-  BetaActivationResult,
-} from "../betaLicense";
+import type { BetaActivationInfo } from "../betaLicense";
 import "./LifetimeUnlockPanel.css";
 
 type PaywallAction = "bug" | "survey" | "payment";
@@ -37,6 +34,7 @@ const LIFETIME_PAYWALL_VIDEO_PLAYED_KEY = "silo.lifetimePaywallVideoPlayed";
 
 interface LifetimeUnlockPanelProps {
   license: LifetimeLicenseState;
+  directPurchase?: boolean;
   demoTestingModeActive?: boolean;
   onClose: () => void;
   onOpenBugReport: () => void;
@@ -45,6 +43,7 @@ interface LifetimeUnlockPanelProps {
 
 export default function LifetimeUnlockPanel({
   license,
+  directPurchase = false,
   demoTestingModeActive = false,
   onClose,
   onOpenBugReport,
@@ -85,19 +84,10 @@ export default function LifetimeUnlockPanel({
   const [verifying, setVerifying] = useState(false);
   const [betaActivationInfo, setBetaActivationInfo] =
     useState<BetaActivationInfo | null>(null);
-  const [betaCopyState, setBetaCopyState] = useState<
-    "idle" | "copied" | "error"
-  >("idle");
   const [betaEmailState, setBetaEmailState] = useState<
     "idle" | "sending" | "sent" | "error"
   >("idle");
   const [betaEmailNotice, setBetaEmailNotice] = useState("");
-  const [activationCode, setActivationCode] = useState("");
-  const [activationNotice, setActivationNotice] = useState("");
-  const [activationStatus, setActivationStatus] = useState<
-    BetaActivationResult["status"] | "idle"
-  >("idle");
-  const [activatingBeta, setActivatingBeta] = useState(false);
   const [hasPlayedLifetimeVideo, setHasPlayedLifetimeVideo] = useState(() => {
     try {
       return (
@@ -113,7 +103,7 @@ export default function LifetimeUnlockPanel({
     left: number;
     top: number;
   } | null>(null);
-  const [paymentOpen, setPaymentOpen] = useState(false);
+  const [paymentOpen, setPaymentOpen] = useState(directPurchase);
   const [beetleCue, setBeetleCue] = useState<BeetleCue | null>(null);
   const videoFrameRef = useRef<HTMLDivElement>(null);
 
@@ -379,16 +369,6 @@ export default function LifetimeUnlockPanel({
     }
   };
 
-  const copyBetaRequestCode = async () => {
-    if (!betaActivationInfo?.requestCode) return;
-    try {
-      await navigator.clipboard.writeText(betaActivationInfo.requestCode);
-      setBetaCopyState("copied");
-    } catch {
-      setBetaCopyState("error");
-    }
-  };
-
   const sendBetaActivationRequest = async () => {
     if (!window.electron?.submitBetaActivationRequest) {
       setBetaEmailState("error");
@@ -411,30 +391,6 @@ export default function LifetimeUnlockPanel({
     } catch {
       setBetaEmailState("error");
       setBetaEmailNotice("Silo could not send the beta request. Try again when online.");
-    }
-  };
-
-  const activateBeta = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!window.electron) {
-      setActivationStatus("error");
-      setActivationNotice("Beta activation is unavailable in this session.");
-      return;
-    }
-    setActivatingBeta(true);
-    setActivationNotice("");
-    try {
-      const result = await window.electron.activateBetaLicense(
-        activationCode.trim(),
-      );
-      setActivationStatus(result.status);
-      setActivationNotice(result.message);
-      if (result.license?.isLicensed) onVerified(result.license);
-    } catch {
-      setActivationStatus("error");
-      setActivationNotice("Silo could not check or save that beta code.");
-    } finally {
-      setActivatingBeta(false);
     }
   };
 
@@ -472,7 +428,7 @@ export default function LifetimeUnlockPanel({
       }}
     >
       <div className="lifetime-unlock-composition">
-        {!license.isLicensed && (
+        {!license.isLicensed && !directPurchase && (
           <section
             className="lifetime-unlock-video-section"
             aria-label="A thank-you message for trying Silo"
@@ -784,32 +740,16 @@ export default function LifetimeUnlockPanel({
                 <p>
                   If approved, please push Silo to its limits and try to break
                   it. Share bugs and rough edges so we can improve it. We’ll
-                  send a follow-up survey one week after activation. This
-                  installation’s request code will be emailed to{" "}
+                  send a follow-up survey one week after activation. The request
+                  email includes this installation’s ID and Silo version, so
+                  you do not need to copy or paste an ID or code. An approved
+                  activation link will activate this installation when opened.
+                  {" "}
                   {betaActivationInfo?.requestEmail ?? "the beta team"}.
                 </p>
               </div>
               {betaActivationInfo ? (
                 <>
-                  <div className="lifetime-beta-request-code">
-                    <code>{betaActivationInfo.requestCode}</code>
-                    <button
-                      type="button"
-                      onClick={() => void copyBetaRequestCode()}
-                    >
-                      {betaCopyState === "copied" ? <FiCheck /> : <FiCopy />}
-                      {betaCopyState === "copied"
-                        ? "Copied"
-                        : betaCopyState === "error"
-                          ? "Copy failed"
-                          : "Copy code"}
-                    </button>
-                  </div>
-                  {betaCopyState === "error" && (
-                    <p className="lifetime-unlock-inline-note" role="status">
-                      Clipboard access failed. Select and copy the code above.
-                    </p>
-                  )}
                   <button
                     className="lifetime-beta-email-request"
                     type="button"
@@ -828,50 +768,11 @@ export default function LifetimeUnlockPanel({
                       {betaEmailNotice}
                     </p>
                   )}
-                  {betaActivationInfo.available ? (
-                    <form
-                      className="lifetime-beta-activate"
-                      onSubmit={activateBeta}
-                    >
-                      <label htmlFor="lifetime-beta-activation-code">
-                        <strong>Enter your activation code</strong>
-                      </label>
-                      <input
-                        id="lifetime-beta-activation-code"
-                        autoComplete="off"
-                        spellCheck={false}
-                        value={activationCode}
-                        onChange={(event) => {
-                          setActivationCode(event.target.value);
-                          setActivationNotice("");
-                          setActivationStatus("idle");
-                        }}
-                        placeholder="Silo beta activation code"
-                        disabled={activatingBeta}
-                      />
-                      <button
-                        type="submit"
-                        disabled={!activationCode.trim() || activatingBeta}
-                      >
-                        {activatingBeta ? "Activating…" : "Activate lifetime access"}
-                      </button>
-                      {activationNotice && (
-                        <p
-                          className="lifetime-unlock-inline-note"
-                          data-status={activationStatus}
-                          role="status"
-                        >
-                          {activationNotice}
-                        </p>
-                      )}
-                    </form>
-                  ) : (
                   <p className="lifetime-beta-unavailable" role="status">
-                      Beta activation is not configured in this build. You can
-                      still request a grant by email, but this build cannot
-                      activate a response yet.
+                    {betaActivationInfo.available
+                      ? "An approved activation email link will activate lifetime beta access in Silo."
+                      : "This build can email a beta request, but beta activation is not configured."}
                   </p>
-                  )}
                 </>
               ) : (
                 <p className="lifetime-beta-unavailable" role="status">

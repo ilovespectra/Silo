@@ -98,6 +98,7 @@ app-update.yml
 .env.*
 !.env.example
 *.log
+/scripts/beta-license-dashboard.local.cjs
 
 # Silo app data, should a data directory ever point inside the repo
 # (FILE_BROWSER_USER_DATA_DIR); mirrors ~/Library/Application Support/file-browser-electron

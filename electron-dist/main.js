@@ -540,7 +540,23 @@ async function migrateLegacyLifetimeLicense() {
 // Two instances on one userData interleave index writes; the newcomer hands off and exits.
 if (!electron_1.app.requestSingleInstanceLock())
     electron_1.app.exit(0);
-electron_1.app.on("second-instance", () => {
+let pendingBetaActivationUrls = [];
+let handlingBetaActivationUrls = false;
+function queueBetaActivationUrl(value) {
+    if (!(0, betaLicense_1.parseBetaActivationUrl)(value))
+        return;
+    pendingBetaActivationUrls.push(value);
+    if (electron_1.app.isReady())
+        void handlePendingBetaActivationUrls();
+}
+electron_1.app.on("open-url", (event, value) => {
+    event.preventDefault();
+    queueBetaActivationUrl(value);
+});
+electron_1.app.on("second-instance", (_event, commandLine) => {
+    const betaUrl = commandLine.find((argument) => argument.toLowerCase().startsWith("silo://beta-activate"));
+    if (betaUrl)
+        queueBetaActivationUrl(betaUrl);
     if (!mainWindow || mainWindow.isDestroyed())
         return;
     if (mainWindow.isMinimized())
@@ -1010,7 +1026,6 @@ const EARLY_IPC_CHANNELS = new Set([
     "is-demo-mode",
     "get-bug-report-status",
     "get-beta-activation-info",
-    "activate-beta-license",
     "verify-lifetime-payment",
     "update-ui-state",
     "is-dev",
@@ -5451,6 +5466,11 @@ function installApplicationMenu() {
     electron_1.Menu.setApplicationMenu(electron_1.Menu.buildFromTemplate(template));
 }
 electron_1.app.whenReady().then(async () => {
+    if (electron_1.app.isPackaged)
+        electron_1.app.setAsDefaultProtocolClient("silo");
+    const startupBetaUrl = process.argv.find((argument) => argument.toLowerCase().startsWith("silo://beta-activate"));
+    if (startupBetaUrl)
+        queueBetaActivationUrl(startupBetaUrl);
     loadPendingDiagnosticReport();
     const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
     if (previousSessionWasUnclosed)
@@ -9114,7 +9134,6 @@ electron_1.ipcMain.handle("set-demo-testing-mode", async (_event, enabledValue) 
     return { available: true, enabled: enabling, restarting: true };
 });
 electron_1.ipcMain.handle("get-beta-activation-info", async () => ({
-    requestCode: (0, betaLicense_1.createBetaRequestCode)(await getBetaInstallationId()),
     requestEmail: betaLicense_1.BETA_ACTIVATION_REQUEST_EMAIL,
     available: Boolean(betaLicensePublicKey_1.BETA_LICENSE_PUBLIC_KEY.trim()),
 }));
@@ -9156,12 +9175,9 @@ electron_1.ipcMain.handle("submit-beta-activation-request", async (event) => {
         };
     }
 });
-electron_1.ipcMain.handle("activate-beta-license", async (_event, activationCodeValue) => {
+async function activateBetaLicenseCode(activationCodeValue) {
     if (typeof activationCodeValue !== "string")
-        return {
-            status: "invalid",
-            message: "Paste the beta activation code you received from Silo's developer.",
-        };
+        return { status: "invalid", message: "The Silo activation link is invalid." };
     if (!betaLicensePublicKey_1.BETA_LICENSE_PUBLIC_KEY.trim())
         return {
             status: "unavailable",
@@ -9180,14 +9196,14 @@ electron_1.ipcMain.handle("activate-beta-license", async (_event, activationCode
     if (!payload)
         return {
             status: "invalid",
-            message: "That code is invalid or belongs to a different Silo installation. Check that you copied the full code.",
+            message: "This activation link is invalid or belongs to a different Silo installation.",
         };
     try {
         await writeBetaLicense(activationCode);
         enableLifetimeFeatures();
         return {
             status: "activated",
-            message: "Your lifetime beta license is active on this installation.",
+            message: "Lifetime beta access is active on this Silo installation.",
             license: {
                 isLicensed: true,
                 licenseType: "beta",
@@ -9198,10 +9214,38 @@ electron_1.ipcMain.handle("activate-beta-license", async (_event, activationCode
     catch {
         return {
             status: "error",
-            message: "Silo could not save the beta license on this device.",
+            message: "Silo could not save lifetime beta access on this device.",
         };
     }
-});
+}
+async function handlePendingBetaActivationUrls() {
+    if (handlingBetaActivationUrls)
+        return;
+    handlingBetaActivationUrls = true;
+    try {
+        while (pendingBetaActivationUrls.length) {
+            const value = pendingBetaActivationUrls.shift();
+            const activationCode = (0, betaLicense_1.parseBetaActivationUrl)(value);
+            if (!activationCode)
+                continue;
+            const result = await activateBetaLicenseCode(activationCode);
+            runtimeLog("beta-license-activation-link", { status: result.status });
+            if (mainWindow && !mainWindow.isDestroyed())
+                void electron_1.dialog.showMessageBox(mainWindow, {
+                    type: result.status === "activated" || result.status === "already-licensed"
+                        ? "info"
+                        : "warning",
+                    title: "Silo beta access",
+                    message: result.message,
+                    buttons: ["OK"],
+                });
+        }
+    }
+    finally {
+        handlingBetaActivationUrls = false;
+    }
+}
+void handlePendingBetaActivationUrls();
 async function verifyAndSaveLifetimePayment(signatureValue) {
     if (typeof signatureValue !== "string" || !(0, lifetimePayment_1.isSolanaTransactionSignature)(signatureValue))
         return {

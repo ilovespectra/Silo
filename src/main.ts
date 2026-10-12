@@ -78,7 +78,7 @@ import {
 import {
   BETA_ACTIVATION_REQUEST_EMAIL,
   createBetaActivationRequestPayload,
-  createBetaRequestCode,
+  parseBetaActivationUrl,
   type BetaActivationInfo,
   type BetaActivationResult,
   verifyBetaActivationCode,
@@ -827,7 +827,25 @@ async function migrateLegacyLifetimeLicense(): Promise<void> {
 
 // Two instances on one userData interleave index writes; the newcomer hands off and exits.
 if (!app.requestSingleInstanceLock()) app.exit(0);
-app.on("second-instance", () => {
+let pendingBetaActivationUrls: string[] = [];
+let handlingBetaActivationUrls = false;
+
+function queueBetaActivationUrl(value: string) {
+  if (!parseBetaActivationUrl(value)) return;
+  pendingBetaActivationUrls.push(value);
+  if (app.isReady()) void handlePendingBetaActivationUrls();
+}
+
+app.on("open-url", (event, value) => {
+  event.preventDefault();
+  queueBetaActivationUrl(value);
+});
+
+app.on("second-instance", (_event, commandLine) => {
+  const betaUrl = commandLine.find((argument) =>
+    argument.toLowerCase().startsWith("silo://beta-activate"),
+  );
+  if (betaUrl) queueBetaActivationUrl(betaUrl);
   if (!mainWindow || mainWindow.isDestroyed()) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.focus();
@@ -1359,7 +1377,6 @@ const EARLY_IPC_CHANNELS = new Set([
   "is-demo-mode",
   "get-bug-report-status",
   "get-beta-activation-info",
-  "activate-beta-license",
   "verify-lifetime-payment",
   "update-ui-state",
   "is-dev",
@@ -6462,6 +6479,11 @@ function installApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  if (app.isPackaged) app.setAsDefaultProtocolClient("silo");
+  const startupBetaUrl = process.argv.find((argument) =>
+    argument.toLowerCase().startsWith("silo://beta-activate"),
+  );
+  if (startupBetaUrl) queueBetaActivationUrl(startupBetaUrl);
   loadPendingDiagnosticReport();
   const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
   if (previousSessionWasUnclosed)
@@ -10965,7 +10987,6 @@ ipcMain.handle("set-demo-testing-mode", async (_event, enabledValue: unknown) =>
 ipcMain.handle(
   "get-beta-activation-info",
   async (): Promise<BetaActivationInfo> => ({
-    requestCode: createBetaRequestCode(await getBetaInstallationId()),
     requestEmail: BETA_ACTIVATION_REQUEST_EMAIL,
     available: Boolean(BETA_LICENSE_PUBLIC_KEY.trim()),
   }),
@@ -11016,63 +11037,86 @@ ipcMain.handle(
     }
   },
 );
-ipcMain.handle(
-  "activate-beta-license",
-  async (_event, activationCodeValue: unknown): Promise<BetaActivationResult> => {
-    if (typeof activationCodeValue !== "string")
-      return {
-        status: "invalid",
-        message:
-          "Paste the beta activation code you received from Silo's developer.",
-      };
-    if (!BETA_LICENSE_PUBLIC_KEY.trim())
-      return {
-        status: "unavailable",
-        message: "Beta activation is not configured in this Silo build.",
-      };
 
-    const currentLicense = await readLifetimeLicense();
-    if (currentLicense.isLicensed)
-      return {
-        status: "already-licensed",
-        message: "Silo already has full lifetime access on this installation.",
-        license: currentLicense,
-      };
+async function activateBetaLicenseCode(
+  activationCodeValue: unknown,
+): Promise<BetaActivationResult> {
+  if (typeof activationCodeValue !== "string")
+    return { status: "invalid", message: "The Silo activation link is invalid." };
+  if (!BETA_LICENSE_PUBLIC_KEY.trim())
+    return {
+      status: "unavailable",
+      message: "Beta activation is not configured in this Silo build.",
+    };
 
-    const installationId = await getBetaInstallationId();
-    const activationCode = activationCodeValue.trim();
-    const payload = verifyBetaActivationCode(
-      activationCode,
-      BETA_LICENSE_PUBLIC_KEY,
-      installationId,
-    );
-    if (!payload)
-      return {
-        status: "invalid",
-        message:
-          "That code is invalid or belongs to a different Silo installation. Check that you copied the full code.",
-      };
+  const currentLicense = await readLifetimeLicense();
+  if (currentLicense.isLicensed)
+    return {
+      status: "already-licensed",
+      message: "Silo already has full lifetime access on this installation.",
+      license: currentLicense,
+    };
 
-    try {
-      await writeBetaLicense(activationCode);
-      enableLifetimeFeatures();
-      return {
-        status: "activated",
-        message: "Your lifetime beta license is active on this installation.",
-        license: {
-          isLicensed: true,
-          licenseType: "beta",
-          verifiedAt: payload.issuedAt,
-        },
-      };
-    } catch {
-      return {
-        status: "error",
-        message: "Silo could not save the beta license on this device.",
-      };
+  const installationId = await getBetaInstallationId();
+  const activationCode = activationCodeValue.trim();
+  const payload = verifyBetaActivationCode(
+    activationCode,
+    BETA_LICENSE_PUBLIC_KEY,
+    installationId,
+  );
+  if (!payload)
+    return {
+      status: "invalid",
+      message:
+        "This activation link is invalid or belongs to a different Silo installation.",
+    };
+
+  try {
+    await writeBetaLicense(activationCode);
+    enableLifetimeFeatures();
+    return {
+      status: "activated",
+      message: "Lifetime beta access is active on this Silo installation.",
+      license: {
+        isLicensed: true,
+        licenseType: "beta",
+        verifiedAt: payload.issuedAt,
+      },
+    };
+  } catch {
+    return {
+      status: "error",
+      message: "Silo could not save lifetime beta access on this device.",
+    };
+  }
+}
+
+async function handlePendingBetaActivationUrls() {
+  if (handlingBetaActivationUrls) return;
+  handlingBetaActivationUrls = true;
+  try {
+    while (pendingBetaActivationUrls.length) {
+      const value = pendingBetaActivationUrls.shift()!;
+      const activationCode = parseBetaActivationUrl(value);
+      if (!activationCode) continue;
+      const result = await activateBetaLicenseCode(activationCode);
+      runtimeLog("beta-license-activation-link", { status: result.status });
+      if (mainWindow && !mainWindow.isDestroyed())
+        void dialog.showMessageBox(mainWindow, {
+          type: result.status === "activated" || result.status === "already-licensed"
+            ? "info"
+            : "warning",
+          title: "Silo beta access",
+          message: result.message,
+          buttons: ["OK"],
+        });
     }
-  },
-);
+  } finally {
+    handlingBetaActivationUrls = false;
+  }
+}
+
+void handlePendingBetaActivationUrls();
 async function verifyAndSaveLifetimePayment(
   signatureValue: unknown,
 ): Promise<LifetimePaymentVerification> {

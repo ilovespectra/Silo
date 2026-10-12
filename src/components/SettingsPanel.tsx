@@ -770,6 +770,7 @@ export default function SettingsPanel({
   const [cacheDestination, setCacheDestination] = useState("");
   const [localFallbackEnabled, setLocalFallbackEnabled] = useState(true);
   const [showLifetimeUnlock, setShowLifetimeUnlock] = useState(false);
+  const [directLifetimePurchase, setDirectLifetimePurchase] = useState(false);
   const [lifetimeLicense, setLifetimeLicense] =
     useState<LifetimeLicenseState>({ isLicensed: false });
   const [demoMode, setDemoMode] = useState({
@@ -1170,6 +1171,20 @@ export default function SettingsPanel({
                     : "Enable demo mode for testing"}
                 </button>
               )}
+            </div>
+          )}
+          {!lifetimeLicense.isLicensed && (
+            <div className="settings-license-actions">
+              <button
+                className="settings-save settings-license-button"
+                onClick={() => {
+                  setDirectLifetimePurchase(true);
+                  setShowLifetimeUnlock(true);
+                }}
+                data-help="Open the one-time lifetime purchase choices directly from Settings."
+              >
+                View lifetime purchase options
+              </button>
             </div>
           )}
         </section>
@@ -1674,8 +1689,12 @@ export default function SettingsPanel({
       {showLifetimeUnlock && (
         <LifetimeUnlockPanel
           license={lifetimeLicense}
+          directPurchase={directLifetimePurchase}
           demoTestingModeActive={demoMode.enabled}
-          onClose={() => setShowLifetimeUnlock(false)}
+          onClose={() => {
+            setShowLifetimeUnlock(false);
+            setDirectLifetimePurchase(false);
+          }}
           onOpenBugReport={onOpenBugReport}
           onVerified={setLifetimeLicense}
         />

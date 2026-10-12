@@ -13,13 +13,13 @@ export interface BetaActivationPayload {
 }
 
 export interface BetaActivationInfo {
-  requestCode: string;
   requestEmail: string;
   available: boolean;
 }
 
 export interface BetaActivationRequestPayload {
   requestCode: string;
+  installationId: string;
   appVersion: string;
   platform: string;
   createdAt: string;
@@ -57,10 +57,41 @@ export function createBetaActivationRequestPayload(
     throw new Error("Invalid beta request timestamp.");
   return {
     requestCode: createBetaRequestCode(installationId),
+    installationId,
     appVersion: appVersion.slice(0, 64),
     platform: platform.slice(0, 32),
     createdAt: new Date(createdAt).toISOString(),
   };
+}
+
+export function createBetaActivationUrl(activationCode: string): string {
+  if (
+    !activationCode.startsWith(`${ACTIVATION_CODE_PREFIX}.`) ||
+    activationCode.length > 4096
+  )
+    throw new Error("Invalid Silo beta activation code.");
+  return `silo://beta-activate?code=${encodeURIComponent(activationCode)}`;
+}
+
+export function parseBetaActivationUrl(value: string): string | null {
+  if (typeof value !== "string" || value.length > 8192) return null;
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "silo:" ||
+      url.hostname !== "beta-activate" ||
+      url.pathname !== "" ||
+      url.username ||
+      url.password
+    )
+      return null;
+    const codes = url.searchParams.getAll("code");
+    if (codes.length !== 1 || !codes[0] || codes[0].length > 4096)
+      return null;
+    return codes[0];
+  } catch {
+    return null;
+  }
 }
 
 export function parseBetaRequestCode(requestCode: string): string | null {

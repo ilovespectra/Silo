@@ -782,9 +782,6 @@ interface Window {
     }>;
     getBetaActivationInfo(): Promise<import("./betaLicense").BetaActivationInfo>;
     submitBetaActivationRequest(): Promise<{ ok: boolean; error?: string }>;
-    activateBetaLicense(
-      activationCode: string,
-    ): Promise<import("./betaLicense").BetaActivationResult>;
     onDemoLimitReached(
       callback: (feature: import("./demoLimits").DemoLimitFeature) => void,
     ): () => void;

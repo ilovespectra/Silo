@@ -127,6 +127,12 @@
       "public/preload.js",
       "package.json"
     ],
+    "protocols": [
+      {
+        "name": "Silo lifetime beta activation",
+        "schemes": ["silo"]
+      }
+    ],
     "extraResources": [
       {
         "from": ".model-test-cache",

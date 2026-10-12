@@ -37,12 +37,12 @@ assert.doesNotThrow(() =>
 );
 assert.doesNotThrow(() =>
   assertRequiredLicenseHandlers(
-    '"get-beta-activation-info" "activate-beta-license" "verify-lifetime-payment"',
+    '"get-beta-activation-info" "silo://beta-activate" "verify-lifetime-payment"',
   ),
 );
 assert.throws(
-  () => assertRequiredLicenseHandlers('"get-beta-activation-info" "activate-beta-license"'),
-  /missing beta or payment handlers/,
+  () => assertRequiredLicenseHandlers('"get-beta-activation-info" "verify-lifetime-payment"'),
+  /missing beta activation or payment handling/,
 );
 
 console.log("Beta release-check tests passed.");

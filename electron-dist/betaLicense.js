@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.verifyBetaActivationCode = exports.createBetaActivationCode = exports.BETA_ACTIVATION_REQUEST_EMAIL = exports.parseBetaRequestCode = exports.createBetaActivationRequestPayload = exports.createBetaRequestCode = void 0;
+exports.verifyBetaActivationCode = exports.createBetaActivationCode = exports.BETA_ACTIVATION_REQUEST_EMAIL = exports.parseBetaRequestCode = exports.parseBetaActivationUrl = exports.createBetaActivationUrl = exports.createBetaActivationRequestPayload = exports.createBetaRequestCode = void 0;
 const crypto_1 = require("crypto");
 const REQUEST_CODE_PREFIX = "SILO-BETA-REQUEST-1";
 const ACTIVATION_CODE_PREFIX = "SILO-BETA-LIFETIME-1";
@@ -16,12 +16,41 @@ function createBetaActivationRequestPayload(installationId, appVersion, platform
         throw new Error("Invalid beta request timestamp.");
     return {
         requestCode: createBetaRequestCode(installationId),
+        installationId,
         appVersion: appVersion.slice(0, 64),
         platform: platform.slice(0, 32),
         createdAt: new Date(createdAt).toISOString(),
     };
 }
 exports.createBetaActivationRequestPayload = createBetaActivationRequestPayload;
+function createBetaActivationUrl(activationCode) {
+    if (!activationCode.startsWith(`${ACTIVATION_CODE_PREFIX}.`) ||
+        activationCode.length > 4096)
+        throw new Error("Invalid Silo beta activation code.");
+    return `silo://beta-activate?code=${encodeURIComponent(activationCode)}`;
+}
+exports.createBetaActivationUrl = createBetaActivationUrl;
+function parseBetaActivationUrl(value) {
+    if (typeof value !== "string" || value.length > 8192)
+        return null;
+    try {
+        const url = new URL(value);
+        if (url.protocol !== "silo:" ||
+            url.hostname !== "beta-activate" ||
+            url.pathname !== "" ||
+            url.username ||
+            url.password)
+            return null;
+        const codes = url.searchParams.getAll("code");
+        if (codes.length !== 1 || !codes[0] || codes[0].length > 4096)
+            return null;
+        return codes[0];
+    }
+    catch {
+        return null;
+    }
+}
+exports.parseBetaActivationUrl = parseBetaActivationUrl;
 function parseBetaRequestCode(requestCode) {
     const match = new RegExp(`^${REQUEST_CODE_PREFIX}\\.([a-f0-9]{32})$`).exec(requestCode.trim());
     return match?.[1] ?? null;

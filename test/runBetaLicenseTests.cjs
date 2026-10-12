@@ -22,7 +22,9 @@ const {
   BETA_ACTIVATION_REQUEST_EMAIL,
   createBetaActivationCode,
   createBetaActivationRequestPayload,
+  createBetaActivationUrl,
   createBetaRequestCode,
+  parseBetaActivationUrl,
   parseBetaRequestCode,
   verifyBetaActivationCode,
 } = betaModule.exports;
@@ -48,6 +50,7 @@ assert.strictEqual(parseBetaRequestCode(requestCode), installationId);
 assert.strictEqual(BETA_ACTIVATION_REQUEST_EMAIL, "tani@kolektivkrog.si");
 assert.deepStrictEqual(requestPayload, {
   requestCode,
+  installationId,
   appVersion: "2.0.0",
   platform: "darwin",
   createdAt: "2026-10-07T08:00:00.000Z",
@@ -67,6 +70,15 @@ assert.deepStrictEqual(
     installationId,
     issuedAt: 123456,
   },
+);
+const activationUrl = createBetaActivationUrl(activationCode);
+assert.strictEqual(parseBetaActivationUrl(activationUrl), activationCode);
+assert.strictEqual(parseBetaActivationUrl(`${activationUrl}&code=duplicate`), null);
+assert.strictEqual(parseBetaActivationUrl("https://example.com/?code=ignored"), null);
+assert.strictEqual(
+  verifyBetaActivationCode(requestCode, publicKey, installationId),
+  null,
+  "an emailed request code must never activate a license",
 );
 assert.strictEqual(
   verifyBetaActivationCode(activationCode, publicKey, otherInstallationId),

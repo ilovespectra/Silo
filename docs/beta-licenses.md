@@ -1,54 +1,45 @@
 # Beta lifetime licenses
 
-Beta testers can receive the same full, permanent access as a paid lifetime
-license without sending payment. The app creates a random installation ID and
-shows a request code in the lifetime-access panel. The tester sends that code
-to you; you sign it locally and return the activation code. No server or
-payment transaction is involved.
+Approved beta testers can receive full lifetime access without sending payment.
+Silo submits the installation ID, request code, app version, platform, and
+request time through the configured HTTPS request relay. The request screen
+keeps those identifiers out of the UI; the developer receives them in the
+request email.
 
-## Prepare a release
+## Signing key
 
-Run this once in the Silo checkout before building the first beta-enabled app:
-
-```sh
-npm run beta:keys
-```
-
-This creates an Ed25519 signing key outside the checkout at
-`~/.config/silo/beta-license-private.pem` with owner-only file permissions and
-writes the matching public key to `src/betaLicensePublicKey.ts`. Commit the
-public-key file and include it in every release. Never commit, upload, or ship
-the private key. Keep a secure backup of it; losing it means you cannot issue
-grants accepted by builds with that public key.
+The release signing key must stay outside the repository and app packages. The
+public key in `src/betaLicensePublicKey.ts` is committed with the app and is
+used to verify every grant. The developer dashboard checks that the private
+key matches this public key before issuing anything.
 
 ## Grant access
 
-When a tester shares their request code, run:
+The Release Dock developer checkout has a local-only interactive dashboard:
 
 ```sh
-npm run beta:grant -- 'SILO-BETA-REQUEST-1.<installation-id>'
+node scripts/beta-license-dashboard.local.cjs
 ```
 
-Copy the printed activation code back to that tester. They paste it into the
-beta-access section of the paywall. The grant is lifetime and tied to that
-Silo installation ID. They do not need to send a transaction signature or
-wallet address for beta access.
+Enter the installation ID from the request email. The dashboard prints a signed
+`silo://beta-activate?...` link to include in the reply. Opening that link in
+the requesting Silo installation verifies the Ed25519 signature and exact
+installation ID, then saves the grant locally. There is no activation-code
+paste field.
 
-Set `SILO_BETA_LICENSE_KEY_PATH` if the private key is stored in a different
-secure location. The request code and activation code are not passwords, but
-the activation code only works for the installation that requested it.
+The dashboard script is intentionally ignored by Git and is not included in
+clones. The signing key is stored separately and is not distributed with Silo.
+A copied or altered request code cannot create an activation grant.
 
-The grant is offline and has no expiry or revocation service. As with other
-local Silo state, copying the app's user-data folder can transfer its saved
-installation ID and grant together. Do not rotate the signing key for an
-existing release; a new public key would not validate earlier grants unless
-the app explicitly supports key rotation.
+The grant has no expiry or revocation service. Copying the app's user-data
+folder can transfer its saved installation ID and beta grant together. Do not
+rotate the signing key for an existing release; an app with a different public
+key cannot verify earlier grants unless it explicitly supports key rotation.
 
 ## Release checks
 
-`npm run dist` runs `npm run release:check` after building the renderer and
-Electron main process, before packaging. The check runs beta-signature tests,
-confirms the generated app contains the configured Ed25519 public key and beta
-activation UI/handlers, and scans packaged text inputs for private-key PEM
-material. It intentionally fails while the public-key module is still blank;
-do not bypass that check to ship a beta build that cannot activate grants.
+`npm run release:check` runs beta-signature tests, confirms the generated app
+contains the configured Ed25519 public key and activation-link handling,
+rejects code-paste UI in the built renderer, and scans packaged text inputs for
+private-key PEM material. The check intentionally fails while the public-key
+module is blank; do not bypass it for a beta-enabled build.

@@ -32,6 +32,7 @@ const preservedUntracked = new Set([
   'electron-dist/paidLicensePublicKey.js',
   'scripts/generate_from_silo_clip_index.py',
   'test/test_silo_clip_generator.py',
+  'scripts/beta-license-dashboard.local.cjs',
 ]);
 
 function run(command, args, options = {}) {
