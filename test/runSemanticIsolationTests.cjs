@@ -766,11 +766,15 @@ test("worker supports both transports, bounded raw decoding, and existing tokeni
       callback?.(null);
     };
     port.postMessage = (response) => responses.emit("response", response);
-    let decoderOptions, tokenizerOptions, modelOptions, rawArguments;
+    let decoderOptions, decoderResize, tokenizerOptions, modelOptions, rawArguments;
     let pixels = 100;
     const decoder = {
       metadata: async () => ({ width: pixels, height: pixels }),
       rotate() {
+        return this;
+      },
+      resize(width, height, options) {
+        decoderResize = { width, height, ...options };
         return this;
       },
       toColourspace() {
@@ -863,14 +867,20 @@ test("worker supports both transports, bounded raw decoding, and existing tokeni
       ),
       [3, 4],
     );
-    assert.equal(decoderOptions.limitInputPixels, 40_000_000);
+    assert.equal(decoderOptions.limitInputPixels, 100_000_000);
     assert.equal(decoderOptions.failOn, "warning");
+    assert.deepEqual(decoderResize, {
+      width: 2048,
+      height: 2048,
+      fit: "inside",
+      withoutEnlargement: true,
+    });
     assert.deepEqual(Array.from(rawArguments[0]), [1, 2, 3]);
     assert.deepEqual(rawArguments.slice(1), [1, 1, 3]);
-    pixels = 10_000;
+    pixels = 10_001;
     assert.match(
       (await send({ id: 4, type: "image", filePath: "/huge.jpg" })).error,
-      /40 million pixel/,
+      /100 million pixel/,
     );
     assert.equal(fakeProcess.env.OMP_NUM_THREADS, "2");
   }
@@ -1006,9 +1016,16 @@ test("Intel macOS uses local WASM sessions for compatible CLIP embeddings", asyn
     },
     RawImage: class {},
   };
-  const sharp = () => ({
-    metadata: async () => ({ width: 1, height: 1 }),
+  const sharpCalls = [];
+  const sharp = (filePath, options) => {
+    sharpCalls.push({ filePath, options, resize: null });
+    return {
+    metadata: async () => ({ width: 8000, height: 6000 }),
     rotate() {
+      return this;
+    },
+    resize(width, height, resizeOptions) {
+      sharpCalls[sharpCalls.length - 1].resize = { width, height, ...resizeOptions };
       return this;
     },
     toColourspace() {
@@ -1022,9 +1039,10 @@ test("Intel macOS uses local WASM sessions for compatible CLIP embeddings", asyn
     },
     toBuffer: async () => ({
       data: Buffer.from([1, 2, 3]),
-      info: { width: 1, height: 1, channels: 3 },
+      info: { width: 2048, height: 1536, channels: 3 },
     }),
-  });
+    };
+  };
   sharp.concurrency = (threads) => assert.equal(threads, 2);
   const fsMock = {
     existsSync: () => true,
@@ -1103,6 +1121,13 @@ test("Intel macOS uses local WASM sessions for compatible CLIP embeddings", asyn
     Array.from((await send({ id: 3, type: "image", filePath: "/test.jpg" })).values),
     [3, 4],
   );
+  assert.equal(sharpCalls[0].options.limitInputPixels, 100_000_000);
+  assert.deepEqual(sharpCalls[0].resize, {
+    width: 2048,
+    height: 2048,
+    fit: "inside",
+    withoutEnlargement: true,
+  });
   assert.equal(fakeProcess.env.OMP_NUM_THREADS, "2");
 });
 

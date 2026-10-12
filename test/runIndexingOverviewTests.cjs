@@ -75,6 +75,7 @@ const eligibleRoots = async () => [
 const semantic = {
   getProgress: () => ({ ...stats("indexing", 0, 100), indexed: 40, errors: 2 }),
   getIndexSummary: () => ({ indexed: 12040, errors: 7, total: 284651, remaining: 272604 }),
+  getRetryableErrorCount: () => 3,
   getReconciliationProgress: () => discovery,
   getSourceCoverageProgress: (roots) => {
     assert.deepEqual(roots, [
@@ -99,6 +100,7 @@ new Function(
   "audioInventoryProgress",
   "magicLibraryProgress",
   "indexRecovery",
+  "semanticRuntimeProgress",
   "listSources",
   "getIndexableRootsFromSources",
   "getAllIndexSources",
@@ -137,6 +139,7 @@ new Function(
   null,
   { analyzed: 5, total: 10, running: true },
   null,
+  { status: "complete", message: "Model ready" },
   async () => sources,
   async (items) => items
     .filter((source) => source.available && source.rootPath.trim())
@@ -155,19 +158,21 @@ async function run() {
   assert(
     overview
       .find((s) => s.id === "discovery")
-      .detail.includes("3 registered sources"),
+      .detail.includes("3 registered roots"),
   );
   assert(
     overview
       .find((s) => s.id === "discovery")
-      .detail.includes("2 eligible for indexing"),
+      .detail.includes("2 eligible"),
   );
   assert(overview.find((s) => s.id === "discovery").message.includes("Saga"));
   const search = overview.find((s) => s.id === "search");
   assert.equal(search.processed, 12040, "Search progress counts all persisted indexed records");
   assert.equal(search.total, 284651, "Search denominator is the recursive all-source total, not the current batch");
   assert.equal(search.errors, 7, "Global indexed errors are included");
+  assert.equal(search.retryable, 3, "Unindexed persisted records with missing vectors are reported as retryable");
   assert.equal(search.unit, "files");
+  assert(search.detail.includes("3 retryable unindexed records"));
   assert(search.detail.includes("recursive totals across saved and current source indexes"));
   assert.equal(overview.find((s) => s.id === "faces").status, "paused");
   assert.equal(overview.find((s) => s.id === "locations").status, "complete");
@@ -210,7 +215,7 @@ async function run() {
   assert.equal(row.processed, 15);
   assert.equal(row.total, 15);
   assert.equal(row.status, "complete");
-  assert(row.detail.includes("15 registered sources"));
+  assert(row.detail.includes("15 registered roots"));
   assert(row.detail.includes("batch: source 4 of 4 · Root 14"));
   coverage = {
     ...coverage,
@@ -225,7 +230,7 @@ async function run() {
   assert.equal(row.status, "error");
   assert.equal(row.errors, 1);
   assert(
-    row.detail.includes("9 pending") && row.detail.includes("1 unavailable"),
+    row.detail.includes("9 awaiting discovery") && row.detail.includes("1 unavailable"),
   );
   coverage = { ...coverage, errors: 0, pending: 10 };
   assert.equal(
@@ -244,7 +249,7 @@ async function run() {
   row = (await m.exports()).find((s) => s.id === "discovery");
   assert.equal(row.total, 14);
   assert.equal(row.status, "waiting");
-  assert(row.detail.includes("15 registered sources"));
+  assert(row.detail.includes("15 registered roots"));
   assert(row.detail.includes("1 disconnected / unauthorized sources excluded"));
   delete semantic.getSourceCoverageProgress;
   row = (await m.exports()).find((s) => s.id === "discovery");

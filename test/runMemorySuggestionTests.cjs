@@ -52,7 +52,7 @@ async function fixture(t, overrides = {}) {
 test("defaults, five cards, lazy covers, detached state, persistent settings and theme rotation", async t => {
   const f = await fixture(t);
   const initial = await f.manager.getState();
-  assert.deepEqual(initial.settings, { showOnLaunch: true, removeAfterDownload: false, movieDirectory: null });
+  assert.deepEqual(initial.settings, { showOnLaunch: true, movieDirectory: null });
   assert.deepEqual(initial.suggestions, []);
   const state = await f.manager.generate();
   assert.equal(state.generating, false);
@@ -177,13 +177,12 @@ test("single-flight searches, generating state, and concurrent dismiss/settings 
   const id = ready.suggestions[0].id;
   await Promise.all([
     f.manager.dismiss(id),
-    f.manager.updateSettings({ removeAfterDownload: true }),
     f.manager.updateSettings({ showOnLaunch: true }),
   ]);
   const persisted = await new MemoryManager(f.root, f.deps).getState();
   assert.equal(persisted.suggestions.length, 4);
   assert.ok(persisted.suggestions.every(card => card.id !== id));
-  assert.deepEqual(persisted.settings, { showOnLaunch: true, removeAfterDownload: true, movieDirectory: null });
+  assert.deepEqual(persisted.settings, { showOnLaunch: true, movieDirectory: null });
   assert.deepEqual((await fs.readdir(path.dirname(f.statePath))).sort(), ["state.json"]);
 });
 
@@ -355,7 +354,7 @@ test("safety revalidation fails closed during generation and before returning st
   assert.deepEqual((await f.manager.generate()).suggestions, []);
 });
 
-test("download timestamps or optional removal persist; replacing never touches original/exported files", async t => {
+test("download timestamps persist without removing cards; replacing never touches original/exported files", async t => {
   const f = await fixture(t);
   const original = path.join(f.root, "original.jpg");
   const movie = path.join(f.root, "exported.mp4");
@@ -367,10 +366,10 @@ test("download timestamps or optional removal persist; replacing never touches o
   assert.ok(marked.suggestions.find(card => card.id === id).downloadedAt > 0);
   let restarted = new MemoryManager(f.root, f.deps);
   assert.ok((await restarted.getSuggestion(id)).downloadedAt > 0);
-  await restarted.updateSettings({ removeAfterDownload: true });
-  await restarted.markDownloaded(id);
+  const saved = await restarted.markDownloaded(id);
+  assert.ok(saved.suggestions.some(card => card.id === id), "saving a movie leaves its memory card in the collection");
   restarted = new MemoryManager(f.root, f.deps);
-  assert.equal(await restarted.getSuggestion(id), undefined);
+  assert.ok((await restarted.getSuggestion(id)).downloadedAt > 0);
   await restarted.generate(true);
   assert.equal(await fs.readFile(original, "utf8"), "original-content");
   assert.equal(await fs.readFile(movie, "utf8"), "exported-content");

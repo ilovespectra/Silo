@@ -763,6 +763,8 @@ export default function SettingsPanel({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [configTransferProgress, setConfigTransferProgress] =
+    useState<ConfigTransferProgress | null>(null);
   const [pendingImport, setPendingImport] = useState<SiloConfigManifest | null>(
     null,
   );
@@ -782,6 +784,10 @@ export default function SettingsPanel({
     status: "checking",
     currentVersion: "",
   });
+
+  useEffect(() => {
+    return electronAPI?.onConfigTransferProgress?.(setConfigTransferProgress);
+  }, [electronAPI]);
 
   useEffect(() => {
     if (lifetimePromptRequest <= 0) return;
@@ -979,7 +985,8 @@ export default function SettingsPanel({
     if (!electronAPI) return;
     setBusy(true);
     setError("");
-    setNotice("Exporting config. Large libraries can take a minute…");
+    setNotice("");
+    setConfigTransferProgress(null);
     try {
       const prefs: Record<string, string> = {};
       for (let index = 0; index < localStorage.length; index += 1) {
@@ -988,14 +995,18 @@ export default function SettingsPanel({
           prefs[key] = localStorage.getItem(key) ?? "";
       }
       const result = await electronAPI.exportConfig(prefs);
-      if (result.canceled) setNotice("");
-      else if (!result.ok) throw new Error(result.error || "Export failed.");
-      else
+      if (result.canceled) {
+        setConfigTransferProgress(null);
+      } else if (!result.ok) {
+        throw new Error(result.error || "Export failed.");
+      } else {
+        setConfigTransferProgress(null);
         setNotice(
           `Config saved (${((result.size ?? 0) / 1024 / 1024).toFixed(1)} MB) to ${result.path}.`,
         );
+      }
     } catch (cause) {
-      setNotice("");
+      setConfigTransferProgress(null);
       setError(cause instanceof Error ? cause.message : "Export failed.");
     } finally {
       setBusy(false);
@@ -1006,16 +1017,20 @@ export default function SettingsPanel({
     if (!electronAPI) return;
     setBusy(true);
     setError("");
-    setNotice("Reading config…");
+    setNotice("");
+    setConfigTransferProgress(null);
     try {
       const result = await electronAPI.importConfig();
-      setNotice("");
-      if (result.canceled) return;
+      if (result.canceled) {
+        setConfigTransferProgress(null);
+        return;
+      }
       if (!result.ok || !result.manifest)
         throw new Error(result.error || "Import failed.");
+      setConfigTransferProgress(null);
       setPendingImport(result.manifest);
     } catch (cause) {
-      setNotice("");
+      setConfigTransferProgress(null);
       setError(cause instanceof Error ? cause.message : "Import failed.");
     } finally {
       setBusy(false);
@@ -1159,16 +1174,14 @@ export default function SettingsPanel({
                   ? "View beta lifetime access"
                   : "View lifetime license"}
               </button>
-              {demoMode.available && (
+              {demoMode.available && demoMode.enabled && (
                 <button
                   className="settings-secondary settings-license-button"
                   disabled={demoModeBusy}
                   onClick={() => void toggleDemoTestingMode()}
                   data-help="Restart Silo with demo limits for testing or return to full lifetime access. Your license and demo usage history are preserved."
                 >
-                  {demoMode.enabled
-                    ? "Return to full access"
-                    : "Enable demo mode for testing"}
+                  Return to full access
                 </button>
               )}
             </div>
@@ -1682,6 +1695,25 @@ export default function SettingsPanel({
           </button>
         </section>
 
+        {configTransferProgress && (
+          <div
+            className="settings-config-progress"
+            role="status"
+            aria-live="polite"
+          >
+            <span>{configTransferProgress.message}</span>
+            <div className="settings-config-progress-row">
+              <progress
+                max={100}
+                value={configTransferProgress.percent ?? undefined}
+                aria-label={configTransferProgress.message}
+              />
+              {configTransferProgress.percent !== null && (
+                <span>{configTransferProgress.percent}%</span>
+              )}
+            </div>
+          </div>
+        )}
         {error && <div className="settings-message error">{error}</div>}
         {notice && <div className="settings-message">{notice}</div>}
       </aside>

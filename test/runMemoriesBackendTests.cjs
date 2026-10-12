@@ -586,9 +586,9 @@ async function run() {
 
   await test("settings and id validation", async () => {
     const update = handler("update-memory-settings");
-    assert.deepEqual(plain(await update(null, { showOnLaunch: false, extra: 1 })), { showOnLaunch: false });
+    assert.deepEqual(plain(await update(null, { showOnLaunch: false })), { showOnLaunch: false });
     assert.deepEqual(plain(await update(null, {})), {});
-    for (const bad of [null, "x", [], { showOnLaunch: "yes" }, { removeAfterDownload: 1 }])
+    for (const bad of [null, "x", [], { showOnLaunch: "yes" }, { extra: 1 }, { removeAfterDownload: 1 }, { movieDirectory: "/tmp/movies" }])
       assert.throws(() => update(null, bad), /Invalid memory settings/);
     for (const name of ["dismiss-memory", "get-memory-soundtracks"]) {
       const fn = handler(name);

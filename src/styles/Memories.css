@@ -9,7 +9,7 @@
   font-family: inherit;
   color-scheme: inherit;
 }
-.memories-page { min-height: 100%; padding: clamp(20px, 3vw, 48px); background: radial-gradient(ellipse at 20% 0, color-mix(in srgb, var(--memories-orange) 8%, transparent), transparent 50%), var(--memories-bg); }
+.memories-page { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: clamp(20px, 3vw, 48px); background: radial-gradient(ellipse at 20% 0, color-mix(in srgb, var(--memories-orange) 8%, transparent), transparent 50%), var(--memories-bg); }
 .memories-page *, .memories-modal * { box-sizing: border-box; }
 .memories-page button, .memories-modal button, .memories-page input, .memories-modal input, .memories-page select { font: inherit; }
 .memories-page button, .memories-modal button { cursor: pointer; }

@@ -752,10 +752,14 @@ function publishDiagnosticReport(reason, message, details = {}) {
     return true;
 }
 function createIndexingDiagnosticReport(reason, progress, stalledForMs = 0) {
+    const classifiedCount = progress.indexed + progress.remaining + progress.errors;
+    const unaccountedCount = progress.total - classifiedCount;
     const reasonText = reason === "indexing-error"
         ? progress.status === "complete" && progress.errors > 0
             ? `Indexing completed with ${progress.errors.toLocaleString()} file errors.`
-            : "The indexer reported an error."
+            : progress.status === "complete" && unaccountedCount !== 0
+                ? "Indexing completed, but its progress counters did not reconcile."
+                : "The indexer reported an error."
         : `Indexing made no measurable progress for ${Math.floor(stalledForMs / 60000)} minutes.`;
     const workerEvents = indexingDiagnosticEvents.slice(-8).map((entry) => {
         const details = Object.entries(entry)
@@ -771,6 +775,9 @@ function createIndexingDiagnosticReport(reason, progress, stalledForMs = 0) {
         `System: ${process.platform} ${os.release()} (${process.arch})`,
         `Index status: ${progress.status}`,
         `Progress: ${progress.indexed} indexed, ${progress.remaining} remaining, ${progress.total} total, ${progress.errors} errors.`,
+        unaccountedCount === 0
+            ? "Counter check: indexed, remaining, and errors account for the total."
+            : `Counter check: ${Math.abs(unaccountedCount)} files are ${unaccountedCount > 0 ? "unaccounted for" : "over-counted"} across indexed, remaining, and errors.`,
         workerEvents.length
             ? `Recent semantic worker diagnostics:
 ${workerEvents.join("\n")}`
@@ -841,7 +848,8 @@ function createAppCrashDiagnosticReport(trigger, details = {}) {
 }
 function monitorIndexing(progress, now = Date.now()) {
     const active = ["scanning", "loading-model", "indexing"].includes(progress.status);
-    if (progress.status === "complete" && progress.errors > 0) {
+    const hasCounterMismatch = progress.total !== progress.indexed + progress.remaining + progress.errors;
+    if (progress.status === "complete" && (progress.errors > 0 || hasCounterMismatch)) {
         if (indexingMonitor?.status === "complete" &&
             indexingMonitor.total === progress.total &&
             indexingMonitor.indexed === progress.indexed &&
@@ -1172,6 +1180,12 @@ async function getLatestPlatformRelease() {
     if (!latest)
         return { status: "not-available", currentVersion };
     const tag = latest.release.tag_name;
+    const tagVersion = tag.replace(/^v/, "");
+    // Preview tags can include a suffix while installer filenames use the
+    // Electron app version (for example, tag v2.0.5-Testing-Preview with
+    // assets named Silo-2.0.5-...). Keep the tag for URLs, but match the
+    // package's core version for the asset and installation checks.
+    const appVersion = /^\d+\.\d+\.\d+/.exec(tagVersion)?.[0] ?? tagVersion;
     const releaseUrl = typeof latest.release.html_url === "string" &&
         latest.release.html_url.startsWith("https://github.com/ilovespectra/silo-downloads/releases/tag/")
         ? latest.release.html_url
@@ -1187,8 +1201,8 @@ async function getLatestPlatformRelease() {
     const isWindows = process.platform === "win32";
     const installerLabel = isWindows ? "EXE" : "Mac DMG";
     const expectedAssetName = isWindows
-        ? `Silo-${latest.version}-${expectedArchitecture}-Setup.exe`
-        : `Silo-${latest.version}-${expectedArchitecture}.dmg`;
+        ? `Silo-${appVersion}-${expectedArchitecture}-Setup.exe`
+        : `Silo-${appVersion}-${expectedArchitecture}.dmg`;
     const assets = Array.isArray(latest.release.assets)
         ? latest.release.assets
         : [];
@@ -1210,7 +1224,7 @@ async function getLatestPlatformRelease() {
     return {
         status: "available",
         currentVersion,
-        version: latest.version,
+        version: appVersion,
         releaseTag: tag,
         downloadUrl,
         downloadDigest,
@@ -1219,7 +1233,7 @@ async function getLatestPlatformRelease() {
         installerLabel,
         message: downloadUrl
             ? undefined
-            : `Version ${latest.version} is available, but this release has no ${expectedArchitecture} ${installerLabel} yet.`,
+            : `Version ${appVersion} is available, but this release has no ${expectedArchitecture} ${installerLabel} yet.`,
     };
 }
 async function checkForAppUpdates() {
@@ -6500,9 +6514,12 @@ electron_1.ipcMain.handle("dismiss-memory", (_event, id) => {
 electron_1.ipcMain.handle("update-memory-settings", (_event, settings) => {
     if (!settings || typeof settings !== "object" || Array.isArray(settings))
         throw new Error("Invalid memory settings.");
+    const values = settings;
+    if (Object.keys(values).some((key) => key !== "showOnLaunch" && key !== "movieDirectory"))
+        throw new Error("Invalid memory settings.");
     const update = {};
     for (const key of ["showOnLaunch"]) {
-        const value = settings[key];
+        const value = values[key];
         if (value === undefined)
             continue;
         if (typeof value !== "boolean")
@@ -6510,8 +6527,10 @@ electron_1.ipcMain.handle("update-memory-settings", (_event, settings) => {
         update[key] = value;
     }
     // Only clearing is accepted here; a folder is set through the native picker.
-    if (settings.movieDirectory === null)
+    if (values.movieDirectory === null)
         update.movieDirectory = null;
+    else if (values.movieDirectory !== undefined)
+        throw new Error("Invalid memory settings.");
     return memoryManager.updateSettings(update);
 });
 electron_1.ipcMain.handle("get-memory-soundtracks", (_event, id) => {
@@ -7365,7 +7384,7 @@ function kickMagicBackground(delay) {
         requestIndexRecoveryStages(["quality"]);
     }, delay);
 }
-electron_1.ipcMain.handle("export-config", async (_event, rendererPrefs) => {
+electron_1.ipcMain.handle("export-config", async (event, rendererPrefs) => {
     if (!mainWindow)
         return { ok: false, error: "App window is unavailable." };
     const stamp = new Date().toISOString().slice(0, 10);
@@ -7380,7 +7399,7 @@ electron_1.ipcMain.handle("export-config", async (_event, rendererPrefs) => {
         ? Object.fromEntries(Object.entries(rendererPrefs).filter(([key, value]) => key.startsWith("silo.") && typeof value === "string"))
         : {};
     try {
-        const { size } = await (0, configBundle_1.exportConfig)(electron_1.app.getPath("userData"), result.filePath, electron_1.app.getVersion(), prefs, indexStorageRoot);
+        const { size } = await (0, configBundle_1.exportConfig)(electron_1.app.getPath("userData"), result.filePath, electron_1.app.getVersion(), prefs, indexStorageRoot, (progress) => event.sender.send("config-transfer-progress", progress));
         return { ok: true, path: result.filePath, size };
     }
     catch (error) {
@@ -7390,7 +7409,7 @@ electron_1.ipcMain.handle("export-config", async (_event, rendererPrefs) => {
         };
     }
 });
-electron_1.ipcMain.handle("import-config", async () => {
+electron_1.ipcMain.handle("import-config", async (event) => {
     if (!mainWindow)
         return { ok: false, error: "App window is unavailable." };
     const result = await electron_1.dialog.showOpenDialog(mainWindow, {
@@ -7401,7 +7420,7 @@ electron_1.ipcMain.handle("import-config", async () => {
     if (result.canceled || !result.filePaths[0])
         return { ok: false, canceled: true };
     try {
-        const manifest = await (0, configBundle_1.stageConfigImport)(electron_1.app.getPath("userData"), result.filePaths[0]);
+        const manifest = await (0, configBundle_1.stageConfigImport)(electron_1.app.getPath("userData"), result.filePaths[0], (progress) => event.sender.send("config-transfer-progress", progress));
         return { ok: true, manifest };
     }
     catch (error) {
@@ -8263,7 +8282,7 @@ electron_1.ipcMain.handle("get-indexing-overview", async () => {
         ? { ...semanticIndexer.getProgress(), status: "loading-model", message: "Opening the saved search index…" }
         : semanticIndexer.getProgress();
     const globalSearch = semanticIndexer.getIndexSummary();
-    const retryableSearchErrors = semanticIndexer.getRetryableErrorCount(eligibleRoots);
+    const retryableSearchRecords = semanticIndexer.getRetryableErrorCount(eligibleRoots);
     const discovery = semanticIndexer.getReconciliationProgress();
     const currentSource = registeredSources.find((source) => source.rootPath === discovery.sourcePath);
     const batchRoot = currentSource?.label ||
@@ -8329,9 +8348,9 @@ electron_1.ipcMain.handle("get-indexing-overview", async () => {
             total: globalSearch.total,
             unit: "files",
             errors: globalSearch.errors,
-            retryable: retryableSearchErrors,
+            retryable: retryableSearchRecords,
             message: search.message,
-            detail: `${globalSearch.indexed.toLocaleString()} indexed · ${globalSearch.remaining.toLocaleString()} awaiting embeddings · ${globalSearch.errors.toLocaleString()} failed records · ${retryableSearchErrors.toLocaleString()} retryable failures with persistent retry state · recursive totals across saved and current source indexes`,
+            detail: `${globalSearch.indexed.toLocaleString()} indexed · ${globalSearch.remaining.toLocaleString()} awaiting embeddings · ${globalSearch.errors.toLocaleString()} failed records · ${retryableSearchRecords.toLocaleString()} retryable unindexed records · recursive totals across saved and current source indexes`,
         },
         {
             id: "faces",

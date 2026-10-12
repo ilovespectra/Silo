@@ -75,16 +75,31 @@ async function main() {
   };
   for (const [relativePath, contents] of Object.entries(destinationEntitlements))
     writeFile(importTargetUserData, relativePath, contents);
+  const exportProgress = [];
   const exportResult = await exportConfig(
     exportSourceUserData,
     configArchive,
     "test",
     {},
     exportSourceIndex,
+    (progress) => exportProgress.push(progress),
   );
+  assert(exportProgress.some((progress) => progress.phase === "copying"));
+  assert(exportProgress.some((progress) => progress.phase === "compressing"));
+  assert.equal(exportProgress.at(-1).phase, "complete");
+  assert.equal(exportProgress.at(-1).percent, 100);
   for (const entitlement of Object.keys(destinationEntitlements))
     assert.equal(exportResult.entries.includes(entitlement), false, `${entitlement} is excluded from config export`);
-  await stageConfigImport(importTargetUserData, configArchive);
+  const importProgress = [];
+  await stageConfigImport(
+    importTargetUserData,
+    configArchive,
+    (progress) => importProgress.push(progress),
+  );
+  assert(importProgress.some((progress) => progress.phase === "reading"));
+  assert(importProgress.some((progress) => progress.phase === "validating"));
+  assert.equal(importProgress.at(-1).phase, "complete");
+  assert.equal(importProgress.at(-1).percent, 100);
   await commitStagedImport(importTargetUserData);
   assert.equal(await applyPendingImport(importTargetUserData, importTargetIndex), true);
   for (const [relativePath, contents] of Object.entries(destinationEntitlements))

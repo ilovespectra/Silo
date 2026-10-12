@@ -23,7 +23,8 @@ interface Runtime {
 
 let runtimePromise: Promise<Runtime> | null = null;
 let taskChain = Promise.resolve();
-const MAX_INPUT_PIXELS = 40_000_000;
+const MAX_INPUT_PIXELS = 100_000_000;
+const MAX_EMBEDDING_IMAGE_EDGE = 2048;
 class RuntimeInitializationError extends Error {
   constructor(
     readonly phase: string,
@@ -282,8 +283,9 @@ async function handleRequest(request: WorkerRequest) {
       : await runtime.textModel!(inputs);
     return Array.from(output.text_embeds.data as Iterable<number>);
   }
-  // Never hand an unbounded encoded file to RawImage.read. All metadata and
-  // decoding remain in this disposable process: libvips can still crash.
+  // Decode in this disposable process with an explicit pixel ceiling, then
+  // downsample before creating a raw buffer for CLIP. Modern phone originals
+  // can exceed 40 MP while CLIP itself only consumes a small square image.
   const sharp = require("sharp") as typeof import("sharp");
   sharp.concurrency(2);
   const decoder = sharp(request.filePath!, {
@@ -297,10 +299,14 @@ async function handleRequest(request: WorkerRequest) {
     metadata.width * metadata.height > MAX_INPUT_PIXELS
   )
     throw new Error(
-      "Image exceeds the 40 million pixel decoder limit or has invalid dimensions.",
+      "Image exceeds the 100 million pixel safety limit or has invalid dimensions.",
     );
   const { data, info } = await decoder
     .rotate()
+    .resize(MAX_EMBEDDING_IMAGE_EDGE, MAX_EMBEDDING_IMAGE_EDGE, {
+      fit: "inside",
+      withoutEnlargement: true,
+    })
     .toColourspace("srgb")
     .removeAlpha()
     .raw()

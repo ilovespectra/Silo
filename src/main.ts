@@ -174,6 +174,7 @@ import {
   commitStagedImport,
   exportConfig,
   stageConfigImport,
+  type ConfigTransferProgress,
 } from "./configBundle";
 import { ContentPreferences, ContentSettingsStore } from "./contentSettings";
 import { LibraryShareServer } from "./libraryShareServer";
@@ -1066,10 +1067,14 @@ function createIndexingDiagnosticReport(
   progress: IndexProgress,
   stalledForMs = 0,
 ) {
+  const classifiedCount = progress.indexed + progress.remaining + progress.errors;
+  const unaccountedCount = progress.total - classifiedCount;
   const reasonText = reason === "indexing-error"
     ? progress.status === "complete" && progress.errors > 0
       ? `Indexing completed with ${progress.errors.toLocaleString()} file errors.`
-      : "The indexer reported an error."
+      : progress.status === "complete" && unaccountedCount !== 0
+        ? "Indexing completed, but its progress counters did not reconcile."
+        : "The indexer reported an error."
     : `Indexing made no measurable progress for ${Math.floor(stalledForMs / 60000)} minutes.`;
   const workerEvents = indexingDiagnosticEvents.slice(-8).map((entry) => {
     const details = Object.entries(entry)
@@ -1085,6 +1090,9 @@ function createIndexingDiagnosticReport(
     `System: ${process.platform} ${os.release()} (${process.arch})`,
     `Index status: ${progress.status}`,
     `Progress: ${progress.indexed} indexed, ${progress.remaining} remaining, ${progress.total} total, ${progress.errors} errors.`,
+    unaccountedCount === 0
+      ? "Counter check: indexed, remaining, and errors account for the total."
+      : `Counter check: ${Math.abs(unaccountedCount)} files are ${unaccountedCount > 0 ? "unaccounted for" : "over-counted"} across indexed, remaining, and errors.`,
     workerEvents.length
       ? `Recent semantic worker diagnostics:
 ${workerEvents.join("\n")}`
@@ -1168,7 +1176,9 @@ function createAppCrashDiagnosticReport(
 function monitorIndexing(progress: IndexProgress, now = Date.now()) {
   const active = ["scanning", "loading-model", "indexing"].includes(progress.status);
 
-  if (progress.status === "complete" && progress.errors > 0) {
+  const hasCounterMismatch =
+    progress.total !== progress.indexed + progress.remaining + progress.errors;
+  if (progress.status === "complete" && (progress.errors > 0 || hasCounterMismatch)) {
     if (
       indexingMonitor?.status === "complete" &&
       indexingMonitor.total === progress.total &&
@@ -1543,6 +1553,12 @@ async function getLatestPlatformRelease(): Promise<AppUpdateState> {
   if (!latest) return { status: "not-available", currentVersion };
 
   const tag = latest.release.tag_name as string;
+  const tagVersion = tag.replace(/^v/, "");
+  // Preview tags can include a suffix while installer filenames use the
+  // Electron app version (for example, tag v2.0.5-Testing-Preview with
+  // assets named Silo-2.0.5-...). Keep the tag for URLs, but match the
+  // package's core version for the asset and installation checks.
+  const appVersion = /^\d+\.\d+\.\d+/.exec(tagVersion)?.[0] ?? tagVersion;
   const releaseUrl =
     typeof latest.release.html_url === "string" &&
     latest.release.html_url.startsWith(
@@ -1561,8 +1577,8 @@ async function getLatestPlatformRelease(): Promise<AppUpdateState> {
   const isWindows = process.platform === "win32";
   const installerLabel = isWindows ? "EXE" : "Mac DMG";
   const expectedAssetName = isWindows
-    ? `Silo-${latest.version}-${expectedArchitecture}-Setup.exe`
-    : `Silo-${latest.version}-${expectedArchitecture}.dmg`;
+    ? `Silo-${appVersion}-${expectedArchitecture}-Setup.exe`
+    : `Silo-${appVersion}-${expectedArchitecture}.dmg`;
   const assets = Array.isArray(latest.release.assets)
     ? (latest.release.assets as GitHubReleaseAsset[])
     : [];
@@ -1589,7 +1605,7 @@ async function getLatestPlatformRelease(): Promise<AppUpdateState> {
   return {
     status: "available",
     currentVersion,
-    version: latest.version,
+    version: appVersion,
     releaseTag: tag,
     downloadUrl,
     downloadDigest,
@@ -1598,7 +1614,7 @@ async function getLatestPlatformRelease(): Promise<AppUpdateState> {
     installerLabel,
     message: downloadUrl
       ? undefined
-      : `Version ${latest.version} is available, but this release has no ${expectedArchitecture} ${installerLabel} yet.`,
+      : `Version ${appVersion} is available, but this release has no ${expectedArchitecture} ${installerLabel} yet.`,
   };
 }
 
@@ -7653,15 +7669,19 @@ ipcMain.handle("dismiss-memory", (_event, id: unknown) => {
 ipcMain.handle("update-memory-settings", (_event, settings: unknown) => {
   if (!settings || typeof settings !== "object" || Array.isArray(settings))
     throw new Error("Invalid memory settings.");
+  const values = settings as Record<string, unknown>;
+  if (Object.keys(values).some((key) => key !== "showOnLaunch" && key !== "movieDirectory"))
+    throw new Error("Invalid memory settings.");
   const update: Partial<MemorySettings> = {};
   for (const key of ["showOnLaunch"] as const) {
-    const value = (settings as Record<string, unknown>)[key];
+    const value = values[key];
     if (value === undefined) continue;
     if (typeof value !== "boolean") throw new Error("Invalid memory settings.");
     update[key] = value;
   }
   // Only clearing is accepted here; a folder is set through the native picker.
-  if ((settings as Record<string, unknown>).movieDirectory === null) update.movieDirectory = null;
+  if (values.movieDirectory === null) update.movieDirectory = null;
+  else if (values.movieDirectory !== undefined) throw new Error("Invalid memory settings.");
   return memoryManager.updateSettings(update);
 });
 ipcMain.handle("get-memory-soundtracks", (_event, id: unknown) => {
@@ -8693,7 +8713,7 @@ function kickMagicBackground(delay: number) {
   }, delay);
 }
 
-ipcMain.handle("export-config", async (_event, rendererPrefs: unknown) => {
+ipcMain.handle("export-config", async (event, rendererPrefs: unknown) => {
   if (!mainWindow) return { ok: false, error: "App window is unavailable." };
   const stamp = new Date().toISOString().slice(0, 10);
   const result = await dialog.showSaveDialog(mainWindow, {
@@ -8721,6 +8741,8 @@ ipcMain.handle("export-config", async (_event, rendererPrefs: unknown) => {
       app.getVersion(),
       prefs,
       indexStorageRoot,
+      (progress: ConfigTransferProgress) =>
+        event.sender.send("config-transfer-progress", progress),
     );
     return { ok: true, path: result.filePath, size };
   } catch (error) {
@@ -8731,7 +8753,7 @@ ipcMain.handle("export-config", async (_event, rendererPrefs: unknown) => {
   }
 });
 
-ipcMain.handle("import-config", async () => {
+ipcMain.handle("import-config", async (event) => {
   if (!mainWindow) return { ok: false, error: "App window is unavailable." };
   const result = await dialog.showOpenDialog(mainWindow, {
     title: "Import Silo config",
@@ -8744,6 +8766,8 @@ ipcMain.handle("import-config", async () => {
     const manifest = await stageConfigImport(
       app.getPath("userData"),
       result.filePaths[0],
+      (progress: ConfigTransferProgress) =>
+        event.sender.send("config-transfer-progress", progress),
     );
     return { ok: true, manifest };
   } catch (error) {
@@ -9786,7 +9810,7 @@ ipcMain.handle("get-indexing-overview", async () => {
     ? { ...semanticIndexer.getProgress(), status: "loading-model", message: "Opening the saved search index…" }
     : semanticIndexer.getProgress();
   const globalSearch = semanticIndexer.getIndexSummary();
-  const retryableSearchErrors = semanticIndexer.getRetryableErrorCount(eligibleRoots);
+  const retryableSearchRecords = semanticIndexer.getRetryableErrorCount(eligibleRoots);
   const discovery = semanticIndexer.getReconciliationProgress();
   const currentSource = registeredSources.find(
     (source) => source.rootPath === discovery.sourcePath,
@@ -9860,9 +9884,9 @@ ipcMain.handle("get-indexing-overview", async () => {
       total: globalSearch.total,
       unit: "files",
       errors: globalSearch.errors,
-      retryable: retryableSearchErrors,
+      retryable: retryableSearchRecords,
       message: search.message,
-      detail: `${globalSearch.indexed.toLocaleString()} indexed · ${globalSearch.remaining.toLocaleString()} awaiting embeddings · ${globalSearch.errors.toLocaleString()} failed records · ${retryableSearchErrors.toLocaleString()} retryable failures with persistent retry state · recursive totals across saved and current source indexes`,
+      detail: `${globalSearch.indexed.toLocaleString()} indexed · ${globalSearch.remaining.toLocaleString()} awaiting embeddings · ${globalSearch.errors.toLocaleString()} failed records · ${retryableSearchRecords.toLocaleString()} retryable unindexed records · recursive totals across saved and current source indexes`,
     },
     {
       id: "faces",

@@ -774,6 +774,14 @@ function App() {
   const [showGuidedTour, setShowGuidedTour] = useState(false);
   const [showTourExitConfirm, setShowTourExitConfirm] = useState(false);
   const [headerToolsCollapsed, setHeaderToolsCollapsed] = useState(false);
+  const [performanceNoticeHidden, setPerformanceNoticeHidden] = useState(false);
+  const [hidePerformanceNoticePermanently, setHidePerformanceNoticePermanently] = useState(() => {
+    try {
+      return localStorage.getItem("silo.hidePerformanceNotice") === "true";
+    } catch {
+      return false;
+    }
+  });
   const [showLocalHelp, setShowLocalHelp] = useState(false);
   const [tourContextStep, setTourContextStep] = useState<GuidedTourStep | null>(
     null,
@@ -4993,6 +5001,21 @@ function App() {
     waitingForSortIndicators ? "photo metadata lookup" : "",
     magicState.running ? "photo quality analysis" : "",
   ].filter(Boolean);
+
+  useEffect(() => {
+    if (intensiveJobs.length === 0) setPerformanceNoticeHidden(false);
+  }, [intensiveJobs.length]);
+
+  const dismissPerformanceNotice = (permanently: boolean) => {
+    setPerformanceNoticeHidden(true);
+    if (!permanently) return;
+    setHidePerformanceNoticePermanently(true);
+    try {
+      localStorage.setItem("silo.hidePerformanceNotice", "true");
+    } catch {
+      // The dismissal still applies for this session when storage is unavailable.
+    }
+  };
   const selectTopMagic = (count: number) => {
     const pool =
       appSection === "people" && personDetail
@@ -5150,7 +5173,7 @@ function App() {
               )}
             </div>
           )}
-          {intensiveJobs.length > 0 && (
+          {intensiveJobs.length > 0 && !performanceNoticeHidden && !hidePerformanceNoticePermanently && (
             <div className="indexing-performance-banner" role="status">
               <FiZap aria-hidden="true" />
               <span>
@@ -5158,6 +5181,24 @@ function App() {
                 Active: {intensiveJobs.join(", ")}. You can keep browsing; previews
                 load progressively.
               </span>
+              <label className="indexing-performance-dismiss-choice">
+                <input
+                  type="checkbox"
+                  onChange={(event) => {
+                    if (event.target.checked) dismissPerformanceNotice(true);
+                  }}
+                />
+                Don’t show again
+              </label>
+              <button
+                className="indexing-performance-dismiss"
+                type="button"
+                aria-label="Dismiss background processing notice"
+                title="Dismiss until background processing is idle"
+                onClick={() => dismissPerformanceNotice(false)}
+              >
+                <FiX aria-hidden="true" />
+              </button>
             </div>
           )}
           {searchError && (
@@ -5446,16 +5487,18 @@ function App() {
           ) : (
             <div className="header-primary-spacer" />
           )}
-          <button
-            className="header-tools-toggle"
-            type="button"
-            aria-expanded={!headerToolsCollapsed}
-            onClick={() => setHeaderToolsCollapsed((current) => !current)}
-            title={headerToolsCollapsed ? "Show search and toolbar controls" : "Collapse search and toolbar controls"}
-          >
-            <FiChevronDown aria-hidden="true" />
-            {headerToolsCollapsed ? "Show tools" : "Hide tools"}
-          </button>
+          {!(["duplicates", "mobile", "map"] as const).includes(appSection as "duplicates" | "mobile" | "map") && (
+            <button
+              className="header-tools-toggle"
+              type="button"
+              aria-expanded={!headerToolsCollapsed}
+              onClick={() => setHeaderToolsCollapsed((current) => !current)}
+              title={headerToolsCollapsed ? "Show search and toolbar controls" : "Collapse search and toolbar controls"}
+            >
+              <FiChevronDown aria-hidden="true" />
+              {headerToolsCollapsed ? "Show tools" : "Hide tools"}
+            </button>
+          )}
         </div>
         <div className="header-tools-row">
           <div className="header-directory" data-help="Use Back, Forward, and Parent to navigate folder history; Refresh reloads the current source view. These controls do not alter the underlying files.">
@@ -5619,17 +5662,7 @@ function App() {
                   </>
                 )}
               </>
-            ) : appSection === "people" ? (
-              <button
-                className="btn btn-primary"
-                onClick={createPerson}
-                data-tour="new-person"
-                title="SILO DATA WRITE — Create a People profile in Silo"
-                data-help="SILO DATA WRITE: Create a People profile in Silo. This does not change source photos."
-              >
-                <FiUserPlus /> New Person
-              </button>
-              ) : null}
+            ) : null}
             </div>
           </div>
         </header>
@@ -5930,7 +5963,7 @@ function App() {
               ))}
             </select>
           </div>
-          <div className="filter-section">
+          {!audioOnlySelected && <div className="filter-section">
             <h3>People</h3>
             <select
               className="type-select"
@@ -5944,8 +5977,8 @@ function App() {
               <option value="yes">With people</option>
               <option value="no">Without people</option>
             </select>
-          </div>
-          <div className="filter-section">
+          </div>}
+          {!audioOnlySelected && <div className="filter-section">
             <h3>Location</h3>
             <select
               className="type-select"
@@ -5959,7 +5992,7 @@ function App() {
               <option value="yes">Mapped</option>
               <option value="no">Unmapped</option>
             </select>
-          </div>
+          </div>}
           <div className="filter-section">
             <h3>Sort By</h3>
             <select
@@ -6677,6 +6710,15 @@ function App() {
                         .length
                     }
                   </span>
+                </button>
+                <button
+                  className="people-new-person-button"
+                  onClick={createPerson}
+                  data-tour="new-person"
+                  title="SILO DATA WRITE — Create a People profile in Silo"
+                  data-help="SILO DATA WRITE: Create a People profile in Silo. This does not change source photos."
+                >
+                  <FiUserPlus aria-hidden="true" /> New Person +
                 </button>
               </nav>
               {peopleTab === "confirmed" ? (

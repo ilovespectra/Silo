@@ -61,6 +61,9 @@ let storedAudio = {
   failedSources: [],
 };
 let offlineBackups = [];
+const pendingSemanticFullScanRoots = new Set();
+const pendingSemanticResumeRoots = new Set();
+const pendingSemanticChangedFiles = new Map();
 const semantic = {
   startWatching: async (roots) => calls.push(["watch", [...roots]]),
   stopWatching: () => {
@@ -80,6 +83,9 @@ const semantic = {
     calls.push(["files", [...roots]]);
     return roots.map(image);
   },
+  getRetryableFiles: () => new Map(),
+  getSourceCoverageErrors: () => [],
+  hasPendingIndexWork: () => false,
   getProgress: () => ({
     status: "complete",
     message: "",
@@ -95,13 +101,21 @@ const semantic = {
 const context = vm.createContext({
   console: { log() {} },
   app: { getPath: () => "/silo-app-data" },
+  indexStorageRoot: "/silo-index-data",
+  pendingSemanticFullScanAll: false,
+  pendingSemanticFullScanRoots,
+  pendingSemanticResumeRoots,
+  pendingSemanticChangedFiles,
+  recoverySearchSourcePaths: [],
   lifetimeLicensed: true,
   fullAccessEnabled: () => true,
   DEMO_LIMITS: { sources: 2 },
   applyDemoSourceLimit,
   notifyDemoLimitReached() {},
   requestSourceProcessingStages() {},
-  requestIndexRecoveryStages() {},
+  requestIndexRecoveryStages: (stages) => calls.push(["recovery", [...stages]]),
+  queueSemanticIndexWork: (request) => calls.push(["queue", request.fullScanRoots]),
+  indexStorageAvailable: true,
   indexRecovery: null,
   path,
   Set,
@@ -302,13 +316,14 @@ for (const name of [
   "buildSourceList",
   "listSources",
   "sourceIncludesSiloAppData",
-  "isSiloAppDataRoot",
+  "isSiloInternalRoot",
   "getIndexableRootsFromSources",
   "getAllIndexSources",
   "getEnabledIndexSources",
   "fileIsInEnabledSource",
   "filterForEnabledSources",
   "indexNewSources",
+  "runGeoCheck",
   "kickGeoCheck",
   "refreshSemanticSafetyIndex",
   "kickMagicBackground",
@@ -331,9 +346,9 @@ function equalRoots(actual, expected = all) {
 
 async function run() {
   const listed = await context.listSources();
-  assert.equal(await context.isSiloAppDataRoot("/silo-app-data/semantic-index"), true);
-  assert.equal(await context.isSiloAppDataRoot("/silo-app-data-sibling"), false);
-  assert.equal(await context.isSiloAppDataRoot(phone), false, "virtual phone roots are not local app-data paths");
+  assert.equal(await context.sourceIncludesSiloAppData("/silo-app-data/semantic-index"), true);
+  assert.equal(await context.sourceIncludesSiloAppData("/silo-app-data-sibling"), false);
+  assert.equal(await context.sourceIncludesSiloAppData(phone), false, "virtual phone roots are not local app-data paths");
   const originalIndexSources = state.indexSources;
   state.indexSources = [...originalIndexSources, { path: "/silo-app-data/semantic-index" }];
   equalRoots(await context.getAllIndexSources());
@@ -379,12 +394,12 @@ async function run() {
 
   await context.indexNewSources([hidden, phone, "/unconfigured"], "test");
   equalRoots(rootsFor("watch"));
-  equalRoots(rootsFor("full-scan"));
+  equalRoots(rootsFor("queue"), [hidden, phone]);
   await handler("start-indexing")();
-  equalRoots(rootsFor("reconcile"));
+  equalRoots(rootsFor("queue"), all);
   equalRoots(rootsFor("watch"));
   assert(
-    calls.some((call) => call[0] === "start" && call[1].includes(cloud)),
+    calls.some((call) => call[0] === "queue" && call[1].includes(cloud)),
     "manual indexing must enumerate ready remote roots",
   );
 
@@ -414,9 +429,10 @@ async function run() {
   context.kickMagicBackground(0);
   await timers.pop()();
   equalRoots(rootsFor("images"));
-  equalRoots(rootsFor("quality"), [image(local).path, image(hidden).path]);
+  assert(calls.some((call) => call[0] === "recovery" && call[1].includes("quality")));
+  context.indexRecovery = { retry: (stage) => calls.push(["recovery-stage", stage]) };
   await handler("scan-duplicates")();
-  equalRoots(rootsFor("duplicates"));
+  assert(calls.some((call) => call[0] === "recovery-stage" && call[1] === "duplicates"));
 
   const stages = evaluate(
     `(${constructors.get("IndexingRecovery").arguments[0].getText(ast)})`,
@@ -500,18 +516,15 @@ async function run() {
       name,
     );
   }
-  // Startup must not derive watcher/reconciliation coverage from visibility.
+  // Discovery, retries, and progress use the current all-source coverage set.
   assert(
     text.includes(
       "const sources = await getAllIndexSources();\n  if (sources.length > 0)",
     ),
   );
-  assert(
-    handlers
-      .get("get-indexing-overview")
-      .getText(ast)
-      .includes("not global coverage"),
-  );
+  const overviewCode = handlers.get("get-indexing-overview").getText(ast);
+  assert(overviewCode.includes("getRetryableErrorCount(eligibleRoots)"));
+  assert(overviewCode.includes("getSourceCoverageProgress(eligibleRoots)"));
   console.log(
     "Source coverage tests passed: unchecked roots indexed by all pipelines, all-source watchers, ready-only remote roots, independent visibility cache, filtered audio/map results, and batch-scoped discovery.",
   );

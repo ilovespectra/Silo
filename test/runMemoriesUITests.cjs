@@ -52,7 +52,7 @@ const memory = (id, count = 30) => ({
   })),
 });
 function fixture(suggestions = [memory("a")]) {
-  let state = { suggestions, settings: { showOnLaunch: true, removeAfterDownload: true }, generating: false, message: "" };
+  let state = { suggestions, settings: { showOnLaunch: true }, generating: false, message: "" };
   const calls = { reads: 0, generations: [], dismissals: [], settings: [], tracks: 0, viewIds: [], exports: [], cancels: 0, subscriptions: 0, unsubscriptions: 0 };
   let listener;
   let finish;
@@ -67,7 +67,6 @@ function fixture(suggestions = [memory("a")]) {
     ]; },
     viewMemory: async (id) => { calls.viewIds.push(id); return { ok: true, path: `/cache/${id}.mp4` }; },
     exportMemory: (options) => { calls.exports.push(options); return new Promise((resolve) => { finish = (result) => {
-      if (result.ok && state.settings.removeAfterDownload) state = { ...state, suggestions: state.suggestions.filter((item) => item.id !== options.suggestionId) };
       resolve(result);
     }; }); },
     cancelMemoryExport: async () => { calls.cancels++; finish?.({ ok: false, canceled: true }); },
@@ -186,9 +185,9 @@ async function run() {
   const selects = document.querySelectorAll("select");
   assert.equal(selects[0].options.length, 13);
   await change(selects[0], "library0");
-  assert.equal(button("Make a movie").disabled, false, "library songs need no rights checkbox");
+  assert.equal(button("Save memory").disabled, false, "library songs need no rights checkbox");
   assert.ok(document.body.textContent.includes("personal viewing only"), "personal-use notice shown for library songs");
-  await click("Make a movie"); await click("Choose location & export");
+  await click("Save memory"); await click("Choose location & save movie");
   assert.deepEqual(page.calls.exports[0], { suggestionId: "a", count: 24, duration: 60, soundtrackId: "library0", originalAudio: 0.18 });
   assert.equal(button("Close dialog").disabled, true);
   await act(async () => page.progress({ suggestionId: "unrelated", phase: "rendering", completed: 1, total: 2, message: "WRONG STORY" }));
@@ -198,14 +197,14 @@ async function run() {
   assert.equal(page.calls.subscriptions, 1, "Progress subscription is only used for export");
   await click("Cancel export"); assert.equal(page.calls.cancels, 1);
   assert.equal(document.querySelectorAll(".memories-card").length, 1);
-  await click("Choose location & export");
+  await click("Choose location & save movie");
   await act(async () => page.finish({ ok: true, path: "/saved movies/story #1.mp4" }));
   const video = document.querySelector("video");
   assert.equal(video.getAttribute("src"), "app-media://stream/%2Fsaved%20movies%2Fstory%20%231.mp4");
   assert.equal(video.autoplay, false); assert.equal(video.controls, false);
-  assert.equal(document.querySelectorAll(".memories-card").length, 0, "Successful download refreshes removed suggestions");
+  assert.equal(document.querySelectorAll(".memories-card").length, 1, "Saving a movie keeps its memory card in the collection");
   await click("Done"); assert.equal(page.calls.unsubscriptions, 1);
-  await click("Generate memories"); assert.deepEqual(page.calls.generations, [true]);
+  await click("Find new memories"); assert.deepEqual(page.calls.generations, [true]);
   await change(checkbox("Show on launch"), false);
   assert.deepEqual(page.calls.settings, [{ showOnLaunch: false }]);
   await click("Clear suggestions"); await click("Clear suggestions");
@@ -218,8 +217,8 @@ async function run() {
   assert.equal(document.querySelectorAll("select")[0].value, "original:tiny", "Placeholder follows manager ID contract");
   assert.equal(document.querySelector('input[type="range"]').value, "2");
   assert.equal(document.querySelector('input[type="range"]').disabled, true);
-  await click("Make a movie"); assert.equal(short.calls.tracks, 1);
-  await click("Choose location & export");
+  await click("Save memory"); assert.equal(short.calls.tracks, 1);
+  await click("Choose location & save movie");
   assert.equal(short.calls.exports[0].soundtrackId, "original:tiny", "Original-only export uses the API-minted ID");
   assert.equal("rightsAcknowledged" in short.calls.exports[0], false, "No rights flag is sent");
   await click("Cancel export"); await click("Done");
@@ -229,10 +228,10 @@ async function run() {
   let failTracks = true;
   flaky.api.getMemorySoundtracks = async (id) => { if (failTracks) { failTracks = false; throw new Error("Audio index busy"); } return listTracks(id); };
   await mount(React.createElement(MemoriesPage, { api: flaky.api }));
-  await click("Make a movie");
+  await click("Save memory");
   assert.equal(flaky.calls.exports.length, 0); assert.equal(document.querySelectorAll('[role="dialog"]').length, 0, "No export with placeholder ID");
   assert.match(document.querySelector('[role="alert"]').textContent, /Audio index busy/);
-  await click("Make a movie"); await click("Choose location & export");
+  await click("Save memory"); await click("Choose location & save movie");
   assert.equal(flaky.calls.exports[0].soundtrackId, "original:flaky");
   await click("Cancel export"); await click("Done"); await unmount();
   const broken = fixture(); broken.api.getMemories = async () => { throw new Error("Cache unavailable; try Refresh."); };

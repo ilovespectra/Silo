@@ -125,7 +125,7 @@ const mapPhotos = [
   { path: "/map/a.jpg", locationLabel: "Sample Location A", latitude: 0, longitude: 0 },
   { path: "/map/c.jpg", locationLabel: "Sample Location B", latitude: 0, longitude: 0 },
 ];
-assert.strictEqual(getDemoDestinationKey(mapPhotos[0]), "Sample Location A");
+assert.strictEqual(getDemoDestinationKey(mapPhotos[0]), "sample location a");
 assert.deepStrictEqual(
   selectDemoMapPhotos(mapPhotos, false, 2, 1).map((photo) => photo.path),
   ["/map/a.jpg", "/map/b.jpg"],

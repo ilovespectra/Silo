@@ -22,15 +22,20 @@ var __importStar = (this && this.__importStar) || function (mod) {
     __setModuleDefault(result, mod);
     return result;
 };
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.applyPendingImport = exports.cancelStagedImport = exports.commitStagedImport = exports.stageConfigImport = exports.exportConfig = exports.CONFIG_MANIFEST = void 0;
-const child_process_1 = require("child_process");
+const archiver_1 = __importDefault(require("archiver"));
 const crypto_1 = require("crypto");
 const fs_1 = require("fs");
 const fsPromises = __importStar(require("fs/promises"));
 const path = __importStar(require("path"));
-const util_1 = require("util");
-const execFileAsync = (0, util_1.promisify)(child_process_1.execFile);
+const stream_1 = require("stream");
+const promises_1 = require("stream/promises");
+const tarStream = __importStar(require("tar-stream"));
+const zlib_1 = require("zlib");
 const FORMAT = "silo-config";
 const FORMAT_VERSION = 1;
 exports.CONFIG_MANIFEST = "silo-config.json";
@@ -99,13 +104,71 @@ const exists = (target) => fsPromises.lstat(target).then(() => true, (error) => 
         return false;
     throw error;
 });
-async function exportConfig(userData, target, appVersion, rendererPrefs, indexStoragePath = userData) {
+async function measureTree(root) {
+    const stats = await fsPromises.lstat(root);
+    if (stats.isSymbolicLink())
+        throw new Error(`Config export refuses symbolic links: ${root}`);
+    if (stats.isFile())
+        return { bytes: stats.size, files: 1 };
+    if (!stats.isDirectory())
+        throw new Error(`Config export found an unsupported item: ${root}`);
+    let bytes = 0;
+    let files = 0;
+    for (const child of await fsPromises.readdir(root)) {
+        const size = await measureTree(path.join(root, child));
+        bytes += size.bytes;
+        files += size.files;
+    }
+    return { bytes, files };
+}
+async function copyTreeWithProgress(source, destination, onFileBytes) {
+    const stats = await fsPromises.lstat(source);
+    if (stats.isSymbolicLink())
+        throw new Error(`Config export refuses symbolic links: ${source}`);
+    if (stats.isDirectory()) {
+        await fsPromises.mkdir(destination, { recursive: true, mode: stats.mode });
+        for (const child of await fsPromises.readdir(source))
+            await copyTreeWithProgress(path.join(source, child), path.join(destination, child), onFileBytes);
+        return;
+    }
+    if (!stats.isFile())
+        throw new Error(`Config export found an unsupported item: ${source}`);
+    await fsPromises.mkdir(path.dirname(destination), { recursive: true });
+    const input = (0, fs_1.createReadStream)(source);
+    input.on("data", (chunk) => onFileBytes(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)));
+    await (0, promises_1.pipeline)(input, (0, fs_1.createWriteStream)(destination, { mode: stats.mode & 0o777 }));
+    await fsPromises.utimes(destination, stats.atime, stats.mtime).catch(() => { });
+}
+const safeReport = (reporter, progress) => {
+    try {
+        reporter?.(progress);
+    }
+    catch {
+        // A closed Settings window must not interrupt a file transfer.
+    }
+};
+async function exportConfig(userData, target, appVersion, rendererPrefs, indexStoragePath = userData, onProgress) {
+    safeReport(onProgress, {
+        operation: "export",
+        phase: "preparing",
+        percent: null,
+        message: "Checking config and index sizes…",
+    });
     const entries = [];
     for (const entry of CONFIG_ENTRIES) {
         const root = INDEX_CONFIG_ENTRIES.has(entry) ? indexStoragePath : userData;
         if (await exists(path.join(root, entry)))
             entries.push(entry);
     }
+    const entryRoots = entries.map((entry) => ({
+        entry,
+        source: path.join(INDEX_CONFIG_ENTRIES.has(entry) ? indexStoragePath : userData, entry),
+    }));
+    const sizes = [];
+    for (const item of entryRoots)
+        sizes.push(await measureTree(item.source));
+    const totalBytes = sizes.reduce((sum, item) => sum + item.bytes, 0);
+    const totalFiles = sizes.reduce((sum, item) => sum + item.files, 0);
     const manifest = {
         format: FORMAT,
         version: FORMAT_VERSION,
@@ -115,26 +178,68 @@ async function exportConfig(userData, target, appVersion, rendererPrefs, indexSt
         rendererPrefs,
     };
     const temporary = await fsPromises.mkdtemp(path.join(indexStoragePath, ".silo-config-export-"));
-    const listPath = path.join(temporary, "files.txt");
+    let copiedBytes = 0;
+    let lastCopyUpdate = 0;
     try {
-        for (const entry of entries) {
-            const root = INDEX_CONFIG_ENTRIES.has(entry) ? indexStoragePath : userData;
-            const stagedPath = path.join(temporary, entry);
-            await fsPromises.mkdir(path.dirname(stagedPath), { recursive: true });
-            await fsPromises.cp(path.join(root, entry), stagedPath, {
-                recursive: true,
-                errorOnExist: true,
-                force: false,
+        safeReport(onProgress, {
+            operation: "export",
+            phase: "copying",
+            percent: 5,
+            message: `Preparing ${totalFiles.toLocaleString()} files for backup…`,
+        });
+        for (const { entry, source } of entryRoots) {
+            await copyTreeWithProgress(source, path.join(temporary, entry), (bytes) => {
+                copiedBytes += bytes;
+                const now = Date.now();
+                if (now - lastCopyUpdate < 120 && copiedBytes < totalBytes)
+                    return;
+                lastCopyUpdate = now;
+                const ratio = totalBytes > 0 ? copiedBytes / totalBytes : 1;
+                safeReport(onProgress, {
+                    operation: "export",
+                    phase: "copying",
+                    percent: Math.min(64, 5 + Math.floor(ratio * 59)),
+                    message: `Copying config and indexes (${Math.min(copiedBytes, totalBytes).toLocaleString()} of ${totalBytes.toLocaleString()} bytes)…`,
+                });
             });
         }
         await fsPromises.writeFile(path.join(temporary, exports.CONFIG_MANIFEST), JSON.stringify(manifest, null, 2));
-        await fsPromises.writeFile(listPath, [exports.CONFIG_MANIFEST, ...entries].join("\n"));
-        await execFileAsync("tar", ["-czf", target, "-C", temporary, "-T", listPath], { maxBuffer: 16 * 1024 * 1024 });
+        safeReport(onProgress, {
+            operation: "export",
+            phase: "compressing",
+            percent: 65,
+            message: "Compressing the config backup…",
+        });
+        const archive = (0, archiver_1.default)("tar", { gzip: true, gzipOptions: { level: 6 } });
+        archive.on("warning", (error) => archive.destroy(error));
+        archive.on("progress", (progress) => {
+            const ratio = progress.fs.totalBytes > 0
+                ? progress.fs.processedBytes / progress.fs.totalBytes
+                : progress.entries.total > 0
+                    ? progress.entries.processed / progress.entries.total
+                    : 0;
+            safeReport(onProgress, {
+                operation: "export",
+                phase: "compressing",
+                percent: Math.min(94, 65 + Math.floor(Math.min(1, ratio) * 29)),
+                message: `Compressing backup (${Math.min(100, Math.floor(ratio * 100))}%)…`,
+            });
+        });
+        const output = (0, fs_1.createWriteStream)(target);
+        const archiveDone = (0, promises_1.pipeline)(archive, output);
+        archive.directory(temporary, false);
+        await Promise.all([archive.finalize(), archiveDone]);
     }
     finally {
         await fsPromises.rm(temporary, { recursive: true, force: true });
     }
     const { size } = await fsPromises.stat(target);
+    safeReport(onProgress, {
+        operation: "export",
+        phase: "complete",
+        percent: 100,
+        message: "Config backup is ready.",
+    });
     return { size, entries };
 }
 exports.exportConfig = exportConfig;
@@ -153,15 +258,96 @@ async function assertSafeTree(root, relative = "") {
     }
 }
 /** Unpacks and validates a config into a staging folder; nothing in use is touched until restart. */
-async function stageConfigImport(userData, archive) {
+async function stageConfigImport(userData, archive, onProgress) {
     const staging = path.join(userData, STAGING);
     await fsPromises.rm(staging, { recursive: true, force: true });
     await fsPromises.rm(path.join(userData, READY_MARKER), { force: true });
     await fsPromises.mkdir(staging, { recursive: true });
     try {
-        // bsdtar refuses absolute paths and ".." entries by default; the tree is still checked below.
-        await execFileAsync("tar", ["-xzf", archive, "-C", staging], {
-            maxBuffer: 16 * 1024 * 1024,
+        const archiveStats = await fsPromises.stat(archive);
+        if (archiveStats.size < 2)
+            throw new Error("The selected config file is empty.");
+        const firstBytes = Buffer.alloc(2);
+        const handle = await fsPromises.open(archive, "r");
+        try {
+            await handle.read(firstBytes, 0, 2, 0);
+        }
+        finally {
+            await handle.close();
+        }
+        if (firstBytes[0] !== 0x1f || firstBytes[1] !== 0x8b)
+            throw new Error("This file is not a supported Silo config backup.");
+        safeReport(onProgress, {
+            operation: "import",
+            phase: "reading",
+            percent: 3,
+            message: "Reading the config backup…",
+        });
+        const extractor = tarStream.extract();
+        const gunzip = (0, zlib_1.createGunzip)();
+        let compressedBytes = 0;
+        let lastReadUpdate = 0;
+        const counter = new stream_1.Transform({
+            transform(chunk, _encoding, callback) {
+                compressedBytes += chunk.length;
+                const now = Date.now();
+                if (now - lastReadUpdate >= 120 || compressedBytes >= archiveStats.size) {
+                    lastReadUpdate = now;
+                    const ratio = Math.min(1, compressedBytes / archiveStats.size);
+                    safeReport(onProgress, {
+                        operation: "import",
+                        phase: "reading",
+                        percent: Math.min(67, 3 + Math.floor(ratio * 64)),
+                        message: `Reading backup data (${Math.floor(ratio * 100)}%)…`,
+                    });
+                }
+                callback(null, chunk);
+            },
+        });
+        const extraction = new Promise((resolve, reject) => {
+            const fail = (error) => reject(error);
+            extractor.once("error", fail);
+            gunzip.once("error", fail);
+            counter.once("error", fail);
+            extractor.once("finish", resolve);
+            extractor.on("entry", (header, stream, next) => {
+                void (async () => {
+                    const name = header.name.replace(/\\/g, "/");
+                    const nameWithoutTrailingSlash = name.replace(/\/$/, "");
+                    const normalized = path.posix.normalize(nameWithoutTrailingSlash);
+                    const segments = normalized.split("/");
+                    if (!name ||
+                        name.startsWith("/") ||
+                        normalized === "." ||
+                        normalized !== nameWithoutTrailingSlash ||
+                        segments.some((segment) => segment === ".." || segment === "") ||
+                        !ALLOWED_ROOTS.has(segments[0]))
+                        throw new Error(`Unexpected item in config: ${header.name}`);
+                    if (header.type === "directory") {
+                        await fsPromises.mkdir(path.join(staging, ...segments), { recursive: true });
+                        stream.resume();
+                        stream.once("end", () => next());
+                        return;
+                    }
+                    if (header.type !== "file")
+                        throw new Error(`Config contains an unsupported item: ${header.name}`);
+                    const destination = path.join(staging, ...segments);
+                    await fsPromises.mkdir(path.dirname(destination), { recursive: true });
+                    const output = (0, fs_1.createWriteStream)(destination, { mode: header.mode & 0o777 });
+                    stream.once("error", (error) => output.destroy(error));
+                    output.once("error", (error) => stream.destroy(error));
+                    output.once("finish", () => next());
+                    stream.pipe(output);
+                })().catch((error) => next(error));
+            });
+            (0, fs_1.createReadStream)(archive).pipe(counter).pipe(gunzip).pipe(extractor);
+        });
+        await extraction;
+        safeReport(onProgress, {
+            operation: "import",
+            phase: "validating",
+            percent: null,
+            message: "Checking backup contents and compatibility…",
         });
         await assertSafeTree(staging);
         const manifest = JSON.parse(await fsPromises.readFile(path.join(staging, exports.CONFIG_MANIFEST), "utf8"));
@@ -169,10 +355,17 @@ async function stageConfigImport(userData, archive) {
             throw new Error("This file is not a Silo config.");
         if (manifest.version > FORMAT_VERSION)
             throw new Error("This config was made by a newer version of Silo. Update Silo and try again.");
-        return {
+        const filteredManifest = {
             ...manifest,
             rendererPrefs: Object.fromEntries(Object.entries(manifest.rendererPrefs ?? {}).filter(([key, value]) => key.startsWith("silo.") && typeof value === "string")),
         };
+        safeReport(onProgress, {
+            operation: "import",
+            phase: "complete",
+            percent: 100,
+            message: "Backup checked. Review its contents before restoring.",
+        });
+        return filteredManifest;
     }
     catch (error) {
         await fsPromises.rm(staging, { recursive: true, force: true });

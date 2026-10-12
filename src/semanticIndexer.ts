@@ -3294,9 +3294,16 @@ export class SemanticIndexer {
 
   private shouldRetryFailure(record: IndexRecord): boolean {
     const failure = this.workerFailures.get(record.path);
-    if (failure?.signature === record.signature && failure.attempts >= 3)
+    if (
+      record.error &&
+      failure?.signature === record.signature &&
+      failure.attempts >= 3
+    )
       return false;
-    return Boolean(record.error);
+    // A persisted record without a vector is either a saved failure or an
+    // interrupted/incomplete entry. Retry incomplete entries even if crash
+    // recovery state is present; only a recorded, capped failure stays parked.
+    return record.vectorOffset < 0;
   }
 
   private signature(file: IndexableFile) {

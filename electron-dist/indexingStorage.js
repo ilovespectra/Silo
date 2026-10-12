@@ -79,13 +79,22 @@ function setIndexStorageExclusionRoots(storageRoots) {
     canonicalIndexStorageExclusionRoots = null;
 }
 exports.setIndexStorageExclusionRoots = setIndexStorageExclusionRoots;
+function storagePathAliases(storageRoot) {
+    const canonical = canonicalizeStoragePath(storageRoot);
+    const aliases = [storageRoot, canonical];
+    // macOS resolves temporary and system paths through /private. Indexed
+    // candidates can still carry the user-visible /var spelling, so retain
+    // that lexical alias alongside the real path when excluding app data.
+    if (process.platform === "darwin" &&
+        /^\/private\/(?:var|tmp|etc)(?:\/|$)/.test(canonical)) {
+        aliases.push(canonical.slice("/private".length));
+    }
+    return aliases;
+}
 function getIndexStorageExclusionRoots() {
     if (canonicalIndexStorageExclusionRoots)
         return canonicalIndexStorageExclusionRoots;
-    canonicalIndexStorageExclusionRoots = Array.from(new Set(indexStorageExclusionRoots.flatMap((storageRoot) => [
-        storageRoot,
-        canonicalizeStoragePath(storageRoot),
-    ])));
+    canonicalIndexStorageExclusionRoots = Array.from(new Set(indexStorageExclusionRoots.flatMap(storagePathAliases)));
     return canonicalIndexStorageExclusionRoots;
 }
 exports.getIndexStorageExclusionRoots = getIndexStorageExclusionRoots;

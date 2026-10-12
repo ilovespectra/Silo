@@ -695,6 +695,19 @@ interface PetCluster {
   selectedCoverPhotoPath?: string | null; // User-selected PFP, prioritized first
 }
 
+interface ConfigTransferProgress {
+  operation: "export" | "import";
+  phase:
+    | "preparing"
+    | "copying"
+    | "compressing"
+    | "reading"
+    | "validating"
+    | "complete";
+  percent: number | null;
+  message: string;
+}
+
 interface SiloConfigManifest {
   format: string;
   version: number;
@@ -1118,6 +1131,9 @@ interface Window {
       error?: string;
       manifest?: SiloConfigManifest;
     }>;
+    onConfigTransferProgress(
+      callback: (progress: ConfigTransferProgress) => void,
+    ): () => void;
     applyConfigImport(): Promise<void>;
     cancelConfigImport(): Promise<void>;
     getPersonSuggestionFiles(personId: string): Promise<FileInfo[]>;

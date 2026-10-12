@@ -316,6 +316,11 @@ contextBridge.exposeInMainWorld("electron", {
   exportConfig: (rendererPrefs) =>
     ipcRenderer.invoke("export-config", rendererPrefs),
   importConfig: () => ipcRenderer.invoke("import-config"),
+  onConfigTransferProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("config-transfer-progress", listener);
+    return () => ipcRenderer.removeListener("config-transfer-progress", listener);
+  },
   applyConfigImport: () => ipcRenderer.invoke("apply-config-import"),
   cancelConfigImport: () => ipcRenderer.invoke("cancel-config-import"),
   onMagicSortProgress: (callback) => {

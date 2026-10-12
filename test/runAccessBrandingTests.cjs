@@ -13,6 +13,17 @@ require.extensions[".ts"] = (module, filename) => {
 const { hasFullAccess } = require("../src/demoLimits.ts");
 
 const sourceText = fs.readFileSync(path.join(__dirname, "../src/main.ts"), "utf8");
+const settingsSource = fs.readFileSync(
+  path.join(__dirname, "../src/components/SettingsPanel.tsx"),
+  "utf8",
+);
+assert.match(
+  settingsSource,
+  /demoMode\.available\s*&&\s*demoMode\.enabled\s*&&\s*\(/,
+  "Settings keeps only the recovery control visible after a licensed owner enables demo mode",
+);
+assert.match(settingsSource, /Return to full access/);
+assert.doesNotMatch(settingsSource, /Enable demo mode for testing/);
 const ast = ts.createSourceFile("main.ts", sourceText, ts.ScriptTarget.Latest, true);
 const functions = new Map();
 (function visit(node) {
