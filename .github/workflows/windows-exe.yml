@@ -121,6 +121,18 @@ jobs:
               MessageBox MB_ICONSTOP "Silo's bundled FFmpeg is missing. Setup will stop rather than install broken Memories export."
               Abort
             ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\@img\sharp-win32-x64\lib\sharp-win32-x64.node"
+              MessageBox MB_ICONSTOP "Silo's Windows image runtime is missing. Setup will stop rather than install broken image processing."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\@img\sharp-win32-x64\lib\libvips-42.dll"
+              MessageBox MB_ICONSTOP "Silo's Windows image library is missing. Setup will stop rather than install broken image processing."
+              Abort
+            ${EndIf}
+            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\@img\sharp-win32-x64\lib\libvips-cpp-8.17.3.dll"
+              MessageBox MB_ICONSTOP "Silo's Windows image library is incomplete. Setup will stop rather than install broken image processing."
+              Abort
+            ${EndIf}
             DetailPrint "Silo's core offline features are in place; your library stays on this PC."
             SetDetailsPrint none
           !macroend
@@ -145,6 +157,9 @@ jobs:
             "$resources/face-wasm/tfjs-backend-wasm-simd.wasm",
             "$resources/face-wasm/tfjs-backend-wasm-threaded-simd.wasm",
             "$resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe",
+            "$resources/app.asar.unpacked/node_modules/@img/sharp-win32-x64/lib/sharp-win32-x64.node",
+            "$resources/app.asar.unpacked/node_modules/@img/sharp-win32-x64/lib/libvips-42.dll",
+            "$resources/app.asar.unpacked/node_modules/@img/sharp-win32-x64/lib/libvips-cpp-8.17.3.dll",
             "$resources/app.asar.unpacked/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm",
             "$resources/app.asar.unpacked/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs"
           )
@@ -152,6 +167,7 @@ jobs:
             if (-not (Test-Path $asset)) { throw "Missing packaged Silo asset: $asset" }
           }
           node test/runWindowsPackageAssets.cjs 'release/win-unpacked/resources'
+          node test/runWindowsPackagedSharpSmoke.cjs 'release/win-unpacked/resources'
           node test/runWindowsFaceRuntimeSmoke.cjs 'release/win-unpacked/resources'
           node test/runWindowsGeoRuntimeSmoke.cjs
           node test/runWindowsMemoryRuntimeSmoke.cjs 'release/win-unpacked/resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe'

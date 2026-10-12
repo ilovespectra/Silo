@@ -1,6 +1,6 @@
 {
   "name": "silo",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "A local-first media library with semantic search, people, maps, messages, and duplicate management.",
   "main": "electron-dist/main.js",
   "homepage": "./",
@@ -17,7 +17,7 @@
     "test:message-coverage": "node test/runMessageCoverageTests.cjs",
     "test:beta-license": "node test/runBetaLicenseTests.cjs && node test/runBetaReleaseCheckTests.cjs && node --check scripts/beta-license.cjs && node --check scripts/check-beta-release.cjs",
     "test:lifetime-payment": "node test/runLifetimePaymentTests.cjs && node test/runPaidLicenseTests.cjs && node test/runLegacyLicenseRejectionTests.cjs",
-    "release:check": "npm run test:beta-license && npm run test:lifetime-payment && node scripts/check-beta-release.cjs",
+    "release:check": "npm run test:beta-license && npm run test:lifetime-payment && npm run test:mac-update-manifest && node scripts/check-beta-release.cjs",
     "react-eject": "react-scripts eject",
     "electron-start": "wait-on http://localhost:8787 && electron .",
     "start": "concurrently -k \"npm run react-start\" \"wait-on http://localhost:8787 && electron .\"",

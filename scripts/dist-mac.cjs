@@ -144,6 +144,8 @@ function buildMac() {
         "--config",
         "electron-builder.config.cjs",
         "--mac",
+        "dmg",
+        "zip",
         `--${architecture}`,
       ];
       if (process.env.SILO_TEST_DIR_ONLY === "1") {

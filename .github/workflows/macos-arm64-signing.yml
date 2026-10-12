@@ -52,7 +52,24 @@ jobs:
         run: npm run build
 
       - name: Package arm64 ad hoc DMG
-        run: npx electron-builder --config electron-builder.config.cjs --mac dmg --arm64 --publish never
+        run: npx electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64 --publish never
+
+      - name: Verify the macOS updater ZIP and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version=$(node -p "require('./package.json').version")
+          zip_path="release/Silo-${package_version}-arm64.zip"
+          test -s "$zip_path"
+          test -s release/latest-mac.yml
+          node - <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const yaml = require('js-yaml');
+          const manifest = yaml.load(fs.readFileSync('release/latest-mac.yml', 'utf8'));
+          assert.ok(manifest.files.some((file) => file.url.endsWith('-arm64.zip')));
+          console.log('macOS updater ZIP and latest-mac.yml are present.');
+          NODE
 
       - name: Verify ad hoc signature and assess Gatekeeper
         shell: bash
@@ -95,7 +112,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: silo-macos-arm64-adhoc
-          path: release/*.dmg
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/latest-mac.yml
           if-no-files-found: error
           retention-days: 14
 
@@ -161,11 +181,28 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npx electron-builder --config electron-builder.config.cjs --mac dmg --arm64 --publish never
+        run: npx electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64 --publish never
 
       - name: Package ad hoc arm64 DMG fallback
         if: steps.signing.outputs.mode == 'adhoc'
-        run: npx electron-builder --config electron-builder.config.cjs --mac dmg --arm64 --publish never
+        run: npx electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64 --publish never
+
+      - name: Verify the macOS updater ZIP and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version=$(node -p "require('./package.json').version")
+          zip_path="release/Silo-${package_version}-arm64.zip"
+          test -s "$zip_path"
+          test -s release/latest-mac.yml
+          node - <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const yaml = require('js-yaml');
+          const manifest = yaml.load(fs.readFileSync('release/latest-mac.yml', 'utf8'));
+          assert.ok(manifest.files.some((file) => file.url.endsWith('-arm64.zip')));
+          console.log('macOS updater ZIP and latest-mac.yml are present.');
+          NODE
 
       - name: Notarize and staple Developer ID DMG
         if: steps.signing.outputs.mode == 'developer-id'
@@ -253,6 +290,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: silo-macos-arm64-${{ steps.signing.outputs.mode }}
-          path: release/*.dmg
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/latest-mac.yml
           if-no-files-found: error
           retention-days: 14

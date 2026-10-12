@@ -23,7 +23,7 @@ const suppliedWindowsInstaller = process.env.SILO_WINDOWS_SETUP_EXE
 const suppliedWindowsBuildSha = process.env.SILO_WINDOWS_BUILD_SHA || '';
 const destination = process.env.SILO_RELEASE_DEST
   ? path.resolve(process.env.SILO_RELEASE_DEST)
-  : path.join(os.homedir(), 'Downloads', 'SILO 2.0.4 REAL');
+  : path.join(os.homedir(), 'Downloads', `SILO ${version} TEST`);
 const preservedUntracked = new Set([
   'claudetest.txt',
   'electron-dist/paidLicense.d.ts',
@@ -146,19 +146,14 @@ function stageFile(source, target) {
 
 async function repackage() {
   if (process.platform !== 'darwin') {
-    throw new Error('Run this command on the release Mac; it builds both Mac DMGs locally.');
-  }
-  if (version !== '2.0.4') {
-    throw new Error(`This recovery command targets Silo 2.0.4, but package.json is ${version}.`);
+    throw new Error('Run this command on the release Mac; it builds both Mac installers locally.');
   }
   if (!fs.existsSync(path.join(projectRoot, 'node_modules'))) {
     throw new Error('Install the project dependencies first with npm ci.');
   }
-  if (!fs.existsSync(destination)) {
-    throw new Error(`The selected Downloads folder does not exist: ${destination}`);
-  }
+  fs.mkdirSync(destination, { recursive: true });
   if (!fs.statSync(destination).isDirectory()) {
-    throw new Error(`The selected Downloads path is not a folder: ${destination}`);
+    throw new Error(`The selected release destination is not a folder: ${destination}`);
   }
 
   assertCleanReleaseInputs();
@@ -185,12 +180,16 @@ async function repackage() {
 
   const expected = [
     `${product}-${version}-x64.dmg`,
+    `${product}-${version}-x64.zip`,
     `${product}-${version}-arm64.dmg`,
+    `${product}-${version}-arm64.zip`,
     `${product}-${version}-x64-Setup.exe`,
+    'latest-mac.yml',
   ];
   fs.mkdirSync(stageParent, { recursive: true });
   const stageRoot = fs.mkdtempSync(path.join(stageParent, '.repackage-binaries-'));
-  const stagedFiles = [];
+  const stagedFiles = new Map();
+  const macManifestPaths = {};
   const pendingInstalls = [];
   let completed = false;
 
@@ -200,11 +199,24 @@ async function repackage() {
       run('npm', [`run`, `dist:mac:${architecture}`], {
         env: { ...process.env, SILO_RELEASE_OUTPUT_DIR: buildOutput },
       });
-      stagedFiles.push(findOne(buildOutput, `${product}-${version}-${architecture}.dmg`));
+      for (const extension of ['dmg', 'zip']) {
+        const name = `${product}-${version}-${architecture}.${extension}`;
+        stagedFiles.set(name, findOne(buildOutput, name));
+      }
+      macManifestPaths[architecture] = findOne(buildOutput, 'latest-mac.yml');
     }
 
+    const mergedManifest = path.join(stageRoot, 'latest-mac.yml');
+    run(process.execPath, [
+      path.join(projectRoot, 'scripts', 'merge-mac-update-manifests.cjs'),
+      macManifestPaths.x64,
+      macManifestPaths.arm64,
+      mergedManifest,
+    ]);
+    stagedFiles.set('latest-mac.yml', mergedManifest);
+
     if (suppliedWindowsInstaller) {
-      stagedFiles.push(suppliedWindowsInstaller);
+      stagedFiles.set(`${product}-${version}-x64-Setup.exe`, suppliedWindowsInstaller);
     } else {
       const previousRunText = capture('gh', [
         'run', 'list', '--repo', repository, '--workflow', workflow,
@@ -222,24 +234,26 @@ async function repackage() {
         'run', 'download', String(workflowRun.databaseId), '--repo', repository,
         '--name', 'silo-windows-x64', '--dir', windowsDownload,
       ]);
-      stagedFiles.push(findOne(windowsDownload, `${product}-${version}-x64-Setup.exe`));
+      const name = `${product}-${version}-x64-Setup.exe`;
+      stagedFiles.set(name, findOne(windowsDownload, name));
     }
 
-    if (stagedFiles.length !== expected.length) {
-      throw new Error(`Expected ${expected.length} release files; staged ${stagedFiles.length}.`);
+    if (stagedFiles.size !== expected.length || expected.some((name) => !stagedFiles.has(name))) {
+      throw new Error(`Expected release files ${expected.join(', ')}; staged ${[...stagedFiles.keys()].join(', ')}.`);
     }
-    for (const [index, source] of stagedFiles.entries()) {
-      if (path.basename(source) !== expected[index]) {
-        throw new Error(`Unexpected release file: ${path.basename(source)}`);
+    for (const name of expected) {
+      const source = stagedFiles.get(name);
+      const target = path.join(destination, name);
+      if (fs.existsSync(target)) {
+        throw new Error(`Refusing to replace an existing test artifact: ${target}`);
       }
-      const target = path.join(destination, expected[index]);
       pendingInstalls.push(stageFile(source, target));
     }
 
     for (const file of pendingInstalls) fs.renameSync(file.temporary, file.target);
     completed = true;
 
-    console.log(`\nInstalled ${expected.length} verified build artifacts in ${destination}:`);
+    console.log(`\nInstalled ${expected.length} verified test release assets in ${destination}:`);
     for (const name of expected) {
       const filePath = path.join(destination, name);
       console.log(`${sha256(filePath)}  ${name}`);
@@ -250,7 +264,7 @@ async function repackage() {
       if (fs.existsSync(file.temporary)) fs.rmSync(file.temporary, { force: true });
     }
     fs.rmSync(stageRoot, { recursive: true, force: true });
-    if (!completed) console.error('Existing Downloads artifacts were left in place until all three builds were ready.');
+    if (!completed) console.error('Existing destination files were left in place until every build asset was ready.');
   }
 }
 

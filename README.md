@@ -83,20 +83,21 @@ npm start       # run the built app
 npm run dist    # package into release/
 ```
 
-### Rebuilding the 2.0.4 release installers
+### Building the 2.0.5 diagnostic test release
 
-On the release Mac, after the release changes are committed and pushed to GitHub
+On the release Mac, after the 2.0.5 changes are committed and pushed to GitHub
 `main`, run:
 
 ```bash
 npm run repackage_binaries
 ```
 
-The script builds both Mac DMGs locally and stages all three installers before
-copying them to the selected destination. By default, it dispatches the Windows
-installer workflow for the same `main` commit, downloads that run's artifact,
-and replaces only the three matching installer names in
-`~/Downloads/SILO 2.0.4 REAL/` after every build succeeds.
+The script builds both Mac DMGs and updater ZIPs locally, merges their
+`latest-mac.yml` manifests, and dispatches the Windows installer workflow for
+the same `main` commit. It stages the three installable builds and Mac updater
+metadata in `~/Downloads/SILO 2.0.5 TEST/` only after every build succeeds. It
+refuses to replace an existing file in that test folder. Upload the two ZIPs and
+`latest-mac.yml` with the DMGs to a release before testing in-app Mac updates.
 
 If the Windows installer was obtained through another authenticated route, set
 both `SILO_WINDOWS_SETUP_EXE` to that non-empty installer file and
@@ -104,12 +105,11 @@ both `SILO_WINDOWS_SETUP_EXE` to that non-empty installer file and
 script rejects a mismatched commit. Without those two variables, GitHub CLI
 (`gh`) must be installed and authenticated with permission to run this
 repository's Actions workflow. `SILO_RELEASE_STAGE_DIR` selects the temporary
-staging parent, and `SILO_RELEASE_DEST` selects an existing destination folder;
-the default destination is the Downloads folder above. The script refuses a
-non-`main` branch, tracked or staged changes, unexpected untracked files, or a
-local commit that does not match GitHub `main`. It prints SHA-256 hashes after
-copying. It does not publish the GitHub release draft; Mac builds remain
-ad-hoc signed and are not notarized.
+staging parent, and `SILO_RELEASE_DEST` overrides the default Downloads folder.
+The script refuses a non-`main` branch, tracked or staged changes, unexpected
+untracked files, existing destination assets, or a local commit that does not
+match GitHub `main`. It prints SHA-256 hashes after copying. It does not publish
+a GitHub release; Mac builds remain ad-hoc signed and are not notarized.
 
 ## Optional CLIP-index image generator
 
