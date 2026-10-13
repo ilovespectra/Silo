@@ -90,9 +90,7 @@ import {
   useMagicRanks,
 } from "./utils/useMagicRanks";
 import MessageExportPanel from "./components/MessageExportPanel";
-import PhoneManagerPanel, {
-  PhoneManagementPanel,
-} from "./components/PhoneManagerPanel";
+import { PhoneManagementPanel } from "./components/PhoneManagerPanel";
 import AudioLibrary from "./components/AudioLibrary";
 import IndexingPanel from "./components/IndexingPanel";
 import SourceClonePanel from "./components/SourceClonePanel";
@@ -7031,22 +7029,6 @@ function App() {
         />
       ) : appSection === "mobile" ? (
         <main className="mobile-page" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
-          <PhoneManagerPanel
-            devices={phoneDevices}
-            tooling={phoneTooling}
-            scanning={phoneScanning}
-            notice={phoneNotice}
-            backups={phoneBackups}
-            backupDestination={phoneBackupDestination}
-            formatFileSize={formatFileSize}
-            onScan={() => void scanForPhones()}
-            onChooseBackupDestination={() =>
-              void choosePhoneBackupDestination()
-            }
-            onResetBackupDestination={() =>
-              void resetPhoneBackupDestination()
-            }
-          />
           <section
             className="mobile-messages-section"
             aria-labelledby="mobile-messages-title"
@@ -7055,7 +7037,7 @@ function App() {
               className="mobile-messages-heading"
             >
               <div>
-                <span className="sidebar-kicker">Conversation archive</span>
+                <span className="sidebar-kicker">Mobile manager</span>
                 <h2 id="mobile-messages-title">Messages</h2>
                 <p>Browse, search, and export messages from supported devices.</p>
               </div>
@@ -7071,12 +7053,21 @@ function App() {
                 ? `${connectedPhone.platform}:${connectedPhone.id}`
                 : null
             }
+            backups={phoneBackups}
+            backupDestination={phoneBackupDestination}
+            formatFileSize={formatFileSize}
             restoreArchives={phoneRestoreArchives}
             onBrowse={browsePhone}
             onConnect={connectPhone}
             onDisconnect={disconnectPhone}
             onRename={renamePhone}
             onRenewBackup={renewPhoneBackup}
+            onChooseBackupDestination={() =>
+              void choosePhoneBackupDestination()
+            }
+            onResetBackupDestination={() =>
+              void resetPhoneBackupDestination()
+            }
             onCreateRestoreArchive={createPhoneRestoreArchive}
             onRestoreFromArchive={restorePhoneFromArchive}
           />

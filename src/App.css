@@ -373,7 +373,7 @@ body {
 }
 
 .app-notice-stack > * {
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 .search-policy-error {
@@ -6571,7 +6571,8 @@ input[type="range"]::-moz-range-progress {
 .indexing-performance-banner {
   position: relative;
   display: flex;
-  align-items: flex-start;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 10px;
   padding: 10px 12px;
   border: 1px solid var(--border-warning);
@@ -6581,6 +6582,7 @@ input[type="range"]::-moz-range-progress {
   color: var(--warning-text);
   font-size: 12px;
   line-height: 1.5;
+  pointer-events: auto;
 }
 
 .indexing-performance-dismiss-choice {
@@ -8008,6 +8010,29 @@ input[type="range"]::-moz-range-progress {
   background: var(--surface);
 }
 
+.phone-manager-settings {
+  display: grid;
+  gap: 10px;
+  padding: 12px 0 4px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.phone-manager-settings .backup-dest-display {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.phone-manager-settings .backup-dest-display small {
+  flex: 1 1 220px;
+  min-width: 0;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .mobile-section-heading,
 .mobile-messages-heading {
   position: sticky;
@@ -8138,8 +8163,8 @@ input[type="range"]::-moz-range-progress {
 
 .mobile-messages-section {
   display: flex;
-  height: min(820px, max(620px, calc(100vh - 280px)));
-  min-height: 620px;
+  height: min(820px, max(700px, calc(100vh - 220px)));
+  min-height: 700px;
   flex-direction: column;
   margin: 18px clamp(12px, 2vw, 24px) 24px;
   overflow: hidden;

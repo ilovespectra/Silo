@@ -461,7 +461,7 @@ export const MessageExportPanel: React.FC = () => {
     <main className={`messages-browser platform-${platform}`} data-tour="mobile-messages" data-help="Select a connected phone or saved message history, load and review a conversation, then choose an export folder and format. Refresh and update actions can read device history, so use them only when you intend to.">
       <header className="messages-toolbar">
         <div>
-          <span className="sidebar-kicker">Connected devices</span>
+          <span className="sidebar-kicker">Mobile manager</span>
           <h2>Messages</h2>
         </div>
         <button onClick={() => void scanDevices()} disabled={loadingDevices}
@@ -553,6 +553,10 @@ export const MessageExportPanel: React.FC = () => {
           {error || notice}
         </div>
       )}
+
+      <div className="mobile-manager-note">
+        Browseable snapshots keep dated USB-accessible copies of photos, docs, and messages. Pick a source and use Update backup to refresh it.
+      </div>
 
       <section className="messages-layout">
         <aside className="conversation-directory">
@@ -784,17 +788,26 @@ export const MessageExportPanel: React.FC = () => {
                   })
                 )}
               </div>
-              <footer className="phone-compose" aria-hidden="true">
+              <footer className="phone-compose">
                 {platform === "ios" && (
-                  <span className="phone-compose-plus">
+                  <span className="phone-compose-plus" aria-hidden="true">
                     <FiPlus />
                   </span>
                 )}
-                <span className="phone-compose-field">
+                <span className="phone-compose-field" aria-hidden="true">
                   {platform === "ios" ? "iMessage" : "Text message"}
                 </span>
+                <button
+                  type="button"
+                  className="save-thread-button"
+                  disabled={!selectedThread || !outputDir || exporting}
+                  onClick={() => void exportMessages()}
+                  title="Save the selected conversation to the chosen folder"
+                >
+                  <FiDownload /> {exporting ? "Saving..." : "Save conversation"}
+                </button>
                 {platform === "android" && (
-                  <span className="phone-compose-send">
+                  <span className="phone-compose-send" aria-hidden="true">
                     <FiSend />
                   </span>
                 )}
@@ -833,15 +846,6 @@ export const MessageExportPanel: React.FC = () => {
             <option value="pdf">PDF</option>
             <option value="xml">XML + text</option>
           </select>
-          <button
-            className="primary"
-            disabled={!selectedThread || !outputDir || exporting}
-            onClick={() => void exportMessages()}
-            title="DESTINATION WRITE — Save the selected conversation to the chosen folder"
-            data-help="DESTINATION WRITE: Write an export copy of the selected conversation to the chosen folder. The phone's message history is unchanged."
-          >
-            <FiDownload /> {exporting ? "Saving..." : "Save conversation"}
-          </button>
           {selectedIdentity?.platform === "ios" && (
             <p className="ios-backup-note">
               iPhone viewing uses a local, unencrypted device backup stored

@@ -19,12 +19,17 @@ interface PhoneManagementPanelProps {
   tooling: PhoneTooling | null;
   busyDeviceId: string | null;
   activeDeviceKey: string | null;
+  backups: Record<string, PhoneBackupProgress>;
+  backupDestination: string | null;
+  formatFileSize: (bytes: number) => string;
   restoreArchives: PhoneRestoreArchive[];
   onBrowse: (device: PhoneDevice) => void;
   onConnect: (device: PhoneDevice) => void;
   onDisconnect: (device: PhoneDevice) => void;
   onRename: (device: PhoneDevice) => void;
   onRenewBackup: (device: PhoneDevice) => void;
+  onChooseBackupDestination: () => void;
+  onResetBackupDestination: () => void;
   onCreateRestoreArchive: (
     device: PhoneDevice,
     password: string,
@@ -145,10 +150,10 @@ function PhoneDeviceCard({
               className="phone-renew-backup-button"
               onClick={() => onRenewBackup(device)}
               disabled={busyDeviceId === device.id}
-              title="DESTINATION WRITE — Renew this phone’s browseable snapshot in Silo; the phone’s files are unchanged"
+              title="DESTINATION WRITE — Update this phone’s browseable snapshot in Silo; the phone’s files are unchanged"
               data-help="DESTINATION WRITE: Scan this connected phone and update its browseable snapshot in Silo. This does not change files on the phone."
             >
-              <FiRefreshCw /> {busyDeviceId === device.id ? "Renewing…" : "Renew backup"}
+              <FiRefreshCw /> {busyDeviceId === device.id ? "Updating…" : "Update backup"}
             </button>
             {device.platform === "ios" && (
               <button
@@ -418,12 +423,17 @@ export function PhoneManagementPanel({
   tooling,
   busyDeviceId,
   activeDeviceKey,
+  backups,
+  backupDestination,
+  formatFileSize,
   restoreArchives,
   onBrowse,
   onConnect,
   onDisconnect,
   onRename,
   onRenewBackup,
+  onChooseBackupDestination,
+  onResetBackupDestination,
   onCreateRestoreArchive,
   onRestoreFromArchive,
 }: PhoneManagementPanelProps) {
@@ -432,31 +442,78 @@ export function PhoneManagementPanel({
       <header className="mobile-section-heading" data-tour="mobile-phone-management">
         <div>
           <span className="sidebar-kicker">Device controls</span>
-          <h2 id="phone-management-title">Manage phones</h2>
-          <p>Browse, renew backups, and manage connected devices.</p>
+          <h2 id="phone-management-title">Mobile manager</h2>
+          <p>Choose a phone, refresh its saved copy, and browse the exported files.</p>
         </div>
       </header>
 
-      {devices.length > 0 ? (
-        <div className="phone-device-list">
-          {devices.map((device) => (
-            <PhoneDeviceCard
-              key={`${device.platform}:${device.id}`}
-              device={device}
-              active={activeDeviceKey === `${device.platform}:${device.id}`}
-              busyDeviceId={busyDeviceId}
-              restoreArchives={restoreArchives}
-              tooling={tooling}
-              onBrowse={onBrowse}
-              onConnect={onConnect}
-              onDisconnect={onDisconnect}
-              onRename={onRename}
-              onRenewBackup={onRenewBackup}
-              onCreateRestoreArchive={onCreateRestoreArchive}
-              onRestoreFromArchive={onRestoreFromArchive}
-            />
-          ))}
+      <div className="phone-backup-settings" data-tour="mobile-backup-settings" data-help="DESTINATION WRITE: Connecting creates or updates dated browseable copies in local storage; source files on the phone are unchanged. DEVICE WRITE: Restoring an iOS archive writes to the connected device and may replace current content.">
+        <small className="phone-backup-scope">
+          Silo saves a dated snapshot of the photos, messages, and other files it can read from each device. Update a backup to refresh the saved source.
+        </small>
+        <label>Browseable-copy destination</label>
+        <div className="backup-dest-display">
+          <small title={backupDestination || "Default (local storage)"}>
+            {backupDestination || "Default (local storage)"}
+          </small>
+          <button className="small-button" onClick={onChooseBackupDestination} title="SILO DATA WRITE — Set the destination for future phone snapshots" data-help="SILO DATA WRITE: Save the destination preference in Silo. This only chooses where future phone snapshots are stored.">
+            {backupDestination ? "Change" : "Choose"} destination
+          </button>
+          {backupDestination && (
+            <button
+              className="small-button"
+              onClick={onResetBackupDestination}
+              title="SILO DATA WRITE — Reset phone snapshot destination to default"
+              aria-label="SILO DATA WRITE — Reset phone snapshot destination to default"
+              data-help="Use Silo’s default local-storage folder for future browseable copies."
+            >
+              <FiX />
+            </button>
+          )}
         </div>
+      </div>
+
+      <p className="phone-source-help">
+        Browse a saved copy in <strong>Files → Sources</strong> and select that phone or tablet.
+      </p>
+
+      {devices.length > 0 ? (
+        <>
+          <div className="phone-device-list">
+            {devices.map((device) => (
+              <PhoneDeviceCard
+                key={`${device.platform}:${device.id}`}
+                device={device}
+                active={activeDeviceKey === `${device.platform}:${device.id}`}
+                busyDeviceId={busyDeviceId}
+                restoreArchives={restoreArchives}
+                tooling={tooling}
+                onBrowse={onBrowse}
+                onConnect={onConnect}
+                onDisconnect={onDisconnect}
+                onRename={onRename}
+                onRenewBackup={onRenewBackup}
+                onCreateRestoreArchive={onCreateRestoreArchive}
+                onRestoreFromArchive={onRestoreFromArchive}
+              />
+            ))}
+          </div>
+          {devices.some((device) => backups[`${device.platform}:${device.id}`]) && (
+            <div className="phone-backup-status-list" aria-label="Phone backup status">
+              {devices.map((device) => {
+                const backup = backups[`${device.platform}:${device.id}`];
+                return backup ? (
+                  <PhoneBackupStatus
+                    key={`${device.platform}:${device.id}`}
+                    device={device}
+                    backup={backup}
+                    formatFileSize={formatFileSize}
+                  />
+                ) : null;
+              })}
+            </div>
+          )}
+        </>
       ) : (
         <div className="phone-device-empty">
           <FiSmartphone aria-hidden="true" />
