@@ -611,6 +611,8 @@ function asFastFileSearchResult(
 
 function App() {
   const electronAPI = window.electron;
+  const appRootRef = useRef<HTMLDivElement | null>(null);
+  const [appVersion, setAppVersion] = useState("…");
   const [currentPath, setCurrentPath] = useState<string | null>(null);
   const [files, setFiles] = useState<FileInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -714,6 +716,13 @@ function App() {
     total: 1,
     label: "Starting…",
   });
+  useEffect(() => {
+    if (!electronAPI?.getAppVersion) return;
+    void electronAPI
+      .getAppVersion()
+      .then((version) => setAppVersion(version))
+      .catch(() => setAppVersion(""));
+  }, [electronAPI]);
   const [indexStorageStatus, setIndexStorageStatus] =
     useState<IndexStorageStatus>({
       message: null,
@@ -1007,6 +1016,9 @@ function App() {
   const [folderSelectionFile, setFolderSelectionFile] = useState<string | null>(
     null,
   );
+  const [folderSelectionPaths, setFolderSelectionPaths] = useState<string[] | null>(
+    null,
+  );
   const [showFolderSelector, setShowFolderSelector] = useState(false);
   const [petClusters, setPetClusters] = useState<PetCluster[]>([]);
   const [petsProgress, setPetsProgress] = useState<{
@@ -1042,12 +1054,28 @@ function App() {
   const [googleState, setGoogleState] = useState<GoogleAccountsState | null>(
     null,
   );
+  const [googleSourcesHidden, setGoogleSourcesHidden] = useState(() => {
+    try {
+      return localStorage.getItem("silo.googleSourcesHidden") === "true";
+    } catch {
+      return false;
+    }
+  });
   const [googleBusy, setGoogleBusy] = useState(false);
   const [googleNotice, setGoogleNotice] = useState("");
   const [pickerSession, setPickerSession] = useState<{
     accountId: string;
     sessionId: string;
   } | null>(null);
+
+  const changeGoogleSourcesVisibility = (hidden: boolean) => {
+    setGoogleSourcesHidden(hidden);
+    try {
+      localStorage.setItem("silo.googleSourcesHidden", String(hidden));
+    } catch {
+      // Keep the current-session preference if storage is unavailable.
+    }
+  };
   const [sources, setSources] = useState<BrowseSource[]>([]);
   const [sourceSort, setSourceSort] = useState<"name" | "kind" | "backup">(
     "name",
@@ -3689,15 +3717,28 @@ function App() {
     onToggle: toggleFileSelection,
   });
 
-  const openFolderSelector = useCallback((filePath?: string) => {
-    if (filePath) setFolderSelectionFile(filePath);
-    setShowFolderSelector(true);
-  }, []);
+  const openFolderSelector = useCallback(
+    (filePath?: string, filePaths?: string[]) => {
+      setFolderSelectionFile(filePath ?? null);
+      setFolderSelectionPaths(filePaths ? Array.from(new Set(filePaths)) : null);
+      setShowFolderSelector(true);
+    },
+    [],
+  );
 
   const closeFolderSelector = useCallback(() => {
     setFolderSelectionFile(null);
+    setFolderSelectionPaths(null);
     setShowFolderSelector(false);
   }, []);
+
+  const folderSelectorFilePaths =
+    folderSelectionPaths ??
+    (selectedFilePaths.size > 0
+      ? Array.from(selectedFilePaths)
+      : folderSelectionFile
+        ? [folderSelectionFile]
+        : []);
 
   const addFilesToFolder = useCallback(
     async (folderId: string, filePaths: string[]) => {
@@ -3708,8 +3749,9 @@ function App() {
       if (activeDigitalFolderId === folderId) {
         await openDigitalFolder(folderId);
       }
-      clearFileSelection();
+      if (!folderSelectionPaths) clearFileSelection();
       setFolderSelectionFile(null);
+      setFolderSelectionPaths(null);
       setShowFolderSelector(false);
     },
     [
@@ -3717,6 +3759,7 @@ function App() {
       applyPersistedState,
       clearFileSelection,
       electronAPI,
+      folderSelectionPaths,
       openDigitalFolder,
     ],
   );
@@ -5001,6 +5044,36 @@ function App() {
     waitingForSortIndicators ? "photo metadata lookup" : "",
     magicState.running ? "photo quality analysis" : "",
   ].filter(Boolean);
+  const startupBlocked = !(startupState.ready && hydrated);
+  const startupProgressPercent = startupState.ready
+    ? 96
+    : Math.min(
+        90,
+        Math.max(
+          4,
+          Math.round(
+            (startupState.step / Math.max(startupState.total, 1)) * 90,
+          ),
+        ),
+      );
+  const startupReadout = [
+    !startupState.ready ? startupState.label : "Opening your saved library…",
+    !hydrated ? "Restoring the initial library view…" : "",
+    ["scanning", "loading-model", "indexing"].includes(indexProgress.status)
+      ? indexProgress.message
+      : "",
+    searchIndexReadiness.status === "preparing"
+      ? searchIndexReadiness.message
+      : "",
+  ].filter((message, index, messages) => Boolean(message) && messages.indexOf(message) === index);
+
+  useEffect(() => {
+    const appRoot = appRootRef.current;
+    if (!appRoot) return;
+    if (startupBlocked) appRoot.setAttribute("inert", "");
+    else appRoot.removeAttribute("inert");
+    return () => appRoot.removeAttribute("inert");
+  }, [startupBlocked]);
 
   useEffect(() => {
     if (intensiveJobs.length === 0) setPerformanceNoticeHidden(false);
@@ -5116,7 +5189,56 @@ function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app" ref={appRootRef} aria-busy={startupBlocked}>
+      {startupBlocked &&
+        createPortal(
+          <div
+            className="startup-splash"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="startup-splash-title"
+            aria-describedby="startup-splash-status"
+          >
+            <section className="startup-splash-card">
+              <img
+                className="startup-splash-mark"
+                src={`${process.env.PUBLIC_URL}/solosilo.png`}
+                alt=""
+              />
+              <p className="startup-splash-eyebrow">LOCAL LIBRARY STARTUP</p>
+              <h1 id="startup-splash-title">Silo</h1>
+              <p className="startup-splash-version">
+                {appVersion ? `Version ${appVersion}` : "Starting…"}
+              </p>
+              <div
+                className="startup-splash-readout"
+                id="startup-splash-status"
+                role="status"
+                aria-live="polite"
+              >
+                {startupReadout.map((message, index) => (
+                  <p key={`${index}-${message}`}>{message}</p>
+                ))}
+              </div>
+              <div
+                className="startup-splash-progress"
+                role="progressbar"
+                aria-label="Silo startup progress"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={startupProgressPercent}
+              >
+                <span style={{ width: `${startupProgressPercent}%` }} />
+              </div>
+              <p className="startup-splash-stage">
+                {startupState.ready
+                  ? "Finishing the first library view…"
+                  : `Preparing startup stage ${Math.min(startupState.step, startupState.total)} of ${startupState.total}`}
+              </p>
+            </section>
+          </div>,
+          document.body,
+        )}
       <div className="preview-construction-banner" role="note">
         <div>
           <strong>Silo is under construction!</strong>
@@ -5131,21 +5253,6 @@ function App() {
           Report a Bug
         </button>
       </div>
-      {!(startupState.ready && hydrated) && (
-        <div className="startup-progress" role="status" aria-live="polite">
-          <div className="startup-progress-track">
-            <div
-              className="startup-progress-fill"
-              style={{
-                width: `${Math.max(6, ((startupState.ready ? startupState.total : startupState.step) / Math.max(startupState.total, 1)) * 100)}%`,
-              }}
-            />
-          </div>
-          <span>
-            {startupState.ready ? "Opening library…" : startupState.label}
-          </span>
-        </div>
-      )}
       {((indexStorageStatus.message ||
         indexStorageStatus.transfer?.state === "moving" ||
         indexStorageStatus.transfer?.state === "complete" ||
@@ -6583,6 +6690,17 @@ function App() {
                           : `${photoMenu.paths.length.toLocaleString()} photos`}{" "}
                         as {personDetail.name}
                       </button>
+                      <button
+                        className="photo-context-folder"
+                        role="menuitem"
+                        onClick={() => {
+                          const paths = photoMenu.paths;
+                          setPhotoMenu(null);
+                          openFolderSelector(undefined, paths);
+                        }}
+                      >
+                        <FiFolder /> Add to Digital Folder
+                      </button>
                       <span className="photo-context-label">Move to</span>
                       <input
                         autoFocus
@@ -7104,35 +7222,36 @@ function App() {
               </div>
             </section>
 
-            <section
+            {!googleSourcesHidden && <details
               className="sidebar-section cloud-accounts"
               data-tour="google-sources"
-              data-help="Connect or reconnect Google accounts, browse Drive files, select Photos, and review or remove account access. These are separate from local folder sources."
+              data-help="Optional online sources. Connecting a Google account uses Google's sign-in and consent flow; it does not affect local folders or offline features."
             >
-              <div className="sidebar-heading">
+              <summary className="sidebar-heading">
                 <div>
-                  <span className="sidebar-kicker">Cloud</span>
+                  <span className="sidebar-kicker">Optional · Cloud</span>
                   <h2>Google Accounts</h2>
                 </div>
-                {googleState?.configured && (
+                <span className="cloud-accounts-chevron" aria-hidden="true">
+                  <FiChevronDown />
+                </span>
+              </summary>
+              <div className="cloud-accounts-content">
+              {!googleState?.configured ? (
+                <p className="sidebar-empty tooling-hint">
+                  Google sources are not configured in this build. Local folders,
+                  phone sources, and offline features work without a Google account.
+                </p>
+              ) : (
+                <>
                   <button
+                    className="connect-phone-button"
                     onClick={googleAddAccount}
                     disabled={googleBusy}
                     title="Add another Google account"
                   >
-                    <FiPlus />
+                    <FiPlus /> Add Google account
                   </button>
-                )}
-              </div>
-
-              {!googleState?.configured ? (
-                <p className="sidebar-empty tooling-hint">
-                  Add <code>GOOGLE_CLIENT_ID</code> and{" "}
-                  <code>GOOGLE_CLIENT_SECRET</code> to <code>.env</code>, then
-                  restart. See the README.
-                </p>
-              ) : (
-                <>
                   {googleState.accounts.length === 0 ? (
                     <button
                       className="connect-phone-button"
@@ -7244,7 +7363,8 @@ function App() {
               )}
 
               {googleNotice && <p className="sidebar-empty">{googleNotice}</p>}
-            </section>
+              </div>
+            </details>}
 
             <section
               className="sidebar-section digital-folders"
@@ -8135,8 +8255,8 @@ function App() {
           <div className="folder-selector-modal">
             <div className="folder-selector-header">
               <h3>
-                {selectedFilePaths.size > 0
-                  ? `Add ${selectedFilePaths.size} files to:`
+                {folderSelectorFilePaths.length > 0
+                  ? `Add ${folderSelectorFilePaths.length} photo${folderSelectorFilePaths.length === 1 ? "" : "s"} to:`
                   : "Add to digital folder"}
               </h3>
               <button
@@ -8154,13 +8274,7 @@ function App() {
                   key={folder.id}
                   className="folder-option"
                   onClick={() => {
-                    const filePaths =
-                      selectedFilePaths.size > 0
-                        ? Array.from(selectedFilePaths)
-                        : folderSelectionFile
-                          ? [folderSelectionFile]
-                          : [];
-                    void addFilesToFolder(folder.id, filePaths);
+                    void addFilesToFolder(folder.id, folderSelectorFilePaths);
                   }}
                 >
                   <FiFolder /> {folder.name}{" "}
@@ -8170,6 +8284,7 @@ function App() {
               <button
                 className="folder-option new-folder"
                 onClick={() => {
+                  const filePaths = folderSelectorFilePaths;
                   closeFolderSelector();
                   openDialog({
                     mode: "text",
@@ -8187,12 +8302,6 @@ function App() {
                             result.digitalFolders.length - 1
                           ];
                         if (newFolder) {
-                          const filePaths =
-                            selectedFilePaths.size > 0
-                              ? Array.from(selectedFilePaths)
-                              : folderSelectionFile
-                                ? [folderSelectionFile]
-                                : [];
                           void addFilesToFolder(newFolder.id, filePaths);
                         }
                       }
@@ -8272,6 +8381,8 @@ function App() {
             setShowSettings(false);
           }}
           hideSettingsForScreenshot={selectingBugReportScreenshot}
+          googleSourcesHidden={googleSourcesHidden}
+          onGoogleSourcesHiddenChange={changeGoogleSourcesVisibility}
           lifetimePromptRequest={lifetimePromptRequest}
           onLifetimePromptHandled={acknowledgeLifetimePrompt}
         />

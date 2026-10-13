@@ -11,6 +11,7 @@ global.navigator = dom.window.navigator;
 global.localStorage = dom.window.localStorage;
 global.HTMLElement = dom.window.HTMLElement;
 global.MutationObserver = dom.window.MutationObserver;
+global.HTMLElement.prototype.scrollIntoView = function () {};
 global.IS_REACT_ACT_ENVIRONMENT = true;
 global.IntersectionObserver = class {
   observe() {}
@@ -109,6 +110,7 @@ const state = {
 };
 const values = {
   getAppState: state,
+  getAppVersion: require("../package.json").version,
   listSources: sources,
   getAllSourcesPath: "/__sources__/all",
   getFiles: files,
@@ -119,7 +121,27 @@ const values = {
     autoplayGlobe: false,
     showBannedPeople: false,
   },
-  getStartupState: { ready: true, step: 1, total: 1, label: "Ready" },
+  getLifetimeLicense: { isLicensed: false },
+  getDemoTestingMode: { available: false, enabled: false },
+  getAppUpdateState: { status: "not-available", currentVersion: "2.0.5" },
+  checkForAppUpdates: { status: "not-available", currentVersion: "2.0.5" },
+  getStartupState: { ready: false, step: 1, total: 7, label: "Loading saved library indexes…" },
+  getIndexStorageStatus: {
+    message: null,
+    usingLocalFallback: false,
+    localFallbackEnabled: true,
+    destinationAvailable: true,
+    selectedDestination: "/backup",
+    localFreeBytes: null,
+    reserveBytes: 10 * 1024 * 1024 * 1024,
+    transfer: null,
+  },
+  getSearchIndexReadiness: {
+    status: "ready",
+    percentage: 100,
+    records: 0,
+    message: "Search index is ready.",
+  },
   getThumbnailPregenProgress: null,
   getDuplicateState: {
     ...progress,
@@ -136,7 +158,9 @@ const values = {
   },
   getPhoneBackupDestination: "/backup",
   getPhoneBackupStates: [],
+  getPhoneRestoreArchives: [],
   getGoogleState: { configured: false, accounts: [] },
+  getLibraryShareStatus: { active: false, sources: [] },
   getAccessIdentity: { displayName: "test", bundlePath: "", isDev: true },
 };
 const bridge = new Proxy(
@@ -178,6 +202,7 @@ const errors = [];
 const originalError = console.error;
 console.error = (...args) => errors.push(args.map(String).join(" "));
 const App = require(path.join(__dirname, "../src/App.tsx")).default;
+const GuidedTour = require(path.join(__dirname, "../src/components/GuidedTour.tsx")).default;
 const root = createRoot(document.getElementById("root"));
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -192,6 +217,25 @@ async function run() {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 350));
     });
+    const appRoot = document.querySelector(".app");
+    assert(document.querySelector(".startup-splash"), "startup splash stays visible until services are ready");
+    assert(appRoot.hasAttribute("inert"), "the app cannot receive commands during startup");
+    assert.match(
+      document.querySelector(".startup-splash-version").textContent,
+      new RegExp(require("../package.json").version),
+      "startup splash displays the packaged app version",
+    );
+    await act(async () => {
+      listeners.get("onStartupProgress")({
+        ready: true,
+        step: 7,
+        total: 7,
+        label: "Ready",
+      });
+      await flush();
+    });
+    assert.equal(document.querySelector(".startup-splash"), null);
+    assert.equal(appRoot.hasAttribute("inert"), false, "the app becomes interactive after startup hydration");
     assert.equal(
       calls.get("getAppState"),
       2,
@@ -214,6 +258,31 @@ async function run() {
       ),
       ["2025 · No person", "2023 · No person", "2024 · Has person"],
     );
+    assert(document.querySelector(".cloud-accounts"));
+    await act(async () => {
+      document.querySelector('button[aria-label="Settings"]').click();
+      await flush();
+    });
+    const hideGoogleButton = [...document.querySelectorAll(".settings-panel button")].find(
+      (button) => button.textContent.trim() === "Hide Google Accounts from Files",
+    );
+    assert(hideGoogleButton, "Settings can hide optional Google sources");
+    await act(async () => {
+      hideGoogleButton.click();
+      await flush();
+    });
+    assert.equal(localStorage.getItem("silo.googleSourcesHidden"), "true");
+    assert.equal(document.querySelector(".cloud-accounts"), null);
+    const showGoogleButton = [...document.querySelectorAll(".settings-panel button")].find(
+      (button) => button.textContent.trim() === "Show Google Accounts in Files",
+    );
+    assert(showGoogleButton, "Settings can restore the hidden Google section");
+    await act(async () => {
+      showGoogleButton.click();
+      await flush();
+    });
+    assert.equal(localStorage.getItem("silo.googleSourcesHidden"), "false");
+    assert(document.querySelector(".cloud-accounts"));
     for (let count = 0; count < 6; count += 1) {
       await act(async () => {
         listeners.get("onPhoneBackupProgress")({
@@ -243,8 +312,67 @@ async function run() {
       ),
       errors.join("\n"),
     );
+
+    const tourHost = document.createElement("div");
+    document.body.appendChild(tourHost);
+    const tourRoot = createRoot(tourHost);
+    await act(async () => {
+      tourRoot.render(
+        React.createElement(GuidedTour, {
+          open: true,
+          showAtStartup: false,
+          contextStep: {
+            id: "late-tour-anchor",
+            title: "A late-loading control",
+            body: "The guide waits for its target before showing this bubble.",
+            target: '[data-tour="late-tour-anchor"]',
+            section: "files",
+          },
+          onShowAtStartupChange: () => {},
+          onNavigate: () => {},
+          onClose: () => {},
+        }),
+      );
+      await flush();
+    });
+    const tourCard = [...document.querySelectorAll(".guided-tour-card")].at(-1);
+    assert.equal(
+      tourCard.style.visibility,
+      "hidden",
+      "the tour bubble stays hidden while navigation renders its target",
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    });
+    assert.equal(
+      tourCard.style.visibility,
+      "hidden",
+      "a slow target never causes a centered bubble flash",
+    );
+    const lateTourAnchor = document.createElement("div");
+    lateTourAnchor.setAttribute("data-tour", "late-tour-anchor");
+    lateTourAnchor.getBoundingClientRect = () => ({
+      x: 40,
+      y: 100,
+      left: 40,
+      right: 60,
+      top: 100,
+      bottom: 130,
+      width: 20,
+      height: 30,
+      toJSON: () => ({}),
+    });
+    document.body.appendChild(lateTourAnchor);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    assert.equal(tourCard.style.visibility, "visible");
+    assert.equal(tourCard.style.left, "84px", "the bubble first appears at the late target's measured position");
+    await act(async () => tourRoot.unmount());
+    tourHost.remove();
+    lateTourAnchor.remove();
     console.log(
-      "Renderer effects passed: StrictMode hydration/subscription counts, stable bridge rerenders, year headers, and no-person grouping.",
+      "Renderer effects passed: stable hydration, persisted Google section visibility, tour bubble positioning, and no-person grouping.",
     );
   } finally {
     await act(async () => root.unmount());

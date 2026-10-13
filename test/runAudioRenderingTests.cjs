@@ -11,6 +11,7 @@ const text = fs.readFileSync(
   "utf8",
 );
 const css = fs.readFileSync(path.join(__dirname, "../src/App.css"), "utf8");
+const main = fs.readFileSync(path.join(__dirname, "../src/main.ts"), "utf8");
 const ast = ts.createSourceFile(
   "AudioLibrary.tsx",
   text,
@@ -176,13 +177,17 @@ test("CSS geometry matches production constants and prevents scroll anchoring", 
   );
   assert.match(
     css,
-    /\.audio-visualizer\s*\{[^}]*max-height: min\(140px, 25vh\);/,
+    /\.audio-visualizer\s*\{[^}]*height: clamp\(120px, 24vh, 220px\);[^}]*max-height: min\(220px, 32vh\);/,
   );
   assert.match(
     css,
     /\.audio-visualizer i\s*\{[^}]*max-height: 100%;/,
   );
   assert.match(css, /@media \(max-height: 620px\)/);
+  assert.match(main, /async function getPlayableAudioPath\(/);
+  assert.match(main, /"\.aif",\s*"\.aifc",\s*"\.aiff",\s*"\.caf",\s*"\.m4p"/);
+  assert.match(main, /process\.platform === "darwin"[\s\S]{0,80}process\.arch === "x64"[\s\S]{0,50}extension === "\.mp3"/);
+  assert.match(text, /preview\?\.playbackError/);
   assert.match(text, /const orderedFiles = useMemo/);
   assert.match(text, /const activeFile = useMemo/);
   assert.match(text, /const activeIndex = useMemo/);

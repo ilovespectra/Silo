@@ -2,6 +2,7 @@ export declare const LIFETIME_PAYMENT_ADDRESS = "89Y6dpvpfTCBZjw2Xcb3KVVFTebdbGp
 export declare const LIFETIME_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 export declare const LIFETIME_PAYMENT_MICRO_USDC = 25000000n;
 export declare const LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = 23750000n;
+export declare const LIFETIME_PAYMENT_SUPPORT_GUIDANCE = "Payment confirmed, but Silo could not activate the license on this computer. Do not pay again. Contact Silo support with the Solana transaction signature and this installation ID.";
 export declare function encodeSolanaPayReference(bytes: Uint8Array): string;
 export declare function isSolanaPayReference(value: string): boolean;
 export declare function createLifetimeSolanaPayUri(reference: string): string;

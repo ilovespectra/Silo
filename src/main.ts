@@ -59,6 +59,7 @@ import { isAudioFile } from "./utils/audioTypes";
 import {
   isSolanaPayReference,
   isSolanaTransactionSignature,
+  LIFETIME_PAYMENT_SUPPORT_GUIDANCE,
   type LifetimeLicenseState,
   type LifetimePaymentVerification,
   LIFETIME_PAYMENT_ADDRESS,
@@ -195,6 +196,13 @@ const mime = require("mime") as { getType(filePath: string): string | null };
 const ffmpegStaticPath = require("ffmpeg-static") as string | null;
 const execFileAsync = promisify(execFile);
 const directlyPlayableVideoExtensions = new Set([".mp4", ".webm", ".ogv"]);
+const audioCompatibilityExtensions = new Set([
+  ".aif",
+  ".aifc",
+  ".aiff",
+  ".caf",
+  ".m4p",
+]);
 const mediaConversionJobs = new Map<string, Promise<string>>();
 
 // Handle EPIPE errors on console streams (can occur during shutdown)
@@ -359,10 +367,10 @@ async function requestRelayJson(
   });
 }
 
-async function requestLifetimeCardPurchase(
+async function requestLifetimePurchase(
   endpoint: URL,
   deviceId: string,
-  paymentMethod: "card" | "solana-pay" | "manual" = "card",
+  paymentMethod: "solana-pay" | "manual",
   reference?: string,
 ): Promise<{
   ok: boolean;
@@ -864,6 +872,7 @@ const activeSessionMarkerPath = path.join(
   "active-session.json",
 );
 const maxBugReportScreenshotBytes = 3 * 1024 * 1024;
+const maxBugReportMessageLength = 100_000;
 const defaultBugReportEndpoint =
   "https://silo-bug-report-relay.vercel.app/api/bug-report";
 const defaultBetaRequestEndpoint =
@@ -1380,6 +1389,7 @@ function respondIndexingOverview(compute: () => Promise<unknown> | unknown): Pro
 const EARLY_IPC_CHANNELS = new Set([
   "get-app-update-state",
   "check-app-updates",
+  "get-app-version",
   "get-startup-state",
   "get-content-settings",
   "get-search-performance-settings",
@@ -5457,6 +5467,72 @@ async function getPlayableVideoPath(
   return { path: await conversion, transcoded: true };
 }
 
+async function getPlayableAudioPath(
+  originalPath: string,
+  localPath: string,
+  size: number,
+  modified: number,
+): Promise<{ path: string; transcoded: boolean } | null> {
+  const extension = path.extname(originalPath).toLowerCase();
+  const intelMp3Fallback =
+    process.platform === "darwin" &&
+    process.arch === "x64" &&
+    extension === ".mp3";
+  if (!audioCompatibilityExtensions.has(extension) && !intelMp3Fallback)
+    return null;
+
+  const cacheDirectory = indexStoragePath("media-cache");
+  const cacheKey = createHash("sha1")
+    .update(`audio:${originalPath}:${size}:${modified}`)
+    .digest("hex");
+  const outputPath = path.join(cacheDirectory, `${cacheKey}.mp3`);
+  try {
+    if ((await fsPromises.stat(outputPath)).size > 0)
+      return { path: outputPath, transcoded: true };
+  } catch {
+    // Cache miss.
+  }
+
+  let conversion = mediaConversionJobs.get(outputPath);
+  if (!conversion) {
+    conversion = (async () => {
+      await fsPromises.mkdir(cacheDirectory, { recursive: true });
+      const temporaryPath = `${outputPath}.partial`;
+      try {
+        await execFileAsync(
+          getFfmpegPath(),
+          [
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            localPath,
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            "-f",
+            "mp3",
+            temporaryPath,
+          ],
+          { maxBuffer: 10 * 1024 * 1024 },
+        );
+        if ((await fsPromises.stat(temporaryPath)).size === 0)
+          throw new Error("FFmpeg produced an empty audio file.");
+        await fsPromises.rename(temporaryPath, outputPath);
+        return outputPath;
+      } finally {
+        await fsPromises.rm(temporaryPath, { force: true });
+      }
+    })().finally(() => mediaConversionJobs.delete(outputPath));
+    mediaConversionJobs.set(outputPath, conversion);
+  }
+  return { path: await conversion, transcoded: true };
+}
+
 function getPreloadPath(): string {
   return path.join(app.getAppPath(), "public", "preload.js");
 }
@@ -8427,9 +8503,20 @@ ipcMain.handle("get-file-preview", async (_event, filePath: string) => {
 
     // Remote media streams lazily through app-media; only images are pulled eagerly.
     const video = mimeType?.startsWith("video/") ?? false;
+    const audio = mimeType?.startsWith("audio/") ?? false;
     const needsVideoConversion =
       video && !directlyPlayableVideoExtensions.has(extension);
-    const deferDownload = remote && Boolean(isMedia) && !needsVideoConversion;
+    const needsAudioConversion =
+      audio &&
+      (audioCompatibilityExtensions.has(extension) ||
+        (process.platform === "darwin" &&
+          process.arch === "x64" &&
+          extension === ".mp3"));
+    const deferDownload =
+      remote &&
+      Boolean(isMedia) &&
+      !needsVideoConversion &&
+      !needsAudioConversion;
     const localPath = deferDownload
       ? filePath
       : (sourcePath ?? (await resolveLocalPath(filePath)));
@@ -8472,6 +8559,32 @@ ipcMain.handle("get-file-preview", async (_event, filePath: string) => {
     const playableVideo = video
       ? await getPlayableVideoPath(filePath, localPath, size, modifiedMs)
       : null;
+    let playableAudio: { path: string; transcoded: boolean } | null = null;
+    let playbackError: string | undefined;
+    if (audio && needsAudioConversion) {
+      try {
+        playableAudio = await getPlayableAudioPath(
+          filePath,
+          localPath,
+          size,
+          modifiedMs,
+        );
+      } catch (error) {
+        playbackError =
+          extension === ".m4p"
+            ? "Silo could not decode this M4P file. It may be protected; try an unprotected copy or another audio format."
+            : "Silo could not convert this audio file for playback. The original file was left unchanged.";
+        runtimeLog("audio-playback-transcode-error", {
+          extension,
+          message:
+            error instanceof Error
+              ? error.message.slice(0, 500)
+              : String(error).slice(0, 500),
+        });
+      }
+    }
+    const playablePath =
+      playableAudio?.path ?? playableVideo?.path ?? filePath;
     const documentPreview =
       !mimeType?.startsWith("image/") && !isMedia
         ? await getDocumentPreview(localPath, path.basename(filePath), mimeType)
@@ -8485,11 +8598,14 @@ ipcMain.handle("get-file-preview", async (_event, filePath: string) => {
       extension,
       path: filePath,
       previewDataUrl,
-      mediaUrl: `app-media://stream/${encodeURIComponent(playableVideo?.path ?? filePath)}`,
-      playbackMimeType: playableVideo?.transcoded
-        ? "video/mp4"
-        : mime.getType(playableVideo?.path ?? filePath),
-      transcoded: playableVideo?.transcoded ?? false,
+      mediaUrl: `app-media://stream/${encodeURIComponent(playablePath)}`,
+      playbackMimeType: playableAudio?.transcoded
+        ? "audio/mpeg"
+        : playableVideo?.transcoded
+          ? "video/mp4"
+          : mime.getType(playablePath),
+      playbackError,
+      transcoded: playableAudio?.transcoded ?? playableVideo?.transcoded ?? false,
       documentPreview,
     };
   } catch (err) {
@@ -9766,6 +9882,78 @@ async function readRuntimeDiagnostics(cursorValue: unknown) {
 }
 
 ipcMain.handle("get-runtime-diagnostics", (_event, cursor: unknown) => readRuntimeDiagnostics(cursor));
+ipcMain.handle("export-runtime-diagnostics", async (event) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents)
+    return { ok: false, error: "The Silo window is not available to export diagnostics." };
+  const choice = await dialog.showOpenDialog(mainWindow, {
+    title: "Choose a folder for Silo diagnostics",
+    defaultPath: app.getPath("documents"),
+    properties: ["openDirectory", "createDirectory"],
+  });
+  if (choice.canceled || !choice.filePaths[0]) return { ok: false, canceled: true };
+
+  const diagnostics = await readRuntimeDiagnostics(0);
+  const report = {
+    schemaVersion: 1,
+    exportedAt: new Date().toISOString(),
+    appVersion: app.getVersion(),
+    platform: process.platform,
+    architecture: process.arch,
+    truncated: diagnostics.truncated,
+    entries: diagnostics.entries,
+  };
+  const timestamp = report.exportedAt.replace(/[:.]/g, "-");
+  let textPath = "";
+  let jsonPath = "";
+  for (let suffix = 0; suffix < 1000; suffix += 1) {
+    const stem = `Silo-Diagnostics-${timestamp}${suffix ? `-${suffix + 1}` : ""}`;
+    textPath = path.join(choice.filePaths[0], `${stem}.txt`);
+    jsonPath = path.join(choice.filePaths[0], `${stem}.json`);
+    const [textExists, jsonExists] = await Promise.all([
+      fsPromises.access(textPath).then(() => true, () => false),
+      fsPromises.access(jsonPath).then(() => true, () => false),
+    ]);
+    if (!textExists && !jsonExists) break;
+    textPath = "";
+    jsonPath = "";
+  }
+  if (!textPath || !jsonPath)
+    return { ok: false, error: "Silo could not find an unused diagnostics filename." };
+
+  const text = [
+    "Silo Runtime Diagnostics",
+    `Exported: ${report.exportedAt}`,
+    `Silo version: ${report.appVersion}`,
+    `Platform: ${report.platform} (${report.architecture})`,
+    `Entries included: ${report.entries.length}`,
+    `Log tail truncated: ${report.truncated ? "yes" : "no"}`,
+    "",
+    "Runtime events (filesystem paths may appear):",
+    ...report.entries.map((entry) => JSON.stringify(entry)),
+    "",
+  ].join("\n");
+  try {
+    await fsPromises.writeFile(textPath, text, { flag: "wx" });
+  } catch {
+    return { ok: false, error: "Silo could not write the TXT diagnostics file." };
+  }
+  try {
+    await fsPromises.writeFile(jsonPath, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
+  } catch {
+    return {
+      ok: false,
+      error: "The TXT diagnostics file was saved, but Silo could not write its JSON companion.",
+      textPath,
+    };
+  }
+  return {
+    ok: true,
+    textPath,
+    jsonPath,
+    entries: report.entries.length,
+    truncated: report.truncated,
+  };
+});
 ipcMain.handle("get-pending-diagnostic-report", (event) => {
   if (!mainWindow || event.sender !== mainWindow.webContents) return null;
   return pendingDiagnosticReport;
@@ -9973,6 +10161,7 @@ ipcMain.handle("get-indexing-overview", async () => {
 });
 
 ipcMain.handle("get-startup-state", () => startupState);
+ipcMain.handle("get-app-version", () => app.getVersion());
 
 function getVisibleDemoMapPhotos(
   photos: GeoPhoto[],
@@ -10645,14 +10834,14 @@ ipcMain.handle(
 ipcMain.handle("get-lifetime-license", () => readLifetimeLicense());
 
 async function createLifetimePurchase(
-  paymentMethod: "card" | "solana-pay" | "manual",
+  paymentMethod: "solana-pay" | "manual",
   reference?: string,
 ) {
   const installationId = await getDeviceBindingId();
   const relayBase = new URL(lifetimePaymentRelayBaseUrl);
   if (relayBase.protocol !== "https:" && relayBase.hostname !== "localhost")
     throw new Error("The payment relay must use HTTPS.");
-  const response = await requestLifetimeCardPurchase(
+  const response = await requestLifetimePurchase(
     new URL(`${relayBase.origin}/api/purchase`),
     installationId,
     paymentMethod,
@@ -10663,7 +10852,7 @@ async function createLifetimePurchase(
     throw new Error(
       typeof payload.error === "string"
         ? payload.error
-        : "A secure payment request could not be started.",
+        : "A payment request could not be started securely.",
     );
   if (
     typeof payload.purchaseId !== "string" ||
@@ -10716,9 +10905,10 @@ ipcMain.handle(
       typeof claimTokenValue !== "string" ||
       claimTokenValue.length < 40 ||
       claimTokenValue.length > 100
-    )
+      )
       return { status: "error" as const, message: "The purchase reference is invalid." };
 
+    let paymentConfirmed = false;
     try {
       const installationId = await getDeviceBindingId();
       const relayBase = new URL(lifetimePaymentRelayBaseUrl);
@@ -10749,6 +10939,7 @@ ipcMain.handle(
         return { status: "error" as const, message: `${message} (HTTP ${response.statusCode})` };
       }
       if (payload.status === "verified") {
+        paymentConfirmed = true;
         if (
           typeof payload.signature !== "string" ||
           !isSolanaTransactionSignature(payload.signature) ||
@@ -10759,7 +10950,7 @@ ipcMain.handle(
         )
           return {
             status: "error" as const,
-            message: "The verified payment is not bound to this Silo installation.",
+            message: LIFETIME_PAYMENT_SUPPORT_GUIDANCE,
           };
         await writeLifetimeLicense(
           payload.licenseToken,
@@ -10795,6 +10986,11 @@ ipcMain.handle(
         name: error instanceof Error ? error.name : "UnknownError",
         message: (error instanceof Error ? error.message : String(error)).slice(0, 500),
       });
+      if (paymentConfirmed)
+        return {
+          status: "error" as const,
+          message: LIFETIME_PAYMENT_SUPPORT_GUIDANCE,
+        };
       return {
         status: "error" as const,
         message: "The license relay is temporarily unavailable. Silo will keep checking.",
@@ -10881,10 +11077,10 @@ ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
   };
   const message =
     typeof report.message === "string" ? report.message.trim() : "";
-  if (!message || message.length > 5000)
+  if (!message || message.length > maxBugReportMessageLength)
     return {
       ok: false,
-      error: "Write a report between 1 and 5,000 characters.",
+      error: `Write a report between 1 and ${maxBugReportMessageLength.toLocaleString()} characters.`,
     };
   const feature =
     typeof report.feature === "string" ? report.feature.trim() : "";
@@ -11129,6 +11325,7 @@ async function verifyAndSaveLifetimePayment(
       license: existingLicense,
     };
 
+  let paymentConfirmed = false;
   try {
     const { relayBase, payload: purchase } = await createLifetimePurchase("manual");
     const installationId = await getDeviceBindingId();
@@ -11149,6 +11346,7 @@ async function verifyAndSaveLifetimePayment(
     );
     const result = response.payload;
     if (result.status === "verified") {
+      paymentConfirmed = true;
       if (
         !response.ok ||
         result.installationId !== installationId ||
@@ -11159,7 +11357,7 @@ async function verifyAndSaveLifetimePayment(
       )
         return {
           status: "error",
-          message: "The relay did not bind this verified payment to this computer.",
+          message: LIFETIME_PAYMENT_SUPPORT_GUIDANCE,
         };
       await writeLifetimeLicense(result.licenseToken, installationId);
       enableLifetimeFeatures();
@@ -11197,8 +11395,9 @@ async function verifyAndSaveLifetimePayment(
   } catch {
     return {
       status: "error",
-      message:
-        "Silo could not verify this computer or reach the license relay. No license status was changed.",
+      message: paymentConfirmed
+        ? LIFETIME_PAYMENT_SUPPORT_GUIDANCE
+        : "Silo could not verify this computer or reach the license relay. No license status was changed.",
     };
   }
 }

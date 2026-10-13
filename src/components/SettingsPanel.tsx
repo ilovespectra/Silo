@@ -28,6 +28,8 @@ interface SettingsPanelProps {
   onOpenStatistics: () => void;
   onOpenBugReport: () => void;
   hideSettingsForScreenshot?: boolean;
+  googleSourcesHidden: boolean;
+  onGoogleSourcesHiddenChange: (hidden: boolean) => void;
   lifetimePromptRequest?: number;
   onLifetimePromptHandled: () => void;
 }
@@ -595,14 +597,14 @@ export function BugReportDialog({
           <span>What happened?</span>
           <textarea
             autoFocus
-            maxLength={5000}
+            maxLength={100000}
             rows={5}
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             placeholder="Describe what you expected and what went wrong…"
             disabled={busy || sent}
           />
-          <small>{message.length.toLocaleString()} / 5,000</small>
+          <small>{message.length.toLocaleString()} / 100,000</small>
         </label>
         <label className="bug-report-field">
           <span>Visible feature (optional)</span>
@@ -752,6 +754,8 @@ export default function SettingsPanel({
   onOpenStatistics,
   onOpenBugReport,
   hideSettingsForScreenshot = false,
+  googleSourcesHidden,
+  onGoogleSourcesHiddenChange,
   lifetimePromptRequest = 0,
   onLifetimePromptHandled,
 }: SettingsPanelProps) {
@@ -1200,6 +1204,28 @@ export default function SettingsPanel({
               </button>
             </div>
           )}
+        </section>
+
+        <section className="settings-google-sources-section">
+          <div className="settings-section-title">
+            <FiExternalLink />
+            <div>
+              <h3>Google account sources</h3>
+              <p>
+                This optional section can be collapsed in Files or hidden here.
+                Hiding it keeps your connected accounts and local files unchanged.
+              </p>
+            </div>
+          </div>
+          <button
+            className="settings-secondary"
+            onClick={() => onGoogleSourcesHiddenChange(!googleSourcesHidden)}
+            aria-pressed={googleSourcesHidden}
+          >
+            {googleSourcesHidden
+              ? "Show Google Accounts in Files"
+              : "Hide Google Accounts from Files"}
+          </button>
         </section>
 
         <section className="settings-update-section" aria-live="polite">

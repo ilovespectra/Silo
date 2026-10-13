@@ -19,6 +19,7 @@ paymentModule._compile(compiled, sourcePath);
 
 const {
   LIFETIME_PAYMENT_ADDRESS,
+  LIFETIME_PAYMENT_SUPPORT_GUIDANCE,
   LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC,
   LIFETIME_USDC_MINT,
   createLifetimeSolanaPayUri,
@@ -27,6 +28,11 @@ const {
   isSolanaTransactionSignature,
   verifyParsedLifetimePayment,
 } = paymentModule.exports;
+
+assert.match(LIFETIME_PAYMENT_SUPPORT_GUIDANCE, /Payment confirmed/i);
+assert.match(LIFETIME_PAYMENT_SUPPORT_GUIDANCE, /Do not pay again/i);
+assert.match(LIFETIME_PAYMENT_SUPPORT_GUIDANCE, /transaction signature/i);
+assert.match(LIFETIME_PAYMENT_SUPPORT_GUIDANCE, /installation ID/i);
 
 const signature = "5".repeat(88);
 const makeRpcResponse = (options = {}) => {

@@ -172,9 +172,29 @@ export class MemoryExporter {
       };
       for (const media of selected) {
         this.checkCancelled();
-        const original = await this.deps.resolveLocalPath(media.path);
+        let original: string;
+        try {
+          original = await this.deps.resolveLocalPath(media.path);
+          const stat = await fs.stat(original);
+          if (!stat.isFile()) throw new Error("not a file");
+        } catch {
+          throw new Error(
+            "A photo or clip in this memory is no longer available. Refresh Memories and try saving it again.",
+          );
+        }
         await protect(original);
-        const source = media.liveVideoPath ? await this.deps.resolveLocalPath(media.liveVideoPath) : original;
+        let source = original;
+        if (media.liveVideoPath) {
+          try {
+            source = await this.deps.resolveLocalPath(media.liveVideoPath);
+            const stat = await fs.stat(source);
+            if (!stat.isFile()) throw new Error("not a file");
+          } catch {
+            throw new Error(
+              "A live photo clip in this memory is no longer available. Refresh Memories and try saving it again.",
+            );
+          }
+        }
         await protect(source);
         inputs.push({ source, video: Boolean(media.liveVideoPath) || media.type === "video" });
       }

@@ -126,6 +126,7 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("select-shelter-destination"),
   getRuntimeDiagnostics: (cursor) =>
     ipcRenderer.invoke("get-runtime-diagnostics", cursor),
+  exportRuntimeDiagnostics: () => ipcRenderer.invoke("export-runtime-diagnostics"),
   retryIndexingStage: (id) => ipcRenderer.invoke("retry-indexing-stage", id),
   onThumbnailPregenProgress: (callback) => {
     const listener = (_event, progress) => callback(progress);
@@ -147,6 +148,7 @@ contextBridge.exposeInMainWorld("electron", {
   saveFileToDevice: (sourcePath, suggestedFileName) =>
     ipcRenderer.invoke("save-file-to-device", sourcePath, suggestedFileName),
   getAppState: () => ipcRenderer.invoke("get-app-state"),
+  getAppVersion: () => ipcRenderer.invoke("get-app-version"),
   getAppUpdateState: () => ipcRenderer.invoke("get-app-update-state"),
   checkForAppUpdates: () => ipcRenderer.invoke("check-app-updates"),
   downloadAndInstallAppUpdate: () =>

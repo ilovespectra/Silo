@@ -5,6 +5,7 @@ import {
   FiCheckCircle,
   FiCloudOff,
   FiCopy,
+  FiDownload,
   FiDatabase,
   FiHardDrive,
   FiRefreshCw,
@@ -94,6 +95,8 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
   const [error, setError] = useState("");
   const [truncated, setTruncated] = useState(false);
   const [isFollowing, setIsFollowing] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [exportMessage, setExportMessage] = useState("");
   const cursor = useRef(0);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const followBottom = useRef(true);
@@ -133,6 +136,26 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
       feedRef.current.scrollTop = feedRef.current.scrollHeight;
   }, [entries]);
 
+  const exportDiagnostics = async () => {
+    setExporting(true);
+    setExportMessage("");
+    try {
+      const result = await api.exportRuntimeDiagnostics();
+      if (result.canceled) return;
+      if (!result.ok) {
+        setExportMessage(result.error || "Silo could not export diagnostics.");
+        return;
+      }
+      setExportMessage(
+        `Saved ${result.entries ?? 0} recent events as TXT and JSON${result.truncated ? " (older log entries were omitted)" : ""}.`,
+      );
+    } catch (cause) {
+      setExportMessage(cause instanceof Error ? cause.message : "Silo could not export diagnostics.");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <section className="stats-console-card">
       <header className="stats-card-heading">
@@ -167,7 +190,11 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
       <footer className="stats-console-footer">
         <span>{entries.length.toLocaleString()} recent events</span>
         <span>{isFollowing ? "Following newest" : "Scroll to bottom to resume follow"}</span>
+        <button className="stats-text-button" onClick={() => void exportDiagnostics()} disabled={exporting}>
+          <FiDownload /> {exporting ? "Exporting…" : "Export TXT + JSON"}
+        </button>
       </footer>
+      {exportMessage && <p className="stats-console-note" role="status">{exportMessage}</p>}
     </section>
   );
 }

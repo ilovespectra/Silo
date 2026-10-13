@@ -5,6 +5,8 @@ export const LIFETIME_USDC_MINT =
 export const LIFETIME_PAYMENT_MICRO_USDC = 25_000_000n;
 // Preserve a $25 card price while allowing up to 5% seller-side checkout fees.
 export const LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = 23_750_000n;
+export const LIFETIME_PAYMENT_SUPPORT_GUIDANCE =
+  "Payment confirmed, but Silo could not activate the license on this computer. Do not pay again. Contact Silo support with the Solana transaction signature and this installation ID.";
 
 const SOLANA_BASE58_ALPHABET =
   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";

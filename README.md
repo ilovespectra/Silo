@@ -63,9 +63,9 @@ If macOS says Silo **is damaged** or **will damage your computer**, stop and do 
 
 ## Preview release and license status
 
-Silo 2.0.4 is an early testing release, not the finished demo. Its $25 lifetime license is intended for **one computer**; each computer needs its own purchase. Configuration export/import can transfer settings and indexes, but it excludes paid and beta licenses and the installation ID. Treat configuration exports as sensitive because they can contain account credentials.
+Silo 2.0.6 is a test preview. Its $25 lifetime license is intended for **one computer**; each computer needs its own verified purchase. Configuration export/import can transfer settings and indexes, but it excludes paid and beta licenses and the installation ID. Treat configuration exports as sensitive because they can contain account credentials.
 
-As of October 11, 2026, the payment relay health check reports ready, but that only confirms service availability. No real 2.0.4 payment, activation, or one-computer enforcement test has been completed on the release machines. Card and Solana payment verification remain unverified until those real-machine tests pass.
+End-to-end payment, signed activation, and one-computer enforcement still require verification on installed 2.0.6 builds. A ready relay health check confirms service availability only; it does not prove a payment or license activation.
 
 ## Development
 
@@ -83,9 +83,9 @@ npm start       # run the built app
 npm run dist    # package into release/
 ```
 
-### Building the 2.0.5 diagnostic test release
+### Building the 2.0.6 test preview
 
-On the release Mac, after the 2.0.5 changes are committed and pushed to GitHub
+On the release Mac, after the 2.0.6 changes are committed and pushed to GitHub
 `main`, run:
 
 ```bash
@@ -95,7 +95,7 @@ npm run repackage_binaries
 The script builds both Mac DMGs and updater ZIPs locally, merges their
 `latest-mac.yml` manifests, and dispatches the Windows installer workflow for
 the same `main` commit. It stages the three installable builds and Mac updater
-metadata in `~/Downloads/SILO 2.0.5 TEST/` only after every build succeeds. It
+metadata in `~/Downloads/SILO 2.0.6 TEST/` only after every build succeeds. It
 refuses to replace an existing file in that test folder. Upload the two ZIPs and
 `latest-mac.yml` with the DMGs to a release before testing in-app Mac updates.
 

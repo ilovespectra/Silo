@@ -96,6 +96,18 @@ async function main() {
       await run(['-f', 'lavfi', '-i', `color=c=${color}:s=640x360`, '-frames:v', '1', '-threads', '2', '-update', '1', file]);
       images.push(file);
     }
+    const missingSource = path.join(directory, 'missing-source.jpg');
+    await assert.rejects(
+      new MemoryExporter(deps).render(
+        { ...suggestion, media: [media(images[0]), media(images[1]), media(missingSource)] },
+        options,
+        soundtrack,
+        path.join(directory, 'missing-source-output.mp4'),
+      ),
+      /no longer available\. Refresh Memories and try saving it again\./,
+    );
+    assert.equal(fs.existsSync(path.join(directory, 'missing-source-output.mp4')), false);
+    console.log('PASS: missing memory source returns a refresh hint without creating an output');
     // A large colourful border proves fitted content remains visible without zoom or crop.
     const border = path.join(directory, 'border.png');
     await run(['-f', 'lavfi', '-i', 'color=c=red:s=640x360', '-vf', 'drawbox=x=0:y=0:w=iw:h=ih:color=yellow:t=14', '-frames:v', '1', '-threads', '2', '-update', '1', border]);
@@ -249,7 +261,7 @@ async function main() {
 
     const previousOutput = await fsp.readFile(movie);
     const missingSuggestion = { ...suggestion, media: [media(path.join(directory, 'missing.jpg'))] };
-    await assert.rejects(new MemoryExporter(deps).render(missingSuggestion, options, soundtrack, movie), /ENOENT/);
+    await assert.rejects(new MemoryExporter(deps).render(missingSuggestion, options, soundtrack, movie), /no longer available\. Refresh Memories and try saving it again\./);
     assert.deepEqual(await fsp.readFile(movie), previousOutput, 'Failure preserves existing destination');
     await assert.rejects(new MemoryExporter({ ...deps, timeoutMs: 1 }).render(suggestion, options, soundtrack, movie), /timed out/);
     assert.deepEqual(await fsp.readFile(movie), previousOutput, 'Timeout preserves existing destination');

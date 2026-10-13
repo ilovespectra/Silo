@@ -1,0 +1,35 @@
+name: Site.eu license relay checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/siteeu-relay/**'
+      - 'test/siteeu-relay-contract-test.php'
+      - '.github/workflows/siteeu-relay.yml'
+  pull_request:
+    paths:
+      - 'server/siteeu-relay/**'
+      - 'test/siteeu-relay-contract-test.php'
+      - '.github/workflows/siteeu-relay.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: curl, pdo_mysql, openssl
+      - name: Check PHP syntax
+        run: |
+          php -l server/siteeu-relay/index.php
+          php -l server/siteeu-relay/lib/relay.php
+          php -l test/siteeu-relay-contract-test.php
+      - name: Test payment and license contract
+        run: php test/siteeu-relay-contract-test.php

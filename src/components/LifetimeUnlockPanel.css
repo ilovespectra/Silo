@@ -99,7 +99,7 @@
 .lifetime-unlock-video-section {
   position: relative;
   z-index: 3;
-  width: 92%;
+  width: 46%;
   margin: 0 auto -78px;
 }
 
@@ -173,7 +173,7 @@
 .lifetime-video-cue {
   position: absolute;
   z-index: 4;
-  left: 70%;
+  left: 50%;
   bottom: -17px;
   min-height: 34px;
   padding: 0 13px;
@@ -184,6 +184,7 @@
   font-size: 11px;
   font-weight: 800;
   box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+  transform: translateX(-50%);
   cursor: pointer;
 }
 
@@ -194,7 +195,9 @@
   gap: 7px;
   position: relative;
   z-index: 4;
-  margin: 0 0 -7px;
+  width: min(460px, calc(100vw - 40px));
+  margin: 0 0 -7px 50%;
+  transform: translateX(-50%);
 }
 
 .lifetime-video-cue:hover,
@@ -776,7 +779,7 @@
   }
 
   .lifetime-unlock-video-section {
-    width: 94%;
+    width: 46%;
     margin-bottom: -68px;
   }
 
@@ -791,7 +794,7 @@
   }
 
   .lifetime-video-cue {
-    left: 62%;
+    left: 50%;
     min-height: 30px;
     padding: 0 9px;
     font-size: 9px;

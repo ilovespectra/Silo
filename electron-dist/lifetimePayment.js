@@ -1,11 +1,12 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.verifyParsedLifetimePayment = exports.isSolanaTransactionSignature = exports.createLifetimeSolanaPayUri = exports.isSolanaPayReference = exports.encodeSolanaPayReference = exports.LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = exports.LIFETIME_PAYMENT_MICRO_USDC = exports.LIFETIME_USDC_MINT = exports.LIFETIME_PAYMENT_ADDRESS = void 0;
+exports.verifyParsedLifetimePayment = exports.isSolanaTransactionSignature = exports.createLifetimeSolanaPayUri = exports.isSolanaPayReference = exports.encodeSolanaPayReference = exports.LIFETIME_PAYMENT_SUPPORT_GUIDANCE = exports.LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = exports.LIFETIME_PAYMENT_MICRO_USDC = exports.LIFETIME_USDC_MINT = exports.LIFETIME_PAYMENT_ADDRESS = void 0;
 exports.LIFETIME_PAYMENT_ADDRESS = "89Y6dpvpfTCBZjw2Xcb3KVVFTebdbGpzWTNEPMWEuMyu";
 exports.LIFETIME_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 exports.LIFETIME_PAYMENT_MICRO_USDC = 25000000n;
 // Preserve a $25 card price while allowing up to 5% seller-side checkout fees.
 exports.LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = 23750000n;
+exports.LIFETIME_PAYMENT_SUPPORT_GUIDANCE = "Payment confirmed, but Silo could not activate the license on this computer. Do not pay again. Contact Silo support with the Solana transaction signature and this installation ID.";
 const SOLANA_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function encodeSolanaPayReference(bytes) {
     if (bytes.length !== 32)

@@ -1,5 +1,15 @@
+const path = require('path');
 const packageJson = require('./package.json');
 const testOutput = process.env.SILO_TEST_OUTPUT_DIR;
+const externalRendererBuild = process.env.BUILD_PATH;
+const files = externalRendererBuild
+  ? [
+      { from: path.resolve(externalRendererBuild), to: 'build', filter: ['**/*'] },
+      ...packageJson.build.files.filter(
+        (entry) => typeof entry !== 'string' || !entry.startsWith('build/'),
+      ),
+    ]
+  : packageJson.build.files;
 const extraResources = testOutput
   ? packageJson.build.extraResources.filter(({ from }) => from !== '.model-test-cache')
   : packageJson.build.extraResources;
@@ -17,6 +27,7 @@ const hasCompleteSigningSetup = signingSecrets.every((name) => {
 
 module.exports = {
   ...packageJson.build,
+  files,
   directories: {
     ...packageJson.build.directories,
     ...(testOutput ? { output: testOutput } : {}),

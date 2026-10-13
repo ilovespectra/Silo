@@ -36,6 +36,7 @@ interface AudioFile {
 interface AudioPreview {
   mediaUrl?: string;
   mimeType?: string | null;
+  playbackError?: string;
 }
 
 interface AudioLibraryProps {
@@ -1117,7 +1118,8 @@ export default function AudioLibrary({
             onEnded={() => stepTrack(1)}
             onError={(event) =>
               setError(
-                `Audio playback failed (media error ${event.currentTarget.error?.code ?? "unknown"}).`,
+                preview?.playbackError ||
+                  `Audio playback failed (media error ${event.currentTarget.error?.code ?? "unknown"}).`,
               )
             }
           />

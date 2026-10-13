@@ -353,6 +353,7 @@ export default function GuidedTour({
   const [stepIndex, setStepIndex] = useState(0);
   const [targetElement, setTargetElement] = useState<HTMLElement | null>(null);
   const [targetRect, setTargetRect] = useState<SpotlightRect | null>(null);
+  const [positionedStepId, setPositionedStepId] = useState<string | null>(null);
   const [viewport, setViewport] = useState({
     width: window.innerWidth,
     height: window.innerHeight,
@@ -366,8 +367,8 @@ export default function GuidedTour({
     const bubbleHeight = 330;
     if (!targetRect) {
       return {
-        left: Math.max(16, (viewport.width - bubbleWidth) / 2),
-        top: Math.max(16, (viewport.height - bubbleHeight) / 2),
+        left: Math.max(16, viewport.width - bubbleWidth - 16),
+        top: Math.max(16, viewport.height - bubbleHeight - 16),
       };
     }
     const gap = 18;
@@ -416,6 +417,7 @@ export default function GuidedTour({
     onNavigate(step.section, step);
     setTargetElement(null);
     setTargetRect(null);
+    setPositionedStepId(null);
     let cancelled = false;
     let attempts = 0;
     let timer = 0;
@@ -434,7 +436,8 @@ export default function GuidedTour({
         return;
       }
       attempts += 1;
-      if (attempts < 18) timer = window.setTimeout(findTarget, 100);
+      if (attempts < 50) timer = window.setTimeout(findTarget, 100);
+      else setPositionedStepId(step.id);
     };
     timer = window.setTimeout(findTarget, 0);
     return () => {
@@ -448,6 +451,7 @@ export default function GuidedTour({
     const measure = () => {
       if (!targetElement.isConnected) {
         setTargetRect(null);
+        setPositionedStepId(null);
         return;
       }
       const rect = targetElement.getBoundingClientRect();
@@ -464,6 +468,7 @@ export default function GuidedTour({
         width: Math.max(0, right - left),
         height: Math.max(0, bottom - top),
       });
+      setPositionedStepId(step.id);
       setViewport({ width: window.innerWidth, height: window.innerHeight });
     };
     measure();
@@ -476,7 +481,7 @@ export default function GuidedTour({
       window.removeEventListener("scroll", measure, true);
       observer.disconnect();
     };
-  }, [open, targetElement]);
+  }, [open, step.id, targetElement]);
 
   if (!open) return null;
 
@@ -530,7 +535,11 @@ export default function GuidedTour({
         tabIndex={-1}
         ref={dialogRef}
         onKeyDown={handleKeyDown}
-        style={{ left: bubblePosition.left, top: bubblePosition.top }}
+        style={{
+          left: bubblePosition.left,
+          top: bubblePosition.top,
+          visibility: positionedStepId === step.id ? "visible" : "hidden",
+        }}
       >
         <header className="guided-tour-header">
           <span>

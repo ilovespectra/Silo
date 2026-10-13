@@ -149,8 +149,15 @@ export default function DuplicatesPage({
   const scan = async () => {
     if (!electronAPI) return;
     setBusy(true);
+    setError("");
     try {
       onStateChange(await electronAPI.scanDuplicates());
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Silo could not start the duplicate scan. Check indexing status and try again.",
+      );
     } finally {
       setBusy(false);
     }

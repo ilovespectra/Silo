@@ -30,6 +30,7 @@ interface FilePreview {
   previewDataUrl: string | null;
   mediaUrl?: string;
   playbackMimeType?: string | null;
+  playbackError?: string;
   transcoded?: boolean;
   documentPreview?: import("./documentPreview").DocumentPreview;
 }
@@ -933,6 +934,15 @@ interface Window {
     verifyShelterSources(sourceIds: string[]): Promise<LibraryDashboardSnapshot>;
     selectShelterDestination(): Promise<string | null>;
     getRuntimeDiagnostics(cursor: number): Promise<RuntimeDiagnosticRead>;
+    exportRuntimeDiagnostics(): Promise<{
+      ok: boolean;
+      canceled?: boolean;
+      error?: string;
+      textPath?: string;
+      jsonPath?: string;
+      entries?: number;
+      truncated?: boolean;
+    }>;
     retryIndexingStage(id: string): Promise<{ ok: boolean }>;
     onThumbnailPregenProgress(
       callback: (progress: ThumbnailPregenProgress) => void,
@@ -947,6 +957,7 @@ interface Window {
       suggestedFileName: string,
     ): Promise<FileOperationResult>;
     getAppState(): Promise<PersistedAppState>;
+    getAppVersion(): Promise<string>;
     getContentSettings(): Promise<PublicContentSettings>;
     getSearchPerformanceSettings(): Promise<SearchPerformanceSnapshot>;
     updateSearchPerformanceSettings(
