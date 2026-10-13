@@ -157,8 +157,6 @@ contextBridge.exposeInMainWorld("electron", {
     return () => ipcRenderer.removeListener("app-update-state", listener);
   },
   getLifetimeLicense: () => ipcRenderer.invoke("get-lifetime-license"),
-  beginLifetimeCardPurchase: () =>
-    ipcRenderer.invoke("begin-lifetime-card-purchase"),
   beginLifetimeWalletPurchase: (reference) =>
     ipcRenderer.invoke("begin-lifetime-wallet-purchase", reference),
   checkLifetimePurchase: (purchaseId, claimToken) =>

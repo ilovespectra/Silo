@@ -771,10 +771,6 @@ interface Window {
       screenshotDataUrl: string | null;
     }): Promise<{ ok: boolean; error?: string }>;
     getLifetimeLicense(): Promise<import("./lifetimePayment").LifetimeLicenseState>;
-    beginLifetimeCardPurchase(): Promise<
-      | { ok: true; purchaseId: string; claimToken: string }
-      | { ok: false; error: string }
-    >;
     beginLifetimeWalletPurchase(reference: string): Promise<
       | { ok: true; purchaseId: string; claimToken: string }
       | { ok: false; error: string }

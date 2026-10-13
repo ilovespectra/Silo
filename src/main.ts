@@ -10676,35 +10676,6 @@ async function createLifetimePurchase(
   return { relayBase, payload };
 }
 
-ipcMain.handle("begin-lifetime-card-purchase", async () => {
-  try {
-    if ((await readLifetimeLicense()).isLicensed)
-      throw new Error("Silo already has a lifetime license on this computer.");
-    const { relayBase, payload } = await createLifetimePurchase("card");
-    const checkoutUrl = new URL(payload.checkoutUrl);
-    if (
-      checkoutUrl.protocol !== "https:" ||
-      checkoutUrl.origin !== relayBase.origin ||
-      checkoutUrl.pathname !== "/checkout.html"
-    )
-      throw new Error("The payment relay returned an invalid checkout link.");
-    await shell.openExternal(checkoutUrl.toString());
-    return {
-      ok: true as const,
-      purchaseId: payload.purchaseId as string,
-      claimToken: payload.claimToken as string,
-    };
-  } catch (error) {
-    return {
-      ok: false as const,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Card checkout could not be started.",
-    };
-  }
-});
-
 ipcMain.handle(
   "begin-lifetime-wallet-purchase",
   async (_event, referenceValue: unknown) => {
