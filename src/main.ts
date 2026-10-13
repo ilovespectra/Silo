@@ -241,8 +241,46 @@ function recommendedIndexStorageRoot(): string {
   if (process.platform === "darwin" && fs.existsSync(macVolumeDefault))
     return macVolumeDefault;
 
-  if (process.platform === "darwin") return path.join("/Volumes", "SiloCache");
   return path.join(app.getPath("home"), "SiloCache");
+}
+
+/** Lets the user pick (or create) a storage folder and saves it. Returns false if they cancel. */
+async function chooseIndexStorageFolder(userDataPath: string, message: string): Promise<boolean> {
+  for (;;) {
+    const chosen = await dialog.showOpenDialog({
+      title: "Choose Silo storage destination",
+      message,
+      defaultPath: recommendedIndexStorageRoot(),
+      properties: ["openDirectory", "createDirectory", "promptToCreate"],
+      buttonLabel: "Use this destination",
+    });
+    if (chosen.canceled || !chosen.filePaths[0]) return false;
+    const storageRoot = path.resolve(chosen.filePaths[0]);
+    const resolvedUserData = path.resolve(userDataPath);
+    const isInside = (child: string, parent: string) => {
+      const relative = path.relative(parent, child);
+      return !relative || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    };
+    try {
+      if (isInside(storageRoot, resolvedUserData) || isInside(resolvedUserData, storageRoot))
+        throw new Error("Choose a folder outside Silo's app data folder.");
+      await fsPromises.mkdir(storageRoot, { recursive: true });
+      await fsPromises.access(storageRoot, fs.constants.R_OK | fs.constants.W_OK);
+      await writeIndexStorageRoot(userDataPath, storageRoot).catch(async () => {
+        // An unreadable settings file must not block choosing a new folder.
+        await fsPromises.rm(path.join(userDataPath, "index-storage.json"), { force: true });
+        await writeIndexStorageRoot(userDataPath, storageRoot);
+      });
+      return true;
+    } catch (error) {
+      await dialog.showMessageBox({
+        type: "warning",
+        message: "That folder can't be used",
+        detail: error instanceof Error ? error.message : String(error),
+        buttons: ["Choose another folder"],
+      });
+    }
+  }
 }
 
 async function requireIndexStorageSelection(userDataPath: string): Promise<boolean> {
@@ -255,48 +293,16 @@ async function requireIndexStorageSelection(userDataPath: string): Promise<boole
   const isDefaultBrowserLocation = selectedRoot === path.resolve(userDataPath);
   if (!isDefaultBrowserLocation) return true;
 
-  const suggestedRoot = recommendedIndexStorageRoot();
-  const chosen = await dialog.showOpenDialog({
-    title: "Choose Silo storage destination",
-    message:
-      "Silo requires a destination outside the browser profile for its generated indexes, caches, and settings.",
-    defaultPath: suggestedRoot,
-    properties: ["openDirectory", "createDirectory"],
-    buttonLabel: "Use this destination",
-  });
-
-  if (chosen.canceled || !chosen.filePaths[0]) {
-    dialog.showErrorBox(
-      "Silo storage destination required",
-      "Silo requires a destination outside the browser profile before it can open. Select a folder to continue.",
-    );
-    app.exit(1);
-    return false;
-  }
-
-  const storageRoot = path.resolve(chosen.filePaths[0]);
-  if (storageRoot === path.resolve(userDataPath)) {
-    dialog.showErrorBox(
-      "Invalid storage destination",
-      "Choose a folder outside Silo's browser profile to continue.",
-    );
-    app.exit(1);
-    return false;
-  }
-
-  try {
-    await fsPromises.mkdir(storageRoot, { recursive: true });
-    await writeIndexStorageRoot(userDataPath, storageRoot);
-    return true;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    dialog.showErrorBox(
-      "Could not save the Silo storage destination",
-      message,
-    );
-    app.exit(1);
-    return false;
-  }
+  if (await chooseIndexStorageFolder(
+    userDataPath,
+    "Choose or create a folder for Silo's indexes, caches, and settings. It can be on this computer or an external drive.",
+  )) return true;
+  dialog.showErrorBox(
+    "Silo storage destination required",
+    "Silo needs a storage folder before it can open. Reopen Silo to choose one.",
+  );
+  app.exit(1);
+  return false;
 }
 
 interface MainIndexStorageStatus {
@@ -6291,11 +6297,6 @@ async function checkSelectedIndexStorageAvailable() {
   const userDataPath = path.resolve(app.getPath("userData"));
   if (path.resolve(selectedIndexStorageRoot) === userDataPath) return true;
   try {
-    const [selectedStats, userDataStats] = await Promise.all([
-      fsPromises.stat(selectedIndexStorageRoot),
-      fsPromises.stat(userDataPath),
-    ]);
-    if (selectedStats.dev === userDataStats.dev) return false;
     await fsPromises.access(
       selectedIndexStorageRoot,
       fs.constants.R_OK | fs.constants.W_OK,
@@ -6669,24 +6670,39 @@ app.whenReady().then(async () => {
   const userDataPath = app.getPath("userData");
   if (!(await requireIndexStorageSelection(userDataPath))) return;
   let storage: Awaited<ReturnType<typeof prepareConfiguredIndexStorage>>;
-  try {
-    storage = await prepareConfiguredIndexStorage(
-      userDataPath,
-      (filesVerified, bytesVerified) =>
-        runtimeLog("index-storage-migration-progress", {
-          filesVerified,
-          bytesVerified,
-        }),
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    runtimeLog("index-storage-initialization-failed", { message });
-    dialog.showErrorBox(
-      "Silo could not safely prepare its index",
-      "Silo stopped before opening the library. Existing index files were preserved. Resolve the storage issue and reopen Silo.",
-    );
-    app.quit();
-    return;
+  for (;;) {
+    try {
+      storage = await prepareConfiguredIndexStorage(
+        userDataPath,
+        (filesVerified, bytesVerified) =>
+          runtimeLog("index-storage-migration-progress", {
+            filesVerified,
+            bytesVerified,
+          }),
+      );
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      runtimeLog("index-storage-initialization-failed", { message });
+      // Recover in place: pick a usable folder and retry without relaunching.
+      const { response } = await dialog.showMessageBox({
+        type: "warning",
+        message: "Silo couldn't prepare its storage folder",
+        detail: `${message}\n\nChoose or create another folder to continue. Existing index files were preserved.`,
+        buttons: ["Choose folder…", "Try again", "Quit"],
+        defaultId: 0,
+        cancelId: 2,
+      });
+      if (response === 2) {
+        app.quit();
+        return;
+      }
+      if (response === 0)
+        await chooseIndexStorageFolder(
+          userDataPath,
+          "Choose or create a folder for Silo's indexes, caches, and settings.",
+        );
+    }
   }
   indexStorageRoot = storage.storageRoot;
   selectedIndexStorageRoot = storage.selectedStorageRoot;

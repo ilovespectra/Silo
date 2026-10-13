@@ -344,10 +344,11 @@ async function validateExternalVolume(userDataPath: string, storageRoot: string)
   )
     throw new Error("External index storage must be separate from Silo app data.");
 
-  const [existingAncestor, userData] = await Promise.all([
-    getExistingAncestor(storageRoot),
-    fsPromises.stat(userDataPath),
-  ]);
+  // A missing drive root (e.g. an unplugged E:\ on Windows) means the
+  // destination is offline, not that the setting is broken.
+  const existingAncestor = await getExistingAncestor(storageRoot).catch(() => {
+    throw new ExternalIndexStorageUnavailableError(storageRoot);
+  });
   // On macOS, /Volumes itself is only a mount-point container. If the
   // selected volume is absent, treating that container as the destination
   // volume can pass the device check and make Silo try to create a path under
@@ -358,15 +359,7 @@ async function validateExternalVolume(userDataPath: string, storageRoot: string)
     path.resolve(storageRoot) !== path.resolve("/Volumes")
   )
     throw new ExternalIndexStorageUnavailableError(storageRoot);
-
-  const volume = await fsPromises.stat(existingAncestor);
-  if (volume.dev === userData.dev) {
-    if (!(await exists(storageRoot)))
-      throw new ExternalIndexStorageUnavailableError(storageRoot);
-    throw new Error(
-      `The selected index storage must be on a separate external volume: ${storageRoot}.`,
-    );
-  }
+  // Folders on the internal drive are allowed; they are created on demand.
 }
 
 export async function validateIndexStorageDestination(
@@ -628,12 +621,6 @@ export async function prepareExternalIndexStorage(
 ): Promise<IndexStorageMigrationResult> {
   await validateExternalVolume(userDataPath, storageRoot);
   await fsPromises.mkdir(storageRoot, { recursive: true });
-  const [userDataStats, storageStats] = await Promise.all([
-    fsPromises.stat(userDataPath),
-    fsPromises.stat(storageRoot),
-  ]);
-  if (userDataStats.dev === storageStats.dev)
-    throw new Error(`Selected index storage is not on an external volume: ${storageRoot}`);
   return migrateIndexStorageEntries(
     userDataPath,
     storageRoot,
