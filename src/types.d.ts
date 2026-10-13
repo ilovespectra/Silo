@@ -810,6 +810,7 @@ interface Window {
     browseMemoryAudio?: import("./memoryTypes").MemoriesAPI["browseMemoryAudio"];
     setMemorySoundtrack?: import("./memoryTypes").MemoriesAPI["setMemorySoundtrack"];
     viewMemory: import("./memoryTypes").MemoriesAPI["viewMemory"];
+    revealMemory: import("./memoryTypes").MemoriesAPI["revealMemory"];
     exportMemory: import("./memoryTypes").MemoriesAPI["exportMemory"];
     cancelMemoryExport: import("./memoryTypes").MemoriesAPI["cancelMemoryExport"];
     onMemoryExportProgress: import("./memoryTypes").MemoriesAPI["onMemoryExportProgress"];

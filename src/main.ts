@@ -91,6 +91,7 @@ import {
   isDeviceBindingId,
   verifyPaidLicenseToken,
 } from "./paidLicense";
+import { readOwnerAuthorizationToken } from "./ownerLicense";
 import {
   getDocumentPreview,
   isDocumentPreviewFile,
@@ -138,6 +139,8 @@ import {
   prepareConfiguredIndexStorage,
   stageIndexStorageRoot,
   validateIndexStorageDestination,
+  getIndexStorageSettings,
+  writeIndexStorageRoot,
   getLocalIndexStorageFreeBytes,
   assertLocalIndexStorageCapacity,
   LOCAL_INDEX_STORAGE_RESERVE_BYTES,
@@ -229,6 +232,73 @@ app.setPath(
   process.env.FILE_BROWSER_USER_DATA_DIR ||
     path.join(app.getPath("appData"), "file-browser-electron"),
 );
+
+function recommendedIndexStorageRoot(): string {
+  const explicit = process.env.SILO_INDEX_STORAGE_ROOT;
+  if (explicit && explicit.trim()) return path.resolve(explicit.trim());
+
+  const macVolumeDefault = "/Volumes/BIGGERDRIVE/LOOK/DOCS/SILOCACHE";
+  if (process.platform === "darwin" && fs.existsSync(macVolumeDefault))
+    return macVolumeDefault;
+
+  if (process.platform === "darwin") return path.join("/Volumes", "SiloCache");
+  return path.join(app.getPath("home"), "SiloCache");
+}
+
+async function requireIndexStorageSelection(userDataPath: string): Promise<boolean> {
+  const settings = await getIndexStorageSettings(userDataPath).catch(() => ({
+    path: userDataPath,
+    allowLocalFallback: true,
+  }));
+
+  const selectedRoot = path.resolve(settings.path);
+  const isDefaultBrowserLocation = selectedRoot === path.resolve(userDataPath);
+  if (!isDefaultBrowserLocation) return true;
+
+  const suggestedRoot = recommendedIndexStorageRoot();
+  const chosen = await dialog.showOpenDialog({
+    title: "Choose Silo storage destination",
+    message:
+      "Silo requires a destination outside the browser profile for its generated indexes, caches, and settings.",
+    defaultPath: suggestedRoot,
+    properties: ["openDirectory", "createDirectory"],
+    buttonLabel: "Use this destination",
+  });
+
+  if (chosen.canceled || !chosen.filePaths[0]) {
+    dialog.showErrorBox(
+      "Silo storage destination required",
+      "Silo requires a destination outside the browser profile before it can open. Select a folder to continue.",
+    );
+    app.exit(1);
+    return false;
+  }
+
+  const storageRoot = path.resolve(chosen.filePaths[0]);
+  if (storageRoot === path.resolve(userDataPath)) {
+    dialog.showErrorBox(
+      "Invalid storage destination",
+      "Choose a folder outside Silo's browser profile to continue.",
+    );
+    app.exit(1);
+    return false;
+  }
+
+  try {
+    await fsPromises.mkdir(storageRoot, { recursive: true });
+    await writeIndexStorageRoot(userDataPath, storageRoot);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    dialog.showErrorBox(
+      "Could not save the Silo storage destination",
+      message,
+    );
+    app.exit(1);
+    return false;
+  }
+}
+
 interface MainIndexStorageStatus {
   message: string | null;
   usingLocalFallback: boolean;
@@ -666,6 +736,18 @@ async function writeBetaLicense(activationCode: string): Promise<void> {
 }
 
 async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
+  try {
+    const deviceId = await getDeviceBindingId();
+    const ownerAuthorization = readOwnerAuthorizationToken(deviceId);
+    if (ownerAuthorization)
+      return {
+        isLicensed: true,
+        licenseType: "owner",
+        signature: "owner-authorization",
+        verifiedAt: ownerAuthorization.issuedAt,
+      };
+  } catch {}
+
   try {
     const stored = JSON.parse(
       await fsPromises.readFile(lifetimeLicensePath, "utf8"),
@@ -2475,14 +2557,27 @@ async function memoryMovieDirectory(): Promise<string> {
   return MEMORY_DEFAULT_MOVIE_DIRECTORY();
 }
 
-/** A rendered movie in the active folder, or one left in app storage before the folder changed. */
+/**
+ * A rendered movie in the active folder, or one left in app storage before the
+ * folder changed. When duplicate copies exist, prefer the newest valid file so the
+ * reveal/open action opens the actual rendered movie instead of a stale older copy.
+ */
 async function findMemoryMovie(suggestion: MemorySuggestion): Promise<string | null> {
   const name = memoryPreviewFileName(suggestion);
-  for (const directory of new Set([await memoryMovieDirectory(), MEMORY_DEFAULT_MOVIE_DIRECTORY()])) {
+  const directories = new Set<string>([await memoryMovieDirectory(), MEMORY_DEFAULT_MOVIE_DIRECTORY()]);
+  let newest: { path: string; mtimeMs: number } | null = null;
+  for (const directory of directories) {
     const candidate = path.join(directory, name);
-    if (await fsPromises.stat(candidate).then((result) => result.isFile(), () => false)) return candidate;
+    try {
+      const stat = await fsPromises.stat(candidate);
+      if (!stat.isFile()) continue;
+      const current = { path: candidate, mtimeMs: stat.mtimeMs || 0 };
+      if (!newest || current.mtimeMs > newest.mtimeMs) newest = current;
+    } catch {
+      // Ignore missing candidates and continue searching other save locations.
+    }
   }
-  return null;
+  return newest?.path ?? null;
 }
 
 /** Converted copies go to a per-export scratch directory; sources are never written. */
@@ -2555,10 +2650,22 @@ function memoryPreviewOptions(suggestion: MemorySuggestion): MemoryExportOptions
   };
 }
 
+function memoryTitleStem(title: string): string {
+  const normalized = title.normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+  const words = normalized.replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/).filter(Boolean);
+  const stem = (words.length ? words.slice(0, 5).join("-") : "memory")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase();
+  return stem || "memory";
+}
+
 function memoryPreviewFileName(suggestion: MemorySuggestion): string {
   const { count, duration } = memoryPreviewOptions(suggestion);
   const selected = suggestion.media.slice(0, count);
-  const fingerprint = createHash("sha256").update(JSON.stringify({
+  const titleStem = memoryTitleStem(suggestion.title);
+  const stableSuffix = suggestion.id.replace(/[^a-z0-9]/gi, "").slice(0, 6).toLowerCase();
+  const fingerprint = createHash("sha1").update(JSON.stringify({
     version: MEMORY_PREVIEW_RENDER_VERSION,
     id: suggestion.id,
     frame: "landscape-16:9",
@@ -2567,8 +2674,9 @@ function memoryPreviewFileName(suggestion: MemorySuggestion): string {
     duration,
     originalAudio: 0.18,
     soundtrack: suggestion.soundtrackId ?? null,
-  })).digest("hex");
-  return `${fingerprint}.mp4`;
+  })).digest("hex").slice(0, 4);
+  const safeStem = titleStem.length > 78 ? titleStem.slice(0, 78).replace(/-+$/g, "") : titleStem;
+  return `${safeStem}${stableSuffix ? `-${stableSuffix}` : ""}${fingerprint ? `-${fingerprint}` : ""}.mp4`;
 }
 
 /** Movies render in the background, one at a time; cards show live status meanwhile. */
@@ -4386,20 +4494,10 @@ async function buildSourceList(): Promise<BrowseSource[]> {
     });
   }
 
-  const offlinePhoneBackups = await phoneManager.getOfflineBackups();
-  const latestBackupByDevice = new Map<string, (typeof offlinePhoneBackups)[number]>();
-  for (const backup of offlinePhoneBackups) {
-    const key = `${backup.platform}:${backup.id}`;
-    const current = latestBackupByDevice.get(key);
-    if (!current || backup.snapshotAt > current.snapshotAt)
-      latestBackupByDevice.set(key, backup);
-  }
-
   for (const device of scannedPhoneDevices) {
     const id = device.rootPath || `${device.platform}:${device.id}`;
     const isReady = device.status === "ready" && Boolean(device.rootPath);
     const deviceKey = `${device.platform}:${device.id}`;
-    const latestBackup = latestBackupByDevice.get(deviceKey);
     const explicitPhoneChoice = explicitPhoneChoiceByDevice.get(deviceKey);
     const cloned = cloneStatus[id];
     const backupState = phoneManager.getBackupStates().find((state) => state.deviceId === device.id && state.platform === device.platform);
@@ -4412,41 +4510,10 @@ async function buildSourceList(): Promise<BrowseSource[]> {
       enabled:
         !disabled.has(id) &&
         isReady &&
-        (explicitPhoneChoice
-          ? explicitPhoneChoice === id
-          : !latestBackup || disabled.has(latestBackup.rootPath)),
+        (explicitPhoneChoice ? explicitPhoneChoice === id : true),
       available: isReady,
       message: device.status === "ready" ? "" : device.message,
       ...(backupState?.lastBackupAt ? { snapshotAt: backupState.lastBackupAt } : {}),
-      ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
-    });
-  }
-
-  const existingPhoneRoots = new Set(sources.filter((source) => source.kind === "ios" || source.kind === "android").map((source) => source.rootPath));
-  for (const backup of offlinePhoneBackups) {
-    if (existingPhoneRoots.has(backup.rootPath)) continue;
-    const disabledByUser = disabled.has(backup.rootPath);
-    const deviceKey = `${backup.platform}:${backup.id}`;
-    const latestBackup = latestBackupByDevice.get(deviceKey);
-    const explicitPhoneChoice = explicitPhoneChoiceByDevice.get(deviceKey);
-    const cloned = cloneStatus[backup.rootPath];
-    sources.push({
-      id: backup.rootPath,
-      kind: backup.platform,
-      label: `${backup.name} · Copy from ${new Date(backup.snapshotAt).toLocaleString()}`,
-      detail: `${backup.totalFiles.toLocaleString()} accessible files in this dated snapshot`,
-      rootPath: backup.rootPath,
-      enabled:
-        !disabledByUser &&
-        (explicitPhoneChoice
-          ? explicitPhoneChoice === backup.rootPath
-          : backup.snapshotId === latestBackup?.snapshotId),
-      available: true,
-      message: backup.failedFiles
-        ? `${backup.failedFiles} accessible files could not be copied.`
-        : "",
-      offlineBackup: true,
-      snapshotAt: backup.snapshotAt,
       ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
     });
   }
@@ -5611,8 +5678,6 @@ async function createWindow() {
       sendToRenderer("demo-limit-reached", feature);
     }
     runtimeLog("renderer-loaded");
-    // Show the window now that content has loaded
-    mainWindow?.show();
     // NOTE: DO NOT schedule derived indexes here - it causes memory exhaustion
     // with 260k+ images. Indexes will be scheduled once initial UI is stable.
   });
@@ -6596,6 +6661,7 @@ app.whenReady().then(async () => {
   installApplicationMenu();
   configureAppUpdater();
   const userDataPath = app.getPath("userData");
+  if (!(await requireIndexStorageSelection(userDataPath))) return;
   let storage: Awaited<ReturnType<typeof prepareConfiguredIndexStorage>>;
   try {
     storage = await prepareConfiguredIndexStorage(
@@ -7788,7 +7854,7 @@ ipcMain.handle("set-memory-soundtrack", async (_event, id: unknown, soundtrackId
   void prepareMemoryPreviews([card]).catch(() => runtimeLog("memory-preview-error"));
   return memoryStateWithPreviews();
 });
-ipcMain.handle("view-memory", async (_event, id: unknown) => {
+async function openMemoryMovie(id: string, revealInFolder: boolean): Promise<{ ok: boolean; path?: string; error?: string; preparing?: boolean; upgradeRequired?: boolean }> {
   if (typeof id !== "string" || !id || id.length > 200) return { ok: false, error: "Invalid memory." };
   const suggestion = await memoryManager.getSuggestion(id);
   if (!suggestion || !suggestion.media.every((file) => memoryAllowed(file.path) &&
@@ -7809,8 +7875,24 @@ ipcMain.handle("view-memory", async (_event, id: unknown) => {
       upgradeRequired: true,
     };
   }
+  if (revealInFolder) {
+    try {
+      shell.showItemInFolder(moviePath);
+    } catch {
+      // Finder may be unavailable while the app is initializing; the renderer handles the fallback toast.
+    }
+  }
   return { ok: true, path: moviePath };
-});
+}
+
+function registerMemoryRevealHandlers() {
+  ipcMain.removeHandler("view-memory");
+  ipcMain.removeHandler("reveal-memory");
+  ipcMain.handle("view-memory", async (_event, id: unknown) => openMemoryMovie(typeof id === "string" ? id : "", false));
+  ipcMain.handle("reveal-memory", async (_event, id: unknown) => openMemoryMovie(typeof id === "string" ? id : "", true));
+}
+
+registerMemoryRevealHandlers();
 ipcMain.handle("cancel-memory-export", () => {
   // Also covers the save dialog and pre-render checks, before the exporter has a controller.
   if (memoryExportRunning) memoryExportCancelRequested = true;
@@ -11495,7 +11577,7 @@ ipcMain.handle(
       throw new Error("The app window is unavailable to confirm this device backup.");
     const confirmation = await dialog.showMessageBox(mainWindow, {
       type: "warning",
-      title: "DESTINATION WRITE — Enable encrypted device backups?",
+      title: "Enable encrypted device backups?",
       message: `Create an encrypted restore archive for ${device.name}?`,
       detail:
         "Silo will enable encrypted iPhone backups if needed. The password is never saved by Silo; if you forget it, this archive cannot be restored. Keep the device connected and powered during the backup.",

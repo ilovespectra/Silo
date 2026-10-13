@@ -542,7 +542,7 @@ export const MessageExportPanel: React.FC = () => {
             loadingMessages
           }
           onClick={() => void loadMessages(true)}
-          title="SILO DATA WRITE — Read phone history and refresh its saved Silo copy; requires a trusted phone"
+          title="Read phone history and refresh its saved Silo copy; requires a trusted phone"
         >
           <FiRefreshCw /> {loadingMessages ? "Updating..." : "Update backup"}
         </button>
@@ -555,7 +555,7 @@ export const MessageExportPanel: React.FC = () => {
       )}
 
       <div className="mobile-manager-note">
-        Browseable snapshots keep dated USB-accessible copies of photos, docs, and messages. Pick a source and use Update backup to refresh it.
+        Browseable snapshots keep dated USB-accessible copies of photos, docs, and messages. Update a backup to refresh a saved source.
       </div>
 
       <section className="messages-layout">
@@ -605,7 +605,7 @@ export const MessageExportPanel: React.FC = () => {
                       <button
                         onClick={() => void saveThreadName(thread)}
                         className="thread-action-save"
-                        title="SILO DATA WRITE — Save this conversation name in Silo"
+                        title="Save this conversation name in Silo"
                       >
                         <FiSave />
                       </button>
@@ -654,8 +654,8 @@ export const MessageExportPanel: React.FC = () => {
                           setEditingThreadName(thread.displayName || "");
                         }}
                         className="thread-action-edit"
-                        title="SILO DATA WRITE — Rename conversation in Silo"
-                        aria-label="SILO DATA WRITE — Rename conversation in Silo"
+                        title="Rename conversation in Silo"
+                        aria-label="Rename conversation in Silo"
                       >
                         <FiEdit2 />
                       </button>
@@ -829,8 +829,8 @@ export const MessageExportPanel: React.FC = () => {
               : "Select a conversation to export it."}
           </p>
           <button onClick={() => void chooseDestination()}
-            title="SILO DATA WRITE — Set the export destination in Silo"
-            data-help="SILO DATA WRITE: Choose and save the export destination in Silo. No conversation file is written until you export."
+            title="Set the export destination in Silo"
+            data-help="Choose and save the export destination in Silo. No conversation file is written until you export."
           >
             <FiDownload /> Choose destination
           </button>

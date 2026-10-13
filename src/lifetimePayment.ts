@@ -3,8 +3,6 @@ export const LIFETIME_PAYMENT_ADDRESS =
 export const LIFETIME_USDC_MINT =
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 export const LIFETIME_PAYMENT_MICRO_USDC = 25_000_000n;
-// Preserve a $25 card price while allowing up to 5% seller-side checkout fees.
-export const LIFETIME_CARD_PAYMENT_MINIMUM_MICRO_USDC = 23_750_000n;
 export const LIFETIME_PAYMENT_SUPPORT_GUIDANCE =
   "Payment confirmed, but Silo could not activate the license on this computer. Do not pay again. Contact Silo support with the Solana transaction signature and this installation ID.";
 
@@ -69,7 +67,7 @@ export type LifetimePaymentStatus =
 
 export interface LifetimeLicenseState {
   isLicensed: boolean;
-  licenseType?: "purchase" | "beta";
+  licenseType?: "purchase" | "beta" | "owner";
   signature?: string;
   verifiedAt?: number;
 }
@@ -275,9 +273,7 @@ export function verifyParsedLifetimePayment(
     return {
       status: "invalid",
       message:
-        minimumPaymentMicroUsdc === LIFETIME_PAYMENT_MICRO_USDC
-          ? "No finalized payment of at least 25 USDC on Solana to Silo was found in that transaction."
-          : "No finalized card settlement meeting Silo's minimum USDC amount was found in that transaction.",
+        "No finalized payment of at least 25 USDC on Solana to Silo was found in that transaction.",
     };
 
   return {

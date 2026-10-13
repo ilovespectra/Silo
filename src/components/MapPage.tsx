@@ -1656,7 +1656,7 @@ export default function MapPage({
   return (
     <main
       className={`map-page ${selectedCluster ? "region-open" : ""} ${selectionArmed ? "selection-armed" : ""}`}
-      data-help="READ ONLY: Map browsing and selection do not change source files. SILO DATA WRITE: Relocate changes Silo's location override and organization metadata after review; it does not write GPS/EXIF into photos or move them."
+      data-help="Map browsing and selection do not change source files. Relocate changes Silo's location override and organization metadata after review; it does not write GPS/EXIF into photos or move them."
     >
       <div className="map-globe" ref={containerRef} />
       <div className="map-status" data-tour="map-overview">
@@ -2047,7 +2047,7 @@ export default function MapPage({
               <button
                 className="map-relocate-button"
                 data-tour="map-relocate"
-                title="SILO DATA WRITE — Change Silo location metadata only"
+                title="Change Silo location metadata only"
                 disabled={selectedPhotos.length === 0}
                 onClick={() => setShowLocationPicker((current) => !current)}
               >

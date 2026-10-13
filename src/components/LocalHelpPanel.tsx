@@ -79,7 +79,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Rename and move files",
     keywords: "file rename move new folder physical virtual name disk",
     answer:
-      "Files labels actions by effect. READ ONLY controls browse, refresh, sort or filter without changing source files. SILO DATA WRITE controls such as Set virtual name, keywords and Digital Folders save organization metadata only. SOURCE WRITE controls Move and New folder change local files; Google Drive and Photos sources are read-only in Files, so those controls are unavailable there. Fallout Shelter is DESTINATION WRITE: it creates and SHA-256 verifies a separate copy while leaving originals in place.",
+      "Use the file controls to browse, rename labels, organize collections, or move items when available. Local source files stay in place unless you explicitly choose a move, folder creation, or backup action.",
     section: "files",
     target: '[data-tour="file-actions"]',
   },
@@ -162,7 +162,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Membership license and device access",
     keywords: "settings membership license lifetime paid beta USDC Solana QR transaction signature unlock computer export import config",
     answer:
-      "Silo offers $25 USDC once for lifetime access on one computer. Each computer needs its own lifetime license. Exporting or importing a Silo config can transfer settings and selected indexes, but it does not transfer a paid or beta license or the computer's installation ID. Unlock another computer with its own $25 payment. The unlicensed panel supports direct Solana Pay to Silo's wallet, manual verification of a transaction signature, and beta-access requests; card checkout is not offered. A paid license activates only after the relay verifies a finalized USDC payment and binds it to this Silo installation. Settings shows whether this computer has an active license; View lifetime license opens its details. Keep the transaction signature private, and never share a wallet seed phrase or private key.",
+      "Silo offers $25 USDC once for lifetime access on one computer. Each computer needs its own lifetime license. Exporting or importing a Silo config can transfer settings and selected indexes, but it does not transfer a paid or beta license or the computer's installation ID. Unlock another computer with its own $25 payment. The unlicensed panel supports direct Solana Pay to Silo's wallet, manual verification of a transaction signature, and beta-access requests. A paid license activates only after the relay verifies a finalized USDC payment and binds it to this Silo installation. Settings shows whether this computer has an active license; View lifetime license opens its details. Keep the transaction signature private, and never share a wallet seed phrase or private key.",
     section: "settings",
     target: '[data-tour="settings-license"]',
   },

@@ -512,25 +512,25 @@
   overflow: hidden;
   align-items: center;
   justify-content: center;
-  padding: 18px;
+  padding: 12px;
   background: var(--surface-inset);
 }
 
 .phone-frame {
   display: flex;
-  width: min(420px, 100%);
-  height: min(780px, 72vh);
+  width: min(390px, calc(100% - 12px));
+  height: min(820px, calc(100% - 8px));
   min-height: 620px;
-  max-height: 860px;
+  max-height: 880px;
   flex-direction: column;
   overflow: hidden;
   border: 10px solid #1d1d1f;
-  border-radius: 42px;
+  border-radius: 44px;
   aspect-ratio: 9 / 18;
   background: var(--msg-thread-bg);
   box-shadow:
     0 0 0 2px #3a3a3c,
-    0 30px 80px rgba(0, 0, 0, 0.6);
+    0 26px 60px rgba(0, 0, 0, 0.5);
   color: var(--msg-text);
   font-family: var(--msg-font);
 }

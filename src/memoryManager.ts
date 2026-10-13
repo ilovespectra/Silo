@@ -5,6 +5,7 @@ import {
   getDefaultMemoryDuration,
   MEMORY_DEFAULT_SELECTION_COUNT,
   MemoryAudioBrowseRequest, MemoryAudioBrowseResult, MemoryAudioBrowseFile,
+  MemoryGenerationProgress,
   MemoryMedia, MemoryMood, MemorySettings, MemorySoundtrack,
   MemoryState, MemorySuggestion,
 } from "./memoryTypes";
@@ -102,6 +103,31 @@ function normalizeCustomTopic(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function customTopicQueries(topic: string): string[] {
+  const normalized = normalizeCustomTopic(topic);
+  if (!normalized) return [];
+  const unique = new Set<string>();
+  const tokens = normalized.split(/\s+/).filter(Boolean).map(word => word.toLocaleLowerCase());
+  const meaningful = tokens.filter((token) => token.length >= 3 && !STOP_WORDS.has(token));
+  const variants = [normalized];
+  if (meaningful.length) variants.push(meaningful.join(" "));
+  variants.push(`photo of ${normalized}`);
+  variants.push(`photos of ${normalized}`);
+  variants.push(`a photo of ${normalized}`);
+  if (meaningful.length > 1) {
+    variants.push(meaningful.slice(0, Math.min(meaningful.length, 4)).join(" "));
+    variants.push(meaningful.slice(-Math.min(meaningful.length, 4)).join(" "));
+  }
+  for (const word of meaningful) {
+    variants.push(word);
+  }
+  for (const variant of variants) {
+    const trimmed = normalizeCustomTopic(variant);
+    if (trimmed) unique.add(trimmed);
+  }
+  return [...unique].slice(0, 8);
+}
+
 function customTopicTitle(topic: string): string {
   return topic.split(" ").map((word, index) => {
     const normalized = word.toLocaleLowerCase();
@@ -182,7 +208,7 @@ function diverse(items: { media: MemoryMedia; score: number }[], count: number):
 /** Constructor is deliberately Electron-free: pass app.getPath("userData") from main. */
 export class MemoryManager {
   private readonly statePath: string;
-  private state: MemoryState = { suggestions: [], settings: { ...DEFAULT_SETTINGS }, generating: false, message: "" };
+  private state: MemoryState = { suggestions: [], settings: { ...DEFAULT_SETTINGS }, generating: false, message: "", generationProgress: undefined };
   private cursor = 0;
   private reserve: MemorySuggestion[] = [];
   private audioIndex?: { files: MemoryAudioFile[]; ids: Map<string, MemoryAudioFile> };
@@ -333,11 +359,29 @@ export class MemoryManager {
     return write;
   }
 
+  private updateGenerationProgress(
+    phase: MemoryGenerationProgress["phase"],
+    completed: number,
+    total: number,
+    label: string,
+    startedAt: number,
+  ): void {
+    const safeTotal = Math.max(1, total);
+    const clamped = Math.max(0, Math.min(completed, safeTotal));
+    const progress = clamped / safeTotal;
+    const elapsedSeconds = (Date.now() - startedAt) / 1000;
+    const etaSeconds = progress > 0.05 && elapsedSeconds > 0
+      ? Math.max(0, Math.round((elapsedSeconds / progress) * (1 - progress)))
+      : undefined;
+    this.state.generationProgress = { phase, label, progress, ...(etaSeconds !== undefined ? { etaSeconds } : {}) };
+  }
+
   async getState(): Promise<MemoryState> {
     await this.initialize();
     return {
       suggestions: await this.visibleSuggestions(), settings: { ...this.state.settings },
       generating: this.state.generating, message: this.state.message,
+      generationProgress: this.state.generationProgress,
       reserveCount: (await this.visibleReserve()).length,
     };
   }
@@ -431,7 +475,9 @@ export class MemoryManager {
 
   private async generateOnce(replace: boolean, customTopic?: string): Promise<MemoryState> {
     await this.initialize();
+    const startedAt = Date.now();
     this.state.generating = true;
+    this.state.generationProgress = { phase: "scanning", label: customTopic ? `Searching for “${customTopic}”...` : "Looking for memories...", progress: 0 };
     this.state.message = customTopic ? `Looking for “${customTopic}” in your library…` : "Looking for memories…";
     try {
       // Existing cards stay in place until replacements actually exist.
@@ -456,19 +502,41 @@ export class MemoryManager {
         }
       };
       let searchFailed = false;
+      const totalSteps = customTopic
+        ? Math.max(2, customTopicQueries(customTopic).length + 1)
+        : Math.max(2, Math.min(MAX_IDEA_ATTEMPTS, want ? 8 : 1) + 5);
+      let completedSteps = 0;
+      const advance = (phase: MemoryGenerationProgress["phase"], label: string, amount = 1) => {
+        completedSteps += amount;
+        this.updateGenerationProgress(phase, completedSteps, totalSteps, label, startedAt);
+      };
       if (customTopic) {
-        try {
-          const topicTitle = customTopicTitle(customTopic);
-          const hits = await this.deps.search(customTopic);
-          const topicKey = createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16);
-          take(await this.buildCard({
-            key: `custom:${topicKey}`,
-            title: topicTitle,
-            description: `A story shaped by “${customTopic}” from your library.`,
-            query: customTopic,
-            mood: customTopicMood(customTopic),
-          }, hits, signatures, new Set()));
-        } catch { searchFailed = true; }
+        const queryVariants = customTopicQueries(customTopic);
+        let triedAny = false;
+        for (let index = 0; index < queryVariants.length; index++) {
+          const query = queryVariants[index];
+          try {
+            triedAny = true;
+            const topicTitle = customTopicTitle(customTopic);
+            advance("scanning", `Searching “${topicTitle}” (${index + 1}/${queryVariants.length})`, 1);
+            const hits = await this.deps.search(query);
+            const card = await this.buildCard({
+              key: `custom:${createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16)}`,
+              title: topicTitle,
+              description: `A story shaped by “${customTopic}” from your library.`,
+              query: customTopic,
+              mood: customTopicMood(customTopic),
+            }, hits, signatures, new Set());
+            if (card) {
+              take(card);
+              advance("matching", `Found a memory for “${topicTitle}”`, 1);
+              break;
+            }
+          } catch {
+            continue;
+          }
+        }
+        if (!triedAny || !produced.length) searchFailed = true;
       } else if (want > 0 && this.deps.discover) {
         let ideas: MemoryStoryCandidate[] = [];
         try { ideas = await this.deps.discover(); } catch { searchFailed = true; }
@@ -476,19 +544,23 @@ export class MemoryManager {
         const valid = ideas.filter(idea => idea && text(idea.key, 1000) && text(idea.title, 200)
           && text(idea.description, 1000) && text(idea.query, 1000)
           && Object.prototype.hasOwnProperty.call(MOOD_WORDS, idea.mood) && typeof idea.load === "function");
-        // Unused ideas first; previously shown ones only when the library has nothing new.
         const ordered = [...valid.filter(idea => !usedKeys.has(idea.key)), ...valid.filter(idea => usedKeys.has(idea.key))];
-        for (let attempt = 0; attempt < Math.min(ordered.length, MAX_IDEA_ATTEMPTS) && produced.length < want; attempt++) {
+        const ideaSteps = Math.min(ordered.length, MAX_IDEA_ATTEMPTS);
+        for (let attempt = 0; attempt < ideaSteps && produced.length < want; attempt++) {
           const idea = ordered[attempt];
+          advance("matching", `Reviewing story ideas (${attempt + 1}/${ideaSteps})`, 1);
           let hits: unknown;
           try { hits = await idea.load(); } catch { continue; }
-          take(await this.buildCard(idea, hits, signatures, usedPaths));
+          const card = await this.buildCard(idea, hits, signatures, usedPaths);
+          take(card);
         }
+        if (!produced.length && !searchFailed) searchFailed = true;
       }
       // Fixed-theme semantic search covers libraries the miners know little about.
       for (let attempt = 0; !customTopic && attempt < 5 && produced.length < want; attempt++) {
         const theme = THEMES[this.cursor];
         this.cursor = (this.cursor + 1) % THEMES.length;
+        advance("assembling", `Finding ${theme.title.toLowerCase()} moments (${attempt + 1}/5)`, 1);
         let hits: MemoryMedia[];
         try { hits = await this.deps.search(theme.query); } catch { searchFailed = true; continue; }
         take(await this.buildCard({ ...theme, key: `theme:${theme.title}`,
@@ -520,6 +592,7 @@ export class MemoryManager {
       }
       this.state.suggestions = visible;
       this.reserve = nextReserve;
+      advance("finishing", customTopic ? "Preparing your memory..." : "Finalizing the collection...", 1);
       await this.assignSoundtracks([...visible, ...nextReserve]);
       this.state.suggestions = await this.visibleSuggestions();
       this.reserve = await this.visibleReserve();
@@ -542,6 +615,7 @@ export class MemoryManager {
                 : "No matching memories yet. Each story needs at least four distinct, allowed photos.";
     } finally {
       this.state.generating = false;
+      this.state.generationProgress = undefined;
     }
     return this.getState();
   }

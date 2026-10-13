@@ -788,6 +788,8 @@ export default function SettingsPanel({
     status: "checking",
     currentVersion: "",
   });
+  const cacheDestinationIsRequired =
+    !cacheDestination || /file-browser-electron/i.test(cacheDestination);
 
   useEffect(() => {
     return electronAPI?.onConfigTransferProgress?.(setConfigTransferProgress);
@@ -1593,9 +1595,27 @@ export default function SettingsPanel({
               </p>
             </div>
           </div>
-          <p className="settings-footnote">
-            {cacheDestination || "Loading current destination…"}
-          </p>
+          <div
+            className="settings-cache-destination-status"
+            title={
+              cacheDestinationIsRequired
+                ? "Required: Silo needs a destination outside the browser profile for its indexes and caches."
+                : `Selected destination: ${cacheDestination}`
+            }
+          >
+            <span
+              className={
+                cacheDestinationIsRequired
+                  ? "settings-required-dot"
+                  : "settings-ready-dot"
+              }
+            />
+            <span>
+              {cacheDestinationIsRequired
+                ? "Required destination"
+                : "Destination ready"}
+            </span>
+          </div>
           <div className="settings-password-row settings-cache-destination-actions">
             <button
               className="settings-save"
@@ -1603,14 +1623,14 @@ export default function SettingsPanel({
               onClick={() => void changeCacheDestination()}
               data-help="Choose an external-drive folder. Silo restarts, verifies the cache copies, and then removes the old copies."
             >
-              <FiFolder /> Choose cache destination…
+              <FiFolder /> {cacheDestinationIsRequired ? "Choose required destination…" : "Choose destination…"}
             </button>
           </div>
           <label className="settings-cache-fallback-option">
             <input
               type="checkbox"
               checked={localFallbackEnabled}
-              disabled={busy || !electronAPI}
+              disabled={busy || !electronAPI || !cacheDestination}
               onChange={() => void changeLocalFallback()}
             />
             <span>

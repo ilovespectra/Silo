@@ -33,6 +33,7 @@
 .memories-topic-input > svg { flex: 0 0 auto; }
 .memories-topic-input input { width: 100%; min-width: 0; padding: 11px 0; border: 0; outline: 0; background: transparent; color: var(--memories-text); font-size: 12px; }
 .memories-topic-controls > button { flex: 0 0 auto; white-space: nowrap; }
+.memories-button-wrap { position: relative; display: inline-flex; }
 .memories-button { border: 1px solid var(--memories-border); border-radius: 10px; background: color-mix(in srgb, var(--memories-text) 4%, transparent); color: var(--memories-text); padding: 11px 15px; display: inline-flex; justify-content: center; align-items: center; gap: 9px; font-size: 13px; line-height: 1.3; transition: background .15s ease; }
 .memories-button:not(:disabled):hover { background: #ffffff10; }
 .memories-button.memories-primary { background: #f5a46a; border-color: #f5a46a; color: #28180e; font-weight: 650; }
@@ -45,6 +46,10 @@
 .memories-settings > span { color: var(--memories-muted); font-size: 11px; }
 .memories-settings > button { margin-left: auto; }
 .memories-page input[type="checkbox"], .memories-modal input[type="checkbox"] { accent-color: #f5a46a; width: 15px; height: 15px; flex-shrink: 0; }
+.memories-generation-progress { display: grid; gap: 8px; margin: 18px 0 12px; padding: 14px 16px; border: 1px solid var(--memories-border); border-radius: 12px; background: color-mix(in srgb, var(--memories-orange) 5%, var(--memories-panel)); }
+.memories-generation-progress-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; }
+.memories-generation-progress-header strong { color: var(--memories-orange); }
+.memories-generation-progress small { color: var(--memories-muted); font-size: 11px; }
 .memories-collection-label { font-size: 13px; margin: 28px 0 18px; }
 .memories-collection-label > span { color: var(--memories-muted); margin-left: 12px; font-size: 11px; }
 .memories-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr)); gap: 22px; align-items: start; }
@@ -75,6 +80,9 @@
 .memories-description { color: var(--memories-muted); font-size: 12px; line-height: 1.65; margin: 0 0 16px; }
 .memories-meta { display: flex; flex-wrap: wrap; gap: 10px; color: var(--memories-muted); font-size: 11px; }
 .memories-meta > span { display: inline-flex; align-items: center; gap: 5px; }
+.memories-card-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 16px; }
+.memories-card-actions .memories-icon-button { border: 1px solid var(--memories-border); background: color-mix(in srgb, var(--memories-text) 4%, transparent); }
+.memories-card-actions .memories-icon-button:not(:disabled):hover { background: color-mix(in srgb, var(--memories-text) 7%, transparent); }
 .memories-settings-dropdown { margin-top: 17px; border-top: 1px solid var(--memories-border); }
 .memories-settings-dropdown > summary { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 13px 2px 2px; color: var(--memories-text); font-size: 12px; cursor: pointer; list-style-position: inside; }
 .memories-settings-dropdown > summary::marker { color: var(--memories-orange); }

@@ -35,7 +35,7 @@ export interface BetaActivationResult {
   message: string;
   license?: {
     isLicensed: boolean;
-    licenseType?: "beta" | "purchase";
+    licenseType?: "beta" | "purchase" | "owner";
     signature?: string;
     verifiedAt?: number;
   };

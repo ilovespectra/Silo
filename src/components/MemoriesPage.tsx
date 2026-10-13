@@ -371,11 +371,12 @@ function PreparingOverlay({ preview }: { preview: MemoryPreviewStatus }) {
   </span>;
 }
 
-function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, onExport, onState }: {
+function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, onExport, onState, onToast }: {
   api: MemoriesAPI; memory: MemorySuggestion; disabled: boolean; preview?: MemoryPreviewStatus;
   onBlockedView: () => void; onDismiss: () => void;
   onExport: (memory: MemorySuggestion, options: MemoryExportOptions) => void;
   onState?: (state: MemoryState) => void;
+  onToast?: (message: string) => void;
 }) {
   const playable = !preview || preview.status === "ready";
   const maximum = Math.min(MEMORY_EXPORT_LIMITS.maxCount, memory.media.length);
@@ -437,6 +438,16 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
       if (mounted.current) setTrackError(errorMessage(cause, "That song could not be used. Choose another one."));
     }
   };
+  const revealSavedMovie = async () => {
+    try {
+      const result = await api.revealMemory(memory.id);
+      if (!mounted.current) return;
+      if (!result.ok || !result.path) throw new Error(result.error || "This movie could not be opened.");
+      onToast?.("Shown in Finder");
+    } catch (cause) {
+      if (mounted.current) onToast?.(errorMessage(cause, "This movie could not be opened."));
+    }
+  };
   const pickBrowsed = async (file: MemoryAudioBrowseFile) => {
     setBrowsing(false);
     const track: MemorySoundtrack = { id: file.id, name: file.name, path: file.path, source: "library",
@@ -483,7 +494,9 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
         <input id={`${fieldId}-audio`} type="range" min={0} max={0.6} step={0.01} value={originalAudio} disabled={disabled} onChange={(event) => setOriginalAudio(Number(event.target.value))} />
       </div>
       </details>
-      <button type="button" className="memories-button memories-primary memories-export-button" disabled={disabled || trackStatus === "loading" || maximum === 0} onClick={() => { void prepareExport(); }}><FiDownload aria-hidden="true" />Save memory<FiArrowRight aria-hidden="true" /></button>
+      <div className="memories-card-actions">
+        <button type="button" className="memories-icon-button memories-reveal-button" disabled={disabled || trackStatus === "loading" || maximum === 0} onClick={() => { void revealSavedMovie(); }} aria-label={`Show saved movie for ${memory.title}`} title={memory.downloadedAt ? `Open saved movie in Finder` : "Movie is already saved in your chosen memory folder"}><FiFolder aria-hidden="true" /></button>
+      </div>
     </div>
     {viewing && <MemoryViewDialog api={api} memory={memory} onClose={() => setViewing(false)} />}
     {browsing && <AudioBrowserDialog api={api} title={`Choose a song · ${memory.title}`} onClose={() => setBrowsing(false)} onPick={(file) => { void pickBrowsed(file); }} />}
@@ -492,7 +505,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
 
 export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   const [state, setState] = useState<MemoryState | null>(null);
-  const [customTopic, setCustomTopic] = useState("");
+  const [demoMode, setDemoMode] = useState(false);
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState("");
   const [error, setError] = useState("");
@@ -531,6 +544,11 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
       .finally(() => { if (mounted.current && revision.current === request) setLoading(false); });
     return () => { mounted.current = false; revision.current += 1; };
   }, [api, ready]);
+  useEffect(() => {
+    void window.electron?.isDemoMode?.().then((isDemoMode) => {
+      if (mounted.current) setDemoMode(Boolean(isDemoMode));
+    }).catch(() => setDemoMode(false));
+  }, []);
   const run = async (label: string, operation: () => Promise<MemoryState>) => {
     if (pending.current || !ready) return;
     pending.current = true; setAction(label); setError("");
@@ -563,64 +581,41 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     });
   };
   const busy = !ready || loading || Boolean(action) || Boolean(exporting);
-  return <section className="memories-page" aria-label="Memories" data-help="READ ONLY: Review local suggestions and previews. SILO DATA WRITE: Removing suggestions changes the Silo list only. DESTINATION WRITE: Export creates a separate movie file; original media remains unchanged.">
+  const memoryGenerationDisabled = busy || demoMode || state?.generating;
+  const generateMemoriesTitle = demoMode ? "Memory generation is not available in demo mode." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Search indexed local photos and clips for new memory stories. This runs only when you choose it.";
+  return <section className="memories-page" aria-label="Memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
       <div><span className="memories-eyebrow">silo / little time capsules</span><h1>Your life, in motion<span>.</span></h1>
         <p>Small stories from your library. Made by you, kept by you.</p></div>
       <div className="memories-header-actions">
         <button type="button" className="memories-button" disabled={busy} onClick={() => { void run("Refreshing memories", () => api.getMemories(true)); }} data-help="Reload the available memory suggestions and their preview status."><FiRefreshCw />Refresh</button>
-        <button type="button" className="memories-button memories-primary" disabled={busy || state?.generating} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Search indexed local photos and clips for new memory stories. This runs only when you choose it."><FiFilm />{action === "Finding memories" ? "Finding memories…" : state?.suggestions.length ? "Find new memories" : "Generate memories"}</button>
+        <span className="memories-button-wrap" title={generateMemoriesTitle}>
+          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Search indexed local photos and clips for new memory stories. This runs only when you choose it."><FiFilm />{action === "Finding memories" ? "Finding memories…" : state?.suggestions.length ? "Find new memories" : "Generate memories"}</button>
+        </span>
       </div>
     </header>
-    <aside className="memories-local-discovery" aria-label="Local semantic discovery">
-      <FiSearch aria-hidden="true" />
-      <div><strong>Local semantic discovery</strong>
-        <p>Automatic themes use Silo’s local concepts; a phrase you enter below searches indexed photos directly on this device. No subscription or online AI is used.</p>
-      </div>
-    </aside>
-    <form className="memories-topic-form" aria-label="Suggest a topic" data-tour="memory-topic" onSubmit={(event) => {
-      event.preventDefault();
-      const query = customTopic.replace(/\s+/g, " ").trim();
-      if (query.length < 3) return;
-      void run("Finding your topic", async () => {
-        const next = await api.generateMemories(false, query);
-        if (mounted.current && next.message.startsWith("Created a memory for")) setCustomTopic("");
-        return next;
-      });
-    }}>
-      <div className="memories-topic-copy">
-        <strong>Suggest a topic</strong>
-        <p>Describe a place, a kind of day, or a mood—like “Rainy Sundays.”</p>
-      </div>
-      <div className="memories-topic-controls">
-        <label className="memories-topic-input">
-          <FiSearch aria-hidden="true" />
-          <input aria-label="Describe a memory topic" type="text" value={customTopic} maxLength={120} minLength={3} required
-            placeholder="Sunny days at the beach…" disabled={busy}
-            onChange={(event) => setCustomTopic(event.target.value)} />
-        </label>
-        <button type="submit" className="memories-button memories-primary" disabled={busy || customTopic.trim().length < 3}
-          data-help="Search your indexed photos for a phrase you choose, then create a memory with a locally selected soundtrack.">
-          <FiFilm aria-hidden="true" />{action === "Finding your topic" ? "Finding…" : "Create memory"}
-        </button>
-      </div>
-    </form>
     <div className="memories-settings">
       <label><input type="checkbox" checked={state?.settings.showOnLaunch ?? false} disabled={busy || !state} data-help="Show the Memories page when Silo opens; it does not generate videos automatically." onChange={(event) => { const showOnLaunch = event.target.checked; void run("Saving settings", () => api.updateMemorySettings({ showOnLaunch })); }} />Show on launch</label>
       <span>Original files are always kept.</span>
-      <button type="button" className="memories-text-button" disabled={busy || state?.generating || !state?.suggestions.length} onClick={() => setClearConfirm(true)} data-help="SILO DATA WRITE: Remove all suggestion cards after confirmation. Original photos, clips, and already-saved movies are kept."><FiTrash2 />Clear suggestions</button>
+      <button type="button" className="memories-text-button" disabled={busy || state?.generating || !state?.suggestions.length} onClick={() => setClearConfirm(true)} data-help="Remove all suggestion cards after confirmation. Original photos, clips, and already-saved movies are kept."><FiTrash2 />Clear suggestions</button>
     </div>
     {error && <p className="memories-error memories-page-notice" role="alert">{error}</p>}
     {(!ready || loading || action || state?.generating || state?.message) && <p className="memories-page-notice" role="status" aria-live="polite">
       {!ready ? "Waiting for silo to finish starting. No memories are generated at startup." : loading ? "Preparing full-resolution memories for instant viewing…" : action === "Finding memories" ? "Finding memories and preparing them for instant viewing…" : action || state?.message || "Memory search uses what is indexed now. Generate whenever you like."}
     </p>}
+    {state?.generating && state.generationProgress && <div className="memories-generation-progress" role="status" aria-live="polite">
+      <div className="memories-generation-progress-header"><span>{state.generationProgress.label}</span><strong>{Math.round((state.generationProgress.progress ?? 0) * 100)}%</strong></div>
+      <div className="memories-preparing-bar"><span style={{ width: `${Math.round((state.generationProgress.progress ?? 0) * 100)}%` }} /></div>
+      <small>{state.generationProgress.etaSeconds !== undefined ? `About ${formatEta(state.generationProgress.etaSeconds)} left` : "Estimating time…"}</small>
+    </div>}
     {state?.generating && <p className="memories-hint">This uses photos and clips already indexed. Anything indexed later will be available the next time you generate.</p>}
     {Boolean(state?.suggestions.length) && <p className="memories-collection-label">{state?.suggestions.length} stories to rediscover <span>New suggestions replace this collection.</span></p>}
     <div className="memories-grid" data-tour="memory-controls" data-help="Each story card lets you preview and save its movie, remove only the suggestion, tune photos, duration and soundtrack, and choose where the saved copy goes.">
       {state?.suggestions.filter((memory) => previews[memory.id]?.status !== "failed").map((memory) => <MemoryCard key={memory.id} api={api} memory={memory} disabled={busy || state.generating}
         preview={previews[memory.id]} onBlockedView={() => blockedView(memory)} onState={(next) => { if (mounted.current) setState(next); }}
         onDismiss={() => { void run("Removing suggestion", () => api.dismissMemory(memory.id)); }}
-        onExport={(selected, options) => setExporting((current) => current || { memory: selected, options })} />)}
+        onExport={(selected, options) => setExporting((current) => current || { memory: selected, options })}
+        onToast={setToast} />)}
     </div>
     {toast && <p className="memories-toast" role="status" aria-live="assertive">{toast}</p>}
     {ready && !loading && !state?.suggestions.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>

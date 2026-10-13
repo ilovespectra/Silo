@@ -781,6 +781,23 @@ function App() {
   const [showGuidedTour, setShowGuidedTour] = useState(false);
   const [showTourExitConfirm, setShowTourExitConfirm] = useState(false);
   const [headerToolsCollapsed, setHeaderToolsCollapsed] = useState(false);
+  const [showConstructionBanner, setShowConstructionBanner] = useState(() => {
+    try {
+      return localStorage.getItem("silo.hideConstructionBanner") !== "true";
+    } catch {
+      return true;
+    }
+  });
+  const dismissConstructionBanner = (permanently: boolean) => {
+    setShowConstructionBanner(false);
+    if (permanently) {
+      try {
+        localStorage.setItem("silo.hideConstructionBanner", "true");
+      } catch {
+        // Keep the banner hidden when storage is unavailable for this session.
+      }
+    }
+  };
   const [performanceNoticeHidden, setPerformanceNoticeHidden] = useState(false);
   const [hidePerformanceNoticePermanently, setHidePerformanceNoticePermanently] = useState(() => {
     try {
@@ -3402,7 +3419,7 @@ function App() {
     if (!electronAPI) return;
     openDialog({
       mode: "text",
-      title: "SILO DATA WRITE — New digital folder",
+      title: "New digital folder",
       message:
         "Digital folders contain references only. Source files are never moved or changed.",
       placeholder: "Digital folder name",
@@ -5188,69 +5205,42 @@ function App() {
 
   return (
     <div className="app" ref={appRootRef} aria-busy={startupBlocked}>
-      {startupBlocked &&
-        createPortal(
-          <div
-            className="startup-splash"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="startup-splash-title"
-            aria-describedby="startup-splash-status"
-          >
-            <section className="startup-splash-card">
-              <img
-                className="startup-splash-mark"
-                src={`${process.env.PUBLIC_URL}/solosilo.png`}
-                alt=""
+      {showConstructionBanner && (
+        <div className="preview-construction-banner" role="note">
+          <div>
+            <strong>Silo is under construction!</strong>
+            <span>
+              Downloads are welcome: these are early pre-release builds for testing.
+              Some features may be unavailable or unfinished. This is not the full
+              demo mode; we’ll announce when the official demo is live. Thanks for
+              trying Silo. If something isn’t working, please report it.
+            </span>
+          </div>
+          <div className="preview-construction-banner-actions">
+            <label className="preview-construction-dismiss-choice">
+              <input
+                type="checkbox"
+                onChange={(event) => {
+                  if (event.target.checked) dismissConstructionBanner(true);
+                }}
               />
-              <p className="startup-splash-eyebrow">LOCAL LIBRARY STARTUP</p>
-              <h1 id="startup-splash-title">Silo</h1>
-              <p className="startup-splash-version">
-                {appVersion ? `Version ${appVersion}` : "Starting…"}
-              </p>
-              <div
-                className="startup-splash-readout"
-                id="startup-splash-status"
-                role="status"
-                aria-live="polite"
-              >
-                {startupReadout.map((message, index) => (
-                  <p key={`${index}-${message}`}>{message}</p>
-                ))}
-              </div>
-              <div
-                className="startup-splash-progress"
-                role="progressbar"
-                aria-label="Silo startup progress"
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={startupProgressPercent}
-              >
-                <span style={{ width: `${startupProgressPercent}%` }} />
-              </div>
-              <p className="startup-splash-stage">
-                {startupState.ready
-                  ? "Finishing the first library view…"
-                  : `Preparing startup stage ${Math.min(startupState.step, startupState.total)} of ${startupState.total}`}
-              </p>
-            </section>
-          </div>,
-          document.body,
-        )}
-      <div className="preview-construction-banner" role="note">
-        <div>
-          <strong>Silo is under construction!</strong>
-          <span>
-            Downloads are welcome: these are early pre-release builds for testing.
-            Some features may be unavailable or unfinished. This is not the full
-            demo mode; we’ll announce when the official demo is live. Thanks for
-            trying Silo. If something isn’t working, please report it.
-          </span>
+              Don’t show again
+            </label>
+            <button
+              className="preview-construction-dismiss"
+              type="button"
+              aria-label="Dismiss under construction notice"
+              title="Dismiss notice"
+              onClick={() => dismissConstructionBanner(false)}
+            >
+              <FiX aria-hidden="true" />
+            </button>
+            <button type="button" onClick={() => setShowBugReport(true)}>
+              Report a Bug
+            </button>
+          </div>
         </div>
-        <button type="button" onClick={() => setShowBugReport(true)}>
-          Report a Bug
-        </button>
-      </div>
+      )}
       {((indexStorageStatus.message ||
         indexStorageStatus.transfer?.state === "moving" ||
         indexStorageStatus.transfer?.state === "complete" ||
@@ -5436,10 +5426,10 @@ function App() {
                   }}
                   placeholder={
                     searchIndexReadiness.status === "ready"
-                      ? "Search names, folders, and by meaning"
+                      ? "Search"
                       : searchIndexReadiness.status === "preparing"
-                        ? "Search while the library index prepares"
-                        : "Search index unavailable"
+                        ? "Search"
+                        : "Search"
                   }
                   title={
                     searchIndexReadiness.status === "preparing"
@@ -5488,10 +5478,10 @@ function App() {
                     ) : searchQuery.trim() && searching ? (
                       "Searching…"
                     ) : (
-                      "Search ready"
+                      ""
                     )
                   ) : (
-                    "Index unavailable"
+                    ""
                   )}
                 </span>
                 {searchQuery && (
@@ -5610,8 +5600,8 @@ function App() {
             {appSection === "files" && (
               <>
                 <button className="btn btn-primary" onClick={selectDirectory}
-                  title="SILO DATA WRITE — Add this folder to Silo's source list"
-                  data-help="SILO DATA WRITE: Add a folder to Silo's source list for browsing and indexing. The source files are not changed.">
+                  title="Add this folder to Silo's source list"
+                  data-help="Add a folder to Silo's source list for browsing and indexing. The source files are not changed.">
                   <FiDownload /> Open Directory
                 </button>
                 {(currentPath || activeDigitalFolderId) && (
@@ -5654,7 +5644,7 @@ function App() {
                           : activeDigitalFolderId &&
                             navigateToDigitalFolder(activeDigitalFolderId, false)
                       }
-                      title="READ ONLY — Refresh current source"
+                      title="Refresh current source"
                       aria-label="Refresh current folder"
                       data-help="Reload the current directory or digital-folder contents from its source."
                     >
@@ -5675,11 +5665,11 @@ function App() {
                   className="btn btn-icon header-tool-item"
                   onClick={createFolder}
                   disabled={!canCreateSourceFolder}
-                  title={isGoogleCloudContext ? "READ ONLY — Google source" : canCreateSourceFolder ? "SOURCE WRITE — New folder" : "Choose a local source folder first"}
+                  title={isGoogleCloudContext ? "Google source" : canCreateSourceFolder ? "New folder" : "Choose a local source folder first"}
                   aria-label={isGoogleCloudContext ? "Google source is read only" : "New folder (writes to source)"}
                   data-help={isGoogleCloudContext
-                    ? "READ ONLY: Google Drive and Google Photos items cannot be changed here. This control only creates folders on local disk paths."
-                    : "SOURCE WRITE: Create a real folder inside the currently open local source directory."}
+                    ? "Google Drive and Google Photos items cannot be changed here. This control only creates folders on local disk paths."
+                    : "Create a real folder inside the currently open local source directory."}
                 >
                   <FiFolderPlus />
                 </button>
@@ -5687,11 +5677,11 @@ function App() {
                   className="btn btn-icon header-tool-item"
                   onClick={moveSelectedFile}
                   disabled={!canMoveSelectedSourceFile}
-                  title={isGoogleCloudContext ? "READ ONLY — Google source" : "SOURCE WRITE — Move selected file"}
+                  title={isGoogleCloudContext ? "Google source" : "Move selected file"}
                   aria-label={isGoogleCloudContext ? "Google Drive item is read only" : "Move selected file (writes to source)"}
                   data-help={isGoogleCloudContext
-                    ? "READ ONLY: Google Drive and Google Photos items cannot be moved by this Files control."
-                    : "SOURCE WRITE: Choose a destination to move this local file on disk. Review the destination before confirming."}
+                    ? "Google Drive and Google Photos items cannot be moved by this Files control."
+                    : "Choose a destination to move this local file on disk. Review the destination before confirming."}
                 >
                   <FiMove />
                 </button>
@@ -5699,9 +5689,9 @@ function App() {
                   className="btn btn-icon header-tool-item"
                   onClick={editVirtualName}
                   disabled={metadataTargets.length !== 1}
-                  title="SILO DATA WRITE — Set virtual name"
+                  title="Set virtual name"
                   aria-label="Set virtual name (writes Silo metadata only)"
-                  data-help="SILO DATA WRITE: Change Silo's display and search label. The source filename and file contents stay unchanged."
+                  data-help="Change Silo's display and search label. The source filename and file contents stay unchanged."
                 >
                   <FiEdit3 />
                 </button>
@@ -5709,16 +5699,16 @@ function App() {
                   className="btn btn-icon header-tool-item"
                   onClick={editKeywords}
                   disabled={metadataTargets.length === 0}
-                  title="SILO DATA WRITE — Edit search keywords"
+                  title="Edit search keywords"
                   aria-label="Edit search keywords (writes Silo metadata only)"
-                  data-help="SILO DATA WRITE: Save local keywords for search. The source files stay unchanged."
+                  data-help="Save local keywords for search. The source files stay unchanged."
                 >
                   <FiTag />
                 </button>
                 <button
                   className={`btn btn-icon header-tool-view ${viewMode === "list" ? "active" : ""}`}
                   onClick={() => setViewMode("list")}
-                  title="READ ONLY — List view"
+                  title="List view"
                   aria-label="List view"
                   data-help="Show files as rows with additional columns and details."
                 >
@@ -5727,7 +5717,7 @@ function App() {
                 <button
                   className={`btn btn-icon header-tool-view ${viewMode === "grid" ? "active" : ""}`}
                   onClick={() => setViewMode("grid")}
-                  title="READ ONLY — Grid view"
+                  title="Grid view"
                   aria-label="Grid view"
                   data-help="Show files as a visual thumbnail grid."
                 >
@@ -5736,7 +5726,7 @@ function App() {
                 <button
                   className={`btn btn-icon header-tool-filter ${showFilters ? "active" : ""}`}
                   onClick={() => setShowFilters(!showFilters)}
-                  title="READ ONLY — Sort and filter files"
+                  title="Sort and filter files"
                   aria-label="Sort and filter files"
                   data-help="Choose a sort order and filter by type, year, people, or location. These controls work in both List and Grid views."
                 >
@@ -5832,7 +5822,7 @@ function App() {
             <button
               onClick={() => editYear()}
               className="bulk-action-btn"
-              title="SILO DATA WRITE — Edit the library year for selected files"
+              title="Edit the library year for selected files"
             >
               <FiEdit3 /> Year
             </button>
@@ -5853,21 +5843,21 @@ function App() {
                   personMediaPaths.has(filePath),
                 )
               }
-              title="SILO DATA WRITE — Add selected media to a People profile"
+              title="Add selected media to a People profile"
             >
               <FiUserPlus /> Add to Person
             </button>
             <button
               onClick={() => setShowFolderSelector(true)}
               className="bulk-action-btn add-to-folder"
-              title="SILO DATA WRITE — Add references to a Digital Folder"
+              title="Add references to a Digital Folder"
             >
               <FiPlus /> Add to Folder
             </button>
             <button
               onClick={() => saveSelectedFileToDevice()}
               className="bulk-action-btn save-to-device"
-              title="DESTINATION WRITE — Save separate copies to this device"
+              title="Save separate copies to this device"
             >
               <FiDownload /> Save to Device
             </button>
@@ -5875,14 +5865,14 @@ function App() {
               onClick={() => setShowLocationPicker((current) => !current)}
               className="bulk-action-btn"
               disabled={locationTargetFiles.length === 0}
-              title="SILO DATA WRITE — Assign a location in Silo metadata"
+              title="Assign a location in Silo metadata"
             >
               <FiMap /> Location
             </button>
             <button
               onClick={() => setSelectedFilePaths(new Set())}
               className="bulk-action-btn clear"
-              title="READ ONLY — Clear the current selection"
+              title="Clear the current selection"
             >
               Clear Selection
             </button>
@@ -6165,7 +6155,7 @@ function App() {
       ) : appSection === "stats" ? (
         electronAPI ? <StatsDashboard api={electronAPI} /> : <main className="viewer-status">Stats services are unavailable.</main>
       ) : appSection === "people" ? (
-        <main className="people-page" data-tour="people-page" data-help="READ ONLY: Review photos and face groups. SILO DATA WRITE: Naming people, correcting assignments, merging profiles and changing visibility save People records only; source photos are unchanged."
+        <main className="people-page" data-tour="people-page" data-help="Review photos and face groups. Naming people, correcting assignments, merging profiles and changing visibility save People records only; source photos are unchanged."
         >
           <section className="face-index-status" data-tour="people-index" data-help="This independent offline index detects and groups faces. It does not move or rename source files.">
             <div>
@@ -6249,7 +6239,7 @@ function App() {
                     {personDetail.faceCount} detected faces
                   </p>
                 </div>
-                <div className="person-actions" data-tour="person-actions" data-help="SILO DATA WRITE: These actions change person/profile records and assignments only. Rename changes the profile label; Merge combines profiles after confirmation and can be undone. Source photos are unchanged.">
+                <div className="person-actions" data-tour="person-actions" data-help="These actions change person/profile records and assignments only. Rename changes the profile label; Merge combines profiles after confirmation and can be undone. Source photos are unchanged.">
                   <select
                     className="merge-dropdown person-sort-select"
                     value={sortValue}
@@ -6335,7 +6325,7 @@ function App() {
                       Merge into…
                     </button>
                   )}
-                  <button onClick={deletePerson} title="SILO DATA WRITE — Delete person profile and Silo references only">
+                  <button onClick={deletePerson} title="Delete person profile and Silo references only">
                     <FiTrash2 />
                   </button>
                 </div>
@@ -6831,8 +6821,8 @@ function App() {
                   className="people-new-person-button"
                   onClick={createPerson}
                   data-tour="new-person"
-                  title="SILO DATA WRITE — Create a People profile in Silo"
-                  data-help="SILO DATA WRITE: Create a People profile in Silo. This does not change source photos."
+                  title="Create a People profile in Silo"
+                  data-help="Create a People profile in Silo. This does not change source photos."
                 >
                   <FiUserPlus aria-hidden="true" /> New Person +
                 </button>
@@ -7029,21 +7019,6 @@ function App() {
         />
       ) : appSection === "mobile" ? (
         <main className="mobile-page" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
-          <section
-            className="mobile-messages-section"
-            aria-labelledby="mobile-messages-title"
-          >
-            <header
-              className="mobile-messages-heading"
-            >
-              <div>
-                <span className="sidebar-kicker">Mobile manager</span>
-                <h2 id="mobile-messages-title">Messages</h2>
-                <p>Browse, search, and export messages from supported devices.</p>
-              </div>
-            </header>
-            <MessageExportPanel />
-          </section>
           <PhoneManagementPanel
             devices={phoneDevices}
             tooling={phoneTooling}
@@ -7071,6 +7046,19 @@ function App() {
             onCreateRestoreArchive={createPhoneRestoreArchive}
             onRestoreFromArchive={restorePhoneFromArchive}
           />
+          <section
+            className="mobile-messages-section"
+            aria-labelledby="mobile-messages-title"
+          >
+            <header className="mobile-messages-heading">
+              <div>
+                <span className="sidebar-kicker">Messages</span>
+                <h2 id="mobile-messages-title">Messages</h2>
+                <p>Browse, search, and export message threads from a saved or connected phone.</p>
+              </div>
+            </header>
+            <MessageExportPanel />
+          </section>
         </main>
       ) : (
         <div
@@ -7110,10 +7098,10 @@ function App() {
                 <button
                   onClick={() => setShowSourceClone(true)}
                   disabled={cloneableSources.length === 0}
-                  title="DESTINATION WRITE — Create a separate Fallout Shelter copy without modifying originals"
+                  title="Create a separate Fallout Shelter copy without modifying originals"
                   aria-label="Create a verified Fallout Shelter copy"
                   data-tour="source-clone"
-                  data-help="DESTINATION WRITE: Create a Fallout Shelter copy of enabled sources and verify it with SHA-256. Original files are not modified or removed."
+                  data-help="Create a Fallout Shelter copy of enabled sources and verify it with SHA-256. Original files are not modified or removed."
                 >
                   <FiCopy />
                 </button>
@@ -7360,7 +7348,7 @@ function App() {
             <section
               className="sidebar-section digital-folders"
               data-tour="digital-folders"
-              data-help="SILO DATA WRITE: Create or change local collections of file references. Adding, removing, renaming, reordering or deleting a Digital Folder does not move, rename or delete the original files."
+              data-help="Create or change local collections of file references. Adding, removing, renaming, reordering or deleting a Digital Folder does not move, rename or delete the original files."
             >
               <div className="sidebar-heading">
                 <div>
@@ -7369,7 +7357,7 @@ function App() {
                 </div>
                 <button
                   onClick={createDigitalFolder}
-                  title="SILO DATA WRITE — New Digital Folder"
+                  title="New Digital Folder"
                 >
                   <FiPlus />
                 </button>
@@ -7446,8 +7434,8 @@ function App() {
                       className="folder-drag-handle"
                       draggable={!folderOrderBusy}
                       disabled={folderOrderBusy}
-                      aria-label={`SILO DATA WRITE — Reorder ${folder.name}`}
-                      title="SILO DATA WRITE — Reorder Digital Folder"
+                      aria-label={`Reorder ${folder.name}`}
+                      title="Reorder Digital Folder"
                       onDragStart={(event) => {
                         draggedFolder.current = folder.id;
                         event.dataTransfer.effectAllowed = "move";
@@ -7466,7 +7454,7 @@ function App() {
                     <button
                       className="digital-folder-name"
                       onClick={() => openDigitalFolder(folder.id)}
-                      title={`READ ONLY — Open ${folder.name}`}
+                      title={`Open ${folder.name}`}
                     >
                       {folder.id === FAVORITES_FOLDER_ID ? (
                         <FiHeart />
@@ -7480,8 +7468,8 @@ function App() {
                     </button>
                     <button
                       onClick={() => renameDigitalFolder(folder)}
-                      title={`SILO DATA WRITE — Rename ${folder.name}`}
-                      aria-label={`SILO DATA WRITE — Rename ${folder.name}`}
+                      title={`Rename ${folder.name}`}
+                      aria-label={`Rename ${folder.name}`}
                     >
                       <FiEdit3 />
                     </button>
@@ -7490,17 +7478,17 @@ function App() {
                       disabled={folder.id === REFUSE_FOLDER_ID}
                       title={
                         folder.id === REFUSE_FOLDER_ID
-                          ? "SILO DATA WRITE — Refuse always hides its contents"
+                          ? "Refuse always hides its contents"
                           : folder.hidden
-                            ? "SILO DATA WRITE — Show folder contents across Silo"
-                            : "SILO DATA WRITE — Hide folder contents across Silo"
+                            ? "Show folder contents across Silo"
+                            : "Hide folder contents across Silo"
                       }
                       aria-label={
                         folder.id === REFUSE_FOLDER_ID
-                          ? "SILO DATA WRITE — Refuse always hides its contents in Silo"
+                          ? "Refuse always hides its contents in Silo"
                           : folder.hidden
-                            ? `SILO DATA WRITE — Show ${folder.name} contents across Silo`
-                            : `SILO DATA WRITE — Hide ${folder.name} contents across Silo`
+                            ? `Show ${folder.name} contents across Silo`
+                            : `Hide ${folder.name} contents across Silo`
                       }
                     >
                       {folder.hidden ? <FiEyeOff /> : <FiEye />}
@@ -7511,16 +7499,16 @@ function App() {
                         selectedFilePaths.size === 0 &&
                         (!selectedFile || selectedFile.isDirectory)
                       }
-                      title={`SILO DATA WRITE — Add selected file${selectedFilePaths.size === 1 ? "" : "s"} to ${folder.name} (reference only)`}
-                      aria-label={`SILO DATA WRITE — Add selected items to ${folder.name} as references only`}
+                      title={`Add selected file${selectedFilePaths.size === 1 ? "" : "s"} to ${folder.name} (reference only)`}
+                      aria-label={`Add selected items to ${folder.name} as references only`}
                     >
                       <FiPlus />
                     </button>
                     <button
                       onClick={() => downloadDigitalFolder(folder.id)}
                       disabled={folder.filePaths.length === 0}
-                      title="DESTINATION WRITE — Save copies to this device"
-                      aria-label="DESTINATION WRITE — Save copies in this Digital Folder to this device"
+                      title="Save copies to this device"
+                      aria-label="Save copies in this Digital Folder to this device"
                     >
                       <FiDownload />
                     </button>
@@ -7528,8 +7516,8 @@ function App() {
                       folder.id !== REFUSE_FOLDER_ID && (
                         <button
                           onClick={() => deleteDigitalFolder(folder.id)}
-                          title="SILO DATA WRITE — Delete Digital Folder only"
-                          aria-label={`SILO DATA WRITE — Delete ${folder.name} from Silo only`}
+                          title="Delete Digital Folder only"
+                          aria-label={`Delete ${folder.name} from Silo only`}
                         >
                           <FiTrash2 />
                         </button>
@@ -7541,7 +7529,7 @@ function App() {
                 <button
                   className="remove-reference"
                   onClick={removeSelectedFromDigitalFolder}
-                  title="SILO DATA WRITE — Remove this reference only"
+                  title="Remove this reference only"
                 >
                   Remove selected reference
                 </button>
@@ -8960,8 +8948,8 @@ function App() {
                         className="face-assignment-delete"
                         type="button"
                         disabled={faceAssignmentBusy}
-                        aria-label="SILO DATA WRITE — Delete detected face record only"
-                        title="SILO DATA WRITE — Delete detected face record only"
+                        aria-label="Delete detected face record only"
+                        title="Delete detected face record only"
                         onPointerDown={(event) => event.stopPropagation()}
                         onClick={(event) => {
                           event.stopPropagation();

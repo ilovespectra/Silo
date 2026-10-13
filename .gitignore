@@ -98,7 +98,20 @@ app-update.yml
 .env.*
 !.env.example
 *.log
+*.pem
+*.p12
+*.p8
+*.key
+*.mobileprovision
+*.cer
 /scripts/beta-license-dashboard.local.cjs
+
+# Private/project-local extras that should never be pushed upstream
+/docs/
+/test/
+/server/private/
+/server/siteeu-relay/
+/electron-dist/
 
 # Silo app data, should a data directory ever point inside the repo
 # (FILE_BROWSER_USER_DATA_DIR); mirrors ~/Library/Application Support/file-browser-electron

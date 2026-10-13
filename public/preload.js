@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld("electron", {
     browseMemoryAudio: (request) => ipcRenderer.invoke("browse-memory-audio", request),
     setMemorySoundtrack: (id, soundtrackId) => ipcRenderer.invoke("set-memory-soundtrack", id, soundtrackId),
     viewMemory: (id) => ipcRenderer.invoke("view-memory", id),
+    revealMemory: (id) => ipcRenderer.invoke("reveal-memory", id),
     exportMemory: (options) => ipcRenderer.invoke("export-memory", options),
     cancelMemoryExport: () => ipcRenderer.invoke("cancel-memory-export"),
     onMemoryExportProgress: (callback) => {

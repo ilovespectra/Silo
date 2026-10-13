@@ -35,6 +35,12 @@ export interface MemorySettings {
   /** Folder for saved memory movies; null keeps them in Silo's app storage. */
   movieDirectory?: string | null;
 }
+export interface MemoryGenerationProgress {
+  phase: "scanning" | "matching" | "assembling" | "finishing";
+  label: string;
+  progress: number;
+  etaSeconds?: number;
+}
 export interface MemoryState {
   suggestions: MemorySuggestion[];
   settings: MemorySettings;
@@ -42,6 +48,8 @@ export interface MemoryState {
   message: string;
   /** Saved stories waiting in reserve; playable even when their source is offline. */
   reserveCount?: number;
+  /** Progress for a generation pass in flight. */
+  generationProgress?: MemoryGenerationProgress;
   /** Background movie status per suggestion id. */
   previews?: Record<string, MemoryPreviewStatus>;
 }
@@ -138,6 +146,7 @@ export interface MemoriesAPI {
   /** Makes a library song this memory's soundtrack; its movie re-renders in the background. */
   setMemorySoundtrack?(id: string, soundtrackId: string): Promise<MemoryState>;
   viewMemory(id: string): Promise<{ ok: boolean; path?: string; error?: string; preparing?: boolean; upgradeRequired?: boolean }>;
+  revealMemory(id: string): Promise<{ ok: boolean; path?: string; error?: string; preparing?: boolean; upgradeRequired?: boolean }>;
   exportMemory(options: MemoryExportOptions): Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
   cancelMemoryExport(): Promise<void>;
   onMemoryExportProgress(callback: (progress: MemoryExportProgress) => void): () => void;

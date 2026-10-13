@@ -144,8 +144,6 @@ export class MemoryExporter {
         throw new Error("Invalid original audio level");
       }
       const selected = suggestion.media.slice(0, options.count);
-      total = selected.length;
-      if (!total) throw new Error("This memory has no photos or clips to export");
       const configuredDimensions = this.deps.dimensions;
       const { width, height } = configuredDimensions
         ? configuredDimensions.width >= configuredDimensions.height
@@ -155,13 +153,6 @@ export class MemoryExporter {
       if (![width, height].every(value => Number.isInteger(value) && value >= 64 && value <= 3840 && value % 2 === 0)) {
         throw new Error("Output dimensions must be even integers between 64 and 3840");
       }
-      // Honor the chosen total: spread whole frames across items so the movie is within half a frame.
-      const totalFrames = Math.round(options.duration * FPS);
-      const clipFrames = Array.from({ length: total }, (_, index) =>
-        Math.floor(totalFrames / total) + (index < totalFrames % total ? 1 : 0));
-      const movieDuration = totalFrames / FPS;
-      const output = path.resolve(destination);
-      emit("preparing", 0, `Preparing ${total} items; ${movieDuration.toFixed(1)} seconds (${(movieDuration / total).toFixed(2)}s each)`);
       // Resolve all selected sources before writing anything; never let an output replace an input.
       const inputs: { source: string; video: boolean }[] = [];
       const protectedPaths = new Set<string>();
@@ -170,6 +161,7 @@ export class MemoryExporter {
         protectedPaths.add(absolute);
         protectedPaths.add(await fs.realpath(absolute));
       };
+      const missing: string[] = [];
       for (const media of selected) {
         this.checkCancelled();
         let original: string;
@@ -178,9 +170,8 @@ export class MemoryExporter {
           const stat = await fs.stat(original);
           if (!stat.isFile()) throw new Error("not a file");
         } catch {
-          throw new Error(
-            "A photo or clip in this memory is no longer available. Refresh Memories and try saving it again.",
-          );
+          missing.push(media.path);
+          continue;
         }
         await protect(original);
         let source = original;
@@ -190,14 +181,29 @@ export class MemoryExporter {
             const stat = await fs.stat(source);
             if (!stat.isFile()) throw new Error("not a file");
           } catch {
-            throw new Error(
-              "A live photo clip in this memory is no longer available. Refresh Memories and try saving it again.",
-            );
+            missing.push(media.liveVideoPath);
+            continue;
           }
         }
         await protect(source);
         inputs.push({ source, video: Boolean(media.liveVideoPath) || media.type === "video" });
       }
+      total = inputs.length;
+      if (!total) {
+        throw new Error(
+          "A photo or clip in this memory is no longer available. Refresh Memories and try saving it again.",
+        );
+      }
+      // Honor the chosen total: spread whole frames across items so the movie is within half a frame.
+      const totalFrames = Math.round(options.duration * FPS);
+      const clipFrames = Array.from({ length: total }, (_, index) =>
+        Math.floor(totalFrames / total) + (index < totalFrames % total ? 1 : 0));
+      const movieDuration = totalFrames / FPS;
+      const output = path.resolve(destination);
+      const skipped = selected.length - total;
+      emit("preparing", 0, skipped
+        ? `Preparing ${total} available items; ${skipped} were skipped because they are no longer accessible.`
+        : `Preparing ${total} items; ${movieDuration.toFixed(1)} seconds (${(movieDuration / total).toFixed(2)}s each)`);
       let musicPath: string | undefined;
       if (soundtrack.path) {
         musicPath = await this.deps.resolveLocalPath(soundtrack.path);

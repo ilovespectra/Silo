@@ -85,7 +85,7 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "file-actions",
     title: "Manage files carefully",
-    body: "READ ONLY: Grid, List and Sort & Filter change the view only. SILO DATA WRITE: Set virtual name and search keywords save Silo metadata without changing source files. SOURCE WRITE: Move and New folder change local files. Google Drive and Photos sources are read-only here; those source-write controls are unavailable for them.",
+    body: "Grid, List and Sort & Filter change the view only. Set virtual name and search keywords save Silo metadata without changing source files. Move and New folder change local files. Google Drive and Photos sources are read-only here; those source-write controls are unavailable for them.",
     target: '[data-tour="file-actions"]',
     section: "files",
   },

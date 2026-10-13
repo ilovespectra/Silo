@@ -425,12 +425,12 @@ export default function DuplicatesPage({
           }
           data-help={
             view === "duplicates" && totalSelectedCount > 0
-              ? "SOURCE WRITE: Move selected duplicate copies to the recoverable Review removed area. The protected original stays in place."
-              : "READ ONLY: Compare indexed file contents to find exact duplicate copies; scanning does not change source files. Review paths and keep the protected first copy before any cleanup."
+              ? "Move selected duplicate copies to the recoverable Review removed area. The protected original stays in place."
+              : "Compare indexed file contents to find exact duplicate copies; scanning does not change source files. Review paths and keep the protected first copy before any cleanup."
           }
           title={view === "duplicates" && totalSelectedCount > 0
-            ? "SOURCE WRITE — Stage selected copies for review"
-            : "READ ONLY — Scan library for exact duplicates"}
+            ? "Stage selected copies for review"
+            : "Scan library for exact duplicates"}
         >
           {view === "duplicates" && totalSelectedCount > 0 ? (
             <>
@@ -472,7 +472,7 @@ export default function DuplicatesPage({
 
       {view === "duplicates" ? (
         <>
-          <div className="duplicate-toolbar" data-tour="duplicates-actions" data-help="READ ONLY: Scanning and selecting do not alter files. SOURCE WRITE: Staging selected duplicate copies moves them into recoverable Review removed; permanent deletion is a separate, irreversible source-file action. The protected original stays in place.">
+          <div className="duplicate-toolbar" data-tour="duplicates-actions" data-help="Scanning and selecting do not alter files. Staging selected duplicate copies moves them into recoverable Review removed; permanent deletion is a separate, irreversible source-file action. The protected original stays in place.">
             <div className="duplicate-toolbar-left">
               <span>
                 The first retained file is protected. Selectable duplicates can
@@ -963,7 +963,7 @@ export default function DuplicatesPage({
         </>
       ) : (
         <>
-          <div className="duplicate-toolbar" data-tour="duplicate-trash-actions" data-help="SOURCE WRITE: Restore moves selected files back to their source paths. Delete selected/all permanently deletes those files and cannot be undone.">
+          <div className="duplicate-toolbar" data-tour="duplicate-trash-actions" data-help="Restore moves selected files back to their source paths. Delete selected/all permanently deletes those files and cannot be undone.">
             <button
               onClick={() =>
                 setSelectedTrash(
@@ -985,7 +985,7 @@ export default function DuplicatesPage({
             <button
               disabled={busy || selectedTrash.size === 0}
               onClick={() => void restore()}
-              title="SOURCE WRITE — Restore files to their original paths"
+              title="Restore files to their original paths"
             >
               <FiRotateCcw /> Restore
             </button>
