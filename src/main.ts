@@ -4402,6 +4402,12 @@ function applyAccessBranding(): void {
 
 function enableLifetimeFeatures(): void {
   lifetimeLicensed = true;
+  demoTestingModeEnabled = false;
+  void writeDemoTestingMode(false).catch((error) => {
+    runtimeLog("demo-testing-mode-clear-failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  });
   lifetimeFullScanPending = true;
   sourceListCache = null;
   sourceListCacheAt = 0;
@@ -6746,8 +6752,26 @@ app.whenReady().then(async () => {
   stateStore = new StateStore(app.getPath("userData"));
   await stateStore.initialize();
   await migrateLegacyLifetimeLicense();
-  lifetimeLicensed = (await readLifetimeLicense()).isLicensed;
-  demoTestingModeEnabled = lifetimeLicensed && (await readDemoTestingMode());
+  const effectiveLicense = await readLifetimeLicense();
+  lifetimeLicensed = effectiveLicense.isLicensed;
+  if (lifetimeLicensed) {
+    const persistedDemoMode = await readDemoTestingMode();
+    if (persistedDemoMode) {
+      try {
+        await writeDemoTestingMode(false);
+        runtimeLog("demo-testing-mode-cleared-for-license", {
+          licenseType: effectiveLicense.licenseType ?? "unknown",
+        });
+      } catch (error) {
+        runtimeLog("demo-testing-mode-clear-failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    demoTestingModeEnabled = false;
+  } else {
+    demoTestingModeEnabled = await readDemoTestingMode();
+  }
   app.setName(accessDisplayName());
   refreshHiddenFolderPathCache();
   contentSettingsStore = new ContentSettingsStore(app.getPath("userData"));
@@ -7234,6 +7258,7 @@ app.whenReady().then(async () => {
   void memoryManager.getState()
     .then((state) => prepareAllMemoryPreviews(state.suggestions))
     .catch(() => runtimeLog("memory-preview-warmup-error"));
+  scheduleAutomaticMemories();
   // even when the audio screen is closed, and retry failures once due.
   audioInventoryRetryTimer = setInterval(
     () => requestIndexRecoveryStages(["audio"]),
@@ -7761,6 +7786,38 @@ app.on("activate", () => {
   }
 });
 
+const AUTO_MEMORY_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const AUTO_MEMORY_POLL_MS = 60 * 1000;
+let lastAutoMemoryRunAt = 0;
+let autoMemoryTimer: NodeJS.Timeout | null = null;
+
+/** Runs the memory generator (5 fresh cards) and pushes the new state to the page. */
+async function runMemoryGenerator(reason: string) {
+  const state = await memoryManager.generate(true);
+  runtimeLog("memory-generate", { reason, count: state.suggestions.length });
+  if (state.suggestions.length)
+    void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
+  const next = { ...(await memoryStateWithPreviews()), message: state.message };
+  sendToRenderer("memories-changed", next);
+  return next;
+}
+
+/** Generates once after startup indexing settles, then every 24 hours while running. */
+function scheduleAutomaticMemories() {
+  if (autoMemoryTimer) return;
+  const tick = () => {
+    if (!memoryManager) return;
+    const due = lastAutoMemoryRunAt === 0 || Date.now() - lastAutoMemoryRunAt >= AUTO_MEMORY_INTERVAL_MS;
+    if (!due || getThumbnailIndexingWaitMessage() !== null) return;
+    const reason = lastAutoMemoryRunAt === 0 ? "startup" : "scheduled";
+    lastAutoMemoryRunAt = Date.now();
+    void runMemoryGenerator(reason)
+      .catch(() => runtimeLog("memory-auto-generate-error"));
+  };
+  autoMemoryTimer = setInterval(tick, AUTO_MEMORY_POLL_MS);
+  setTimeout(tick, 15000);
+}
+
 // IPC Handlers
 ipcMain.handle("get-memories", async (_event, prepareViews: unknown) => {
   // Returns immediately; movies render in the background and report progress per card.
@@ -7774,6 +7831,15 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
   if (customTopic !== undefined && typeof customTopic !== "string") {
     const current = await memoryStateWithPreviews();
     return { ...current, message: "Enter a topic using plain text." };
+  }
+  if (customTopic === undefined) {
+    try {
+      return await runMemoryGenerator("on-demand");
+    } catch {
+      runtimeLog("memory-generate-error");
+      const current = await memoryStateWithPreviews();
+      return { ...current, message: "Memory generation hit a problem; your saved memories are unchanged." };
+    }
   }
   let state;
   try {

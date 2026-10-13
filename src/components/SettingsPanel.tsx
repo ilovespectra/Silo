@@ -1135,64 +1135,31 @@ export default function SettingsPanel({
           </button>
         </header>
 
-        <section
-          className="settings-license-section"
-          data-tour="settings-license"
-          data-help={
-            demoMode.enabled
-              ? "Demo testing limits are active while your paid or beta lifetime license remains saved."
-              : lifetimeLicense.isLicensed
-              ? "Review your paid or beta lifetime license."
-              : "Demo limits stay unobtrusive until you choose a feature that is not included."
-          }
-        >
-          <div className="settings-section-title">
-            <FiLock />
-            <div>
-              <h3>
-                {demoMode.enabled
-                  ? "Demo testing mode enabled"
-                  : lifetimeLicense.isLicensed
-                  ? lifetimeLicense.licenseType === "beta"
-                    ? "Lifetime beta access active"
-                    : "Lifetime license verified"
-                  : "Demo mode"}
-              </h3>
-              <p>
-                {demoMode.enabled
-                  ? "Demo limits are active for testing; your lifetime license is still saved on this installation."
-                  : lifetimeLicense.isLicensed
-                  ? lifetimeLicense.licenseType === "beta"
-                    ? "Your lifetime beta license is active on this installation."
-                    : "Your lifetime license is active on this Mac."
-                  : "The demo indexes up to 1,000 representative files with real search, face scanning, place mapping and deduplication; demo deletion is limited to 100 files. Full-access options appear only when you click an unavailable feature."}
-              </p>
+        {!lifetimeLicense.isLicensed && (
+          <section
+            className="settings-license-section"
+            data-tour="settings-license"
+            data-help={
+              demoMode.enabled
+                ? "Demo testing limits are active while your paid or beta lifetime license remains saved."
+                : "Demo limits stay unobtrusive until you choose a feature that is not included."
+            }
+          >
+            <div className="settings-section-title">
+              <FiLock />
+              <div>
+                <h3>
+                  {demoMode.enabled
+                    ? "Demo testing mode enabled"
+                    : "Demo mode"}
+                </h3>
+                <p>
+                  {demoMode.enabled
+                    ? "Demo limits are active for testing; your lifetime license is still saved on this installation."
+                    : "The demo indexes up to 1,000 representative files with real search, face scanning, place mapping and deduplication; demo deletion is limited to 100 files. Full-access options appear only when you click an unavailable feature."}
+                </p>
+              </div>
             </div>
-          </div>
-          {lifetimeLicense.isLicensed && (
-            <div className="settings-license-actions">
-              <button
-                className="settings-save settings-license-button"
-                onClick={() => setShowLifetimeUnlock(true)}
-                data-help="Review your active lifetime-license details."
-              >
-                {lifetimeLicense.licenseType === "beta"
-                  ? "View beta lifetime access"
-                  : "View lifetime license"}
-              </button>
-              {demoMode.available && demoMode.enabled && (
-                <button
-                  className="settings-secondary settings-license-button"
-                  disabled={demoModeBusy}
-                  onClick={() => void toggleDemoTestingMode()}
-                  data-help="Restart Silo with demo limits for testing or return to full lifetime access. Your license and demo usage history are preserved."
-                >
-                  Return to full access
-                </button>
-              )}
-            </div>
-          )}
-          {!lifetimeLicense.isLicensed && (
             <div className="settings-license-actions">
               <button
                 className="settings-save settings-license-button"
@@ -1205,30 +1172,8 @@ export default function SettingsPanel({
                 View lifetime purchase options
               </button>
             </div>
-          )}
-        </section>
-
-        <section className="settings-google-sources-section">
-          <div className="settings-section-title">
-            <FiExternalLink />
-            <div>
-              <h3>Google account sources</h3>
-              <p>
-                This optional section can be collapsed in Files or hidden here.
-                Hiding it keeps your connected accounts and local files unchanged.
-              </p>
-            </div>
-          </div>
-          <button
-            className="settings-secondary"
-            onClick={() => onGoogleSourcesHiddenChange(!googleSourcesHidden)}
-            aria-pressed={googleSourcesHidden}
-          >
-            {googleSourcesHidden
-              ? "Show Google Accounts in Files"
-              : "Hide Google Accounts from Files"}
-          </button>
-        </section>
+          </section>
+        )}
 
         <section className="settings-update-section" aria-live="polite">
           <div className="settings-section-title">
@@ -1376,7 +1321,7 @@ export default function SettingsPanel({
             <input
               type="checkbox"
               checked={settings.showNsfw}
-              disabled={busy}
+              disabled={busy || !settings.parentalPasswordSet}
               data-help="Allow images flagged by explicit terms or visual safety classification to appear."
               onChange={(event) =>
                 void update({ showNsfw: event.target.checked }, true)
@@ -1391,7 +1336,7 @@ export default function SettingsPanel({
             <input
               type="checkbox"
               checked={settings.safeSearch}
-              disabled={busy}
+              disabled={busy || !settings.parentalPasswordSet}
               data-help="Keep explicit queries and flagged results out of search."
               onChange={(event) =>
                 void update({ safeSearch: event.target.checked }, true)
@@ -1425,9 +1370,10 @@ export default function SettingsPanel({
               placeholder={
                 settings.parentalPasswordSet
                   ? "Required to change protection"
-                  : "Create a password below first"
+                  : "password"
               }
               autoComplete="current-password"
+              disabled={!settings.parentalPasswordSet}
               data-help="Enter the parental password to authorize protected-content setting changes."
             />
           </label>
@@ -1642,6 +1588,28 @@ export default function SettingsPanel({
               </small>
             </span>
           </label>
+        </section>
+
+        <section className="settings-google-sources-section">
+          <div className="settings-section-title">
+            <FiExternalLink />
+            <div>
+              <h3>Google account sources</h3>
+              <p>
+                This optional section can be collapsed in Files or hidden here.
+                Hiding it keeps your connected accounts and local files unchanged.
+              </p>
+            </div>
+          </div>
+          <button
+            className="settings-secondary"
+            onClick={() => onGoogleSourcesHiddenChange(!googleSourcesHidden)}
+            aria-pressed={googleSourcesHidden}
+          >
+            {googleSourcesHidden
+              ? "Show Google Accounts in Files"
+              : "Hide Google Accounts from Files"}
+          </button>
         </section>
 
         <section data-tour="settings-backup" data-help="Export or review a Silo configuration restore. Restore replaces app setup and restarts Silo, but does not modify source media; protect exported credentials.">

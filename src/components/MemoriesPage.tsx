@@ -518,6 +518,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   const revision = useRef(0);
   useEffect(() => { if (state?.previews) setPreviews((current) => ({ ...current, ...state.previews })); }, [state]);
   useEffect(() => api.onMemoryPreviewProgress?.((next) => setPreviews((current) => ({ ...current, ...next }))), [api]);
+  useEffect(() => api.onMemoriesChanged?.((next) => { if (mounted.current && !pending.current) setState(next); }), [api]);
   const waiting = Boolean(state?.suggestions.some((memory) => previews[memory.id] && previews[memory.id].status !== "ready" && previews[memory.id].status !== "failed"));
   useEffect(() => {
     // Bridges without progress events still update by polling the cached state.
@@ -545,9 +546,16 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     return () => { mounted.current = false; revision.current += 1; };
   }, [api, ready]);
   useEffect(() => {
-    void window.electron?.isDemoMode?.().then((isDemoMode) => {
+    const bridge = (window as unknown as { electron?: {
+      isDemoMode?: () => Promise<boolean>;
+      onLifetimeAccessChanged?: (callback: (access: { fullAccess: boolean }) => void) => () => void;
+    } }).electron;
+    void bridge?.isDemoMode?.().then((isDemoMode) => {
       if (mounted.current) setDemoMode(Boolean(isDemoMode));
     }).catch(() => setDemoMode(false));
+    return bridge?.onLifetimeAccessChanged?.((access) => {
+      if (mounted.current) setDemoMode(!access.fullAccess);
+    });
   }, []);
   const run = async (label: string, operation: () => Promise<MemoryState>) => {
     if (pending.current || !ready) return;
@@ -582,15 +590,14 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   };
   const busy = !ready || loading || Boolean(action) || Boolean(exporting);
   const memoryGenerationDisabled = busy || demoMode || state?.generating;
-  const generateMemoriesTitle = demoMode ? "Memory generation is not available in demo mode." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Search indexed local photos and clips for new memory stories. This runs only when you choose it.";
+  const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new memory stories from your indexed photos and clips. Silo also does this after startup indexing and every 24 hours.";
   return <section className="memories-page" aria-label="Memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
       <div><span className="memories-eyebrow">silo / little time capsules</span><h1>Your life, in motion<span>.</span></h1>
         <p>Small stories from your library. Made by you, kept by you.</p></div>
       <div className="memories-header-actions">
-        <button type="button" className="memories-button" disabled={busy} onClick={() => { void run("Refreshing memories", () => api.getMemories(true)); }} data-help="Reload the available memory suggestions and their preview status."><FiRefreshCw />Refresh</button>
         <span className="memories-button-wrap" title={generateMemoriesTitle}>
-          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Search indexed local photos and clips for new memory stories. This runs only when you choose it."><FiFilm />{action === "Finding memories" ? "Finding memories…" : state?.suggestions.length ? "Find new memories" : "Generate memories"}</button>
+          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Create 5 new memory stories from your indexed photos and clips. Silo also does this after startup indexing and every 24 hours."><FiFilm />{action === "Finding memories" ? "Finding memories…" : state?.suggestions.length ? "Find new memories" : "Generate memories"}</button>
         </span>
       </div>
     </header>
@@ -601,7 +608,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     </div>
     {error && <p className="memories-error memories-page-notice" role="alert">{error}</p>}
     {(!ready || loading || action || state?.generating || state?.message) && <p className="memories-page-notice" role="status" aria-live="polite">
-      {!ready ? "Waiting for silo to finish starting. No memories are generated at startup." : loading ? "Preparing full-resolution memories for instant viewing…" : action === "Finding memories" ? "Finding memories and preparing them for instant viewing…" : action || state?.message || "Memory search uses what is indexed now. Generate whenever you like."}
+      {!ready ? "Waiting for silo to finish starting. New memories are created automatically once indexing settles." : loading ? "Preparing full-resolution memories for instant viewing…" : action === "Finding memories" ? "Finding memories and preparing them for instant viewing…" : action || state?.message || "Memory search uses what is indexed now. Generate whenever you like."}
     </p>}
     {state?.generating && state.generationProgress && <div className="memories-generation-progress" role="status" aria-live="polite">
       <div className="memories-generation-progress-header"><span>{state.generationProgress.label}</span><strong>{Math.round((state.generationProgress.progress ?? 0) * 100)}%</strong></div>

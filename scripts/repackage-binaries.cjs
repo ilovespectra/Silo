@@ -11,8 +11,88 @@ const projectRoot = path.resolve(__dirname, '..');
 const repository = 'ilovespectra/Silo';
 const workflow = 'windows-exe.yml';
 const branch = 'main';
-const version = packageJson.version;
 const product = packageJson.build.productName;
+
+function parseSemver(value) {
+  if (typeof value !== 'string') return null;
+  const cleaned = value.trim().replace(/^v/i, '').replace(/[-_ ].*$/, '');
+  const match = /^([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:\.(?:[0-9]+))*$/.exec(cleaned);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? '0')];
+}
+
+function compareVersions(left, right) {
+  const a = parseSemver(left);
+  const b = parseSemver(right);
+  if (!a || !b) return 0;
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] === b[index]) continue;
+    return a[index] > b[index] ? 1 : -1;
+  }
+  return 0;
+}
+
+function bumpPatchVersion(value) {
+  const parsed = parseSemver(value);
+  if (!parsed) return value;
+  const [major, minor, patch] = parsed;
+  return `${major}.${minor}.${patch + 1}`;
+}
+
+function findLatestVersionInFolder(folder) {
+  if (!folder || !fs.existsSync(folder)) return null;
+
+  let latest = null;
+  for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const match = /Silo-([0-9]+\.[0-9]+(?:\.[0-9]+)?)/.exec(entry.name);
+    if (!match) continue;
+    const candidate = match[1];
+    if (!latest || compareVersions(candidate, latest) > 0) {
+      latest = candidate;
+    }
+  }
+  return latest;
+}
+
+function readLatestGitHubReleaseTag() {
+  try {
+    const output = capture('gh', ['api', 'repos/ilovespectra/silo-downloads/releases/latest', '--jq', '.tag_name']);
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveReleaseVersion() {
+  const current = packageJson.version;
+  const destinationVersion = findLatestVersionInFolder(destination);
+  const remoteVersion = readLatestGitHubReleaseTag();
+  const candidates = [current, destinationVersion, remoteVersion].filter(Boolean);
+  let latest = current;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (compareVersions(candidate, latest) > 0) {
+      latest = candidate;
+    }
+  }
+
+  if (destinationVersion && destinationVersion === latest) {
+    return bumpPatchVersion(latest);
+  }
+
+  const exactName = `${product}-${latest}`;
+  if (destinationVersion && fs.existsSync(path.join(destination, `${exactName}-arm64.dmg`))) {
+    return bumpPatchVersion(latest);
+  }
+
+  return latest;
+}
+
+const destination = process.env.SILO_RELEASE_DEST
+  ? path.resolve(process.env.SILO_RELEASE_DEST)
+  : path.join(os.homedir(), 'Downloads', `SILO ${packageJson.version} TEST`);
+const version = resolveReleaseVersion();
 const outputFolder = path.join(projectRoot, 'release');
 const stageParent = process.env.SILO_RELEASE_STAGE_DIR
   ? path.resolve(process.env.SILO_RELEASE_STAGE_DIR)
@@ -21,9 +101,6 @@ const suppliedWindowsInstaller = process.env.SILO_WINDOWS_SETUP_EXE
   ? path.resolve(process.env.SILO_WINDOWS_SETUP_EXE)
   : '';
 const suppliedWindowsBuildSha = process.env.SILO_WINDOWS_BUILD_SHA || '';
-const destination = process.env.SILO_RELEASE_DEST
-  ? path.resolve(process.env.SILO_RELEASE_DEST)
-  : path.join(os.homedir(), 'Downloads', `SILO ${version} TEST`);
 const preservedUntracked = new Set([
   'claudetest.txt',
   'electron-dist/paidLicense.d.ts',

@@ -661,6 +661,8 @@ function App() {
     ),
   );
   const [viewerOpen, setViewerOpen] = useState(false);
+  const viewerOpenRef = useRef(viewerOpen);
+  viewerOpenRef.current = viewerOpen;
   const [viewerMediaFile, setViewerMediaFile] = useState<FileInfo | null>(null);
   const [viewerScopeFiles, setViewerScopeFiles] = useState<FileInfo[] | null>(
     null,
@@ -2968,10 +2970,16 @@ function App() {
           : null;
       const playbackFile = livePhotoVideo ?? file;
       setViewerMediaFile(playbackFile);
-      setFilePreview(cachedImagePreview(playbackFile));
+      // While navigating inside an open viewer, keep the current full-size image
+      // until the next one is ready instead of flashing a low-res thumbnail.
+      const navigatingImages =
+        viewerOpenRef.current && playbackFile.type === "image";
+      if (!navigatingImages) {
+        setFilePreview(cachedImagePreview(playbackFile));
+        setViewerDimensions({ width: 0, height: 0 });
+      }
       setViewerZoom(1);
       setViewerFit(true);
-      setViewerDimensions({ width: 0, height: 0 });
       setMediaPlaying(false);
       setMediaCurrentTime(0);
       setMediaDuration(0);
@@ -2981,8 +2989,19 @@ function App() {
       setViewerOpen(true);
       try {
         const preview = await electronAPI.getFilePreview(playbackFile.path);
-        if (request === filePreviewRequestRef.current && preview)
-          setFilePreview(preview);
+        if (request !== filePreviewRequestRef.current || !preview) return;
+        if (navigatingImages && preview.previewDataUrl) {
+          const nextImage = new Image();
+          nextImage.src = preview.previewDataUrl;
+          await nextImage.decode().catch(() => undefined);
+          if (request !== filePreviewRequestRef.current) return;
+          if (nextImage.naturalWidth > 0)
+            setViewerDimensions({
+              width: nextImage.naturalWidth,
+              height: nextImage.naturalHeight,
+            });
+        }
+        setFilePreview(preview);
       } catch (error) {
         if (request === filePreviewRequestRef.current)
           setMediaError(

@@ -512,21 +512,41 @@ export class MemoryManager {
       };
       if (customTopic) {
         const queryVariants = customTopicQueries(customTopic);
+        const tokenQueries = customTopic
+          .split(/\s+/)
+          .map((word) => normalizeCustomTopic(word))
+          .filter((word) => word.length >= 3 && !STOP_WORDS.has(word.toLowerCase()));
+        const broadQueries = Array.from(new Set([
+          ...queryVariants,
+          ...tokenQueries,
+          ...tokenQueries.slice(0, 4).join(" ") ? [tokenQueries.slice(0, 4).join(" ")] : [],
+          ...tokenQueries.map((word) => `photo of ${word}`),
+          ...tokenQueries.map((word) => `${word} photos`),
+        ].filter((query) => query.length >= 3 && query.length <= 160))).slice(0, 12);
         let triedAny = false;
-        for (let index = 0; index < queryVariants.length; index++) {
-          const query = queryVariants[index];
+        const mergedHits: MemoryMedia[] = [];
+        const mergeSeen = new Set<string>();
+        for (let index = 0; index < broadQueries.length; index++) {
+          const query = broadQueries[index];
           try {
             triedAny = true;
             const topicTitle = customTopicTitle(customTopic);
-            advance("scanning", `Searching “${topicTitle}” (${index + 1}/${queryVariants.length})`, 1);
+            advance("scanning", `Searching “${topicTitle}” (${index + 1}/${broadQueries.length})`, 1);
             const hits = await this.deps.search(query);
+            if (!Array.isArray(hits)) continue;
+            for (const candidate of hits) {
+              const media = mediaValue(candidate);
+              if (!media || mergeSeen.has(media.path)) continue;
+              mergeSeen.add(media.path);
+              mergedHits.push(media);
+            }
             const card = await this.buildCard({
               key: `custom:${createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16)}`,
               title: topicTitle,
               description: `A story shaped by “${customTopic}” from your library.`,
               query: customTopic,
               mood: customTopicMood(customTopic),
-            }, hits, signatures, new Set());
+            }, mergedHits, signatures, new Set());
             if (card) {
               take(card);
               advance("matching", `Found a memory for “${topicTitle}”`, 1);

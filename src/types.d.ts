@@ -815,6 +815,7 @@ interface Window {
     cancelMemoryExport: import("./memoryTypes").MemoriesAPI["cancelMemoryExport"];
     onMemoryExportProgress: import("./memoryTypes").MemoriesAPI["onMemoryExportProgress"];
     onMemoryPreviewProgress?: import("./memoryTypes").MemoriesAPI["onMemoryPreviewProgress"];
+    onMemoriesChanged?: import("./memoryTypes").MemoriesAPI["onMemoriesChanged"];
     readInventoryPage(
       token: string,
       offset: number,

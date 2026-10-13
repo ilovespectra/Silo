@@ -152,4 +152,5 @@ export interface MemoriesAPI {
   onMemoryExportProgress(callback: (progress: MemoryExportProgress) => void): () => void;
   /** Optional so older bridges keep working; cards fall back to polling state. */
   onMemoryPreviewProgress?(callback: (previews: Record<string, MemoryPreviewStatus>) => void): () => void;
+  onMemoriesChanged?(callback: (state: MemoryState) => void): () => void;
 }
