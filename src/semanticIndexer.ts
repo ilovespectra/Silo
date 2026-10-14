@@ -804,6 +804,24 @@ export class SemanticIndexer {
     return paths;
   }
 
+  /**
+   * Running counters add one per attempt, so a retried file can land in both
+   * indexed and errors. At completion, use the per-file record counts instead.
+   */
+  private reconcileCompletedCounts(sourcePaths: string[]) {
+    const roots = Array.from(new Set([...this.watchedSources, ...sourcePaths]));
+    const summary = this.getIndexSummary(roots);
+    this.auditTotal = summary.total;
+    this.auditIndexed = summary.indexed;
+    this.auditErrors = summary.errors;
+    return {
+      total: summary.total,
+      indexed: summary.indexed,
+      errors: summary.errors,
+      remaining: summary.remaining,
+    };
+  }
+
   /** Cumulative counts from all current records, not just the active indexing batch. */
   getIndexSummary(sourcePaths?: string[]) {
     if (this.demoFileLimit !== null) {
@@ -2639,7 +2657,10 @@ export class SemanticIndexer {
           );
           await this.checkpointPendingWork(sourcePaths, true);
         } else {
-          await this.updateProgress({ status: "complete", message }, true);
+          await this.updateProgress(
+            { ...this.reconcileCompletedCounts(sourcePaths), status: "complete", message },
+            true,
+          );
           await this.checkpointPendingWork([], true);
         }
         return;
@@ -2817,11 +2838,12 @@ export class SemanticIndexer {
           true,
         );
       } else {
+        const completedCounts = this.reconcileCompletedCounts(sourcePaths);
         await this.updateProgress(
           {
+            ...completedCounts,
             status: "complete",
             currentFile: null,
-            remaining: 0,
             message: `${this.auditIndexed.toLocaleString()} of ${this.auditTotal.toLocaleString()} original files have CLIP embeddings.${demoSampleMessage ? ` ${demoSampleMessage}` : ""}`,
           },
           true,
