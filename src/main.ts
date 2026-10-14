@@ -127,6 +127,7 @@ import {
   MEMORY_EXPORT_LIMITS,
   MEMORY_DEFAULT_SELECTION_COUNT,
   getMemorySelectionMinimum,
+  MEMORY_MIN_SELECTION_COUNT,
   selectMemoryPhotoCandidates,
   MemoryExportOptions,
   MemoryMedia,
@@ -2362,6 +2363,60 @@ async function filterMemoryPhotos(paths: string[]): Promise<string[]> {
   return aestheticScorer.filterSimilar(paths, MEMORY_DUPLICATE_SIMILARITY);
 }
 
+// Custom memory prompts accept looser visual matches than interactive search.
+const MEMORY_SEARCH_MIN_CONFIDENCE = 20;
+const MEMORY_NAMED_IMAGE_EXTENSIONS = new Set([
+  ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".tif", ".tiff", ".bmp", ".avif",
+]);
+
+function memoryNameMatches(name: string | undefined, query: string): boolean {
+  const normalized = name?.trim().toLocaleLowerCase();
+  if (!normalized || normalized.length < 3) return false;
+  return query.includes(normalized) || normalized.includes(query);
+}
+
+/** Photos the user has named via digital folders, people, pets, keywords or virtual names. */
+async function namedMemoryMedia(query: string, roots: string[]): Promise<ScoredMemoryMedia[]> {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  if (normalizedQuery.length < 3) return [];
+  const state = stateStore.getState();
+  const paths = new Set<string>();
+  for (const folder of state.digitalFolders)
+    if (memoryNameMatches(folder.name, normalizedQuery)) folder.filePaths.forEach((filePath) => paths.add(filePath));
+  for (const person of faceIndexer.getPeople())
+    if (memoryNameMatches(person.name, normalizedQuery))
+      faceIndexer.getPerson(person.id)?.confirmedPhotoPaths.forEach((filePath) => paths.add(filePath));
+  for (const entry of state.nameIndex)
+    if (entry.sourceType !== "person" && memoryNameMatches(entry.name, normalizedQuery))
+      entry.filePaths.forEach(({ path: filePath }) => paths.add(filePath));
+  for (const filePath in state.fileMetadata) {
+    const metadata = state.fileMetadata[filePath];
+    if (memoryNameMatches(metadata.displayName, normalizedQuery)
+      || metadata.keywords.some((keyword) => memoryNameMatches(keyword, normalizedQuery)))
+      paths.add(filePath);
+  }
+  const eligible = [...paths].filter((filePath) =>
+    MEMORY_NAMED_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase())
+    && memoryAllowed(filePath)
+    && roots.some((root) => filePath === root || filePath.startsWith(root.endsWith(path.sep) ? root : root + path.sep)));
+  // Spread a large named collection across the whole set instead of its first entries.
+  const step = Math.max(1, eligible.length / 160);
+  const sampled = Array.from({ length: Math.min(eligible.length, 160) }, (_, index) => eligible[Math.floor(index * step)]);
+  const media: ScoredMemoryMedia[] = [];
+  for (let start = 0; start < sampled.length; start += 32) {
+    const stats = await Promise.all(sampled.slice(start, start + 32).map(async (filePath) => {
+      try {
+        const stat = await fsPromises.stat(filePath);
+        return stat.isFile() ? { filePath, stat } : null;
+      } catch { return null; }
+    }));
+    for (const entry of stats)
+      if (entry) media.push({ path: entry.filePath, name: path.basename(entry.filePath), type: "image",
+        modified: entry.stat.mtimeMs, size: entry.stat.size, score: 100 });
+  }
+  return media;
+}
+
 async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   if (typeof query !== "string" || !query.trim()) return [];
   if (!semanticIndexer || !faceIndexer)
@@ -2371,16 +2426,22 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
     runtimeLog("memory-search-trace", { stage: "no-index-sources" });
     return [];
   }
-  // A wide pool leaves 15-20 distinct, good photos after duplicate and quality filtering.
-  const matches = await semanticIndexer.search(query, 120, roots);
-  const photoCandidates: ScoredMemoryMedia[] = [];
+  const [named, matches] = await Promise.all([
+    namedMemoryMedia(query, roots),
+    semanticIndexer.search(query, MEMORY_SEARCH_MIN_CONFIDENCE, roots),
+  ]);
+  // User-named photos lead; visual matches fill the rest of a wide pool.
+  const photoCandidates: ScoredMemoryMedia[] = named.slice(0, 120);
+  const candidatePaths = new Set(photoCandidates.map((file) => file.path));
   const musicDirectories = memoryMusicDirectories();
   const dropped = { notImage: 0, notAllowed: 0, notPersonal: 0 };
   for (const file of matches) {
-    if (photoCandidates.length >= 120) break;
+    if (photoCandidates.length >= 160) break;
+    if (candidatePaths.has(file.path)) continue;
     if (file.type !== "image") { dropped.notImage++; continue; }
     if (!memoryAllowed(file.path)) { dropped.notAllowed++; continue; }
     if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) { dropped.notPersonal++; continue; }
+    candidatePaths.add(file.path);
     photoCandidates.push({ path: file.path, name: file.name, type: "image",
       modified: file.modified, size: file.size, score: file.confidence });
   }
@@ -2389,16 +2450,24 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
       ({ path: filePath, name, size: size ?? 0, modified })), "variety", MEMORY_DUPLICATE_SIMILARITY)
     : { order: [], scores: {}, analyzed: 0, total: 0, running: false };
   const candidatesByPath = new Map(photoCandidates.map((file) => [file.path, file]));
-  const rankedPhotos: ScoredMemoryMedia[] = magic.order.slice(0, 38).flatMap((filePath) => {
+  const namedPaths = new Set(named.map((file) => file.path));
+  const rankedPhotos: ScoredMemoryMedia[] = magic.order.slice(0, 48).flatMap((filePath) => {
     const candidate = candidatesByPath.get(filePath);
     if (!candidate) return [];
     const magicScore = magic.scores[filePath];
     return [{ ...candidate, magicScore: Number.isFinite(magicScore) ? magicScore : -1,
-      score: (Number.isFinite(magicScore) ? magicScore : 0) + candidate.score / 1000 }];
+      score: (Number.isFinite(magicScore) ? magicScore : 0) + candidate.score / 1000
+        + (namedPaths.has(filePath) ? 1 : 0) }];
   });
   const qualityPhotos = await applyMemoryPhotoQuality(rankedPhotos);
+  // Resolution rules must not leave a prompt short when lower-resolution matches exist.
+  if (qualityPhotos.length < MEMORY_MIN_SELECTION_COUNT) {
+    const kept = new Set(qualityPhotos.map((file) => file.path));
+    qualityPhotos.push(...rankedPhotos.filter((file) => !kept.has(file.path))
+      .slice(0, MEMORY_MIN_SELECTION_COUNT - qualityPhotos.length));
+  }
   const photos = selectMemoryPhotoCandidates(qualityPhotos).map(({ magicScore, ...photo }) => photo);
-  runtimeLog("memory-search-trace", { stage: "photos", roots: roots.length, matches: matches.length, ...dropped,
+  runtimeLog("memory-search-trace", { stage: "photos", roots: roots.length, named: named.length, matches: matches.length, ...dropped,
     candidates: photoCandidates.length, distinct: magic.order.length, analyzed: magic.analyzed,
     ranked: rankedPhotos.length, quality: qualityPhotos.length, selected: photos.length });
   // Clips beside matched photos; first frames are classified on demand, never a library rescan.

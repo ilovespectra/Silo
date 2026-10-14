@@ -23,6 +23,7 @@ const {
   isMemoryDurationAllowed,
   MEMORY_DURATION_SECONDS,
   MEMORY_DEFAULT_SELECTION_COUNT,
+  MEMORY_MIN_SELECTION_COUNT,
   getMemorySelectionMinimum,
   MEMORY_MAGIC_SCORE_THRESHOLD,
   MEMORY_EXPORT_LIMITS,
@@ -86,12 +87,16 @@ const context = vm.createContext({
   },
   app: { getPath: (name) => { assert.equal(name, "userData"); return userData; } },
   indexStoragePath: (...segments) => path.join(userData, ...segments),
-  stateStore: { getState: () => { metadataReads++; return { fileMetadata: context.__metadata }; } },
+  stateStore: { getState: () => { metadataReads++; return { fileMetadata: context.__metadata, digitalFolders: context.__folders, nameIndex: context.__names }; } },
+  __folders: [],
+  __names: [],
+  __people: [],
   __metadata: {},
   contentSettingsStore: { getPublicSettings: () => { throw new Error("Memories must not consult reveal toggles"); } },
   hiddenPaths: new Set(),
   getHiddenFolderPaths: (except) => { assert.equal(except, undefined); return context.hiddenPaths; },
-  faceIndexer: { getBannedPhotoPaths: () => context.banned, getProgress: () => ({ status: progress.face }) },
+  faceIndexer: { getBannedPhotoPaths: () => context.banned, getProgress: () => ({ status: progress.face }),
+    getPeople: () => context.__people, getPerson: (id) => context.__people.find((person) => person.id === id) },
   aestheticScorer: {
     rankDistinct: async (items, preset, threshold) => {
       magicRankCalls.push({ items, preset, threshold });
@@ -102,7 +107,7 @@ const context = vm.createContext({
   banned: new Set(),
   semanticUnsafePaths: new Set(),
   fileTextLooksExplicit, NSFW_VISUAL_PROMPT, SAFE_VISUAL_PROMPT, MEMORY_DURATION_SECONDS, MEMORY_EXPORT_LIMITS,
-  MEMORY_DEFAULT_SELECTION_COUNT, getMemorySelectionMinimum, MEMORY_MAGIC_SCORE_THRESHOLD, selectMemoryPhotoCandidates,
+  MEMORY_DEFAULT_SELECTION_COUNT, MEMORY_MIN_SELECTION_COUNT, getMemorySelectionMinimum, MEMORY_MAGIC_SCORE_THRESHOLD, selectMemoryPhotoCandidates,
   getDefaultMemoryDuration, isMemoryDurationAllowed, MemoryExportCancelledError,
   isRemotePath: (value) => value.startsWith("/__phone__/"),
   PIPELINE_BUSY_STATUSES: new Set(["scanning", "loading-model", "indexing"]),
@@ -158,6 +163,8 @@ const context = vm.createContext({
   consumeDemoMemoryPreview: async () => true,
   runtimeLog() {},
   MEMORY_DUPLICATE_SIMILARITY: 0.85,
+  MEMORY_SEARCH_MIN_CONFIDENCE: 20,
+  MEMORY_NAMED_IMAGE_EXTENSIONS: new Set([".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".tif", ".tiff", ".bmp", ".avif"]),
   MEMORY_VIDEO_EXTENSIONS: new Set([".mov", ".mp4", ".m4v", ".webm"]),
 });
 function evaluate(source) {
@@ -167,7 +174,7 @@ function evaluate(source) {
 }
 for (const name of [
   "memoryFileMetadata", "memoryAllowed", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
-  "memoryDot", "filterMemoryPhotos", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
+  "memoryDot", "filterMemoryPhotos", "memoryNameMatches", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
   "memoryMusicDirectories", "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
   "memoryPreviewOptions", "memoryPreviewFileName", "memoryMovieDirectory", "findMemoryMovie", "runMemoryRender",
   "prepareMemoryPreviewsNow", "prepareMemoryPreviews", "prepareAllMemoryPreviews", "setMemoryPreviewStatus",
@@ -312,7 +319,7 @@ async function run() {
     context.semanticUnsafePaths = new Set([path.join(story, "p0.jpg")]);
     opened.length = 0;
     const hits = await context.searchMemoryMedia("beach");
-    assert.deepEqual(plain(searchCalls.at(-1).slice(0, 3)), ["beach", 120, [library, "/__phone__/ios/ready"]]);
+    assert.deepEqual(plain(searchCalls.at(-1).slice(0, 3)), ["beach", 20, [library, "/__phone__/ios/ready"]]);
     assert(hits.length <= 50, "manager only reads the first 50 hits");
     const photos = hits.filter((hit) => hit.type === "image");
     assert.equal(photos.length, 20);
@@ -328,6 +335,26 @@ async function run() {
     assert.deepEqual(plain(opened), [story]);
     for (let i = 1; i < hits.length; i++) assert(hits[i - 1].score >= hits[i].score);
     context.semanticUnsafePaths = new Set();
+  });
+
+  await test("custom prompts include digital folders, named pets, people and keywords", async () => {
+    const dog = path.join(library, "dog");
+    await fsp.mkdir(dog, { recursive: true });
+    const files = Array.from({ length: 24 }, (_, i) => path.join(dog, `y${i}.jpg`));
+    for (const file of files) await fsp.writeFile(file, "x");
+    for (const file of files) context.memoryExifCache.set(file, null);
+    context.__folders = [{ name: "Yoshimi", filePaths: files.slice(6, 18) }];
+    context.__names = [{ name: "yoshimi", sourceType: "pet", filePaths: [{ path: files[18], confirmed: true }] }];
+    context.__people = [{ id: "p1", name: "Yoshimi", confirmedPhotoPaths: [files[19]] }];
+    context.__metadata = { [files[20]]: { keywords: ["Yoshimi"], updatedAt: 1 }, [files[21]]: { displayName: "unrelated", keywords: [], updatedAt: 1 } };
+    searchResults = [];
+    const hits = await context.searchMemoryMedia("photo of yoshimi");
+    assert.equal(searchCalls.at(-1)[1], 20, "custom prompts search at 20% confidence");
+    const names = new Set(hits.map((hit) => path.basename(hit.path)));
+    assert(names.size >= MEMORY_MIN_SELECTION_COUNT, `only ${names.size} named photos`);
+    for (const expected of ["y18.jpg", "y19.jpg", "y20.jpg"]) assert(names.has(expected), `missing ${expected}`);
+    assert(!names.has("y21.jpg") && !names.has("y22.jpg"), "unnamed photos must not match");
+    context.__folders = []; context.__names = []; context.__people = []; context.__metadata = {};
   });
 
   await test("video candidates: at most 4 directories and 12 clips", async () => {
