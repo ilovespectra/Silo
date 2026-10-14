@@ -2710,7 +2710,8 @@ async function verifyMemoryExport(options: MemoryExportOptions) {
     throw new Error("This memory contains newly hidden photos. Regenerate suggestions before exporting.");
   const soundtrack = await memoryManager.resolveSoundtrack(options.soundtrackId, suggestion.id);
   if (!soundtrack) throw new Error("Soundtrack is no longer available.");
-  if (soundtrack.source === "library" && (!soundtrack.path || !memoryAllowed(soundtrack.path)))
+  if (soundtrack.source === "library" && (!soundtrack.path || !memoryAllowed(soundtrack.path)
+    || !await fsPromises.access(soundtrack.path).then(() => true, () => false)))
     throw new Error("Soundtrack is no longer available.");
   return { suggestion, soundtrack };
 }
@@ -2836,21 +2837,21 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
       try {
         let options = memoryPreviewOptions(suggestion);
         // An offline music source falls back to the story's own audio rather than no movie.
+        const originalAudioId = `original:${suggestion.id}`;
         const verified = await verifyMemoryExport(options).catch(async (error) => {
-          if (options.soundtrackId === `original:${suggestion.id}`) throw error;
-          options = { ...options, soundtrackId: `original:${suggestion.id}` };
+          if (options.soundtrackId === originalAudioId) throw error;
+          options = { ...options, soundtrackId: originalAudioId };
           return verifyMemoryExport(options);
         });
         const { suggestion: current, soundtrack } = verified;
         await fsPromises.mkdir(cacheDirectory, { recursive: true });
         const scratch = await fsPromises.mkdtemp(path.join(os.tmpdir(), "silo-memory-preview-"));
-        try {
-          await runMemoryRender(async () => {
+        const renderPreview = (renderOptions: MemoryExportOptions, track: typeof soundtrack) => runMemoryRender(async () => {
             memoryExportScratch = scratch;
             const startedAt = Date.now();
             setMemoryPreviewStatus(suggestion.id, { status: "rendering", progress: 0 });
             try {
-              await memoryExporter.render(current, options, soundtrack, destination, (progress) => {
+              await memoryExporter.render(current, renderOptions, track, destination, (progress) => {
                 const fraction = progress.total > 0 ? Math.min(0.99, progress.completed / progress.total) : 0;
                 const elapsed = (Date.now() - startedAt) / 1000;
                 setMemoryPreviewStatus(suggestion.id, { status: "rendering", progress: fraction,
@@ -2860,6 +2861,17 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
               memoryExportScratch = null;
             }
           });
+        try {
+          try {
+            await renderPreview(options, soundtrack);
+          } catch (error) {
+            // A song that vanished mid-render (e.g. drive unplugged) falls back to the story's own audio.
+            if (options.soundtrackId === originalAudioId) throw error;
+            runtimeLog("memory-preview-soundtrack-fallback", { message: error instanceof Error ? error.message : String(error) });
+            const fallbackOptions = { ...options, soundtrackId: originalAudioId };
+            const fallback = await verifyMemoryExport(fallbackOptions);
+            await renderPreview(fallbackOptions, fallback.soundtrack);
+          }
         } finally {
           await fsPromises.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
         }

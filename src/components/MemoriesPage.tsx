@@ -359,8 +359,11 @@ function formatEta(seconds: number) {
 function PreparingOverlay({ preview }: { preview: MemoryPreviewStatus }) {
   const percent = Math.round((preview.progress ?? 0) * 100);
   return <span className={`memories-preparing ${preview.status}`} role="status" aria-live="polite">
-    <span className="memories-spinner" aria-hidden="true" />
-    {preview.status === "rendering" ? <>
+    {preview.status !== "failed" && <span className="memories-spinner" aria-hidden="true" />}
+    {preview.status === "failed" ? <>
+      <strong>Preview unavailable</strong>
+      <small>Some of its files are offline. Reconnect them to prepare it.</small>
+    </> : preview.status === "rendering" ? <>
       <strong>Preparing memory… {percent}%</strong>
       <span className="memories-preparing-bar"><span style={{ width: `${percent}%` }} /></span>
       <small>{preview.etaSeconds ? `About ${formatEta(preview.etaSeconds)} left` : "Estimating time…"}</small>
@@ -509,7 +512,6 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState("");
   const [error, setError] = useState("");
-  const [clearConfirm, setClearConfirm] = useState(false);
   const [exporting, setExporting] = useState<{ memory: MemorySuggestion; options: MemoryExportOptions } | null>(null);
   const [previews, setPreviews] = useState<Record<string, MemoryPreviewStatus>>({});
   const [toast, setToast] = useState("");
@@ -532,7 +534,9 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     return () => window.clearTimeout(timer);
   }, [toast]);
   const renderingTitle = state?.suggestions.find((memory) => previews[memory.id]?.status === "rendering")?.title;
-  const blockedView = (memory: MemorySuggestion) => setToast(renderingTitle && renderingTitle !== memory.title
+  const blockedView = (memory: MemorySuggestion) => setToast(previews[memory.id]?.status === "failed"
+    ? `“${memory.title}” could not be prepared because some of its files are offline. Reconnect them and it will be prepared next time.`
+    : renderingTitle && renderingTitle !== memory.title
     ? `Please wait for “${renderingTitle}” to finish processing; “${memory.title}” is next in line.`
     : `“${memory.title}” is still being prepared. It will play as soon as it’s ready.`);
   useEffect(() => {
@@ -575,19 +579,6 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     const next = await api.getMemories(true);
     if (mounted.current) setState(next);
   };
-  const clear = async () => {
-    setClearConfirm(false);
-    await run("Clearing suggestions", async () => {
-      try {
-        for (const memory of state?.suggestions || []) await api.dismissMemory(memory.id);
-        return await api.getMemories();
-      } catch (cause) {
-        // Reconcile partial removals without hiding the original error.
-        try { const next = await api.getMemories(); if (mounted.current) setState(next); } catch { /* Keep the last known cache. */ }
-        throw cause;
-      }
-    });
-  };
   const busy = !ready || loading || Boolean(action) || Boolean(exporting);
   const memoryGenerationDisabled = busy || demoMode || state?.generating;
   const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new memory stories from your indexed photos and clips. Silo also does this after startup indexing and every 24 hours.";
@@ -604,7 +595,6 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     <div className="memories-settings">
       <label><input type="checkbox" checked={state?.settings.showOnLaunch ?? false} disabled={busy || !state} data-help="Show the Memories page when Silo opens; it does not generate videos automatically." onChange={(event) => { const showOnLaunch = event.target.checked; void run("Saving settings", () => api.updateMemorySettings({ showOnLaunch })); }} />Show on launch</label>
       <span>Original files are always kept.</span>
-      <button type="button" className="memories-text-button" disabled={busy || state?.generating || !state?.suggestions.length} onClick={() => setClearConfirm(true)} data-help="Remove all suggestion cards after confirmation. Original photos, clips, and already-saved movies are kept."><FiTrash2 />Clear suggestions</button>
     </div>
     {error && <p className="memories-error memories-page-notice" role="alert">{error}</p>}
     {(!ready || loading || action || state?.generating || state?.message) && <p className="memories-page-notice" role="status" aria-live="polite">
@@ -622,7 +612,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
         <div className="memories-cover-placeholder"><FiFilm /><span>{index === 0 ? state?.generationProgress?.label || "Finding a story…" : "Waiting for a story…"}</span></div>
         <div className="memories-card-pending-body"><span /><span /></div>
       </article>)}
-      {state?.suggestions.filter((memory) => previews[memory.id]?.status !== "failed").map((memory) => <MemoryCard key={memory.id} api={api} memory={memory} disabled={busy || state.generating}
+      {state?.suggestions.map((memory) => <MemoryCard key={memory.id} api={api} memory={memory} disabled={busy || state.generating}
         preview={previews[memory.id]} onBlockedView={() => blockedView(memory)} onState={(next) => { if (mounted.current) setState(next); }}
         onDismiss={() => { void run("Removing suggestion", () => api.dismissMemory(memory.id)); }}
         onExport={(selected, options) => setExporting((current) => current || { memory: selected, options })}
@@ -633,9 +623,6 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
       <h2>A little nostalgia goes a long way.</h2><p>Find themed stories in your indexed photos and clips, then choose the mood, frame and length of your movie.</p>
       <p className="memories-hint">Nothing runs until you choose Generate memories. It uses what is indexed now, even while indexing continues. Each movie is then prepared in the background, one at a time, with progress shown on its card.</p>
     </div>}
-    {clearConfirm && <MemoriesDialog title="Clear these suggestions?" onClose={() => setClearConfirm(false)}><div className="memories-modal-body">
-      <p>This removes the memory cards, not your original files or saved movies.</p><div className="memories-modal-actions"><button type="button" className="memories-button" onClick={() => setClearConfirm(false)}>Keep memories</button><button type="button" className="memories-button memories-primary" onClick={() => { void clear(); }}>Clear suggestions</button></div>
-    </div></MemoriesDialog>}
     {exporting && <ExportDialog api={api} memory={exporting.memory} options={exporting.options} onClose={() => setExporting(null)} onDownloaded={refreshAfterDownload} />}
   </section>;
 }
