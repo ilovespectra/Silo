@@ -9,6 +9,7 @@ import {
 } from "react-icons/fi";
 import type { GuidedTourSection } from "./GuidedTour";
 import "./LocalHelpPanel.css";
+import { GOOGLE_FEATURES_ENABLED } from "../featureFlags";
 
 export interface LocalHelpTopic {
   id: string;
@@ -21,14 +22,14 @@ export interface LocalHelpTopic {
   fallbackTarget?: string;
 }
 
-const HELP_ARTICLES: LocalHelpTopic[] = [
+const ALL_HELP_ARTICLES: LocalHelpTopic[] = [
   {
     id: "app-sections",
     guidePath: "/",
     title: "Silo tabs and sections",
     keywords: "tabs pages navigation memories files people map duplicates mobile settings help overview",
     answer:
-      "Memories is for reviewing and making story videos from indexed media. Files manages folder, Google, and saved-device sources, indexing, search, and file organization. People reviews face clusters and assignments; Map browses geotagged photos and updates their location metadata; Duplicates compares exact copies for careful cleanup; Mobile manages phone/tablet copies and message exports. Settings contains membership-license status, trusted-Wi-Fi library sharing, content protection, Memory and cache destinations, appearance, configuration backup/restore, and a button that opens the full Library Statistics dashboard. Help searches its offline answers and can spotlight the relevant control.",
+      "Memories is for reviewing and making story videos from indexed media. Files manages folder and saved-device sources, indexing, search, and file organization. People reviews face clusters and assignments; Map browses geotagged photos and updates their location metadata; Duplicates compares exact copies for careful cleanup; Mobile manages phone/tablet copies and message exports. Settings contains membership-license status, trusted-Wi-Fi library sharing, content protection, Memory and cache destinations, appearance, configuration backup/restore, and a button that opens the full Library Statistics dashboard. Help searches its offline answers and can spotlight the relevant control.",
     section: "files",
     target: '[data-tour="app-tabs"]',
   },
@@ -38,7 +39,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Sources and indexing",
     keywords: "folder source add plus index progress phone google drive backup",
     answer:
-      "In Files, use + beside Sources to add a folder. Silo starts indexing it automatically; follow the Library indexing stages below the source list. Google accounts and phones are added from their own sections. A source must be available and enabled to browse its files.",
+      "In Files, use + beside Sources to add a folder. Silo starts indexing it automatically; follow the Library indexing stages below the source list. Phones are added from Mobile. A source must be available and enabled to browse its files.",
     section: "files",
     target: '[data-tour="sources-add"]',
   },
@@ -364,12 +365,14 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
   {
     id: "sources-cloud-phones",
     guidePath: "/guide/09-cloud-sources",
-    title: "Google and phone sources",
+    title: GOOGLE_FEATURES_ENABLED ? "Google and phone sources" : "Phone sources",
     keywords: "google drive account reconnect browse photos pick sign out phone tablet source backup",
     answer:
-      "The Files sidebar contains Google Accounts and phone/device sources in addition to folder sources. Their controls add or reconnect accounts, browse available files, or choose photos; removing access and disconnecting a device are separate actions. Check the label and availability before browsing or indexing.",
+      GOOGLE_FEATURES_ENABLED
+        ? "The Files sidebar contains Google Accounts and phone/device sources in addition to folder sources. Their controls add or reconnect accounts, browse available files, or choose photos; removing access and disconnecting a device are separate actions. Check the label and availability before browsing or indexing."
+        : "The Files sidebar lists saved phone and tablet copies alongside folder sources. Back up a device from Mobile, then browse its saved copy from Files. Check the label and availability before browsing or indexing.",
     section: "files",
-    target: '[data-tour="google-sources"]',
+    target: GOOGLE_FEATURES_ENABLED ? '[data-tour="google-sources"]' : '[data-tour="sources-add"]',
   },
 ];
 
@@ -382,7 +385,7 @@ interface GuideDocSection {
 }
 
 // Bundled offline copy of ilovespectra/silo-user-guide at 13b1dd5856ef297fa5d081aaf0652e0ce302f036.
-const GUIDE_DOC_SECTIONS: GuideDocSection[] = [
+const ALL_GUIDE_DOC_SECTIONS: GuideDocSection[] = [
   {"chapterTitle":"Silo User Guide","title":"Start here","guidePath":"/","excerpt":"Install and take the first tour Add a folder and learn the Files workspace Understand indexing and semantic search Choose the feature you need","searchText":"Silo Your files, one local-first library. Browse folders, drives, connected phones and selected cloud files; search photos by meaning; organize with people, places and virtual collections; review duplicates; and make memory videos. This guide describes the Silo 2.0.2 source snapshot reviewed on October 9, 2026 . The installed Mac app used for screenshots currently reports bundle version 1.0.0 and minimum macOS 12.0 , so the source and packaged version labels do not agree. See Compatibility and known limits before relying on version-specific details. Silo Files screen at first launch Start here Install and take the first tour Add a folder and learn the Files workspace Understand indexing and semantic search Choose the feature you need"},
   {"chapterTitle":"Silo User Guide","title":"Guide","guidePath":"/","excerpt":"People and face scanning Digital folders and offline references Map and photo locations Duplicates and safe review Memories and story videos Phones, backups and messages Google Drive and Google Photos Shelter copies and Time…","searchText":"Guide People and face scanning Digital folders and offline references Map and photo locations Duplicates and safe review Memories and story videos Phones, backups and messages Google Drive and Google Photos Shelter copies and Time Machine Settings, storage and privacy Troubleshooting Compatibility and known limits License, demo and support access"},
   {"chapterTitle":"Silo User Guide","title":"What Silo does","guidePath":"/","excerpt":"Silo presents selected sources in a unified desktop workspace. It keeps original files where they are unless you choose an action that changes them. Search indexes, face groups, location indexes, thumbnails and other derived data…","searchText":"What Silo does Silo presents selected sources in a unified desktop workspace. It keeps original files where they are unless you choose an action that changes them. Search indexes, face groups, location indexes, thumbnails and other derived data are local Silo data; they are not substitutes for a backup of your originals. Most first-run tasks take time on a large library. Finding files, preparing CLIP search, face scanning, location extraction, duplicate hashing and thumbnail generation are separate jobs. A progress bar reaching 100% for one job does not mean every other job is complete."},
@@ -462,6 +465,13 @@ const GUIDE_DOC_SECTIONS: GuideDocSection[] = [
   {"chapterTitle":"License, demo and support access","title":"Demo or beta access","guidePath":"/guide/14-license-and-demo","excerpt":"A preview may expose beta-access request or activation controls. Those controls require the matching release service and configuration to be live. A test/demo mode may limit browsing or licensing state without deleting indexed…","searchText":"Demo or beta access A preview may expose beta-access request or activation controls. Those controls require the matching release service and configuration to be live. A test/demo mode may limit browsing or licensing state without deleting indexed records, but exact behavior can differ between builds. Read the status displayed by the installed app and the release notes for that build."},
   {"chapterTitle":"License, demo and support access","title":"Support reports","guidePath":"/guide/14-license-and-demo","excerpt":"Settings may include a bug-report flow. Before sending, review any screenshot and text for faces, paths, filenames, account names and other personal details. Do not attach license signatures, private keys, or config exports that…","searchText":"Support reports Settings may include a bug-report flow. Before sending, review any screenshot and text for faces, paths, filenames, account names and other personal details. Do not attach license signatures, private keys, or config exports that may contain access tokens."},
 ];
+
+const GUIDE_DOC_SECTIONS = ALL_GUIDE_DOC_SECTIONS.filter(
+  (section) =>
+    GOOGLE_FEATURES_ENABLED ||
+    (!section.guidePath.includes("cloud-sources") && !/google/i.test(section.title)),
+);
+const HELP_ARTICLES = ALL_HELP_ARTICLES;
 
 const HELP_SEARCH_STOP_WORDS = new Set([
   "a",

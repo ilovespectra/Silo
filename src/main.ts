@@ -121,6 +121,7 @@ import {
 import { MemoryTopicProfile, RefreshScheduler } from "./memoryTopicProfile";
 import * as exifr from "exifr";
 import { MemoryExportCancelledError, MemoryExporter } from "./memoryExporter";
+import { GOOGLE_FEATURES_ENABLED } from "./featureFlags";
 import {
   isMemoryDurationAllowed,
   MEMORY_DURATION_SECONDS,
@@ -4872,7 +4873,7 @@ async function buildSourceList(): Promise<BrowseSource[]> {
     });
   }
 
-  for (const account of googleManager.getState().accounts) {
+  for (const account of GOOGLE_FEATURES_ENABLED ? googleManager.getState().accounts : []) {
     const driveClone = cloneStatus[account.driveRootPath];
     sources.push({
       id: account.driveRootPath,

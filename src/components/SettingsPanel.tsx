@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { FaBug, FaGithub } from "react-icons/fa";
 import {
   FiAlertCircle,
@@ -11,8 +11,10 @@ import {
   FiExternalLink,
   FiFolder,
   FiHardDrive,
+  FiHelpCircle,
   FiLock,
   FiSettings,
+  FiShare2,
   FiShield,
   FiUpload,
   FiX,
@@ -21,6 +23,16 @@ import type { LifetimeLicenseState } from "../lifetimePayment";
 import LifetimeUnlockPanel from "./LifetimeUnlockPanel";
 import LibraryShareSettings from "./LibraryShareSettings";
 
+type SettingsGroupId = "general" | "library" | "privacy" | "sharing" | "help";
+
+const SETTINGS_GROUPS: Array<{ id: SettingsGroupId; label: string; icon: React.ComponentType }> = [
+  { id: "general", label: "General", icon: FiSettings },
+  { id: "library", label: "Library & storage", icon: FiHardDrive },
+  { id: "privacy", label: "Privacy & safety", icon: FiShield },
+  { id: "sharing", label: "Sharing & backup", icon: FiShare2 },
+  { id: "help", label: "Help & feedback", icon: FiHelpCircle },
+];
+
 interface SettingsPanelProps {
   settings: PublicContentSettings;
   onChange: (settings: PublicContentSettings) => void;
@@ -28,8 +40,6 @@ interface SettingsPanelProps {
   onOpenStatistics: () => void;
   onOpenBugReport: () => void;
   hideSettingsForScreenshot?: boolean;
-  googleSourcesHidden: boolean;
-  onGoogleSourcesHiddenChange: (hidden: boolean) => void;
   lifetimePromptRequest?: number;
   onLifetimePromptHandled: () => void;
 }
@@ -754,8 +764,6 @@ export default function SettingsPanel({
   onOpenStatistics,
   onOpenBugReport,
   hideSettingsForScreenshot = false,
-  googleSourcesHidden,
-  onGoogleSourcesHiddenChange,
   lifetimePromptRequest = 0,
   onLifetimePromptHandled,
 }: SettingsPanelProps) {
@@ -788,6 +796,25 @@ export default function SettingsPanel({
     status: "checking",
     currentVersion: "",
   });
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [activeGroup, setActiveGroup] = useState<SettingsGroupId>("general");
+  const scrollToGroup = useCallback((id: SettingsGroupId) => {
+    setActiveGroup(id);
+    contentRef.current
+      ?.querySelector(`[data-settings-group="${id}"]`)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+  const updateActiveGroup = useCallback(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    const top = content.getBoundingClientRect().top + 32;
+    let current: SettingsGroupId = "general";
+    content.querySelectorAll<HTMLElement>("[data-settings-group]").forEach((group) => {
+      if (group.getBoundingClientRect().top <= top) current = group.dataset.settingsGroup as SettingsGroupId;
+    });
+    if (content.scrollTop + content.clientHeight >= content.scrollHeight - 2) current = "help";
+    setActiveGroup(current);
+  }, []);
   const cacheDestinationIsRequired =
     !cacheDestination || /file-browser-electron/i.test(cacheDestination);
 
@@ -1119,7 +1146,7 @@ export default function SettingsPanel({
         if (!hideSettingsForScreenshot && event.target === event.currentTarget) onClose();
       }}
     >
-      <aside
+      <section
         className="settings-panel"
         role="dialog"
         aria-modal="true"
@@ -1135,602 +1162,612 @@ export default function SettingsPanel({
           </button>
         </header>
 
-        {!lifetimeLicense.isLicensed && (
-          <section
-            className="settings-license-section"
-            data-tour="settings-license"
-            data-help={
-              demoMode.enabled
-                ? "Demo testing limits are active while your paid or beta lifetime license remains saved."
-                : "Demo limits stay unobtrusive until you choose a feature that is not included."
-            }
-          >
-            <div className="settings-section-title">
-              <FiLock />
-              <div>
-                <h3>
-                  {demoMode.enabled
-                    ? "Demo testing mode enabled"
-                    : "Demo mode"}
-                </h3>
-                <p>
-                  {demoMode.enabled
-                    ? "Demo limits are active for testing; your lifetime license is still saved on this installation."
-                    : "The demo indexes up to 1,000 representative files with real search, face scanning, place mapping and deduplication; demo deletion is limited to 100 files. Full-access options appear only when you click an unavailable feature."}
-                </p>
+        <div className="settings-layout">
+          <nav className="settings-nav" aria-label="Settings categories">
+            {SETTINGS_GROUPS.map((group) => (
+              <button
+                key={group.id}
+                type="button"
+                className={activeGroup === group.id ? "active" : ""}
+                aria-current={activeGroup === group.id ? "true" : undefined}
+                onClick={() => scrollToGroup(group.id)}
+              >
+                <group.icon aria-hidden="true" />
+                <span>{group.label}</span>
+              </button>
+            ))}
+          </nav>
+          <div className="settings-content" ref={contentRef} onScroll={updateActiveGroup}>
+            <div className="settings-group" data-settings-group="general">
+              <h3 className="settings-group-title">General</h3>
+              <div className="settings-group-cards">
+                {!lifetimeLicense.isLicensed && (
+                  <section
+                    className="settings-license-section"
+                    data-tour="settings-license"
+                    data-help={
+                      demoMode.enabled
+                        ? "Demo testing limits are active while your paid or beta lifetime license remains saved."
+                        : "Demo limits stay unobtrusive until you choose a feature that is not included."
+                    }
+                  >
+                    <div className="settings-section-title">
+                      <FiLock />
+                      <div>
+                        <h3>
+                          {demoMode.enabled
+                            ? "Demo testing mode enabled"
+                            : "Demo mode"}
+                        </h3>
+                        <p>
+                          {demoMode.enabled
+                            ? "Demo limits are active for testing; your lifetime license is still saved on this installation."
+                            : "The demo indexes up to 1,000 representative files with real search, face scanning, place mapping and deduplication; demo deletion is limited to 100 files. Full-access options appear only when you click an unavailable feature."}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="settings-license-actions">
+                      <button
+                        className="settings-save settings-license-button"
+                        onClick={() => {
+                          setDirectLifetimePurchase(true);
+                          setShowLifetimeUnlock(true);
+                        }}
+                        data-help="Open the one-time lifetime purchase choices directly from Settings."
+                      >
+                        View lifetime purchase options
+                      </button>
+                    </div>
+                  </section>
+                )}
+                <section className="settings-update-section" aria-live="polite">
+                  <div className="settings-section-title">
+                    <FiDownload />
+                    <div>
+                      <h3>
+                        {appUpdate.status === "available"
+                          ? "Update Available!"
+                          : "Software updates"}
+                      </h3>
+                      <p>
+                        {appUpdate.status === "checking"
+                          ? appUpdate.message ?? "Checking for a newer Silo version…"
+                          : appUpdate.status === "available"
+                          ? appUpdate.message ??
+                            `Silo ${appUpdate.version} is available to download and install.`
+                          : appUpdate.status === "downloading"
+                          ? `Downloading Silo ${appUpdate.version ?? "update"}… ${appUpdate.downloadPercent ?? 0}%`
+                          : appUpdate.status === "installing"
+                          ? appUpdate.message ??
+                            "Silo is installing the update and will restart automatically."
+                          : appUpdate.status === "not-available"
+                          ? `Silo ${appUpdate.currentVersion} is up to date.`
+                          : appUpdate.status === "unsupported"
+                          ? appUpdate.message
+                          : appUpdate.message ?? "Could not check for updates."}
+                      </p>
+                    </div>
+                  </div>
+                  {appUpdate.status === "available" && appUpdate.downloadUrl && (
+                    <button
+                      type="button"
+                      className="settings-save settings-update-download"
+                      onClick={() => void electronAPI?.downloadAndInstallAppUpdate()}
+                    >
+                      Download and install Silo {appUpdate.version}
+                    </button>
+                  )}
+                  {(appUpdate.status === "downloading" ||
+                    appUpdate.status === "installing") && (
+                    <button
+                      type="button"
+                      className="settings-save settings-update-download"
+                      disabled
+                    >
+                      {appUpdate.status === "downloading"
+                        ? `Downloading… ${appUpdate.downloadPercent ?? 0}%`
+                        : "Installing and restarting…"}
+                    </button>
+                  )}
+                  {appUpdate.status === "error" && appUpdate.downloadUrl && (
+                    <a
+                      className="settings-secondary settings-update-download"
+                      href={appUpdate.downloadUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {`Download ${appUpdate.installerLabel ?? "installer"} instead`}
+                    </a>
+                  )}
+                  {appUpdate.status === "available" &&
+                    !appUpdate.downloadUrl &&
+                    appUpdate.releaseUrl && (
+                      <a
+                        className="settings-secondary settings-update-download"
+                        href={appUpdate.releaseUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        View release and available builds
+                      </a>
+                    )}
+                </section>
+                <section data-tour="settings-appearance" data-help="Choose the app theme and whether the Map globe rotates automatically when the Map page opens.">
+                  <div className="settings-section-title">
+                    <FiSettings />
+                    <div>
+                      <h3>Appearance & behavior</h3>
+                    </div>
+                  </div>
+                  <label className="settings-select">
+                    <span>Theme</span>
+                    <select
+                      value={settings.theme}
+                      data-help="Choose whether Silo follows macOS appearance or always uses Dark or Light mode."
+                      onChange={(event) =>
+                        void update({
+                          theme: event.target.value as ContentPreferences["theme"],
+                        })
+                      }
+                    >
+                      <option value="system">System</option>
+                      <option value="dark">Dark</option>
+                      <option value="light">Light</option>
+                    </select>
+                  </label>
+                  <label className="settings-toggle">
+                    <div>
+                      <strong>Automatic globe rotation</strong>
+                      <span>Resume slow globe movement when Map opens.</span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.autoplayGlobe}
+                      data-help="Resume slow globe rotation automatically when you open Map."
+                      onChange={(event) =>
+                        void update({ autoplayGlobe: event.target.checked })
+                      }
+                    />
+                  </label>
+                  <label className="settings-toggle">
+                    <div>
+                      <strong>Preload Map textures</strong>
+                      <span>
+                        Load the day and night globe images after Silo opens for a faster
+                        first visit to Map.
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.preloadMapTextures}
+                      data-help="Load the local day and night globe images in the background after Silo opens so Map can appear sooner on its first visit."
+                      onChange={(event) =>
+                        void update({ preloadMapTextures: event.target.checked })
+                      }
+                    />
+                  </label>
+                </section>
               </div>
             </div>
-            <div className="settings-license-actions">
-              <button
-                className="settings-save settings-license-button"
-                onClick={() => {
-                  setDirectLifetimePurchase(true);
-                  setShowLifetimeUnlock(true);
-                }}
-                data-help="Open the one-time lifetime purchase choices directly from Settings."
-              >
-                View lifetime purchase options
-              </button>
-            </div>
-          </section>
-        )}
-
-        <section className="settings-update-section" aria-live="polite">
-          <div className="settings-section-title">
-            <FiDownload />
-            <div>
-              <h3>
-                {appUpdate.status === "available"
-                  ? "Update Available!"
-                  : "Software updates"}
-              </h3>
-              <p>
-                {appUpdate.status === "checking"
-                  ? appUpdate.message ?? "Checking for a newer Silo version…"
-                  : appUpdate.status === "available"
-                  ? appUpdate.message ??
-                    `Silo ${appUpdate.version} is available to download and install.`
-                  : appUpdate.status === "downloading"
-                  ? `Downloading Silo ${appUpdate.version ?? "update"}… ${appUpdate.downloadPercent ?? 0}%`
-                  : appUpdate.status === "installing"
-                  ? appUpdate.message ??
-                    "Silo is installing the update and will restart automatically."
-                  : appUpdate.status === "not-available"
-                  ? `Silo ${appUpdate.currentVersion} is up to date.`
-                  : appUpdate.status === "unsupported"
-                  ? appUpdate.message
-                  : appUpdate.message ?? "Could not check for updates."}
-              </p>
-            </div>
-          </div>
-          {appUpdate.status === "available" && appUpdate.downloadUrl && (
-            <button
-              type="button"
-              className="settings-save settings-update-download"
-              onClick={() => void electronAPI?.downloadAndInstallAppUpdate()}
-            >
-              Download and install Silo {appUpdate.version}
-            </button>
-          )}
-          {(appUpdate.status === "downloading" ||
-            appUpdate.status === "installing") && (
-            <button
-              type="button"
-              className="settings-save settings-update-download"
-              disabled
-            >
-              {appUpdate.status === "downloading"
-                ? `Downloading… ${appUpdate.downloadPercent ?? 0}%`
-                : "Installing and restarting…"}
-            </button>
-          )}
-          {appUpdate.status === "error" && appUpdate.downloadUrl && (
-            <a
-              className="settings-secondary settings-update-download"
-              href={appUpdate.downloadUrl}
-              target="_blank"
-              rel="noreferrer"
-            >
-              {`Download ${appUpdate.installerLabel ?? "installer"} instead`}
-            </a>
-          )}
-          {appUpdate.status === "available" &&
-            !appUpdate.downloadUrl &&
-            appUpdate.releaseUrl && (
-              <a
-                className="settings-secondary settings-update-download"
-                href={appUpdate.releaseUrl}
-                target="_blank"
-                rel="noreferrer"
-              >
-                View release and available builds
-              </a>
-            )}
-        </section>
-
-        <section className="settings-bug-report">
-          <div className="settings-section-title">
-            <FaBug />
-            <div>
-              <h3>Report a Bug</h3>
-              <p>Send a note about a problem or confusing feature.</p>
-            </div>
-          </div>
-          <button
-            className="settings-secondary"
-            onClick={onOpenBugReport}
-            data-help="Describe a problem, identify a visible feature, and optionally attach a screenshot of the Silo window."
-          >
-            <FaBug /> Report a Bug
-          </button>
-        </section>
-
-        <section
-          className="settings-bug-report"
-          data-help="Open the Silo user guide for walkthroughs, feature explanations, limitations, and troubleshooting."
-        >
-          <div className="settings-section-title">
-            <FiBookOpen />
-            <div>
-              <h3>Help & Documentation</h3>
-              <p>Browse the Silo walkthrough, feature guides, and troubleshooting tips.</p>
-            </div>
-          </div>
-          <div className="settings-help-links">
-            <a
-              className="settings-secondary"
-              href="https://repo-six-inky-51.vercel.app/"
-              target="_blank"
-              rel="noreferrer"
-            >
-              <FiBookOpen aria-hidden="true" /> Silo Docs <FiExternalLink aria-hidden="true" />
-            </a>
-            <a
-              className="settings-secondary settings-help-github"
-              href="https://github.com/ilovespectra/Silo"
-              target="_blank"
-              rel="noreferrer"
-              aria-label="Silo source code on GitHub"
-              title="Silo source code on GitHub"
-            >
-              <FaGithub aria-hidden="true" />
-            </a>
-          </div>
-        </section>
-
-        <LibraryShareSettings />
-
-        <section data-tour="content-protection" data-help="Control visibility of explicit images and banned people, Safe Search, and authorization for protected-setting changes.">
-          <div className="settings-section-title">
-            <FiShield />
-            <div>
-              <h3>Content protection</h3>
-              <p>
-                Explicit content is hidden and blocked from search by default.
-              </p>
-            </div>
-          </div>
-          <label className="settings-toggle">
-            <div>
-              <strong>Show NSFW images</strong>
-              <span>
-                Display files flagged by explicit terms or visual safety
-                classification.
-              </span>
-            </div>
-            <input
-              type="checkbox"
-              checked={settings.showNsfw}
-              disabled={busy || !settings.parentalPasswordSet}
-              data-help="Allow images flagged by explicit terms or visual safety classification to appear."
-              onChange={(event) =>
-                void update({ showNsfw: event.target.checked }, true)
-              }
-            />
-          </label>
-          <label className="settings-toggle">
-            <div>
-              <strong>Safe Search</strong>
-              <span>Reject explicit queries and remove flagged results.</span>
-            </div>
-            <input
-              type="checkbox"
-              checked={settings.safeSearch}
-              disabled={busy || !settings.parentalPasswordSet}
-              data-help="Keep explicit queries and flagged results out of search."
-              onChange={(event) =>
-                void update({ safeSearch: event.target.checked }, true)
-              }
-            />
-          </label>
-          <label className="settings-toggle">
-            <div>
-              <strong>Show banned people</strong>
-              <span>
-                Photos containing people you banned in People → Confirmed faces
-                stay hidden unless this is on.
-              </span>
-            </div>
-            <input
-              type="checkbox"
-              checked={settings.showBannedPeople}
-              disabled={busy}
-              data-help="Allow photos containing people you banned to appear in the library."
-              onChange={(event) =>
-                void update({ showBannedPeople: event.target.checked })
-              }
-            />
-          </label>
-          <label className="settings-password">
-            <span>Parental password</span>
-            <input
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              placeholder={
-                settings.parentalPasswordSet
-                  ? "Required to change protection"
-                  : "password"
-              }
-              autoComplete="current-password"
-              disabled={!settings.parentalPasswordSet}
-              data-help="Enter the parental password to authorize protected-content setting changes."
-            />
-          </label>
-        </section>
-
-        <section data-tour="settings-password" data-help="Create or change the parental password used to authorize protected-content setting changes. The password itself is not stored.">
-          <div className="settings-section-title">
-            <FiLock />
-            <div>
-              <h3>
-                {settings.parentalPasswordSet
-                  ? "Change parental password"
-                  : "Create parental password"}
-              </h3>
-              <p>At least 6 characters. The password itself is never stored.</p>
-            </div>
-          </div>
-          {settings.parentalPasswordSet && (
-            <input
-              type="password"
-              value={currentPassword}
-              onChange={(event) => setCurrentPassword(event.target.value)}
-              placeholder="Current password"
-              autoComplete="current-password"
-              data-help="Confirm the current parental password before replacing it."
-            />
-          )}
-          <div className="settings-password-row">
-            <input
-              type="password"
-              value={newPassword}
-              onChange={(event) => setNewPassword(event.target.value)}
-              placeholder="New password"
-              autoComplete="new-password"
-              data-help="Enter a new parental password of at least six characters. Silo stores only a verifier, not the password itself."
-            />
-            <input
-              type="password"
-              value={confirmPassword}
-              onChange={(event) => setConfirmPassword(event.target.value)}
-              placeholder="Confirm password"
-              autoComplete="new-password"
-              data-help="Re-enter the new password so Silo can check both entries match."
-            />
-          </div>
-          <button
-            className="settings-save"
-            disabled={busy || !newPassword || !confirmPassword}
-            onClick={() => void savePassword()}
-            data-help="Save or replace the parental password used to authorize protected-setting changes."
-          >
-            {settings.parentalPasswordSet
-              ? "Change password"
-              : "Create password"}
-          </button>
-        </section>
-
-        <section data-tour="settings-appearance" data-help="Choose the app theme and whether the Map globe rotates automatically when the Map page opens.">
-          <div className="settings-section-title">
-            <FiSettings />
-            <div>
-              <h3>Appearance & behavior</h3>
-            </div>
-          </div>
-          <label className="settings-select">
-            <span>Theme</span>
-            <select
-              value={settings.theme}
-              data-help="Choose whether Silo follows macOS appearance or always uses Dark or Light mode."
-              onChange={(event) =>
-                void update({
-                  theme: event.target.value as ContentPreferences["theme"],
-                })
-              }
-            >
-              <option value="system">System</option>
-              <option value="dark">Dark</option>
-              <option value="light">Light</option>
-            </select>
-          </label>
-          <label className="settings-toggle">
-            <div>
-              <strong>Automatic globe rotation</strong>
-              <span>Resume slow globe movement when Map opens.</span>
-            </div>
-            <input
-              type="checkbox"
-              checked={settings.autoplayGlobe}
-              data-help="Resume slow globe rotation automatically when you open Map."
-              onChange={(event) =>
-                void update({ autoplayGlobe: event.target.checked })
-              }
-            />
-          </label>
-          <label className="settings-toggle">
-            <div>
-              <strong>Preload Map textures</strong>
-              <span>
-                Load the day and night globe images after Silo opens for a faster
-                first visit to Map.
-              </span>
-            </div>
-            <input
-              type="checkbox"
-              checked={settings.preloadMapTextures}
-              data-help="Load the local day and night globe images in the background after Silo opens so Map can appear sooner on its first visit."
-              onChange={(event) =>
-                void update({ preloadMapTextures: event.target.checked })
-              }
-            />
-          </label>
-        </section>
-
-        <PerformanceSettingsSection />
-
-        <section data-tour="settings-memories" data-help="Choose where generated Memory movies and spare story files are saved; this does not move source media.">
-          <div className="settings-section-title">
-            <FiFolder />
-            <div>
-              <h3>Memories</h3>
-              <p>
-                Memory movies and a few spare stories are saved here, so they
-                stay watchable when the source drive or phone is disconnected.
-              </p>
-            </div>
-          </div>
-          <p className="settings-footnote">
-            {memoryDirectory
-              ? `Saving to ${memoryDirectory}/Silo Memories`
-              : "Saving inside Silo's app storage on this Mac."}
-          </p>
-          <div className="settings-password-row">
-            <button
-              className="settings-save"
-              disabled={busy}
-              onClick={() => void changeMemoryDirectory(false)}
-              data-help="Choose where Silo saves generated Memory movies and spare story files."
-            >
-              <FiFolder /> Choose destination…
-            </button>
-            {memoryDirectory && (
-              <button
-                className="settings-secondary"
-                disabled={busy}
-                onClick={() => void changeMemoryDirectory(true)}
-                data-help="Return Memory movie storage to Silo’s app folder on this Mac."
-              >
-                Use app storage
-              </button>
-            )}
-          </div>
-        </section>
-
-        <section
-          data-tour="settings-cache-destination"
-          data-help="Choose the external drive folder for Silo's indexes, thumbnails, previews, and other large generated caches."
-        >
-          <div className="settings-section-title">
-            <FiHardDrive />
-            <div>
-              <h3>Silo Cache Destination</h3>
-              <p>
-                Search indexes, faces, places, thumbnails, previews, and other
-                generated caches live here. Settings remain on this Mac.
-              </p>
-            </div>
-          </div>
-          <div
-            className="settings-cache-destination-status"
-            title={
-              cacheDestinationIsRequired
-                ? "Required: Silo needs a destination outside the browser profile for its indexes and caches."
-                : `Selected destination: ${cacheDestination}`
-            }
-          >
-            <span
-              className={
-                cacheDestinationIsRequired
-                  ? "settings-required-dot"
-                  : "settings-ready-dot"
-              }
-            />
-            <span>
-              {cacheDestinationIsRequired
-                ? "Required destination"
-                : "Destination ready"}
-            </span>
-          </div>
-          <div className="settings-password-row settings-cache-destination-actions">
-            <button
-              className="settings-save"
-              disabled={busy}
-              onClick={() => void changeCacheDestination()}
-              data-help="Choose an external-drive folder. Silo restarts, verifies the cache copies, and then removes the old copies."
-            >
-              <FiFolder /> {cacheDestinationIsRequired ? "Choose required destination…" : "Choose destination…"}
-            </button>
-          </div>
-          <label className="settings-cache-fallback-option">
-            <input
-              type="checkbox"
-              checked={localFallbackEnabled}
-              disabled={busy || !electronAPI || !cacheDestination}
-              onChange={() => void changeLocalFallback()}
-            />
-            <span>
-              <strong>Use a local cache if this destination disconnects</strong>
-              <small>
-                Silo keeps at least 10 GB free. When the destination reconnects,
-                it verifies and moves the local cache back automatically.
-                Clear this option to pause indexing instead.
-              </small>
-            </span>
-          </label>
-        </section>
-
-        <section className="settings-google-sources-section">
-          <div className="settings-section-title">
-            <FiExternalLink />
-            <div>
-              <h3>Google account sources</h3>
-              <p>
-                This optional section can be collapsed in Files or hidden here.
-                Hiding it keeps your connected accounts and local files unchanged.
-              </p>
-            </div>
-          </div>
-          <button
-            className="settings-secondary"
-            onClick={() => onGoogleSourcesHiddenChange(!googleSourcesHidden)}
-            aria-pressed={googleSourcesHidden}
-          >
-            {googleSourcesHidden
-              ? "Show Google Accounts in Files"
-              : "Hide Google Accounts from Files"}
-          </button>
-        </section>
-
-        <section data-tour="settings-backup" data-help="Export or review a Silo configuration restore. Restore replaces app setup and restarts Silo, but does not modify source media; protect exported credentials.">
-          <div className="settings-section-title">
-            <FiDownload />
-            <div>
-              <h3>Backup & restore</h3>
-              <p>
-                Save Silo's whole setup to one file: search index, people and
-                bans, keywords and names, albums, map locations, magic scores,
-                sources, Google connections, sorting, theme, and search history.
-                Restore it after reinstalling to skip re-indexing and
-                re-confirming.
-              </p>
-            </div>
-          </div>
-          {pendingImport ? (
-            <div className="settings-import-review">
-              <strong>
-                Restore config from{" "}
-                {new Date(pendingImport.exportedAt).toLocaleString()}?
-              </strong>
-              <span>
-                Made with Silo {pendingImport.appVersion}. Includes{" "}
-                {pendingImport.entries.length} data sets. Your current Silo
-                setup will be replaced and Silo will restart. Photos and other
-                files on disk are not touched.
-              </span>
-              <div className="settings-password-row">
-                <button
-                  className="settings-save"
-                  disabled={busy}
-                  onClick={() => void applyImport()}
-                  data-help="Replace the current Silo setup with the reviewed config and restart the app; source files are not changed."
+            <div className="settings-group" data-settings-group="library">
+              <h3 className="settings-group-title">Library & storage</h3>
+              <div className="settings-group-cards">
+                <section
+                  data-tour="settings-cache-destination"
+                  data-help="Choose the external drive folder for Silo's indexes, thumbnails, previews, and other large generated caches."
                 >
-                  Restore & restart
-                </button>
-                <button
-                  className="settings-secondary"
-                  disabled={busy}
-                  onClick={() => {
-                    setPendingImport(null);
-                    void electronAPI?.cancelConfigImport();
-                  }}
-                  data-help="Cancel this restore review and keep the current Silo setup."
+                  <div className="settings-section-title">
+                    <FiHardDrive />
+                    <div>
+                      <h3>Silo Cache Destination</h3>
+                      <p>
+                        Search indexes, faces, places, thumbnails, previews, and other
+                        generated caches live here. Settings remain on this Mac.
+                      </p>
+                    </div>
+                  </div>
+                  <div
+                    className="settings-cache-destination-status"
+                    title={
+                      cacheDestinationIsRequired
+                        ? "Required: Silo needs a destination outside the browser profile for its indexes and caches."
+                        : `Selected destination: ${cacheDestination}`
+                    }
+                  >
+                    <span
+                      className={
+                        cacheDestinationIsRequired
+                          ? "settings-required-dot"
+                          : "settings-ready-dot"
+                      }
+                    />
+                    <span>
+                      {cacheDestinationIsRequired
+                        ? "Required destination"
+                        : "Destination ready"}
+                    </span>
+                  </div>
+                  <div className="settings-password-row settings-cache-destination-actions">
+                    <button
+                      className="settings-save"
+                      disabled={busy}
+                      onClick={() => void changeCacheDestination()}
+                      data-help="Choose an external-drive folder. Silo restarts, verifies the cache copies, and then removes the old copies."
+                    >
+                      <FiFolder /> {cacheDestinationIsRequired ? "Choose required destination…" : "Choose destination…"}
+                    </button>
+                  </div>
+                  <label className="settings-cache-fallback-option">
+                    <input
+                      type="checkbox"
+                      checked={localFallbackEnabled}
+                      disabled={busy || !electronAPI || !cacheDestination}
+                      onChange={() => void changeLocalFallback()}
+                    />
+                    <span>
+                      <strong>Use a local cache if this destination disconnects</strong>
+                      <small>
+                        Silo keeps at least 10 GB free. When the destination reconnects,
+                        it verifies and moves the local cache back automatically.
+                        Clear this option to pause indexing instead.
+                      </small>
+                    </span>
+                  </label>
+                </section>
+                <section data-tour="settings-memories" data-help="Choose where generated Memory movies and spare story files are saved; this does not move source media.">
+                  <div className="settings-section-title">
+                    <FiFolder />
+                    <div>
+                      <h3>Memories</h3>
+                      <p>
+                        Memory movies and a few spare stories are saved here, so they
+                        stay watchable when the source drive or phone is disconnected.
+                      </p>
+                    </div>
+                  </div>
+                  <p className="settings-footnote">
+                    {memoryDirectory
+                      ? `Saving to ${memoryDirectory}/Silo Memories`
+                      : "Saving inside Silo's app storage on this Mac."}
+                  </p>
+                  <div className="settings-password-row">
+                    <button
+                      className="settings-save"
+                      disabled={busy}
+                      onClick={() => void changeMemoryDirectory(false)}
+                      data-help="Choose where Silo saves generated Memory movies and spare story files."
+                    >
+                      <FiFolder /> Choose destination…
+                    </button>
+                    {memoryDirectory && (
+                      <button
+                        className="settings-secondary"
+                        disabled={busy}
+                        onClick={() => void changeMemoryDirectory(true)}
+                        data-help="Return Memory movie storage to Silo’s app folder on this Mac."
+                      >
+                        Use app storage
+                      </button>
+                    )}
+                  </div>
+                </section>
+                <PerformanceSettingsSection />
+                <section
+                  className="settings-statistics-section"
+                  data-tour="library-statistics"
+                  data-help="Open the full dashboard to review source inventory, indexing progress, and verified Fallout Shelter status. Refresh measurements or start a backup only after checking source selections and destinations."
                 >
-                  Cancel
-                </button>
+                  <div className="settings-section-title">
+                    <FiBarChart2 />
+                    <div>
+                      <h3>Library statistics</h3>
+                      <p>Inventory, source coverage, indexing, and backup health.</p>
+                    </div>
+                  </div>
+                  <button
+                    className="settings-save settings-statistics-button"
+                    onClick={onOpenStatistics}
+                    data-help="Open the complete, full-page library statistics dashboard."
+                  >
+                    Open statistics dashboard
+                  </button>
+                </section>
               </div>
             </div>
-          ) : (
-            <div className="settings-password-row">
-              <button
-                className="settings-save"
-                disabled={busy}
-                onClick={() => void exportConfig()}
-                data-help="Export Silo configuration and library knowledge to a private backup file."
-              >
-                <FiDownload /> Export config
-              </button>
-              <button
-                className="settings-secondary"
-                disabled={busy}
-                onClick={() => void importConfig()}
-                data-help="Choose a previously exported Silo config file and review its contents before restoring."
-              >
-                <FiUpload /> Import config
-              </button>
+            <div className="settings-group" data-settings-group="privacy">
+              <h3 className="settings-group-title">Privacy & safety</h3>
+              <div className="settings-group-cards">
+                <section data-tour="content-protection" data-help="Control visibility of explicit images and banned people, Safe Search, and authorization for protected-setting changes.">
+                  <div className="settings-section-title">
+                    <FiShield />
+                    <div>
+                      <h3>Content protection</h3>
+                      <p>
+                        Explicit content is hidden and blocked from search by default.
+                      </p>
+                    </div>
+                  </div>
+                  <label className="settings-toggle">
+                    <div>
+                      <strong>Show NSFW images</strong>
+                      <span>
+                        Display files flagged by explicit terms or visual safety
+                        classification.
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.showNsfw}
+                      disabled={busy || !settings.parentalPasswordSet}
+                      data-help="Allow images flagged by explicit terms or visual safety classification to appear."
+                      onChange={(event) =>
+                        void update({ showNsfw: event.target.checked }, true)
+                      }
+                    />
+                  </label>
+                  <label className="settings-toggle">
+                    <div>
+                      <strong>Safe Search</strong>
+                      <span>Reject explicit queries and remove flagged results.</span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.safeSearch}
+                      disabled={busy || !settings.parentalPasswordSet}
+                      data-help="Keep explicit queries and flagged results out of search."
+                      onChange={(event) =>
+                        void update({ safeSearch: event.target.checked }, true)
+                      }
+                    />
+                  </label>
+                  <label className="settings-toggle">
+                    <div>
+                      <strong>Show banned people</strong>
+                      <span>
+                        Photos containing people you banned in People → Confirmed faces
+                        stay hidden unless this is on.
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.showBannedPeople}
+                      disabled={busy}
+                      data-help="Allow photos containing people you banned to appear in the library."
+                      onChange={(event) =>
+                        void update({ showBannedPeople: event.target.checked })
+                      }
+                    />
+                  </label>
+                  <label className="settings-password">
+                    <span>Parental password</span>
+                    <input
+                      type="password"
+                      value={password}
+                      onChange={(event) => setPassword(event.target.value)}
+                      placeholder={
+                        settings.parentalPasswordSet
+                          ? "Required to change protection"
+                          : "password"
+                      }
+                      autoComplete="current-password"
+                      disabled={!settings.parentalPasswordSet}
+                      data-help="Enter the parental password to authorize protected-content setting changes."
+                    />
+                  </label>
+                </section>
+                <section data-tour="settings-password" data-help="Create or change the parental password used to authorize protected-content setting changes. The password itself is not stored.">
+                  <div className="settings-section-title">
+                    <FiLock />
+                    <div>
+                      <h3>
+                        {settings.parentalPasswordSet
+                          ? "Change parental password"
+                          : "Create parental password"}
+                      </h3>
+                      <p>At least 6 characters. The password itself is never stored.</p>
+                    </div>
+                  </div>
+                  {settings.parentalPasswordSet && (
+                    <input
+                      type="password"
+                      value={currentPassword}
+                      onChange={(event) => setCurrentPassword(event.target.value)}
+                      placeholder="Current password"
+                      autoComplete="current-password"
+                      data-help="Confirm the current parental password before replacing it."
+                    />
+                  )}
+                  <div className="settings-password-row">
+                    <input
+                      type="password"
+                      value={newPassword}
+                      onChange={(event) => setNewPassword(event.target.value)}
+                      placeholder="New password"
+                      autoComplete="new-password"
+                      data-help="Enter a new parental password of at least six characters. Silo stores only a verifier, not the password itself."
+                    />
+                    <input
+                      type="password"
+                      value={confirmPassword}
+                      onChange={(event) => setConfirmPassword(event.target.value)}
+                      placeholder="Confirm password"
+                      autoComplete="new-password"
+                      data-help="Re-enter the new password so Silo can check both entries match."
+                    />
+                  </div>
+                  <button
+                    className="settings-save"
+                    disabled={busy || !newPassword || !confirmPassword}
+                    onClick={() => void savePassword()}
+                    data-help="Save or replace the parental password used to authorize protected-setting changes."
+                  >
+                    {settings.parentalPasswordSet
+                      ? "Change password"
+                      : "Create password"}
+                  </button>
+                </section>
+              </div>
             </div>
-          )}
-          <p className="settings-footnote">
-            The file contains your Google account sign-in tokens and parental
-            password hash. Keep it somewhere private. Thumbnails and previews
-            aren't included; they rebuild automatically. Phone backups aren't
-            included either.
-          </p>
-        </section>
-
-        <section
-          className="settings-statistics-section"
-          data-tour="library-statistics"
-          data-help="Open the full dashboard to review source inventory, indexing progress, and verified Fallout Shelter status. Refresh measurements or start a backup only after checking source selections and destinations."
-        >
-          <div className="settings-section-title">
-            <FiBarChart2 />
-            <div>
-              <h3>Library statistics</h3>
-              <p>Inventory, source coverage, indexing, and backup health.</p>
+            <div className="settings-group" data-settings-group="sharing">
+              <h3 className="settings-group-title">Sharing & backup</h3>
+              <div className="settings-group-cards">
+                <LibraryShareSettings />
+                <section data-tour="settings-backup" data-help="Export or review a Silo configuration restore. Restore replaces app setup and restarts Silo, but does not modify source media; protect exported credentials.">
+                  <div className="settings-section-title">
+                    <FiDownload />
+                    <div>
+                      <h3>Backup & restore</h3>
+                      <p>
+                        Save Silo's whole setup to one file: search index, people and
+                        bans, keywords and names, albums, map locations, magic scores,
+                        sources, sorting, theme, and search history.
+                        Restore it after reinstalling to skip re-indexing and
+                        re-confirming.
+                      </p>
+                    </div>
+                  </div>
+                  {pendingImport ? (
+                    <div className="settings-import-review">
+                      <strong>
+                        Restore config from{" "}
+                        {new Date(pendingImport.exportedAt).toLocaleString()}?
+                      </strong>
+                      <span>
+                        Made with Silo {pendingImport.appVersion}. Includes{" "}
+                        {pendingImport.entries.length} data sets. Your current Silo
+                        setup will be replaced and Silo will restart. Photos and other
+                        files on disk are not touched.
+                      </span>
+                      <div className="settings-password-row">
+                        <button
+                          className="settings-save"
+                          disabled={busy}
+                          onClick={() => void applyImport()}
+                          data-help="Replace the current Silo setup with the reviewed config and restart the app; source files are not changed."
+                        >
+                          Restore & restart
+                        </button>
+                        <button
+                          className="settings-secondary"
+                          disabled={busy}
+                          onClick={() => {
+                            setPendingImport(null);
+                            void electronAPI?.cancelConfigImport();
+                          }}
+                          data-help="Cancel this restore review and keep the current Silo setup."
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="settings-password-row">
+                      <button
+                        className="settings-save"
+                        disabled={busy}
+                        onClick={() => void exportConfig()}
+                        data-help="Export Silo configuration and library knowledge to a private backup file."
+                      >
+                        <FiDownload /> Export config
+                      </button>
+                      <button
+                        className="settings-secondary"
+                        disabled={busy}
+                        onClick={() => void importConfig()}
+                        data-help="Choose a previously exported Silo config file and review its contents before restoring."
+                      >
+                        <FiUpload /> Import config
+                      </button>
+                    </div>
+                  )}
+                  <p className="settings-footnote">
+                    The file contains connected-account sign-in tokens and your parental
+                    password hash. Keep it somewhere private. Thumbnails and previews
+                    aren't included; they rebuild automatically. Phone backups aren't
+                    included either.
+                  </p>
+                </section>
+              </div>
             </div>
-          </div>
-          <button
-            className="settings-save settings-statistics-button"
-            onClick={onOpenStatistics}
-            data-help="Open the complete, full-page library statistics dashboard."
-          >
-            Open statistics dashboard
-          </button>
-        </section>
-
-        {configTransferProgress && (
-          <div
-            className="settings-config-progress"
-            role="status"
-            aria-live="polite"
-          >
-            <span>{configTransferProgress.message}</span>
-            <div className="settings-config-progress-row">
-              <progress
-                max={100}
-                value={configTransferProgress.percent ?? undefined}
-                aria-label={configTransferProgress.message}
-              />
-              {configTransferProgress.percent !== null && (
-                <span>{configTransferProgress.percent}%</span>
+            <div className="settings-group" data-settings-group="help">
+              <h3 className="settings-group-title">Help & feedback</h3>
+              <div className="settings-group-cards">
+                <section
+                  className="settings-bug-report"
+                  data-help="Open the Silo user guide for walkthroughs, feature explanations, limitations, and troubleshooting."
+                >
+                  <div className="settings-section-title">
+                    <FiBookOpen />
+                    <div>
+                      <h3>Help & Documentation</h3>
+                      <p>Browse the Silo walkthrough, feature guides, and troubleshooting tips.</p>
+                    </div>
+                  </div>
+                  <div className="settings-help-links">
+                    <a
+                      className="settings-secondary"
+                      href="https://repo-six-inky-51.vercel.app/"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <FiBookOpen aria-hidden="true" /> Silo Docs <FiExternalLink aria-hidden="true" />
+                    </a>
+                    <a
+                      className="settings-secondary settings-help-github"
+                      href="https://github.com/ilovespectra/Silo"
+                      target="_blank"
+                      rel="noreferrer"
+                      aria-label="Silo source code on GitHub"
+                      title="Silo source code on GitHub"
+                    >
+                      <FaGithub aria-hidden="true" />
+                    </a>
+                  </div>
+                </section>
+                <section className="settings-bug-report">
+                  <div className="settings-section-title">
+                    <FaBug />
+                    <div>
+                      <h3>Report a Bug</h3>
+                      <p>Send a note about a problem or confusing feature.</p>
+                    </div>
+                  </div>
+                  <button
+                    className="settings-secondary"
+                    onClick={onOpenBugReport}
+                    data-help="Describe a problem, identify a visible feature, and optionally attach a screenshot of the Silo window."
+                  >
+                    <FaBug /> Report a Bug
+                  </button>
+                </section>
+              </div>
+            </div>
+            <div className="settings-feedback">
+              {configTransferProgress && (
+                <div
+                  className="settings-config-progress"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span>{configTransferProgress.message}</span>
+                  <div className="settings-config-progress-row">
+                    <progress
+                      max={100}
+                      value={configTransferProgress.percent ?? undefined}
+                      aria-label={configTransferProgress.message}
+                    />
+                    {configTransferProgress.percent !== null && (
+                      <span>{configTransferProgress.percent}%</span>
+                    )}
+                  </div>
+                </div>
               )}
+              {error && <div className="settings-message error">{error}</div>}
+              {notice && <div className="settings-message">{notice}</div>}
             </div>
           </div>
-        )}
-        {error && <div className="settings-message error">{error}</div>}
-        {notice && <div className="settings-message">{notice}</div>}
-      </aside>
+        </div>
+      </section>
     </div>
       {showLifetimeUnlock && (
         <LifetimeUnlockPanel

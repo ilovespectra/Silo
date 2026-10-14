@@ -92,6 +92,7 @@ import {
 import MessageExportPanel from "./components/MessageExportPanel";
 import { PhoneManagementPanel } from "./components/PhoneManagerPanel";
 import GoogleReclaimDialog from "./components/GoogleReclaimDialog";
+import { GOOGLE_FEATURES_ENABLED } from "./featureFlags";
 import AudioLibrary from "./components/AudioLibrary";
 import IndexingPanel from "./components/IndexingPanel";
 import SourceClonePanel from "./components/SourceClonePanel";
@@ -576,7 +577,7 @@ function cachedImagePreview(file: FileInfo): FilePreview | null {
   };
 }
 
-const GOOGLE_SOURCES_IN_SIDEBAR = true;
+const GOOGLE_SOURCES_IN_SIDEBAR = GOOGLE_FEATURES_ENABLED;
 const FAST_FILE_SEARCH_RESULT_LIMIT = 5000;
 const FAST_FILE_SEARCH_CHUNK_SIZE = 512;
 const FAST_FILE_SEARCH_CHUNK_DELAY_MS = 24;
@@ -8455,8 +8456,6 @@ function App() {
             setShowSettings(false);
           }}
           hideSettingsForScreenshot={selectingBugReportScreenshot}
-          googleSourcesHidden={googleSourcesHidden}
-          onGoogleSourcesHiddenChange={changeGoogleSourcesVisibility}
           lifetimePromptRequest={lifetimePromptRequest}
           onLifetimePromptHandled={acknowledgeLifetimePrompt}
         />
@@ -8511,7 +8510,7 @@ function App() {
         />
       )}
 
-      {electronAPI && googleReclaimAccountId && (() => {
+      {GOOGLE_FEATURES_ENABLED && electronAPI && googleReclaimAccountId && (() => {
         const account = googleState?.accounts.find((item) => item.id === googleReclaimAccountId);
         return account ? (
           <GoogleReclaimDialog

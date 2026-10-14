@@ -435,7 +435,8 @@ body {
   z-index: 1300;
   inset: 0;
   display: grid;
-  justify-items: end;
+  place-items: center;
+  padding: 24px;
   background: rgba(2, 4, 5, 0.62);
   backdrop-filter: blur(4px);
 }
@@ -445,26 +446,25 @@ body {
 }
 
 .settings-panel {
-  width: min(470px, 100vw);
-  height: 100vh;
-  overflow-y: auto;
-  border-left: 1px solid var(--line);
+  display: flex;
+  width: min(1040px, 100%);
+  height: min(780px, 100%);
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 14px;
   background: var(--surface);
   color: var(--text);
-  box-shadow: -16px 0 40px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
 }
 
 .settings-panel > header {
-  position: sticky;
-  z-index: 2;
-  top: 0;
   display: flex;
+  flex: none;
   align-items: center;
   justify-content: space-between;
-  padding: 16px;
+  padding: 14px 18px;
   border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--surface) 94%, transparent);
-  backdrop-filter: blur(10px);
 }
 
 .settings-panel > header div,
@@ -486,15 +486,129 @@ body {
   height: 30px;
   place-items: center;
   border: 1px solid var(--line);
+  border-radius: 8px;
   background: var(--raised);
   color: var(--text);
 }
 
-.settings-panel > section {
+.settings-layout {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  grid-template-columns: 200px minmax(0, 1fr);
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 10px;
+  border-right: 1px solid var(--line);
+  background: var(--surface-inset, var(--surface));
+}
+.settings-nav button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.settings-nav button:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--raised) 60%, transparent);
+}
+.settings-nav button.active {
+  background: var(--raised);
+  color: var(--text);
+}
+.settings-nav button svg {
+  flex: none;
+}
+.settings-nav button.active svg {
+  color: var(--orange);
+}
+
+.settings-content {
+  position: relative;
+  overflow-y: auto;
+  padding: 18px 28px 32px;
+}
+.settings-group {
+  max-width: 720px;
+  margin: 0 auto;
+  scroll-margin-top: 12px;
+}
+.settings-group + .settings-group {
+  margin-top: 26px;
+}
+.settings-group-title {
+  margin: 0 0 8px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.settings-group-cards {
+  display: grid;
+  gap: 10px;
+}
+.settings-group-cards > section {
   display: grid;
   gap: 10px;
   padding: 16px;
-  border-bottom: 1px solid var(--line);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--raised);
+}
+.settings-feedback {
+  position: sticky;
+  bottom: -32px;
+  display: grid;
+  gap: 8px;
+  max-width: 720px;
+  margin: 0 auto;
+}
+.settings-feedback:not(:empty) {
+  padding-top: 12px;
+}
+
+@media (max-width: 680px) {
+  .settings-backdrop {
+    padding: 0;
+  }
+  .settings-panel {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+  }
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .settings-nav {
+    flex-direction: row;
+    overflow-x: auto;
+    padding: 8px 10px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .settings-nav button {
+    width: auto;
+    flex: none;
+    white-space: nowrap;
+  }
+  .settings-content {
+    padding: 14px 12px 24px;
+  }
 }
 
 .settings-section-title {
@@ -523,6 +637,10 @@ body {
 .settings-toggle strong,
 .settings-toggle span {
   display: block;
+}
+.settings-toggle strong {
+  font-size: 12px;
+  font-weight: 600;
 }
 .settings-toggle input[type="checkbox"] {
   width: 18px;

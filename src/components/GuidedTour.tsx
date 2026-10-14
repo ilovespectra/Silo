@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { FiArrowLeft, FiArrowRight, FiX } from "react-icons/fi";
 import "./GuidedTour.css";
+import { GOOGLE_FEATURES_ENABLED } from "../featureFlags";
 
 export type GuidedTourSection =
   | "files"
@@ -22,7 +23,7 @@ export interface GuidedTourStep {
   section: GuidedTourSection;
 }
 
-export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
+const ALL_GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "sections",
     title: "Find your way around Silo",
@@ -323,6 +324,10 @@ export const GUIDED_TOUR_STEPS: GuidedTourStep[] = [
     section: "stats",
   },
 ];
+
+export const GUIDED_TOUR_STEPS = ALL_GUIDED_TOUR_STEPS.filter(
+  (step) => GOOGLE_FEATURES_ENABLED || step.id !== "google-sources",
+);
 
 interface GuidedTourProps {
   open: boolean;
