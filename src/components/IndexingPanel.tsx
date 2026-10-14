@@ -50,6 +50,16 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
     id: string;
     message: string;
   } | null>(null);
+  // When several stages wait on the same thing, say it once above the list.
+  const waitCounts = new Map<string, number>();
+  for (const stage of stages) {
+    if (stage.resumeQueued && stage.blockedReason && stage.status !== "complete")
+      waitCounts.set(stage.blockedReason, (waitCounts.get(stage.blockedReason) ?? 0) + 1);
+  }
+  let sharedWaitReason = "";
+  for (const [reason, count] of waitCounts) {
+    if (count >= 2 && count > (waitCounts.get(sharedWaitReason) ?? 0)) sharedWaitReason = reason;
+  }
   useEffect(() => {
     onStagesChange?.(stages);
   }, [onStagesChange, stages]);
@@ -179,6 +189,11 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
           </small>
         </div>
       )}
+      {sharedWaitReason && (
+        <p className="indexing-panel-status" role="status">
+          Waiting: {sharedWaitReason}
+        </p>
+      )}
       {stages.map((stage) => {
         const processed = Math.max(0, Number(stage.processed) || 0);
         const total = Math.max(0, Number(stage.total) || 0);
@@ -197,6 +212,38 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
         const showStageReason =
           (stage.status === "error" || stage.status === "paused") &&
           Boolean(stage.message?.trim());
+        const resuming = !complete && (stage.recoveryRunning || stage.resumeQueued);
+        // A paused note is redundant once a resume is already lined up.
+        const stageReason =
+          showStageReason && !(resuming && stage.status === "paused")
+            ? (stage.message ?? "").trim()
+            : "";
+        const ownBlockedReason =
+          stage.blockedReason && stage.blockedReason !== sharedWaitReason
+            ? stage.blockedReason
+            : "";
+        let statusText = "";
+        let statusAlert = stage.status === "error" && Boolean(stageReason);
+        if (complete) {
+          statusText = "";
+        } else if (stage.recoveryRunning) {
+          statusText = "Resuming…";
+        } else if (stage.resumeQueued) {
+          statusText = ownBlockedReason ? `Queued · ${ownBlockedReason}` : "Queued";
+        } else if (stage.recoveryError && stage.recoveryError !== stage.message) {
+          statusAlert = true;
+          statusText = `Retry failed: ${stage.recoveryError}${
+            stage.retryAt && stage.retryAt > Date.now()
+              ? ` · next try in ${Math.ceil((stage.retryAt - Date.now()) / 1000)}s`
+              : ""
+          }`;
+        } else if (stage.status === "error" && stage.blockedReason) {
+          statusText = `Blocked: ${stage.blockedReason}`;
+        }
+        const statusParts = [stageReason, statusText].filter(Boolean);
+        const statusLine = statusParts.length
+          ? { text: statusParts.join(" · "), alert: statusAlert }
+          : null;
         return (
           <div
             key={stage.id}
@@ -220,45 +267,16 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
             <small className="indexing-stage-message" title={stage.message}>
               {processDescription}
             </small>
-            {showStageReason && (
+            {statusLine && (
               <small
-                role={stage.status === "error" ? "alert" : undefined}
+                role={statusLine.alert ? "alert" : undefined}
                 className="indexing-stage-errors"
                 style={stageErrorStyle}
+                title={statusLine.text}
               >
-                {stage.message}
+                {statusLine.text}
               </small>
             )}
-            {stage.recoveryError && stage.recoveryError !== stage.message && (
-              <small
-                role="alert"
-                className="indexing-stage-errors"
-                style={stageErrorStyle}
-              >
-                Retry error: {stage.recoveryError}
-                {stage.retryAt && stage.retryAt > Date.now()
-                  ? ` Automatic retry in ${Math.ceil((stage.retryAt - Date.now()) / 1000)}s.`
-                  : " Automatic retry is queued."}
-              </small>
-            )}
-            {stage.recoveryRunning && (
-              <small className="indexing-stage-errors" style={stageErrorStyle}>
-                Retry is running.
-              </small>
-            )}
-            {stage.resumeQueued && (
-              <small className="indexing-stage-errors" style={stageErrorStyle}>
-                Retry queued{stage.blockedReason ? ` · Waiting: ${stage.blockedReason}` : "."}
-              </small>
-            )}
-            {!stage.resumeQueued &&
-              !stage.recoveryRunning &&
-              stage.status === "error" &&
-              stage.blockedReason && (
-                <small className="indexing-stage-errors" style={stageErrorStyle}>
-                  Retry blocked: {stage.blockedReason}
-                </small>
-              )}
             {stageRetryError?.id === stage.id && (
               <small
                 role="alert"
@@ -269,6 +287,8 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
               </small>
             )}
             {stage.canRetry &&
+              !stage.resumeQueued &&
+              !stage.recoveryRunning &&
               (stage.id === "quality" ||
                 stage.status === "paused" ||
                 stage.status === "error" ||
