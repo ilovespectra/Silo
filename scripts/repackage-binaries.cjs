@@ -44,8 +44,11 @@ function findLatestVersionInFolder(folder) {
 
   let latest = null;
   for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
-    if (!entry.isFile()) continue;
-    const match = /Silo-([0-9]+\.[0-9]+(?:\.[0-9]+)?)/.exec(entry.name);
+    const match = entry.isFile()
+      ? /Silo-([0-9]+\.[0-9]+(?:\.[0-9]+)?)/.exec(entry.name)
+      : entry.isDirectory() && fs.existsSync(path.join(folder, entry.name, `${product}-${entry.name}-arm64.dmg`))
+        ? /^([0-9]+\.[0-9]+\.[0-9]+)$/.exec(entry.name)
+        : null;
     if (!match) continue;
     const candidate = match[1];
     if (!latest || compareVersions(candidate, latest) > 0) {
@@ -67,8 +70,10 @@ function readLatestGitHubReleaseTag() {
 const explicitDestination = process.env.SILO_RELEASE_DEST
   ? path.resolve(process.env.SILO_RELEASE_DEST)
   : '';
-const defaultDestinationFor = (value) =>
-  path.join(os.homedir(), 'Downloads', `SILO ${value} TEST`);
+// With an explicit output root, each release gets its own <root>/<version> folder.
+const defaultDestinationFor = (value) => (explicitDestination
+  ? path.join(explicitDestination, value)
+  : path.join(os.homedir(), 'Downloads', `SILO ${value} TEST`));
 
 // The release version always comes from package.json. When that version was
 // already packaged (in the destination) or published, bump the patch and
@@ -95,7 +100,7 @@ function resolveReleaseVersion() {
 }
 
 const version = resolveReleaseVersion();
-const destination = explicitDestination || defaultDestinationFor(version);
+const destination = defaultDestinationFor(version);
 const outputFolder = path.join(projectRoot, 'release');
 const stageParent = process.env.SILO_RELEASE_STAGE_DIR
   ? path.resolve(process.env.SILO_RELEASE_STAGE_DIR)
