@@ -91,6 +91,7 @@ import {
 } from "./utils/useMagicRanks";
 import MessageExportPanel from "./components/MessageExportPanel";
 import { PhoneManagementPanel } from "./components/PhoneManagerPanel";
+import GoogleReclaimDialog from "./components/GoogleReclaimDialog";
 import AudioLibrary from "./components/AudioLibrary";
 import IndexingPanel from "./components/IndexingPanel";
 import SourceClonePanel from "./components/SourceClonePanel";
@@ -575,7 +576,7 @@ function cachedImagePreview(file: FileInfo): FilePreview | null {
   };
 }
 
-const GOOGLE_SOURCES_IN_SIDEBAR = false;
+const GOOGLE_SOURCES_IN_SIDEBAR = true;
 const FAST_FILE_SEARCH_RESULT_LIMIT = 5000;
 const FAST_FILE_SEARCH_CHUNK_SIZE = 512;
 const FAST_FILE_SEARCH_CHUNK_DELAY_MS = 24;
@@ -1087,6 +1088,7 @@ function App() {
   });
   const [googleBusy, setGoogleBusy] = useState(false);
   const [googleNotice, setGoogleNotice] = useState("");
+  const [googleReclaimAccountId, setGoogleReclaimAccountId] = useState<string | null>(null);
   const [pickerSession, setPickerSession] = useState<{
     accountId: string;
     sessionId: string;
@@ -7263,7 +7265,6 @@ function App() {
               ))}
             </section>
 
-            {/* Google sources do not work in this build; hidden until they are supported. */}
             {GOOGLE_SOURCES_IN_SIDEBAR && !googleSourcesHidden && <details
               className="sidebar-section cloud-accounts"
               data-tour="google-sources"
@@ -7390,6 +7391,15 @@ function App() {
                               </button>
                             )}
                           </>
+                        )}
+                        {!account.needsReauth && (
+                          <button
+                            onClick={() => setGoogleReclaimAccountId(account.id)}
+                            title={`Free up space in ${account.email}`}
+                            aria-label={`Free up space in ${account.email}`}
+                          >
+                            <FiTrash2 />
+                          </button>
                         )}
                         <button
                           onClick={() => googleRemoveAccount(account.id)}
@@ -8500,6 +8510,21 @@ function App() {
           }}
         />
       )}
+
+      {electronAPI && googleReclaimAccountId && (() => {
+        const account = googleState?.accounts.find((item) => item.id === googleReclaimAccountId);
+        return account ? (
+          <GoogleReclaimDialog
+            api={electronAPI}
+            account={account}
+            onReconnect={() => {
+              setGoogleReclaimAccountId(null);
+              void googleAddAccount();
+            }}
+            onClose={() => setGoogleReclaimAccountId(null)}
+          />
+        ) : null;
+      })()}
 
       <GuidedTour
         open={showGuidedTour}

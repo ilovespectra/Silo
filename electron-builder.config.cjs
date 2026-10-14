@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 const packageJson = require('./package.json');
 const testOutput = process.env.SILO_TEST_OUTPUT_DIR;
@@ -10,9 +11,32 @@ const files = externalRendererBuild
       ),
     ]
   : packageJson.build.files;
-const extraResources = testOutput
-  ? packageJson.build.extraResources.filter(({ from }) => from !== '.model-test-cache')
-  : packageJson.build.extraResources;
+// Google OAuth (desktop client, PKCE) ships as a Google-only file built from .env or CI env vars.
+function writeGoogleOAuthResource() {
+  const values = {};
+  try {
+    for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split('\n')) {
+      const match = /^\s*(GOOGLE_[A-Z_]+)\s*=\s*(.*?)\s*$/.exec(line);
+      if (match) values[match[1]] = match[2].replace(/^["']|["']$/g, '');
+    }
+  } catch {
+    // No local .env; fall back to the environment.
+  }
+  for (const key of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI'])
+    if (process.env[key]) values[key] = process.env[key];
+  if (!values.GOOGLE_CLIENT_ID || !values.GOOGLE_CLIENT_SECRET) return null;
+  const target = path.join(__dirname, '.google-oauth', 'google.env');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n') + '\n', { mode: 0o600 });
+  return { from: '.google-oauth/google.env', to: 'google.env' };
+}
+const googleOAuthResource = writeGoogleOAuthResource();
+const extraResources = [
+  ...(testOutput
+    ? packageJson.build.extraResources.filter(({ from }) => from !== '.model-test-cache')
+    : packageJson.build.extraResources),
+  ...(googleOAuthResource ? [googleOAuthResource] : []),
+];
 
 const signingSecrets = [
   'CSC_LINK',

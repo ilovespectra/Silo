@@ -1,0 +1,192 @@
+.google-reclaim-dialog {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+
+.google-reclaim-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.google-reclaim-header span {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.google-reclaim-icon,
+.google-reclaim-secondary,
+.google-reclaim-danger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--text);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.google-reclaim-icon { padding: 6px; }
+.google-reclaim-danger { border-color: var(--error-border); background: var(--error-surface); color: var(--error-text); }
+.google-reclaim-dialog button:disabled { opacity: 0.5; cursor: default; }
+.google-reclaim-icon .spinning { animation: google-reclaim-spin 1s linear infinite; }
+@keyframes google-reclaim-spin { to { transform: rotate(360deg); } }
+
+.google-reclaim-bar {
+  display: flex;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-inset);
+}
+
+.google-reclaim-bar span { height: 100%; }
+.google-reclaim-dialog .drive { background: var(--orange); }
+.google-reclaim-dialog .trash { background: #d4a72c; }
+.google-reclaim-dialog .other { background: #6f8fbf; }
+
+.google-reclaim-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.google-reclaim-legend i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 5px;
+  border-radius: 50%;
+}
+
+.google-reclaim-legend strong { margin-left: auto; color: var(--text); font-weight: 600; }
+
+.google-reclaim-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--surface-inset);
+}
+
+.google-reclaim-tabs button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.google-reclaim-tabs button.active { background: var(--raised); color: var(--text); }
+.google-reclaim-tabs small { color: var(--muted); }
+
+.google-reclaim-list {
+  min-height: 140px;
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.google-reclaim-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.google-reclaim-row:last-child { border-bottom: 0; }
+.google-reclaim-row:hover { background: var(--surface-inset); }
+.google-reclaim-all { position: sticky; top: 0; z-index: 1; background: var(--surface-card); color: var(--muted); font-size: 12px; }
+.google-reclaim-name { min-width: 0; }
+
+.google-reclaim-name strong,
+.google-reclaim-name small,
+.google-reclaim-destination span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.google-reclaim-name strong { color: var(--text); font-size: 12px; font-weight: 500; }
+.google-reclaim-name small { color: var(--muted); font-size: 11px; }
+.google-reclaim-size { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+.google-reclaim-empty {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  padding: 28px 16px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.google-reclaim-destination {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.google-reclaim-destination span { flex: 1; min-width: 0; }
+
+.google-reclaim-progress small,
+.google-reclaim-note,
+.google-reclaim-result {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.google-reclaim-progress-bar {
+  height: 4px;
+  margin-bottom: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-inset);
+}
+
+.google-reclaim-progress-bar span { display: block; height: 100%; background: var(--orange); transition: width 0.2s; }
+.google-reclaim-result p { color: var(--text); }
+.google-reclaim-result ul { margin: 6px 0 0 16px; max-height: 90px; overflow-y: auto; }
+
+.google-reclaim-trash {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.google-reclaim-trash > span { flex: 1 1 100%; }
+.google-reclaim-dialog .dialog-actions { margin-top: 0; }

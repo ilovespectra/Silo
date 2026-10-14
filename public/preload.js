@@ -513,6 +513,22 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("google-rename-file", filePath, name),
   googleTrashFile: (filePath) =>
     ipcRenderer.invoke("google-trash-file", filePath),
+  googleReclaimOverview: (accountId) =>
+    ipcRenderer.invoke("google-reclaim-overview", accountId),
+  googleReclaimChooseDestination: () =>
+    ipcRenderer.invoke("google-reclaim-choose-destination"),
+  googleReclaimRun: (accountId, items) =>
+    ipcRenderer.invoke("google-reclaim-run", accountId, items),
+  googleReclaimCancel: () => ipcRenderer.invoke("google-reclaim-cancel"),
+  googleEmptyDriveTrash: (accountId) =>
+    ipcRenderer.invoke("google-empty-drive-trash", accountId),
+  googleOpenGmailTrash: (accountId) =>
+    ipcRenderer.invoke("google-open-gmail-trash", accountId),
+  onGoogleReclaimProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("google-reclaim-progress", listener);
+    return () => ipcRenderer.removeListener("google-reclaim-progress", listener);
+  },
   googleUploadFile: (parentPath) =>
     ipcRenderer.invoke("google-upload-file", parentPath),
   exportMessages: (

@@ -16,6 +16,9 @@ const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke";
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const PICKER_API = "https://photospicker.googleapis.com/v1";
+const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
+const GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
+const LARGE_EMAIL_QUERY = "larger:5M -in:trash";
 
 /**
  * photoslibrary.readonly was removed on 2025-04-01, so a user's full Photos
@@ -26,6 +29,8 @@ const SCOPES = [
   "https://www.googleapis.com/auth/userinfo.email",
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
+  // Moves large emails to Gmail Trash after Silo saves a verified copy; cannot permanently delete.
+  GMAIL_MODIFY_SCOPE,
 ];
 
 export interface GoogleConfig {
@@ -41,6 +46,55 @@ export interface GoogleAccountSummary {
   photosRootPath: string;
   pickedCount: number;
   needsReauth: boolean;
+  gmailAccess: boolean;
+}
+
+export interface GoogleStorageQuota {
+  limit: number | null;
+  usage: number;
+  usageInDrive: number;
+  usageInDriveTrash: number;
+}
+
+export type GoogleReclaimKind = "drive" | "gmail";
+
+export interface GoogleReclaimItem {
+  id: string;
+  kind: GoogleReclaimKind;
+  name: string;
+  detail: string;
+  size: number;
+  modified: number;
+}
+
+export interface GoogleReclaimOverview {
+  accountId: string;
+  email: string;
+  storage: GoogleStorageQuota | null;
+  driveFiles: GoogleReclaimItem[];
+  emails: GoogleReclaimItem[];
+  gmailAccess: boolean;
+  driveError?: string;
+  gmailError?: string;
+  destination: string | null;
+}
+
+export interface GoogleReclaimProgress {
+  accountId: string;
+  done: number;
+  total: number;
+  bytes: number;
+  current: string;
+}
+
+export interface GoogleReclaimResult {
+  ok: boolean;
+  canceled?: boolean;
+  trashed: number;
+  bytes: number;
+  failed: Array<{ id: string; name: string; error: string }>;
+  destination: string | null;
+  error?: string;
 }
 
 export interface GoogleAccountsState {
@@ -78,6 +132,7 @@ interface StoredAccount {
   refreshToken: string | null;
   expiresAt: number;
   needsReauth?: boolean;
+  scopes?: string[];
 }
 
 const GOOGLE_EXPORT_TYPES: Record<string, string> = {
@@ -137,11 +192,13 @@ export class GoogleManager {
   private accounts = new Map<string, StoredAccount>();
   private pickedItems = new Map<string, Map<string, PickedMediaItem>>();
   private accountsPath: string;
+  private reclaimSettingsPath: string;
   private cacheRoot: string;
   private authServer: Server | null = null;
 
   constructor(userDataPath: string, cacheRoot: string = userDataPath) {
     this.accountsPath = path.join(userDataPath, "google-accounts.json");
+    this.reclaimSettingsPath = path.join(userDataPath, "google-reclaim.json");
     this.cacheRoot = path.join(cacheRoot, "cloud-cache");
   }
 
@@ -193,6 +250,7 @@ export class GoogleManager {
       ),
       pickedCount: this.pickedItems.get(account.id)?.size ?? 0,
       needsReauth: Boolean(account.needsReauth),
+      gmailAccess: Boolean(account.scopes?.includes(GMAIL_MODIFY_SCOPE)),
     }));
 
     return {
@@ -278,6 +336,7 @@ export class GoogleManager {
       access_token: string;
       refresh_token?: string;
       expires_in: number;
+      scope?: string;
     };
 
     const email = await this.fetchEmail(payload.access_token);
@@ -292,6 +351,7 @@ export class GoogleManager {
       refreshToken: payload.refresh_token ?? existing?.refreshToken ?? null,
       expiresAt: Date.now() + payload.expires_in * 1000,
       needsReauth: false,
+      scopes: payload.scope ? payload.scope.split(/\s+/).filter(Boolean) : existing?.scopes,
     });
     await this.persist();
 
@@ -795,6 +855,267 @@ export class GoogleManager {
       },
     );
     if (!response.ok) throw new Error(`Upload failed: ${response.status}`);
+  }
+
+  // ----------------------------------------------------------------- reclaim
+
+  /** Turns a failed Google response into a short, actionable message. */
+  private async describeFailure(accountId: string, response: Response, action: string): Promise<string> {
+    const details = (await response.json().catch(() => null)) as {
+      error?: { message?: string; errors?: Array<{ reason?: string }>; details?: Array<{ reason?: string }> };
+    } | null;
+    const reasons = [...(details?.error?.errors ?? []), ...(details?.error?.details ?? [])]
+      .map((item) => item.reason ?? "");
+    if (response.status === 401 || reasons.some((reason) => reason === "insufficientPermissions" || reason === "ACCESS_TOKEN_SCOPE_INSUFFICIENT")) {
+      const account = this.accounts.get(accountId);
+      if (account) { account.needsReauth = true; await this.persist(); }
+      return `Reconnect this Google account and approve access to ${action}.`;
+    }
+    if (reasons.includes("insufficientFilePermissions") || reasons.includes("cannotTrash") || reasons.includes("cannotModifyTrashedState"))
+      return "Only files you own can be moved to trash.";
+    if (response.status === 404) return "It no longer exists in Google.";
+    if (response.status === 429 || reasons.includes("rateLimitExceeded") || reasons.includes("userRateLimitExceeded"))
+      return "Google is rate limiting requests. Try again in a minute.";
+    return details?.error?.message || `Google returned ${response.status}.`;
+  }
+
+  async getReclaimDestination(): Promise<string | null> {
+    try {
+      const stored = JSON.parse(await fsPromises.readFile(this.reclaimSettingsPath, "utf8")) as { destination?: unknown };
+      return typeof stored.destination === "string" && path.isAbsolute(stored.destination) ? stored.destination : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async setReclaimDestination(destination: string): Promise<void> {
+    if (!path.isAbsolute(destination)) throw new Error("Choose an absolute folder.");
+    await fsPromises.writeFile(this.reclaimSettingsPath, JSON.stringify({ destination }, null, 2), { mode: 0o600 });
+  }
+
+  gmailTrashUrl(accountId: string): string {
+    const email = this.accounts.get(accountId)?.email ?? "";
+    return `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#trash`;
+  }
+
+  async getStorageQuota(accountId: string): Promise<GoogleStorageQuota> {
+    const response = await this.apiFetch(accountId, `${DRIVE_API}/about?fields=storageQuota`);
+    if (!response.ok) throw new Error(await this.describeFailure(accountId, response, "Google Drive"));
+    const { storageQuota: quota } = (await response.json()) as {
+      storageQuota: { limit?: string; usage?: string; usageInDrive?: string; usageInDriveTrash?: string };
+    };
+    return {
+      limit: quota.limit ? Number(quota.limit) : null,
+      usage: Number(quota.usage ?? 0),
+      usageInDrive: Number(quota.usageInDrive ?? 0),
+      usageInDriveTrash: Number(quota.usageInDriveTrash ?? 0),
+    };
+  }
+
+  /** Largest files this account owns; native Docs/Sheets are skipped because a PDF copy is not a faithful backup. */
+  async listLargeDriveFiles(accountId: string, limit = 200): Promise<GoogleReclaimItem[]> {
+    const url = new URL(`${DRIVE_API}/files`);
+    url.searchParams.set("q", "'me' in owners and trashed = false and not mimeType contains 'application/vnd.google-apps.'");
+    url.searchParams.set("orderBy", "quotaBytesUsed desc");
+    url.searchParams.set("pageSize", String(limit));
+    url.searchParams.set("fields", "files(id, name, mimeType, size, quotaBytesUsed, modifiedTime)");
+    const response = await this.apiFetch(accountId, url.toString());
+    if (!response.ok) throw new Error(await this.describeFailure(accountId, response, "Google Drive"));
+    const payload = (await response.json()) as {
+      files: Array<{ id: string; name: string; mimeType: string; size?: string; quotaBytesUsed?: string; modifiedTime?: string }>;
+    };
+    return payload.files
+      .filter((file) => !file.mimeType.startsWith("application/vnd.google-apps."))
+      .map((file) => ({
+        id: file.id,
+        kind: "drive" as const,
+        name: file.name,
+        detail: file.mimeType,
+        size: Number(file.quotaBytesUsed ?? file.size ?? 0),
+        modified: file.modifiedTime ? new Date(file.modifiedTime).getTime() : 0,
+      }))
+      .filter((file) => file.size > 0);
+  }
+
+  /** Emails over 5 MB, largest first. */
+  async listLargeEmails(accountId: string, limit = 100): Promise<GoogleReclaimItem[]> {
+    const url = new URL(`${GMAIL_API}/messages`);
+    url.searchParams.set("q", LARGE_EMAIL_QUERY);
+    url.searchParams.set("maxResults", String(limit));
+    const response = await this.apiFetch(accountId, url.toString());
+    if (!response.ok) throw new Error(await this.describeFailure(accountId, response, "Gmail"));
+    const { messages = [] } = (await response.json()) as { messages?: Array<{ id: string }> };
+    const items: GoogleReclaimItem[] = [];
+    for (let index = 0; index < messages.length; index += 10) {
+      const batch = await Promise.all(messages.slice(index, index + 10).map(async ({ id }): Promise<GoogleReclaimItem | null> => {
+        const detail = new URL(`${GMAIL_API}/messages/${encodeURIComponent(id)}`);
+        detail.searchParams.set("format", "metadata");
+        for (const header of ["Subject", "From"]) detail.searchParams.append("metadataHeaders", header);
+        const message = await this.apiFetch(accountId, detail.toString());
+        if (!message.ok) return null;
+        const payload = (await message.json()) as {
+          sizeEstimate?: number; internalDate?: string;
+          payload?: { headers?: Array<{ name: string; value: string }> };
+        };
+        const header = (name: string) => payload.payload?.headers?.find((item) => item.name.toLowerCase() === name.toLowerCase())?.value ?? "";
+        return {
+          id,
+          kind: "gmail",
+          name: header("Subject") || "(no subject)",
+          detail: header("From"),
+          size: payload.sizeEstimate ?? 0,
+          modified: Number(payload.internalDate ?? 0),
+        };
+      }));
+      items.push(...batch.filter((item): item is GoogleReclaimItem => item !== null));
+    }
+    return items.sort((a, b) => b.size - a.size);
+  }
+
+  async getReclaimOverview(accountId: string): Promise<GoogleReclaimOverview> {
+    const account = this.accounts.get(accountId);
+    if (!account) throw new Error("That Google account is not connected.");
+    const gmailAccess = Boolean(account.scopes?.includes(GMAIL_MODIFY_SCOPE));
+    const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    const [storage, drive, gmail] = await Promise.allSettled([
+      this.getStorageQuota(accountId),
+      this.listLargeDriveFiles(accountId),
+      gmailAccess ? this.listLargeEmails(accountId) : Promise.reject(new Error("Reconnect this Google account and allow Gmail access to free up email space.")),
+    ]);
+    return {
+      accountId,
+      email: account.email,
+      storage: storage.status === "fulfilled" ? storage.value : null,
+      driveFiles: drive.status === "fulfilled" ? drive.value : [],
+      emails: gmail.status === "fulfilled" ? gmail.value : [],
+      gmailAccess,
+      driveError: drive.status === "rejected" ? message(drive.reason) : storage.status === "rejected" ? message(storage.reason) : undefined,
+      gmailError: gmail.status === "rejected" ? message(gmail.reason) : undefined,
+      destination: await this.getReclaimDestination(),
+    };
+  }
+
+  /** Writes a stream to `target` via a partial file, returning its byte count and MD5. */
+  private async writeVerified(target: string, chunks: AsyncIterable<Uint8Array>): Promise<{ bytes: number; md5: string }> {
+    const partial = `${target}.silo-partial`;
+    const hash = createHash("md5");
+    let bytes = 0;
+    const handle = await fsPromises.open(partial, "w");
+    try {
+      for await (const chunk of chunks) {
+        await handle.write(chunk);
+        hash.update(chunk);
+        bytes += chunk.byteLength;
+      }
+      await handle.sync();
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      await fsPromises.rm(partial, { force: true });
+      throw error;
+    }
+    await handle.close();
+    return { bytes, md5: hash.digest("hex") };
+  }
+
+  private async uniqueTarget(directory: string, name: string, id: string): Promise<string> {
+    const safe = name.replace(/[\/\\:*?"<>|\u0000-\u001f]/g, "_").replace(/^\.+/, "_").trim().slice(0, 180) || id;
+    const first = path.join(directory, safe);
+    try { await fsPromises.access(first); } catch { return first; }
+    const extension = path.extname(safe);
+    return path.join(directory, `${safe.slice(0, safe.length - extension.length)} (${id.slice(0, 8)})${extension}`);
+  }
+
+  private async backupDriveFile(accountId: string, id: string, directory: string): Promise<{ name: string; bytes: number }> {
+    const metaResponse = await this.apiFetch(accountId, `${DRIVE_API}/files/${encodeURIComponent(id)}?fields=name,mimeType,size,md5Checksum,ownedByMe,trashed&supportsAllDrives=true`);
+    if (!metaResponse.ok) throw new Error(await this.describeFailure(accountId, metaResponse, "Google Drive"));
+    const meta = (await metaResponse.json()) as { name: string; mimeType: string; size?: string; md5Checksum?: string; ownedByMe?: boolean; trashed?: boolean };
+    if (meta.trashed) throw new Error("It is already in Google Drive trash.");
+    if (meta.ownedByMe === false) throw new Error("Only files you own can be moved to trash.");
+    if (meta.mimeType.startsWith("application/vnd.google-apps.")) throw new Error("Google Docs, Sheets and Slides are skipped.");
+    const download = await this.apiFetch(accountId, `${DRIVE_API}/files/${encodeURIComponent(id)}?alt=media&supportsAllDrives=true`);
+    if (!download.ok || !download.body) throw new Error(await this.describeFailure(accountId, download, "Google Drive"));
+    const target = await this.uniqueTarget(directory, meta.name, id);
+    const written = await this.writeVerified(target, download.body as unknown as AsyncIterable<Uint8Array>);
+    const expectedSize = meta.size === undefined ? null : Number(meta.size);
+    if ((expectedSize !== null && written.bytes !== expectedSize) || (meta.md5Checksum && written.md5 !== meta.md5Checksum)) {
+      await fsPromises.rm(`${target}.silo-partial`, { force: true });
+      throw new Error("The downloaded copy did not match Google's checksum, so it was not trashed.");
+    }
+    await fsPromises.rename(`${target}.silo-partial`, target);
+    return { name: meta.name, bytes: written.bytes };
+  }
+
+  private async backupEmail(accountId: string, id: string, directory: string): Promise<{ name: string; bytes: number }> {
+    const response = await this.apiFetch(accountId, `${GMAIL_API}/messages/${encodeURIComponent(id)}?format=raw`);
+    if (!response.ok) throw new Error(await this.describeFailure(accountId, response, "Gmail"));
+    const message = (await response.json()) as { raw?: string; internalDate?: string; sizeEstimate?: number };
+    if (!message.raw) throw new Error("Gmail did not return the message contents.");
+    const raw = Buffer.from(message.raw, "base64url");
+    const subject = /^Subject:\s*(.*)$/im.exec(raw.subarray(0, 65536).toString("utf8"))?.[1]?.trim() || "(no subject)";
+    const date = new Date(Number(message.internalDate ?? Date.now())).toISOString().slice(0, 10);
+    const target = await this.uniqueTarget(directory, `${date} ${subject}.eml`, id);
+    const expected = createHash("md5").update(raw).digest("hex");
+    const written = await this.writeVerified(target, (async function* () { yield raw; })());
+    const reread = createHash("md5").update(await fsPromises.readFile(`${target}.silo-partial`)).digest("hex");
+    if (written.bytes !== raw.length || written.md5 !== expected || reread !== expected) {
+      await fsPromises.rm(`${target}.silo-partial`, { force: true });
+      throw new Error("The saved email did not verify, so it was not trashed.");
+    }
+    await fsPromises.rename(`${target}.silo-partial`, target);
+    return { name: subject, bytes: raw.length };
+  }
+
+  /** Saves a verified local copy of each item, then moves only verified items to Google's trash. */
+  async backupAndTrash(
+    accountId: string,
+    items: Array<{ id: string; kind: GoogleReclaimKind }>,
+    onProgress: (progress: GoogleReclaimProgress) => void,
+    isCancelled: () => boolean,
+  ): Promise<GoogleReclaimResult> {
+    const account = this.accounts.get(accountId);
+    if (!account) return { ok: false, trashed: 0, bytes: 0, failed: [], destination: null, error: "That Google account is not connected." };
+    const destination = await this.getReclaimDestination();
+    if (!destination) return { ok: false, trashed: 0, bytes: 0, failed: [], destination, error: "Choose a backup folder first." };
+    const accountFolder = path.join(destination, account.email.replace(/[\/\\:*?"<>|]/g, "_"));
+    const folders = { drive: path.join(accountFolder, "Google Drive"), gmail: path.join(accountFolder, "Gmail") };
+    try {
+      await fsPromises.mkdir(folders.drive, { recursive: true });
+      await fsPromises.mkdir(folders.gmail, { recursive: true });
+    } catch (error) {
+      return { ok: false, trashed: 0, bytes: 0, failed: [], destination, error: `Silo cannot write to ${destination}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    const failed: GoogleReclaimResult["failed"] = [];
+    let trashed = 0;
+    let bytes = 0;
+    for (const [index, item] of items.entries()) {
+      if (isCancelled()) return { ok: failed.length === 0, canceled: true, trashed, bytes, failed, destination };
+      onProgress({ accountId, done: index, total: items.length, bytes, current: item.kind === "gmail" ? "Saving email…" : "Saving file…" });
+      let saved: { name: string; bytes: number } | null = null;
+      try {
+        saved = item.kind === "gmail"
+          ? await this.backupEmail(accountId, item.id, folders.gmail)
+          : await this.backupDriveFile(accountId, item.id, folders.drive);
+        onProgress({ accountId, done: index, total: items.length, bytes, current: `Moving “${saved.name}” to trash…` });
+        const response = item.kind === "gmail"
+          ? await this.apiFetch(accountId, `${GMAIL_API}/messages/${encodeURIComponent(item.id)}/trash`, { method: "POST" })
+          : await this.apiFetch(accountId, `${DRIVE_API}/files/${encodeURIComponent(item.id)}?supportsAllDrives=true`, {
+            method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trashed: true }),
+          });
+        if (!response.ok) throw new Error(`Saved locally, but not trashed: ${await this.describeFailure(accountId, response, item.kind === "gmail" ? "Gmail" : "Google Drive")}`);
+        trashed += 1;
+        bytes += saved.bytes;
+      } catch (error) {
+        failed.push({ id: item.id, name: saved?.name ?? item.id, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    onProgress({ accountId, done: items.length, total: items.length, bytes, current: "Done" });
+    return { ok: failed.length === 0, trashed, bytes, failed, destination };
+  }
+
+  /** Permanently empties this account's Drive trash; this is what returns Drive space. */
+  async emptyDriveTrash(accountId: string): Promise<void> {
+    const response = await this.apiFetch(accountId, `${DRIVE_API}/files/trash`, { method: "DELETE" });
+    if (!response.ok) throw new Error(await this.describeFailure(accountId, response, "Google Drive"));
   }
 
   // ------------------------------------------------------------------ photos

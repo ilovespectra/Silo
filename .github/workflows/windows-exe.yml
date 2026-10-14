@@ -19,6 +19,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Optional: Google Drive/Gmail sources ship only when these repository secrets exist.
+  GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+  GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+
 jobs:
   build-windows-x64:
     name: Build unsigned Windows x64 installer

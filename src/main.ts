@@ -7518,7 +7518,10 @@ app.whenReady().then(async () => {
   if (!indexStorageInitializationDeferred)
     await googleManager.initialize(
       (await loadGoogleEnv(path.join(app.getPath("userData"), ".env"))) ??
-        (await loadGoogleEnv(path.join(app.getAppPath(), ".env"))),
+        (await loadGoogleEnv(path.join(app.getAppPath(), ".env"))) ??
+        (app.isPackaged
+          ? await loadGoogleEnv(path.join(process.resourcesPath, "google.env"))
+          : null),
     );
   console.log(
     "[STARTUP] googleManager initialized, creating messageExportCoordinator...",
@@ -12787,6 +12790,95 @@ ipcMain.handle("google-trash-file", async (_event, filePath: string) => {
       error: error instanceof Error ? error.message : "Could not trash file.",
     };
   }
+});
+
+// Reclaim space: verified local copy first, then Google's trash.
+let googleReclaimRunning = false;
+let googleReclaimCancelled = false;
+
+function googleAccountIdArgument(accountId: unknown): string | null {
+  return typeof accountId === "string" &&
+    googleManager.getState().accounts.some((account) => account.id === accountId)
+    ? accountId
+    : null;
+}
+
+ipcMain.handle("google-reclaim-overview", async (_event, accountId: unknown) => {
+  const id = googleAccountIdArgument(accountId);
+  if (!id) return { ok: false, error: "That Google account is not connected." };
+  try {
+    return { ok: true, overview: await googleManager.getReclaimOverview(id) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle("google-reclaim-choose-destination", async () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: "App window is unavailable." };
+  const current = await googleManager.getReclaimDestination();
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions("Save Google backups to…", current),
+  );
+  const chosen = result.filePaths[0];
+  if (result.canceled || !chosen) return { ok: false, canceled: true, destination: current };
+  try {
+    await fs.promises.mkdir(chosen, { recursive: true });
+    await fs.promises.access(chosen, fs.constants.W_OK);
+    await googleManager.setReclaimDestination(chosen);
+    return { ok: true, destination: chosen };
+  } catch (error) {
+    return { ok: false, destination: current, error: `Silo cannot write to ${chosen}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+});
+
+ipcMain.handle("google-reclaim-run", async (_event, accountId: unknown, items: unknown) => {
+  const id = googleAccountIdArgument(accountId);
+  if (!id) return { ok: false, trashed: 0, bytes: 0, failed: [], destination: null, error: "That Google account is not connected." };
+  if (googleReclaimRunning) return { ok: false, trashed: 0, bytes: 0, failed: [], destination: null, error: "A Google backup is already running." };
+  const valid = Array.isArray(items)
+    ? items.filter((item): item is { id: string; kind: "drive" | "gmail" } =>
+      Boolean(item) && typeof item.id === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(item.id) &&
+      (item.kind === "drive" || item.kind === "gmail"))
+    : [];
+  if (!valid.length) return { ok: false, trashed: 0, bytes: 0, failed: [], destination: null, error: "Select at least one item." };
+  googleReclaimRunning = true;
+  googleReclaimCancelled = false;
+  try {
+    const result = await googleManager.backupAndTrash(
+      id,
+      valid.slice(0, 1000),
+      (progress) => sendToRenderer("google-reclaim-progress", progress),
+      () => googleReclaimCancelled,
+    );
+    runtimeLog("google-reclaim", { trashed: result.trashed, failed: result.failed.length, bytes: result.bytes, canceled: Boolean(result.canceled) });
+    return result;
+  } finally {
+    googleReclaimRunning = false;
+  }
+});
+
+ipcMain.handle("google-reclaim-cancel", () => {
+  googleReclaimCancelled = true;
+  return { ok: true };
+});
+
+ipcMain.handle("google-empty-drive-trash", async (_event, accountId: unknown) => {
+  const id = googleAccountIdArgument(accountId);
+  if (!id) return { ok: false, error: "That Google account is not connected." };
+  try {
+    await googleManager.emptyDriveTrash(id);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle("google-open-gmail-trash", async (_event, accountId: unknown) => {
+  const id = googleAccountIdArgument(accountId);
+  if (!id) return { ok: false, error: "That Google account is not connected." };
+  await shell.openExternal(googleManager.gmailTrashUrl(id));
+  return { ok: true };
 });
 
 ipcMain.handle("google-upload-file", async (_event, parentPath: string) => {

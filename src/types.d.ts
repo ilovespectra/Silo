@@ -189,6 +189,48 @@ interface GoogleAccountSummary {
   photosRootPath: string;
   pickedCount: number;
   needsReauth: boolean;
+  gmailAccess: boolean;
+}
+
+type GoogleReclaimKind = "drive" | "gmail";
+
+interface GoogleReclaimItem {
+  id: string;
+  kind: GoogleReclaimKind;
+  name: string;
+  detail: string;
+  size: number;
+  modified: number;
+}
+
+interface GoogleReclaimOverview {
+  accountId: string;
+  email: string;
+  storage: { limit: number | null; usage: number; usageInDrive: number; usageInDriveTrash: number } | null;
+  driveFiles: GoogleReclaimItem[];
+  emails: GoogleReclaimItem[];
+  gmailAccess: boolean;
+  driveError?: string;
+  gmailError?: string;
+  destination: string | null;
+}
+
+interface GoogleReclaimProgress {
+  accountId: string;
+  done: number;
+  total: number;
+  bytes: number;
+  current: string;
+}
+
+interface GoogleReclaimResult {
+  ok: boolean;
+  canceled?: boolean;
+  trashed: number;
+  bytes: number;
+  failed: Array<{ id: string; name: string; error: string }>;
+  destination: string | null;
+  error?: string;
 }
 
 interface GoogleAccountsState {
@@ -1429,6 +1471,13 @@ interface Window {
       name: string,
     ): Promise<FileOperationResult>;
     googleTrashFile(filePath: string): Promise<FileOperationResult>;
+    googleReclaimOverview(accountId: string): Promise<{ ok: boolean; overview?: GoogleReclaimOverview; error?: string }>;
+    googleReclaimChooseDestination(): Promise<{ ok: boolean; canceled?: boolean; destination?: string | null; error?: string }>;
+    googleReclaimRun(accountId: string, items: Array<{ id: string; kind: GoogleReclaimKind }>): Promise<GoogleReclaimResult>;
+    googleReclaimCancel(): Promise<{ ok: boolean }>;
+    googleEmptyDriveTrash(accountId: string): Promise<{ ok: boolean; error?: string }>;
+    googleOpenGmailTrash(accountId: string): Promise<{ ok: boolean; error?: string }>;
+    onGoogleReclaimProgress(callback: (progress: GoogleReclaimProgress) => void): () => void;
     googleUploadFile(parentPath: string): Promise<FileOperationResult>;
   };
 }

@@ -154,3 +154,6 @@ runtime.jsonl
 
 # Bundled phone tools (built by scripts/build-phone-tools.sh)
 /vendor/
+
+# Generated at build time from .env / CI secrets
+/.google-oauth/
