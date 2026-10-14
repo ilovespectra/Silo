@@ -151,7 +151,7 @@ async function run() {
   assert.equal(page.calls.reads, 1); assert.deepEqual(page.calls.prepareViews, [true], "Saved memory movies are prepared before the page shows their cards");
   assert.equal(page.calls.tracks, 0); assert.deepEqual(page.calls.generations, []);
   const sliders = document.querySelectorAll('input[type="range"]');
-  assert.equal(sliders[0].min, "20"); assert.equal(sliders[0].max, "24");
+  assert.equal(sliders[0].min, "15"); assert.equal(sliders[0].max, "24");
   assert.ok(document.body.textContent.includes("3.0s each"), "default cut holds each item for about three seconds");
   assert.equal(sliders.length, 2, "movie length is fixed instead of adjustable");
   assert.equal(sliders[1].value, "0.18"); assert.equal(sliders[1].max, "0.6");

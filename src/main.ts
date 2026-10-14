@@ -126,6 +126,7 @@ import {
   MEMORY_DURATION_SECONDS,
   MEMORY_EXPORT_LIMITS,
   MEMORY_DEFAULT_SELECTION_COUNT,
+  getMemorySelectionMinimum,
   selectMemoryPhotoCandidates,
   MemoryExportOptions,
   MemoryMedia,
@@ -2370,8 +2371,8 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
     runtimeLog("memory-search-trace", { stage: "no-index-sources" });
     return [];
   }
-  // Confidence is similarity * 100; MemoryManager reads only the first 50 hits.
-  const matches = await semanticIndexer.search(query, 24, roots);
+  // A wide pool leaves 15-20 distinct, good photos after duplicate and quality filtering.
+  const matches = await semanticIndexer.search(query, 120, roots);
   const photoCandidates: ScoredMemoryMedia[] = [];
   const musicDirectories = memoryMusicDirectories();
   const dropped = { notImage: 0, notAllowed: 0, notPersonal: 0 };
@@ -2738,7 +2739,7 @@ async function verifyMemoryExport(options: MemoryExportOptions) {
   const suggestion = await memoryManager.getSuggestion(options.suggestionId);
   if (!suggestion || suggestion.media.length === 0)
     throw new Error("This memory is no longer available. Refresh suggestions.");
-  const minimumCount = Math.min(MEMORY_DEFAULT_SELECTION_COUNT, suggestion.media.length);
+  const minimumCount = getMemorySelectionMinimum(suggestion.media.length);
   const maximumCount = Math.min(MEMORY_EXPORT_LIMITS.maxCount, suggestion.media.length);
   if (options.count < minimumCount || options.count > maximumCount)
     throw new Error(`Choose ${minimumCount} to ${maximumCount} items to keep this memory moving briskly.`);

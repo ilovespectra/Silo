@@ -5,6 +5,7 @@ import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as Chevron
 import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryGenerationStatus, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
 import {
   MEMORY_DEFAULT_SELECTION_COUNT,
+  getMemorySelectionMinimum,
   MEMORY_DURATION_SECONDS,
   MEMORY_EXPORT_LIMITS,
 } from "../memoryTypes";
@@ -401,7 +402,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
 }) {
   const playable = !preview || preview.status === "ready";
   const maximum = Math.min(MEMORY_EXPORT_LIMITS.maxCount, memory.media.length);
-  const minimum = Math.min(MEMORY_DEFAULT_SELECTION_COUNT, maximum);
+  const minimum = getMemorySelectionMinimum(maximum);
   const initialCount = Math.min(MEMORY_DEFAULT_SELECTION_COUNT, maximum);
   const [count, setCount] = useState(initialCount);
   const [originalAudio, setOriginalAudio] = useState(0.18);
@@ -499,7 +500,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
       <div className="memories-card-controls">
         <label htmlFor={`${fieldId}-count`}>Photos & clips <output>{selectedCount} / {memory.media.length} · {(MEMORY_DURATION_SECONDS / Math.max(1, selectedCount)).toFixed(1)}s each</output></label>
         <input id={`${fieldId}-count`} type="range" min={minimum} max={maximum} step={1} value={selectedCount} disabled={disabled || maximum <= minimum} onChange={(event) => changeCount(Number(event.target.value))} />
-        {maximum < MEMORY_DEFAULT_SELECTION_COUNT && <small className="memories-hint">Uses all {maximum} available items rather than repeating shots.</small>}
+        <small className="memories-hint">{maximum < MEMORY_DEFAULT_SELECTION_COUNT ? `Up to ${maximum} available items; shots never repeat.` : "More shots means quicker cuts."}</small>
         <div className="memories-fixed-length"><span>Movie length</span><output>1 minute · {MEMORY_DURATION_SECONDS} seconds</output></div>
         <label htmlFor={`${fieldId}-soundtrack`}><span><FiMusic aria-hidden="true" />Soundtrack · {memory.mood}</span></label>
         <select id={`${fieldId}-soundtrack`} value={selectedTrack.id} disabled={disabled || trackStatus === "loading"} onFocus={() => { void loadTracks(); }} onChange={(event) => { const next = availableTracks.find((track) => track.id === event.target.value); if (next) void chooseTrack(next); }}>

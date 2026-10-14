@@ -98,7 +98,7 @@ test("custom topic searches locally, keeps its wording, and selects a matching l
   const state = await f.manager.generate(false, query);
   const [memory] = state.suggestions;
 
-  assert.deepEqual(f.queries, [query]);
+  assert.equal(f.queries[0], query, "the user's wording is searched first");
   assert.equal(state.suggestions.length, 1);
   assert.equal(memory.title, "Sunny Days at the Beach");
   assert.equal(memory.query, query);
@@ -290,7 +290,7 @@ test("generate never hides saved cards; discovery ideas fill five cards plus a r
   let loads = 0;
   const idea = (key, prefix) => ({
     key, title: `Story ${key}`, description: `About ${key}.`, query: key, mood: "bright",
-    load: async () => { loads++; if (!online) throw new Error("source offline"); return photos(prefix, 8); },
+    load: async () => { loads++; if (!online) throw new Error("source offline"); return photos(prefix, 16); },
   });
   const ideas = Array.from({ length: 12 }, (_, i) => idea(`idea-${i}`, `idea-${i}`));
   const f = await fixture(t, {

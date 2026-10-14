@@ -107,6 +107,16 @@ export interface MemoryExportOptions {
 export const MEMORY_DURATION_SECONDS = 60;
 export const MEMORY_EXPORT_LIMITS = { minCount: 1, maxCount: 24, minDuration: MEMORY_DURATION_SECONDS, maxDuration: MEMORY_DURATION_SECONDS } as const;
 export const MEMORY_DEFAULT_SELECTION_COUNT = 20;
+/** A one-minute memory needs at least this many shots (about 4 seconds each). */
+export const MEMORY_MIN_SELECTION_COUNT = 15;
+
+/** Slider floor: normally 15, but always below the maximum so the slider stays adjustable. */
+export function getMemorySelectionMinimum(available: number): number {
+  const maximum = Math.min(MEMORY_EXPORT_LIMITS.maxCount, Math.max(0, Math.floor(available)));
+  if (maximum <= 1) return maximum;
+  if (maximum > MEMORY_MIN_SELECTION_COUNT) return MEMORY_MIN_SELECTION_COUNT;
+  return Math.max(1, Math.min(maximum - 1, Math.ceil(maximum / 2)));
+}
 export const MEMORY_MAGIC_SCORE_THRESHOLD = 90;
 
 export function selectMemoryPhotoCandidates<T extends { score: number; magicScore?: number }>(candidates: T[]): T[] {

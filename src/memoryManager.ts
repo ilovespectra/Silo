@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "crypto";
 import {
   getDefaultMemoryDuration,
   MEMORY_DEFAULT_SELECTION_COUNT,
+  MEMORY_MIN_SELECTION_COUNT,
   MemoryAudioBrowseRequest, MemoryAudioBrowseResult, MemoryAudioBrowseFile,
   MemoryGenerationProgress,
   MemoryGenerationStatus,
@@ -549,8 +550,17 @@ export class MemoryManager {
         ...[...current, ...reserve].map(card => card.storyKey).filter((key): key is string => Boolean(key))]);
       const usedPaths = new Set(current.flatMap(card => card.media.map(item => item.path)));
       const produced: MemorySuggestion[] = [];
-      const take = (card: MemorySuggestion | null) => {
+      // Thin stories (under 15 shots) are kept only as a last resort.
+      const thin: MemorySuggestion[] = [];
+      const take = (card: MemorySuggestion | null, allowThin = false) => {
         if (!card) return;
+        if (!allowThin && card.media.length < MEMORY_MIN_SELECTION_COUNT) {
+          thin.push(card);
+          // Reserve its shots so later stories stay distinct if this one is used as a fallback.
+          if (!customTopic) card.media.forEach(item => usedPaths.add(item.path));
+          this.trace("memory-story-thin", { story: card.storyKey?.split(":")[0] ?? "theme", items: card.media.length });
+          return;
+        }
         produced.push(card);
         card.media.forEach(item => usedPaths.add(item.path));
         if (card.storyKey) {
@@ -602,11 +612,13 @@ export class MemoryManager {
               query: customTopic,
               mood: customTopicMood(customTopic),
             }, mergedHits, signatures, new Set());
-            if (card) {
+            if (card && card.media.length >= MEMORY_MIN_SELECTION_COUNT) {
               take(card);
               advance("matching", `Found a memory for “${topicTitle}”`, 1);
               break;
             }
+            // Keep merging queries; the latest merged card is the fullest fallback.
+            if (card) { thin.length = 0; thin.push(card); signatures.delete(signature(card.media)); }
           } catch (error) {
             searchErrors += 1;
             this.deps.onSearchError?.("custom-topic", error);
@@ -643,6 +655,13 @@ export class MemoryManager {
         try { hits = await this.deps.search(theme.query); } catch (error) { searchFailed = true; this.deps.onSearchError?.("theme", error); continue; }
         take(await this.buildCard({ ...theme, key: `theme:${theme.title}`,
           description: `A ${theme.mood} story inspired by ${theme.title.toLowerCase()}.` }, hits, signatures, usedPaths));
+      }
+
+      if (produced.length < want && thin.length) {
+        const fallback = thin.sort((a, b) => b.media.length - a.media.length).slice(0, want - produced.length);
+        this.trace("memory-thin-fallback", { used: fallback.length, items: fallback.map(card => card.media.length) });
+        if (customTopic && fallback[0]) signatures.add(signature(fallback[0].media));
+        fallback.forEach(card => take(card, true));
       }
 
       let visible: MemorySuggestion[];
