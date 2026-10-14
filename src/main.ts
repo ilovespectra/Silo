@@ -1808,6 +1808,22 @@ async function installMacAppUpdate(downloadPath: string, version: string): Promi
   await execFileAsync("/usr/bin/xattr", ["-dr", "com.apple.quarantine", stagedBundle]).catch(() => {});
 
   const currentBundle = path.resolve(path.dirname(process.execPath), "..", "..");
+  await execFileAsync("/usr/bin/codesign", ["--verify", "--deep", "--strict", stagedBundle]).catch(() => {
+    throw new Error("The downloaded app's code signature is invalid.");
+  });
+  // macOS keeps privacy grants only while the designated requirement stays the
+  // same. Once Silo is certificate-signed, refuse an update that would change it
+  // (and silently reset permissions); ad hoc installs migrate on their next update.
+  const currentRequirement = await execFileAsync("/usr/bin/codesign", ["-d", "-r-", currentBundle])
+    .then(({ stdout, stderr }) => /designated => (.+)/.exec(`${stdout}\n${stderr}`)?.[1]?.trim() ?? "", () => "");
+  if (currentRequirement.includes("certificate")) {
+    await execFileAsync("/usr/bin/codesign", ["--verify", "--deep", "--strict", `-R=${currentRequirement}`, stagedBundle])
+      .catch(() => { throw new Error("The downloaded app is not signed by Silo's signing certificate."); });
+  }
+  runtimeLog("app-update-mac-signature-verified", {
+    version,
+    stableIdentity: currentRequirement.includes("certificate"),
+  });
   const bundleParent = path.dirname(currentBundle);
   const canReplace =
     currentBundle.endsWith(".app") &&

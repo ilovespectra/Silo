@@ -244,7 +244,12 @@ function buildMac() {
       buildArguments.push(
         `--config.directories.output=${outputDirectory}`,
       );
-      run("npx", buildArguments);
+      // Release builds must keep one signing identity so updates keep macOS permissions.
+      const requireStableSigning =
+        process.env.SILO_TEST_DIR_ONLY !== "1" && process.env.SILO_ALLOW_ADHOC_SIGNING !== "1";
+      run("npx", buildArguments, {
+        env: { ...process.env, SILO_REQUIRE_STABLE_MAC_SIGNING: requireStableSigning ? "1" : "0" },
+      });
       const architectureDirectory = architecture === "x64" ? "mac" : "mac-arm64";
       assertPackagedMacApp(
         path.join(
