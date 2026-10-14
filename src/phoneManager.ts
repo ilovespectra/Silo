@@ -1282,10 +1282,20 @@ export class PhoneManager {
           `Silo could not read any files from ${device.name}. Unlock it, keep it connected, and try again.`,
         );
       const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-      const remainingBytes = files.reduce((sum, file) => {
-        const signature = `${file.size}:${file.modified}`;
-        return sum + (manifest.files[file.path] === signature ? 0 : file.size);
-      }, 0);
+      this.updateBackup(manifest, {
+        message: `Checking ${files.length.toLocaleString()} files against your backup...`,
+      });
+      const alreadySaved = new Set<string>();
+      for (let index = 0; index < files.length; index++) {
+        if (await this.isAlreadyBackedUp(manifest, files[index])) alreadySaved.add(files[index].path);
+        if (index % 500 === 499) await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      const newFiles = files.length - alreadySaved.size;
+      const remainingBytes = files.reduce(
+        (sum, file) => sum + (alreadySaved.has(file.path) ? 0 : file.size),
+        0,
+      );
+      this.log(`runBackup: ${alreadySaved.size} files already saved, ${newFiles} new or changed`);
 
       // Check disk space on the actual backup destination
       this.log(
@@ -1316,20 +1326,16 @@ export class PhoneManager {
         completedBytes: 0,
         copiedFiles: 0,
         failedFiles: 0,
-        message: `Backing up ${files.length.toLocaleString()} files from ${device.name}...`,
+        message: newFiles
+          ? `Adding ${newFiles.toLocaleString()} new files from ${device.name} (${alreadySaved.size.toLocaleString()} already saved)...`
+          : `Everything on ${device.name} is already saved. Updating the browseable copy...`,
       });
+      let lastPersistAt = 0;
       for (const file of files) {
         const signature = `${file.size}:${file.modified}`;
-        const localPath = this.localCachePath(file.path);
-        let cached = manifest.files[file.path] === signature;
-        if (cached) {
-          cached = await fsPromises.stat(localPath).then(
-            (stats) =>
-              stats.isFile() && (file.size === 0 || stats.size === file.size),
-            () => false,
-          );
-        }
-        if (!cached) {
+        if (alreadySaved.has(file.path)) {
+          manifest.files[file.path] = signature;
+        } else {
           try {
             await this.materialize(file.path, true);
             manifest.files[file.path] = signature;
@@ -1346,11 +1352,20 @@ export class PhoneManager {
         manifest.progress.completedFiles += 1;
         manifest.progress.completedBytes += file.size;
         manifest.progress.currentFile = file.relativePath || file.name;
-        manifest.progress.message = `${manifest.progress.completedFiles.toLocaleString()} of ${manifest.progress.totalFiles.toLocaleString()} files backed up`;
-        this.onBackupProgress({ ...manifest.progress });
-        await this.persistBackupState();
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        manifest.progress.message = newFiles
+          ? `${manifest.progress.copiedFiles.toLocaleString()} of ${newFiles.toLocaleString()} new files saved · ${alreadySaved.size.toLocaleString()} already backed up`
+          : `${manifest.progress.completedFiles.toLocaleString()} of ${manifest.progress.totalFiles.toLocaleString()} files checked`;
+        const now = Date.now();
+        // Skipped files are cheap; avoid rewriting backup state for every one of them.
+        if (!alreadySaved.has(file.path) || now - lastPersistAt > 1000) {
+          lastPersistAt = now;
+          this.onBackupProgress({ ...manifest.progress });
+          await this.persistBackupState();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
       }
+      this.onBackupProgress({ ...manifest.progress });
+      await this.persistBackupState();
       const snapshot = await this.createBrowseableSnapshot(
         device,
         manifest,
@@ -1379,6 +1394,16 @@ export class PhoneManager {
     }
   }
 
+  /** A saved copy counts when it exists and matches the phone's size; unknown sizes never force a recopy. */
+  private async isAlreadyBackedUp(
+    manifest: PhoneBackupManifest,
+    file: PhoneFileInfo,
+  ): Promise<boolean> {
+    if (!manifest.files[file.path]) return false;
+    const stats = await fsPromises.stat(this.localCachePath(file.path)).catch(() => null);
+    return Boolean(stats?.isFile()) && (file.size === 0 || stats!.size === file.size);
+  }
+
   private async createBrowseableSnapshot(
     device: PhoneDevice,
     manifest: PhoneBackupManifest,
@@ -1404,6 +1429,19 @@ export class PhoneManager {
         failedFiles += 1;
         continue;
       }
+      snapshotFiles[remotePath] = signature;
+      sourceFiles.push({ remotePath, source, signature });
+    }
+
+    // Files deleted from the phone stay in the browseable copy; backups only ever add.
+    for (const [virtualPath, signature] of Object.entries(manifest.files)) {
+      const parsed = this.parsePhonePath(virtualPath);
+      if (!parsed || parsed.offlineBackup || parsed.deviceId !== device.id) continue;
+      const remotePath = path.posix.normalize(parsed.remotePath);
+      if (snapshotFiles[remotePath] || remotePath === "/" || remotePath.startsWith("/..")) continue;
+      const source = this.localCachePath(virtualPath, backupDir);
+      const stats = await fsPromises.stat(source).catch(() => null);
+      if (!stats?.isFile()) continue;
       snapshotFiles[remotePath] = signature;
       sourceFiles.push({ remotePath, source, signature });
     }
@@ -3053,9 +3091,10 @@ export class PhoneManager {
             (dir) =>
               fullPath.includes(`/${dir}/`) || fullPath.endsWith(`/${dir}`),
           );
+        // A stable placeholder keeps unknown files from looking new on every backup.
         stat = {
           size: 0,
-          modified: Date.now(),
+          modified: 0,
           isDirectory: isDir,
         };
       }
@@ -3156,28 +3195,36 @@ export class PhoneManager {
     } catch {
       debugLog(`[PhoneManager] materialize: File not in cache, pulling...`);
       await fsPromises.mkdir(path.dirname(localPath), { recursive: true });
-      if (force) await fsPromises.rm(localPath, { force: true });
     }
 
+    // Pull beside the saved copy and swap it in only on success, so a failed
+    // refresh never loses an earlier backup (dated snapshots keep their own links).
+    const partialPath = `${localPath}.silo-partial`;
+    await fsPromises.rm(partialPath, { force: true });
     const pulled =
       platform === "android"
         ? await this.run(
             "adb",
-            ["-s", deviceId, "pull", remotePath, localPath],
+            ["-s", deviceId, "pull", remotePath, partialPath],
             120000,
           )
         : await this.run(
             "afcclient",
-            ["-u", deviceId, "get", remotePath, localPath],
+            ["-u", deviceId, "get", remotePath, partialPath],
             120000,
           );
 
-    if (!pulled.ok) {
+    const pulledStats = pulled.ok
+      ? await fsPromises.stat(partialPath).catch(() => null)
+      : null;
+    if (!pulled.ok || !pulledStats?.isFile()) {
+      await fsPromises.rm(partialPath, { force: true });
       console.error(
         `[PhoneManager] materialize: Failed to pull file: ${pulled.stderr}`,
       );
       throw new Error(`Could not read file from device: ${remotePath}`);
     }
+    await fsPromises.rename(partialPath, localPath);
     debugLog(
       `[PhoneManager] materialize: Successfully pulled file to ${localPath}`,
     );
