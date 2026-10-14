@@ -1673,18 +1673,29 @@ async function getLatestPlatformRelease(): Promise<AppUpdateState> {
   }
   const expectedArchitecture = process.arch === "arm64" ? "arm64" : "x64";
   const isWindows = process.platform === "win32";
-  const installerLabel = isWindows ? "EXE" : "Mac DMG";
-  const expectedAssetName = isWindows
-    ? `Silo-${appVersion}-${expectedArchitecture}-Setup.exe`
-    : `Silo-${appVersion}-${expectedArchitecture}.dmg`;
+  const expectedAssetNames = isWindows
+    ? [`Silo-${appVersion}-${expectedArchitecture}-Setup.exe`]
+    : [
+        `Silo-${appVersion}-${expectedArchitecture}.zip`,
+        `Silo-${appVersion}-${expectedArchitecture}.dmg`,
+      ];
   const assets = Array.isArray(latest.release.assets)
     ? (latest.release.assets as GitHubReleaseAsset[])
     : [];
-  const matchingAsset = assets.find(
-    (asset) =>
-      asset.name === expectedAssetName &&
-      isTrustedReleaseUrl(asset.browser_download_url, tag),
-  );
+  const matchingAsset = expectedAssetNames
+    .map((name) =>
+      assets.find(
+        (asset) =>
+          asset.name === name &&
+          isTrustedReleaseUrl(asset.browser_download_url, tag),
+      ),
+    )
+    .find(Boolean);
+  const installerLabel: AppUpdateState["installerLabel"] = isWindows
+    ? "EXE"
+    : String(matchingAsset?.name ?? "").endsWith(".zip")
+      ? "Mac app"
+      : "Mac DMG";
   const candidateDownloadUrl = matchingAsset?.browser_download_url;
   const downloadUrl = isTrustedReleaseUrl(candidateDownloadUrl, tag)
     ? candidateDownloadUrl
@@ -1734,15 +1745,6 @@ async function checkForAppUpdates(): Promise<AppUpdateState> {
       currentVersion: app.getVersion(),
     });
     try {
-      if (process.platform === "darwin") {
-        try {
-          await autoUpdater.checkForUpdates();
-        } catch (error) {
-          runtimeLog("updater-metadata-unavailable", {
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
       const state = await getLatestPlatformRelease();
       publishAppUpdateState(state);
       return state;
@@ -1762,6 +1764,86 @@ async function checkForAppUpdates(): Promise<AppUpdateState> {
     }
   })();
   return appUpdateCheck;
+}
+
+// Silo's Mac builds are ad-hoc signed, which Squirrel.Mac (electron-updater)
+// rejects, so the verified bundle is swapped in by a helper after Silo quits.
+// Returns false when the bundle location is not writable; the downloaded
+// installer is then opened for a manual drag-to-Applications install.
+async function installMacAppUpdate(downloadPath: string, version: string): Promise<boolean> {
+  const stagingDirectory = await fsPromises.mkdtemp(
+    path.join(os.tmpdir(), "silo-update-stage-"),
+  );
+  if (downloadPath.endsWith(".zip")) {
+    await execFileAsync("/usr/bin/ditto", ["-x", "-k", downloadPath, stagingDirectory]);
+  } else {
+    const mountPoint = path.join(stagingDirectory, "mount");
+    await fsPromises.mkdir(mountPoint);
+    await execFileAsync("/usr/bin/hdiutil", [
+      "attach", "-nobrowse", "-readonly", "-mountpoint", mountPoint, downloadPath,
+    ]);
+    try {
+      await execFileAsync("/usr/bin/ditto", [
+        path.join(mountPoint, "Silo.app"),
+        path.join(stagingDirectory, "Silo.app"),
+      ]);
+    } finally {
+      await execFileAsync("/usr/bin/hdiutil", ["detach", mountPoint, "-force"]).catch(() => {});
+    }
+  }
+
+  const stagedBundle = path.join(stagingDirectory, "Silo.app");
+  const { stdout: stagedVersion } = await execFileAsync("/usr/bin/plutil", [
+    "-extract", "CFBundleShortVersionString", "raw",
+    path.join(stagedBundle, "Contents", "Info.plist"),
+  ]);
+  if (stagedVersion.trim() !== version)
+    throw new Error(`The downloaded app is version ${stagedVersion.trim()}, expected ${version}.`);
+  await execFileAsync("/usr/bin/xattr", ["-dr", "com.apple.quarantine", stagedBundle]).catch(() => {});
+
+  const currentBundle = path.resolve(path.dirname(process.execPath), "..", "..");
+  const bundleParent = path.dirname(currentBundle);
+  const canReplace =
+    currentBundle.endsWith(".app") &&
+    !currentBundle.includes("/AppTranslocation/") &&
+    !currentBundle.startsWith("/Volumes/") &&
+    (await fsPromises.access(bundleParent, fs.constants.W_OK).then(() => true, () => false)) &&
+    (await fsPromises.access(currentBundle, fs.constants.W_OK).then(() => true, () => false));
+  if (!canReplace) {
+    runtimeLog("app-update-mac-manual-install", { currentBundle });
+    await shell.openPath(downloadPath);
+    return false;
+  }
+
+  const scriptPath = path.join(stagingDirectory, "install-update.sh");
+  await fsPromises.writeFile(
+    scriptPath,
+    [
+      "#!/bin/sh",
+      'PID="$1"; APP="$2"; NEW="$3"; STAGE="$4"; OLD="$APP.silo-update-old"',
+      'while kill -0 "$PID" 2>/dev/null; do sleep 0.5; done',
+      'rm -rf "$OLD"',
+      'if mv "$APP" "$OLD"; then',
+      '  if /usr/bin/ditto "$NEW" "$APP"; then rm -rf "$OLD"; else rm -rf "$APP"; mv "$OLD" "$APP"; fi',
+      "fi",
+      '/usr/bin/open "$APP"',
+      'rm -rf "$STAGE"',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  const helper = spawn(
+    "/bin/sh",
+    [scriptPath, String(process.pid), currentBundle, stagedBundle, stagingDirectory],
+    { detached: true, stdio: "ignore" },
+  );
+  await new Promise<void>((resolve, reject) => {
+    helper.once("error", reject);
+    helper.once("spawn", resolve);
+  });
+  helper.unref();
+  runtimeLog("app-update-mac-install-scheduled", { version, currentBundle });
+  return true;
 }
 
 async function downloadAndInstallAppUpdate(): Promise<AppUpdateState> {
@@ -1803,72 +1885,83 @@ async function downloadAndInstallAppUpdate(): Promise<AppUpdateState> {
     });
 
     try {
-      if (process.platform === "win32") {
-        const releaseTag = announcedUpdate.releaseTag;
-        const downloadUrl = announcedUpdate.downloadUrl;
-        const expectedArchitecture = process.arch === "arm64" ? "arm64" : "x64";
-        const expectedInstallerName =
-          `Silo-${version}-${expectedArchitecture}-Setup.exe`;
-        if (
-          !releaseTag ||
-          !isTrustedReleaseUrl(downloadUrl, releaseTag) ||
-          decodeURIComponent(new URL(downloadUrl).pathname.split("/").pop() ?? "") !==
-            expectedInstallerName
-        ) {
-          throw new Error("The Windows update does not point to this release's matching installer.");
-        }
+      const releaseTag = announcedUpdate.releaseTag;
+      const downloadUrl = announcedUpdate.downloadUrl as string;
+      const expectedArchitecture = process.arch === "arm64" ? "arm64" : "x64";
+      const assetName = decodeURIComponent(
+        new URL(downloadUrl).pathname.split("/").pop() ?? "",
+      );
+      const allowedAssetNames =
+        process.platform === "win32"
+          ? [`Silo-${version}-${expectedArchitecture}-Setup.exe`]
+          : [
+              `Silo-${version}-${expectedArchitecture}.zip`,
+              `Silo-${version}-${expectedArchitecture}.dmg`,
+            ];
+      if (
+        !releaseTag ||
+        !isTrustedReleaseUrl(downloadUrl, releaseTag) ||
+        !allowedAssetNames.includes(assetName)
+      ) {
+        throw new Error("The update does not point to this release's matching installer.");
+      }
 
-        const installerDirectory = await fsPromises.mkdtemp(
-          path.join(os.tmpdir(), "silo-windows-update-"),
-        );
-        const installerPath = path.join(installerDirectory, expectedInstallerName);
-        const response = await net.fetch(downloadUrl, {
-          signal: AbortSignal.timeout(15 * 60 * 1000),
-        });
-        if (!response.ok || !response.body)
-          throw new Error(`Windows installer download returned HTTP ${response.status}.`);
+      const downloadDirectory = await fsPromises.mkdtemp(
+        path.join(os.tmpdir(), "silo-update-"),
+      );
+      const downloadPath = path.join(downloadDirectory, assetName);
+      const response = await net.fetch(downloadUrl, {
+        signal: AbortSignal.timeout(15 * 60 * 1000),
+      });
+      if (!response.ok || !response.body)
+        throw new Error(`Update download returned HTTP ${response.status}.`);
 
-        const expectedSize = announcedUpdate.downloadSize;
-        const expectedDigest = announcedUpdate.downloadDigest;
-        const hasher = createHash("sha256");
-        let downloadedBytes = 0;
-        const progress = new Transform({
-          transform(chunk, _encoding, callback) {
-            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            downloadedBytes += bytes.length;
-            hasher.update(bytes);
-            const downloadPercent = expectedSize
-              ? Math.min(100, Math.round((downloadedBytes / expectedSize) * 100))
-              : undefined;
+      const expectedSize = announcedUpdate.downloadSize;
+      const expectedDigest = announcedUpdate.downloadDigest;
+      const hasher = createHash("sha256");
+      let downloadedBytes = 0;
+      let lastPublishedPercent = -1;
+      const progress = new Transform({
+        transform(chunk, _encoding, callback) {
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          downloadedBytes += bytes.length;
+          hasher.update(bytes);
+          const downloadPercent = expectedSize
+            ? Math.min(100, Math.round((downloadedBytes / expectedSize) * 100))
+            : undefined;
+          if (downloadPercent === undefined || downloadPercent !== lastPublishedPercent) {
+            lastPublishedPercent = downloadPercent ?? lastPublishedPercent;
             publishAppUpdateState({
               ...announcedUpdate,
               status: "downloading",
               currentVersion,
               ...(downloadPercent === undefined ? {} : { downloadPercent }),
               message: downloadPercent === undefined
-                ? `Downloading Silo ${version} Windows installer…`
-                : `Downloading Silo ${version} Windows installer… ${downloadPercent}%`,
+                ? `Downloading Silo ${version}…`
+                : `Downloading Silo ${version}… ${downloadPercent}%`,
             });
-            callback(null, bytes);
-          },
-        });
+          }
+          callback(null, bytes);
+        },
+      });
 
-        await pipeline(
-          Readable.from(response.body as any),
-          progress,
-          fs.createWriteStream(installerPath, { flags: "wx" }),
-        );
+      await pipeline(
+        Readable.from(response.body as any),
+        progress,
+        fs.createWriteStream(downloadPath, { flags: "wx" }),
+      );
 
-        const installerStats = await fsPromises.stat(installerPath);
-        if (!installerStats.isFile() || installerStats.size === 0)
-          throw new Error("The Windows installer download is empty.");
-        if (expectedSize && installerStats.size !== expectedSize)
-          throw new Error("The Windows installer size does not match GitHub's release record.");
-        const actualDigest = `sha256:${hasher.digest("hex")}`;
-        if (expectedDigest && actualDigest.toLowerCase() !== expectedDigest.toLowerCase())
-          throw new Error("The Windows installer SHA-256 does not match GitHub's release record.");
+      const downloadStats = await fsPromises.stat(downloadPath);
+      if (!downloadStats.isFile() || downloadStats.size === 0)
+        throw new Error("The update download is empty.");
+      if (expectedSize && downloadStats.size !== expectedSize)
+        throw new Error("The update size does not match GitHub's release record.");
+      const actualDigest = `sha256:${hasher.digest("hex")}`;
+      if (expectedDigest && actualDigest.toLowerCase() !== expectedDigest.toLowerCase())
+        throw new Error("The update SHA-256 does not match GitHub's release record.");
 
-        const installerProcess = spawn(installerPath, ["--updated"], {
+      if (process.platform === "win32") {
+        const installerProcess = spawn(downloadPath, ["--updated"], {
           detached: true,
           stdio: "ignore",
         });
@@ -1882,53 +1975,30 @@ async function downloadAndInstallAppUpdate(): Promise<AppUpdateState> {
           ...announcedUpdate,
           status: "installing",
           currentVersion,
-          message: `Silo ${version} is installing. The app will close while the Windows installer finishes.`,
+          message: `Silo ${version} is installing. Silo will close now.`,
         };
         publishAppUpdateState(state);
         setTimeout(() => app.quit(), 300);
         return state;
       }
 
-      const updateCheck = await autoUpdater.checkForUpdates();
-      if (
-        !updateCheck?.isUpdateAvailable ||
-        compareAppVersions(updateCheck.updateInfo.version, version) !== 0
-      ) {
-        throw new Error("The release metadata does not match the announced update.");
-      }
-
       publishAppUpdateState({
         ...announcedUpdate,
-        status: "downloading",
+        status: "installing",
         currentVersion,
-        downloadPercent: 0,
-        message: `Downloading Silo ${version}…`,
+        message: `Preparing Silo ${version}…`,
       });
-      await autoUpdater.downloadUpdate();
-
+      const installedBundle = await installMacAppUpdate(downloadPath, version);
       const state: AppUpdateState = {
         ...announcedUpdate,
         status: "installing",
         currentVersion,
-        message: `Silo ${version} is installing. The app will restart automatically.`,
+        message: installedBundle
+          ? `Silo ${version} is installing. The app will restart automatically.`
+          : `Silo ${version} downloaded. Drag Silo into Applications to finish updating.`,
       };
       publishAppUpdateState(state);
-      setTimeout(() => {
-        try {
-          autoUpdater.quitAndInstall(false, true);
-        } catch (error) {
-          runtimeLog("app-update-restart-failed", {
-            version,
-            message: error instanceof Error ? error.message : String(error),
-          });
-          publishAppUpdateState({
-            ...state,
-            status: "error",
-            downloadUrl: announcedUpdate.downloadUrl,
-            message: "The update downloaded, but Silo could not restart to install it.",
-          });
-        }
-      }, 500);
+      if (installedBundle) setTimeout(() => app.quit(), 500);
       return state;
     } catch (error) {
       runtimeLog("app-update-install-failed", {
@@ -2092,7 +2162,7 @@ type AppUpdateState = {
   downloadDigest?: string;
   downloadSize?: number;
   releaseUrl?: string;
-  installerLabel?: "EXE" | "Mac DMG";
+  installerLabel?: "EXE" | "Mac DMG" | "Mac app";
   downloadPercent?: number;
   message?: string;
 };

@@ -752,7 +752,7 @@ interface AppUpdateState {
   version?: string;
   downloadUrl?: string;
   releaseUrl?: string;
-  installerLabel?: "EXE" | "Mac DMG";
+  installerLabel?: "EXE" | "Mac DMG" | "Mac app";
   downloadPercent?: number;
   message?: string;
 }
