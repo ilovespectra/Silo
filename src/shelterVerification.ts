@@ -35,6 +35,7 @@ interface ManifestFile {
 interface ManifestAlias {
   path?: unknown;
   canonicalPath?: unknown;
+  canonicalClone?: unknown;
   sha256?: unknown;
   sourceId?: unknown;
   sourceRelativePath?: unknown;
@@ -156,15 +157,32 @@ export async function verifyShelterCloneSource(
   }
 
   const aliasRecords = new Map<string, { digest: string; canonicalPath: string }>();
+  const crossCloneFiles = new Map<string, { absolutePath: string; digest: string }>();
   for (const raw of manifest.aliases as ManifestAlias[]) {
     if (!hasSha256(raw.sha256)) throw new Error("The Fallout Shelter clone manifest contains an invalid duplicate hash.");
     const relative = normalizedRelativePath(raw.path);
-    const canonicalPath = normalizedRelativePath(raw.canonicalPath);
-    const canonicalDigest = records.get(canonicalPath);
-    if (!canonicalDigest || canonicalDigest !== raw.sha256.toLowerCase())
-      throw new Error("A Fallout Shelter duplicate does not point to its verified canonical file.");
+    let canonicalPath = normalizedRelativePath(raw.canonicalPath);
     if (records.has(relative) || aliasRecords.has(relative))
       throw new Error("The Fallout Shelter clone manifest contains duplicate file paths.");
+    if (raw.canonicalClone !== undefined) {
+      // Stored once in an earlier snapshot in the same shelter folder.
+      if (raw.materialized === true || typeof raw.canonicalClone !== "string" || !raw.canonicalClone ||
+          raw.canonicalClone !== path.basename(raw.canonicalClone) || raw.canonicalClone === "." || raw.canonicalClone === "..")
+        throw new Error("A Fallout Shelter duplicate points to an unsafe earlier snapshot.");
+      const storedKey = `\0${raw.canonicalClone}/${canonicalPath}`;
+      if (!crossCloneFiles.has(storedKey))
+        crossCloneFiles.set(storedKey, {
+          absolutePath: path.join(path.dirname(path.resolve(clonePath)), raw.canonicalClone, ...canonicalPath.split("/")),
+          digest: raw.sha256.toLowerCase(),
+        });
+      else if (crossCloneFiles.get(storedKey)!.digest !== raw.sha256.toLowerCase())
+        throw new Error("A Fallout Shelter duplicate does not point to its verified canonical file.");
+      canonicalPath = storedKey;
+    } else {
+      const canonicalDigest = records.get(canonicalPath);
+      if (!canonicalDigest || canonicalDigest !== raw.sha256.toLowerCase())
+        throw new Error("A Fallout Shelter duplicate does not point to its verified canonical file.");
+    }
     aliasRecords.set(relative, { digest: raw.sha256.toLowerCase(), canonicalPath });
     if (raw.materialized === true) physicalFiles.set(relative, raw.sha256.toLowerCase());
     if (raw.sourceId === sourceId) {
@@ -205,6 +223,11 @@ export async function verifyShelterCloneSource(
     }
     for (const relative of physicalFiles.keys()) {
       if (!actualFiles!.has(relative)) destinationIntegrity = false;
+    }
+    for (const [storedKey, stored] of crossCloneFiles) {
+      const actualDigest = await hashStableFile(stored.absolutePath).catch(() => null);
+      if (actualDigest !== stored.digest) destinationIntegrity = false;
+      else actualStoredDigests.set(storedKey, actualDigest);
     }
     if (!destinationIntegrity && !result.error)
       result.error = "One or more stored Fallout Shelter files failed SHA-256 or presence checks.";

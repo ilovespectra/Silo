@@ -3988,6 +3988,7 @@ interface FileInfo {
   sourceId?: string;
   sourceLabel?: string;
   backupTimestamp?: number;
+  siloAlias?: boolean;
   sourceSnapshotAt?: number;
 }
 
@@ -4033,7 +4034,7 @@ interface SourceClonePlanEntry {
 interface SourceClonePlan {
   id: string;
   operationId: string;
-  destinations: Array<{ destination: string; cloneRoot: string; freeBytes: number; shortfallBytes: number }>;
+  destinations: Array<{ destination: string; cloneRoot: string; freeBytes: number; shortfallBytes: number; reusableBytes?: number }>;
   entries: SourceClonePlanEntry[];
   totalFiles: number;
   totalBytes: number;
@@ -4043,6 +4044,14 @@ interface SourceClonePlan {
   configDirectory: string;
   replicaOf?: string;
   sourceManifest?: Record<string, unknown>;
+  reuseByDestination?: Map<string, Map<string, ShelterReusableFile>>;
+}
+
+interface ShelterReusableFile {
+  cloneName: string;
+  relativePath: string;
+  absolutePath: string;
+  size: number;
 }
 
 const sourceClonePlans = new Map<string, SourceClonePlan>();
@@ -4276,6 +4285,7 @@ async function readFiles(
     return results;
   }
   const pendingDirectories = [rootPath];
+  const cloneRoots = new Set<string>();
   let nextPendingDirectory = 0;
   const timeMachine = await isTimeMachineDirectory(rootPath);
   if (diagnostics) diagnostics.isTimeMachine = timeMachine;
@@ -4307,6 +4317,8 @@ async function readFiles(
       continue;
     }
 
+    if (entries.some((entry) => entry.name === "silo-clone-manifest.json" && entry.isFile()))
+      cloneRoots.add(directoryPath);
     const ENTRY_BATCH_SIZE = 32;
     for (let offset = 0; offset < entries.length; offset += ENTRY_BATCH_SIZE) {
       const entryBatch = entries.slice(offset, offset + ENTRY_BATCH_SIZE);
@@ -4395,6 +4407,7 @@ async function readFiles(
     }
   }
 
+  await appendSiloOnlyCloneAliases(rootPath, exploded, cloneRoots, results);
   // Final progress update with all results
   if (onProgress) onProgress(results);
 
@@ -4402,6 +4415,61 @@ async function readFiles(
   return timeMachine && !exploded
     ? sortTimeMachineEntriesAsync(results)
     : results;
+}
+
+// Fallout Shelter duplicates on drives without hard links are stored once and
+// recorded as manifest aliases; show them in Silo at their original locations.
+async function appendSiloOnlyCloneAliases(
+  rootPath: string,
+  exploded: boolean,
+  cloneRoots: Set<string>,
+  results: FileInfo[],
+) {
+  const root = path.resolve(rootPath);
+  for (let current = path.dirname(root), depth = 0; depth < 32; current = path.dirname(current), depth += 1) {
+    if (await fsPromises.stat(path.join(current, "silo-clone-manifest.json")).then((stats) => stats.isFile(), () => false)) {
+      cloneRoots.add(current);
+      break;
+    }
+    if (path.dirname(current) === current) break;
+  }
+  for (const cloneRoot of cloneRoots) {
+    let aliases: Array<Record<string, unknown>>;
+    try {
+      const manifest = JSON.parse(await fsPromises.readFile(path.join(cloneRoot, "silo-clone-manifest.json"), "utf8"));
+      if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || !Array.isArray(manifest.aliases)) continue;
+      aliases = manifest.aliases;
+    } catch {
+      continue;
+    }
+    for (const alias of aliases) {
+      if (alias.materialized !== false || typeof alias.path !== "string" || typeof alias.canonicalPath !== "string") continue;
+      const aliasPath = path.resolve(cloneRoot, alias.path);
+      if (!aliasPath.startsWith(`${cloneRoot}${path.sep}`)) continue;
+      if (exploded ? !aliasPath.startsWith(`${root}${path.sep}`) : path.dirname(aliasPath) !== root) continue;
+      const canonicalClone = typeof alias.canonicalClone === "string" ? alias.canonicalClone : null;
+      if (canonicalClone !== null && (!canonicalClone || canonicalClone !== path.basename(canonicalClone) ||
+          canonicalClone === "." || canonicalClone === "..")) continue;
+      const canonicalRoot = canonicalClone ? path.join(path.dirname(cloneRoot), canonicalClone) : cloneRoot;
+      const canonicalPath = path.resolve(canonicalRoot, alias.canonicalPath);
+      if (!canonicalPath.startsWith(`${canonicalRoot}${path.sep}`)) continue;
+      const stats = await fsPromises.stat(canonicalPath).catch(() => null);
+      if (!stats?.isFile()) continue;
+      const name = path.basename(aliasPath);
+      const mimeType = mime.getType(name);
+      results.push({
+        name,
+        path: canonicalPath,
+        relativePath: path.relative(rootPath, aliasPath),
+        size: stats.size,
+        modified: stats.mtimeMs,
+        isDirectory: false,
+        type: classifyFile(name, mimeType),
+        extension: path.extname(name).toLowerCase(),
+        siloAlias: true,
+      });
+    }
+  }
 }
 
 async function readReferencedFiles(filePaths: string[]): Promise<FileInfo[]> {
@@ -5061,8 +5129,14 @@ async function prepareSourceClone(
         if (alias.materialized !== false || typeof alias.path !== "string" ||
             typeof alias.canonicalPath !== "string" || typeof alias.sha256 !== "string" ||
             presentPaths.has(alias.path)) continue;
-        const canonicalPath = path.resolve(selected[0].rootPath, alias.canonicalPath);
-        const relative = path.relative(path.resolve(selected[0].rootPath), canonicalPath);
+        const crossClone = typeof alias.canonicalClone === "string" ? alias.canonicalClone : null;
+        if (crossClone !== null && (!crossClone || crossClone !== path.basename(crossClone) || crossClone === "." || crossClone === ".."))
+          throw new Error("Fallout Shelter manifest contains an unsafe duplicate alias.");
+        const canonicalRoot = crossClone
+          ? path.join(path.dirname(path.resolve(selected[0].rootPath)), crossClone)
+          : path.resolve(selected[0].rootPath);
+        const canonicalPath = path.resolve(canonicalRoot, alias.canonicalPath);
+        const relative = path.relative(canonicalRoot, canonicalPath);
         if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
           throw new Error("Fallout Shelter manifest contains an unsafe duplicate alias.");
         const stats = await fsPromises.stat(canonicalPath);
@@ -5077,7 +5151,8 @@ async function prepareSourceClone(
           size: stats.size,
           modified: stats.mtimeMs,
           sha256: alias.sha256,
-          duplicateOf: alias.canonicalPath,
+          // Snapshot-to-snapshot aliases become real files in the replica.
+          ...(crossClone ? {} : { duplicateOf: alias.canonicalPath }),
           isDirectory: false,
         });
         presentPaths.add(alias.path);
@@ -5123,7 +5198,20 @@ async function prepareSourceClone(
     const uniqueFiles = files.filter((entry) => !entry.duplicateOf);
     const duplicateFiles = files.length - uniqueFiles.length;
 
-    const destinationDevices = new Map<string, { freeBytes: number; count: number }>();
+    const reuseByDestination = new Map<string, Map<string, ShelterReusableFile>>();
+    const neededBytesByDestination = new Map<string, number>();
+    for (const destination of destinationPlans) {
+      const reuse = await buildShelterReuseIndex(destination.destination);
+      reuseByDestination.set(destination.destination, reuse);
+      let reusableBytes = 0;
+      for (const entry of uniqueFiles) {
+        const prior = reuse.get(entry.sha256!);
+        if (prior && prior.size === entry.size) reusableBytes += entry.size;
+      }
+      destination.reusableBytes = reusableBytes;
+      neededBytesByDestination.set(destination.destination, totalBytes - reusableBytes);
+    }
+    const destinationDevices = new Map<string, { freeBytes: number; neededBytes: number }>();
     const destinationDeviceByPath = new Map<string, string>();
     for (const destination of destinationPlans) {
       const [stats, disk] = await Promise.all([
@@ -5133,22 +5221,22 @@ async function prepareSourceClone(
       const device = String(disk.dev);
       destinationDeviceByPath.set(destination.destination, device);
       const current = destinationDevices.get(device) ?? {
-        freeBytes: Number(stats.bavail) * Number(stats.bsize), count: 0,
+        freeBytes: Number(stats.bavail) * Number(stats.bsize), neededBytes: 0,
       };
-      current.count += 1;
+      current.neededBytes += neededBytesByDestination.get(destination.destination) ?? totalBytes;
       destinationDevices.set(device, current);
       destination.freeBytes = current.freeBytes;
     }
     for (const destination of destinationPlans) {
       const group = destinationDevices.get(destinationDeviceByPath.get(destination.destination)!)!;
-      destination.shortfallBytes = Math.max(0, totalBytes * group.count - group.freeBytes);
+      destination.shortfallBytes = Math.max(0, group.neededBytes - group.freeBytes);
     }
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const plan: SourceClonePlan = { id, operationId, destinations: destinationPlans,
       entries, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles,
       sourceLabels: selected.map((source) => source.label), sourceIds: selected.map((source) => source.id), configDirectory,
       replicaOf: prepareOptions.replicaOf,
-      sourceManifest: prepareOptions.sourceManifest };
+      sourceManifest: prepareOptions.sourceManifest, reuseByDestination };
     sourceClonePlans.set(id, plan);
     return { planId: id, destinations: destinationPlans, totalSources: selected.length,
       sourceLabels: plan.sourceLabels, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles };
@@ -5193,6 +5281,43 @@ async function findLatestShelterSnapshot(): Promise<{
   candidates.sort((first, second) => second.createdAt - first.createdAt);
   const latest = candidates[0];
   return latest ? { rootPath: latest.rootPath, manifestPath: latest.manifestPath, manifest: latest.manifest } : null;
+}
+
+// Index every physically stored file in earlier complete directory snapshots in a
+// destination folder so new snapshots can hard-link (or Silo-alias) instead of copying.
+async function buildShelterReuseIndex(destination: string): Promise<Map<string, ShelterReusableFile>> {
+  const reusable = new Map<string, ShelterReusableFile>();
+  const root = await fsPromises.realpath(destination).catch(() => null);
+  if (!root) return reusable;
+  const entries = await fsPromises.readdir(root, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const cloneRoot = path.join(root, entry.name);
+    try {
+      if (await fsPromises.access(path.join(cloneRoot, ".silo-clone-in-progress.json")).then(() => true, () => false))
+        continue;
+      const manifest = JSON.parse(await fsPromises.readFile(path.join(cloneRoot, "silo-clone-manifest.json"), "utf8"));
+      if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || manifest.complete !== true ||
+          manifest.container === "zip" || !Array.isArray(manifest.files)) continue;
+      const physical = [
+        ...(manifest.files as Array<Record<string, unknown>>).filter((file) => !file.error),
+        ...(Array.isArray(manifest.aliases) ? manifest.aliases as Array<Record<string, unknown>> : [])
+          .filter((alias) => alias.materialized === true),
+      ];
+      for (const record of physical) {
+        if (typeof record.sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(record.sha256) ||
+            typeof record.path !== "string" || typeof record.size !== "number") continue;
+        const digest = record.sha256.toLowerCase();
+        if (reusable.has(digest)) continue;
+        const absolutePath = path.resolve(cloneRoot, record.path);
+        if (!absolutePath.startsWith(`${cloneRoot}${path.sep}`)) continue;
+        reusable.set(digest, { cloneName: entry.name, relativePath: record.path, absolutePath, size: record.size });
+      }
+    } catch {
+      // Ignore unreadable, incomplete, or non-Silo directories.
+    }
+  }
+  return reusable;
 }
 
 async function prepareShelterReplica(destinations: string[], operationId: string) {
@@ -5315,7 +5440,7 @@ async function runSourceClone(
       let failedFiles = 0;
       let lastProgressAt = 0;
       const manifestFiles: Array<{ path: string; size: number; sha256?: string; modified?: number; sourceId?: string; sourceRelativePath?: string; error?: string }> = [];
-      const manifestAliases: Array<{ path: string; canonicalPath: string; size: number; sha256: string; sourceId?: string; sourceRelativePath?: string; materialized: boolean }> = [];
+      const manifestAliases: Array<{ path: string; canonicalPath: string; canonicalClone?: string; size: number; sha256: string; sourceId?: string; sourceRelativePath?: string; materialized: boolean }> = [];
       const emit = (phase: SourceClonePhase, currentFile: string, message: string, force = false) => {
         const now = Date.now();
         if (!force && now - lastProgressAt < 350) return;
@@ -5327,6 +5452,8 @@ async function runSourceClone(
       };
       if (runOptions.compress) {
         const archivePath = `${destinationPlan.cloneRoot}${CLONE_ARCHIVE_EXTENSION}`;
+        if ((destinationPlan.reusableBytes ?? 0) > 0 && plan.totalBytes > destinationPlan.freeBytes)
+          throw new Error("Compressed clones cannot reuse earlier snapshots, and this destination does not have enough free space.");
         try {
           const uniqueEntries = plan.entries.filter((item) => !item.isDirectory && !item.duplicateOf);
           for (const entry of uniqueEntries) {
@@ -5406,6 +5533,11 @@ async function runSourceClone(
           if (!directory.startsWith(`${destinationPlan.cloneRoot}${path.sep}`)) throw new Error("Unsafe clone directory path.");
           await fsPromises.mkdir(directory, { recursive: true });
         }
+        const hardLinkFallbackCodes = new Set(["EXDEV", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EACCES", "EMLINK"]);
+        const reuse = plan.reuseByDestination?.get(destinationPlan.destination);
+        const preverifiedPaths = new Set<string>();
+        const crossCloneTargets = new Map<string, { cloneName: string; relativePath: string }>();
+        let reusedFiles = 0;
         for (const entry of plan.entries.filter((item) => !item.isDirectory && !item.duplicateOf)) {
           ensureCloneActive(operationId);
           const sourcePath = entry.localPath;
@@ -5413,6 +5545,44 @@ async function runSourceClone(
           const destinationPath = path.resolve(destinationPlan.cloneRoot, entry.destinationRelativePath);
           if (!destinationPath.startsWith(`${destinationPlan.cloneRoot}${path.sep}`)) throw new Error("Unsafe clone file path.");
           await fsPromises.mkdir(path.dirname(destinationPath), { recursive: true });
+          const prior = entry.sha256 ? reuse?.get(entry.sha256) : undefined;
+          if (prior && prior.size === entry.size) {
+            let linked = false;
+            try {
+              const sourceStats = await fsPromises.stat(sourcePath);
+              if (sourceStats.size !== entry.size || sourceStats.mtimeMs !== entry.modified)
+                throw new Error(`Source changed after preflight: ${entry.destinationRelativePath}`);
+              try {
+                await fsPromises.link(prior.absolutePath, destinationPath);
+                linked = true;
+              } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (!code || !hardLinkFallbackCodes.has(code)) throw error;
+              }
+              if ((await hashFile(linked ? destinationPath : prior.absolutePath)) !== entry.sha256)
+                throw new Error("Earlier snapshot copy no longer matches.");
+              if (linked) {
+                manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size, sha256: entry.sha256,
+                  sourceId: entry.sourceId, sourceRelativePath: entry.sourceRelativePath });
+                preverifiedPaths.add(entry.destinationRelativePath);
+              } else {
+                crossCloneTargets.set(entry.destinationRelativePath, { cloneName: prior.cloneName, relativePath: prior.relativePath });
+                manifestAliases.push({ path: entry.destinationRelativePath, canonicalPath: prior.relativePath,
+                  canonicalClone: prior.cloneName, size: entry.size, sha256: entry.sha256!, sourceId: entry.sourceId,
+                  sourceRelativePath: entry.sourceRelativePath, materialized: false });
+                verifiedFiles += 1;
+              }
+              reusedFiles += 1;
+              completedFiles += 1;
+              copiedBytes += entry.size;
+              emit("copying", entry.destinationRelativePath, `Already in shelter · ${entry.destinationRelativePath}`);
+              continue;
+            } catch (error) {
+              if (linked) await fsPromises.rm(destinationPath, { force: true }).catch(() => undefined);
+              if (operation.cancelled) throw error;
+              // Fall back to a normal verified copy.
+            }
+          }
           const partialPath = `${destinationPath}.silo-partial`;
           const sourceHash = createHash("sha256");
           const inputStats = await fsPromises.stat(sourcePath);
@@ -5454,6 +5624,10 @@ async function runSourceClone(
         for (const record of manifestFiles) {
           ensureCloneActive(operationId);
           if (!record.sha256) continue;
+          if (preverifiedPaths.has(record.path)) {
+            verifiedFiles += 1;
+            continue;
+          }
           const copiedHash = await hashFile(path.join(destinationPlan.cloneRoot, record.path));
           if (copiedHash !== record.sha256) {
             record.error = "SHA-256 mismatch during verification.";
@@ -5462,12 +5636,19 @@ async function runSourceClone(
           } else verifiedFiles += 1;
           emit("verifying", record.path, `Verified ${verifiedFiles.toLocaleString()} of ${plan.totalFiles.toLocaleString()} files`);
         }
-        const hardLinkFallbackCodes = new Set(["EXDEV", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EACCES", "EMLINK"]);
         for (const entry of plan.entries.filter((item) => !item.isDirectory && item.duplicateOf)) {
           ensureCloneActive(operationId);
           const sourceStats = await fsPromises.stat(entry.localPath!);
           if (sourceStats.size !== entry.size || sourceStats.mtimeMs !== entry.modified)
             throw new Error(`Duplicate source changed after hash preflight: ${entry.destinationRelativePath}`);
+          const crossCloneTarget = crossCloneTargets.get(entry.duplicateOf!);
+          if (crossCloneTarget) {
+            await fsPromises.mkdir(path.dirname(path.resolve(destinationPlan.cloneRoot, entry.destinationRelativePath)), { recursive: true });
+            manifestAliases.push({ path: entry.destinationRelativePath, canonicalPath: crossCloneTarget.relativePath,
+              canonicalClone: crossCloneTarget.cloneName, size: entry.size, sha256: entry.sha256!, sourceId: entry.sourceId,
+              sourceRelativePath: entry.sourceRelativePath, materialized: false });
+            continue;
+          }
           const canonicalPath = path.resolve(destinationPlan.cloneRoot, entry.duplicateOf!);
           const aliasPath = path.resolve(destinationPlan.cloneRoot, entry.destinationRelativePath);
           if (!canonicalPath.startsWith(`${destinationPlan.cloneRoot}${path.sep}`) ||
@@ -5510,7 +5691,8 @@ async function runSourceClone(
         invalidateSiloCloneDirectoryCache(destinationPlan.cloneRoot);
         await fsPromises.rm(inProgressMarker, { force: true });
         emit(complete ? "complete" : "error", "", complete
-          ? `Clone complete. Verified ${verifiedFiles.toLocaleString()} files with SHA-256, including Silo config/indexes.`
+          ? `Clone complete. Verified ${verifiedFiles.toLocaleString()} files with SHA-256, including Silo config/indexes.` +
+            (reusedFiles ? ` ${reusedFiles.toLocaleString()} were already in the shelter and were linked, not copied.` : "")
           : `Clone finished with ${failedFiles.toLocaleString()} file error(s). Originals were not changed.`, true);
         if (!complete) throw new Error(`Verification failed for destination ${destinationPlan.destination}.`);
         successfulDestinations.push(destinationPlan.cloneRoot);

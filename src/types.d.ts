@@ -16,6 +16,7 @@ interface FileInfo {
   sourceId?: string;
   sourceLabel?: string;
   backupTimestamp?: number;
+  siloAlias?: boolean;
   duplicateFiles: number;
   sourceSnapshotAt?: number;
 }

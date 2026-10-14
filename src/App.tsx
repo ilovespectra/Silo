@@ -607,6 +607,10 @@ function asFastFileSearchResult(
   };
 }
 
+// Fallout Shelter Silo-only aliases share a physical path with their canonical file.
+const fileListKey = (file: { path: string; relativePath?: string; siloAlias?: boolean }) =>
+  file.siloAlias ? `${file.path}\u0000${file.relativePath ?? ""}` : file.path;
+
 function App() {
   const electronAPI = window.electron;
   const appRootRef = useRef<HTMLDivElement | null>(null);
@@ -2007,8 +2011,8 @@ function App() {
       )
         return;
       setFiles((current) => {
-        const merged = new Map(current.map((file) => [file.path, file]));
-        for (const file of deltas) merged.set(file.path, file);
+        const merged = new Map(current.map((file) => [fileListKey(file), file]));
+        for (const file of deltas) merged.set(fileListKey(file), file);
         return Array.from(merged.values());
       });
     };
@@ -2060,8 +2064,8 @@ function App() {
                 cached.length
               )
                 setFiles((current) => {
-                  const merged = new Map(cached.map((file) => [file.path, file]));
-                  for (const file of current) merged.set(file.path, file);
+                  const merged = new Map(cached.map((file) => [fileListKey(file), file]));
+                  for (const file of current) merged.set(fileListKey(file), file);
                   return Array.from(merged.values());
                 });
               if (requestId === scanRequestRef.current && cached.length) {
@@ -2669,9 +2673,9 @@ function App() {
           .then((sourceFiles) => {
             allSourcesLoadedRef.current.add(source.id);
             setFiles((current) => {
-              const byPath = new Map(current.map((file) => [file.path, file]));
+              const byPath = new Map(current.map((file) => [fileListKey(file), file]));
               sourceFiles.forEach((file) =>
-                byPath.set(file.path, {
+                byPath.set(fileListKey(file), {
                   ...file,
                   sourceId: source.id,
                   sourceLabel: source.label,
@@ -7820,7 +7824,7 @@ function App() {
                         const file = item.file;
                         return (
                           <tr
-                            key={file.path}
+                            key={fileListKey(file)}
                             data-file-path={file.path}
                             data-directory={file.isDirectory ? "true" : "false"}
                             className={`file-row ${file.isDirectory ? "directory" : ""} ${selectedFile?.path === file.path ? "selected" : ""} ${selectedFilePaths.has(file.path) ? "bulk-selected" : ""}`}
@@ -7960,7 +7964,7 @@ function App() {
                       const file = item.file;
                       return (
                         <div
-                          key={file.path}
+                          key={fileListKey(file)}
                           data-file-path={file.path}
                           data-directory={file.isDirectory ? "true" : "false"}
                           className={`file-card ${file.isDirectory ? "directory" : ""} ${selectedFile?.path === file.path ? "selected" : ""} ${selectedFilePaths.has(file.path) ? "bulk-selected" : ""}`}
