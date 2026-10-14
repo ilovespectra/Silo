@@ -334,7 +334,8 @@ async function repackage() {
     for (const name of expected) {
       const source = stagedFiles.get(name);
       const target = path.join(destination, name);
-      if (fs.existsSync(target)) {
+      // latest-mac.yml is unversioned and always describes the newest build.
+      if (fs.existsSync(target) && name !== 'latest-mac.yml') {
         throw new Error(`Refusing to replace an existing test artifact: ${target}`);
       }
       pendingInstalls.push(stageFile(source, target));
