@@ -64,35 +64,38 @@ function readLatestGitHubReleaseTag() {
   }
 }
 
+const explicitDestination = process.env.SILO_RELEASE_DEST
+  ? path.resolve(process.env.SILO_RELEASE_DEST)
+  : '';
+const defaultDestinationFor = (value) =>
+  path.join(os.homedir(), 'Downloads', `SILO ${value} TEST`);
+
+// The release version always comes from package.json. When that version was
+// already packaged (in the destination) or published, bump the patch and
+// commit/push the bump so the Mac builds and Windows CI use the same version.
 function resolveReleaseVersion() {
   const current = packageJson.version;
-  const destinationVersion = findLatestVersionInFolder(destination);
+  const existingFolders = [...new Set(
+    [explicitDestination, defaultDestinationFor(current)].filter(Boolean),
+  )];
+  const alreadyPackaged = existingFolders.some((folder) =>
+    fs.existsSync(path.join(folder, `${product}-${current}-arm64.dmg`)));
   const remoteVersion = readLatestGitHubReleaseTag();
-  const candidates = [current, destinationVersion, remoteVersion].filter(Boolean);
-  let latest = current;
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    if (compareVersions(candidate, latest) > 0) {
-      latest = candidate;
-    }
+  const remoteIsNewerOrSame = remoteVersion && compareVersions(remoteVersion, current) >= 0;
+  if (!alreadyPackaged && !remoteIsNewerOrSame) return current;
+  const base = remoteVersion && compareVersions(remoteVersion, current) > 0
+    ? parseSemver(remoteVersion).join('.')
+    : current;
+  let next = bumpPatchVersion(base);
+  for (const folder of existingFolders) {
+    const folderVersion = findLatestVersionInFolder(folder);
+    while (folderVersion && compareVersions(folderVersion, next) >= 0) next = bumpPatchVersion(next);
   }
-
-  if (destinationVersion && destinationVersion === latest) {
-    return bumpPatchVersion(latest);
-  }
-
-  const exactName = `${product}-${latest}`;
-  if (destinationVersion && fs.existsSync(path.join(destination, `${exactName}-arm64.dmg`))) {
-    return bumpPatchVersion(latest);
-  }
-
-  return latest;
+  return next;
 }
 
-const destination = process.env.SILO_RELEASE_DEST
-  ? path.resolve(process.env.SILO_RELEASE_DEST)
-  : path.join(os.homedir(), 'Downloads', `SILO ${packageJson.version} TEST`);
 const version = resolveReleaseVersion();
+const destination = explicitDestination || defaultDestinationFor(version);
 const outputFolder = path.join(projectRoot, 'release');
 const stageParent = process.env.SILO_RELEASE_STAGE_DIR
   ? path.resolve(process.env.SILO_RELEASE_STAGE_DIR)
@@ -234,6 +237,16 @@ async function repackage() {
   }
 
   assertCleanReleaseInputs();
+  if (version !== packageJson.version) {
+    if (suppliedWindowsInstaller) {
+      throw new Error(`Version ${packageJson.version} is already packaged; bump package.json before supplying a Windows installer.`);
+    }
+    console.log(`\nBumping Silo ${packageJson.version} -> ${version} and pushing to ${branch}…`);
+    run('npm', ['version', version, '--no-git-tag-version']);
+    run('git', ['add', 'package.json', 'package-lock.json']);
+    run('git', ['commit', '-m', `Release v${version}`]);
+    run('git', ['push', 'origin', branch]);
+  }
   const localSha = capture('git', ['rev-parse', 'HEAD']);
   if (suppliedWindowsInstaller) {
     if (!fs.existsSync(suppliedWindowsInstaller) ||
