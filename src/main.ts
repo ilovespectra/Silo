@@ -2876,6 +2876,7 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
           await fsPromises.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
         }
         setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
+        await rememberMemoryMovieTitles([suggestion]).catch(() => undefined);
       } catch (error) {
         setMemoryPreviewStatus(suggestion.id, { status: "failed" });
         runtimeLog("memory-preview-skipped", { message: error instanceof Error ? error.message : String(error) });
@@ -8254,6 +8255,76 @@ function registerMemoryRevealHandlers() {
 }
 
 registerMemoryRevealHandlers();
+
+const MEMORY_MOVIE_TITLES_PATH = () => path.join(app.getPath("userData"), "memories", "movie-titles.json");
+
+async function readMemoryMovieTitles(): Promise<Record<string, string>> {
+  try {
+    const raw = JSON.parse(await fsPromises.readFile(MEMORY_MOVIE_TITLES_PATH(), "utf8"));
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Remembers each movie's story title so it keeps a readable name after its card is removed. */
+async function rememberMemoryMovieTitles(suggestions: MemorySuggestion[]): Promise<void> {
+  const titles = await readMemoryMovieTitles();
+  let changed = false;
+  for (const suggestion of suggestions) {
+    const name = memoryPreviewFileName(suggestion);
+    if (titles[name] !== suggestion.title) { titles[name] = suggestion.title; changed = true; }
+  }
+  if (!changed) return;
+  await fsPromises.mkdir(path.dirname(MEMORY_MOVIE_TITLES_PATH()), { recursive: true });
+  await fsPromises.writeFile(MEMORY_MOVIE_TITLES_PATH(), JSON.stringify(titles)).catch(() => undefined);
+}
+
+function titleFromMemoryMovieName(name: string): string {
+  const stem = name.replace(/\.mp4$/i, "").replace(/-[a-z0-9]{1,6}-[a-f0-9]{4}$/i, "");
+  const dated = /^(\d{4}-\d{2}-\d{2})-(.+)$/.exec(stem);
+  const words = (dated ? dated[2] : stem).replace(/-+/g, " ").trim();
+  const title = words ? `${words.charAt(0).toLocaleUpperCase()}${words.slice(1)}` : "Memory";
+  return dated ? `${title} · ${dated[1]}` : title;
+}
+
+async function memoryMovieDirectories(): Promise<string[]> {
+  return Array.from(new Set([await memoryMovieDirectory(), MEMORY_DEFAULT_MOVIE_DIRECTORY()]));
+}
+
+ipcMain.handle("list-saved-memory-movies", async () => {
+  const state = await memoryManager.getState();
+  const cards = [...state.suggestions, ...await memoryManager.getReserve()];
+  await rememberMemoryMovieTitles(cards).catch(() => undefined);
+  const cardFiles = new Set(state.suggestions.map(memoryPreviewFileName));
+  const titles = await readMemoryMovieTitles();
+  const movies = new Map<string, { path: string; title: string; modified: number; size: number }>();
+  for (const directory of await memoryMovieDirectories()) {
+    const names = await fsPromises.readdir(directory).catch(() => [] as string[]);
+    for (const name of names) {
+      // Cards already show their own movie; hidden and in-progress files are skipped.
+      if (!/\.mp4$/i.test(name) || name.startsWith(".") || cardFiles.has(name) || movies.has(name)) continue;
+      const moviePath = path.join(directory, name);
+      const stat = await fsPromises.stat(moviePath).catch(() => null);
+      if (!stat?.isFile() || stat.size === 0) continue;
+      movies.set(name, { path: moviePath, title: titles[name] || titleFromMemoryMovieName(name), modified: stat.mtimeMs, size: stat.size });
+    }
+  }
+  return Array.from(movies.values()).sort((a, b) => b.modified - a.modified);
+});
+
+ipcMain.handle("reveal-saved-memory-movie", async (_event, moviePath: unknown) => {
+  if (typeof moviePath !== "string" || !/\.mp4$/i.test(moviePath)) return { ok: false, error: "Invalid movie." };
+  const resolved = path.resolve(moviePath);
+  const directories = await memoryMovieDirectories();
+  if (!directories.some((directory) => path.dirname(resolved) === path.resolve(directory)))
+    return { ok: false, error: "That movie is not in your memories folder." };
+  if (!await fsPromises.stat(resolved).then((stat) => stat.isFile(), () => false))
+    return { ok: false, error: "That movie was moved or deleted." };
+  shell.showItemInFolder(resolved);
+  return { ok: true };
+});
+
 ipcMain.handle("cancel-memory-export", () => {
   // Also covers the save dialog and pre-render checks, before the exporter has a controller.
   if (memoryExportRunning) memoryExportCancelRequested = true;

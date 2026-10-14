@@ -2,7 +2,7 @@ import React, { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { IconBaseProps } from "react-icons";
 import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
-import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack } from "../memoryTypes";
+import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
 import {
   MEMORY_DEFAULT_SELECTION_COUNT,
   MEMORY_DURATION_SECONDS,
@@ -506,9 +506,46 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
   </article>;
 }
 
+function SavedMovieDialog({ movie, onClose }: { movie: SavedMemoryMovie; onClose: () => void }) {
+  return <MemoriesDialog title={`Memories · ${movie.title}`} onClose={onClose}>
+    <div className="memories-modal-body">
+      <MemoryVideoPlayer src={`app-media://stream/${encodeURIComponent(movie.path)}`} autoPlay label={`Memory movie: ${movie.title}`} />
+      <div className="memories-modal-actions">
+        <button type="button" className="memories-button memories-primary" onClick={onClose}>Done</button>
+      </div>
+    </div>
+  </MemoriesDialog>;
+}
+
+/** A finished movie from the memories folder whose story card is no longer kept. */
+function SavedMovieCard({ api, movie, onToast }: { api: MemoriesAPI; movie: SavedMemoryMovie; onToast: (message: string) => void }) {
+  const [viewing, setViewing] = useState(false);
+  const reveal = async () => {
+    const result = await api.revealSavedMemoryMovie?.(movie.path).catch(() => null);
+    if (!result?.ok) onToast(result?.error || "The movie could not be shown in Finder.");
+  };
+  return <article className="memories-card memories-saved-movie">
+    <button type="button" className="memories-cover-button" aria-label={`Watch memory: ${movie.title}`} onClick={() => setViewing(true)}>
+      <span className="memories-cover memories-cover-1">
+        <video src={`app-media://stream/${encodeURIComponent(movie.path)}#t=2`} preload="metadata" muted playsInline tabIndex={-1} aria-hidden="true" />
+      </span>
+      <span className="memories-view-badge"><FiPlay />Watch memory</span>
+    </button>
+    <div className="memories-card-body">
+      <div className="memories-card-heading"><div className="memories-card-badges"><span className="memories-saved-label"><FiCheck aria-hidden="true" />Saved movie</span></div>
+        <button type="button" className="memories-icon-button" aria-label={`Show ${movie.title} in Finder`} title="Show in Finder" onClick={() => { void reveal(); }}><FiFolder /></button>
+      </div>
+      <h2>{movie.title}</h2>
+      <div className="memories-meta"><span><FiFilm />{new Date(movie.modified).toLocaleDateString()}</span><span>{formatBytes(movie.size)}</span></div>
+    </div>
+    {viewing && <SavedMovieDialog movie={movie} onClose={() => setViewing(false)} />}
+  </article>;
+}
+
 export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   const [state, setState] = useState<MemoryState | null>(null);
   const [demoMode, setDemoMode] = useState(false);
+  const [savedMovies, setSavedMovies] = useState<SavedMemoryMovie[]>([]);
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState("");
   const [error, setError] = useState("");
@@ -533,6 +570,14 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     const timer = window.setTimeout(() => setToast(""), 4000);
     return () => window.clearTimeout(timer);
   }, [toast]);
+  const cardIds = state?.suggestions.map((memory) => memory.id).join("|") ?? "";
+  const readyCount = Object.values(previews).filter((preview) => preview.status === "ready").length;
+  useEffect(() => {
+    if (!ready || !api.listSavedMemoryMovies) return;
+    let disposed = false;
+    void api.listSavedMemoryMovies().then((movies) => { if (!disposed && Array.isArray(movies)) setSavedMovies(movies); }).catch(() => undefined);
+    return () => { disposed = true; };
+  }, [api, ready, cardIds, readyCount]);
   const renderingTitle = state?.suggestions.find((memory) => previews[memory.id]?.status === "rendering")?.title;
   const blockedView = (memory: MemorySuggestion) => setToast(previews[memory.id]?.status === "failed"
     ? `“${memory.title}” could not be prepared because some of its files are offline. Reconnect them and it will be prepared next time.`
@@ -606,7 +651,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
       <small>{state.generationProgress.etaSeconds !== undefined ? `About ${formatEta(state.generationProgress.etaSeconds)} left` : "Estimating time…"}</small>
     </div>}
     {state?.generating && <p className="memories-hint">This uses photos and clips already indexed. Anything indexed later will be available the next time you generate.</p>}
-    {Boolean(state?.suggestions.length) && <p className="memories-collection-label">{state?.suggestions.length} stories to rediscover <span>New memories are added to this collection.</span></p>}
+    {Boolean(state?.suggestions.length || savedMovies.length) && <p className="memories-collection-label">{(state?.suggestions.length ?? 0) + savedMovies.length} stories to rediscover <span>New memories are added to this collection.</span></p>}
     <div className="memories-grid" data-tour="memory-controls" data-help="Each story card lets you preview and save its movie, remove only the suggestion, tune photos, duration and soundtrack, and choose where the saved copy goes.">
       {(action === "Finding memories" || state?.generating) && Array.from({ length: 5 }, (_, index) => <article key={`pending-${index}`} className="memories-card memories-card-pending" aria-busy="true" aria-label="Memory being created">
         <div className="memories-cover-placeholder"><FiFilm /><span>{index === 0 ? state?.generationProgress?.label || "Finding a story…" : "Waiting for a story…"}</span></div>
@@ -617,9 +662,10 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
         onDismiss={() => { void run("Removing suggestion", () => api.dismissMemory(memory.id)); }}
         onExport={(selected, options) => setExporting((current) => current || { memory: selected, options })}
         onToast={setToast} />)}
+      {savedMovies.map((movie) => <SavedMovieCard key={movie.path} api={api} movie={movie} onToast={setToast} />)}
     </div>
     {toast && <p className="memories-toast" role="status" aria-live="assertive">{toast}</p>}
-    {ready && !loading && !state?.suggestions.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>
+    {ready && !loading && !state?.suggestions.length && !savedMovies.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>
       <h2>A little nostalgia goes a long way.</h2><p>Find themed stories in your indexed photos and clips, then choose the mood, frame and length of your movie.</p>
       <p className="memories-hint">Nothing runs until you choose Generate memories. It uses what is indexed now, even while indexing continues. Each movie is then prepared in the background, one at a time, with progress shown on its card.</p>
     </div>}

@@ -134,6 +134,14 @@ export interface MemoryExportProgress {
   total: number;
   message: string;
 }
+/** A finished movie in the memories folder, kept even after its card is removed. */
+export interface SavedMemoryMovie {
+  path: string;
+  title: string;
+  modified: number;
+  size: number;
+}
+
 export interface MemoriesAPI {
   getMemories(prepareViews?: boolean): Promise<MemoryState>;
   generateMemories(replace?: boolean, customTopic?: string): Promise<MemoryState>;
@@ -153,4 +161,7 @@ export interface MemoriesAPI {
   /** Optional so older bridges keep working; cards fall back to polling state. */
   onMemoryPreviewProgress?(callback: (previews: Record<string, MemoryPreviewStatus>) => void): () => void;
   onMemoriesChanged?(callback: (state: MemoryState) => void): () => void;
+  /** Movies in the memories folder that no longer have a card. */
+  listSavedMemoryMovies?(): Promise<SavedMemoryMovie[]>;
+  revealSavedMemoryMovie?(moviePath: string): Promise<{ ok: boolean; error?: string }>;
 }
