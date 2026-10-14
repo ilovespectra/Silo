@@ -99,6 +99,11 @@ metadata in `~/Downloads/SILO 2.0.6 TEST/` only after every build succeeds. It
 refuses to replace an existing file in that test folder. Upload the two ZIPs and
 `latest-mac.yml` with the DMGs to a release before testing in-app Mac updates.
 
+Automatic release increments roll patch 9 into the next minor version:
+`2.0.8 → 2.0.9 → 2.1.0 → 2.1.1`. An existing `2.0.10` also advances
+to `2.1.0`; existing release tags and assets are not renamed.
+Run `node test/runReleaseVersionTests.cjs` to verify rollover behavior.
+
 If the Windows installer was obtained through another authenticated route, set
 both `SILO_WINDOWS_SETUP_EXE` to that non-empty installer file and
 `SILO_WINDOWS_BUILD_SHA` to the exact pushed `main` commit used to build it. The

@@ -3631,6 +3631,7 @@ function discoverAndBackupPhones(): Promise<void> {
         scheduleThumbnailPregeneration(true);
       }
 
+      if (devicesChanged) invalidateSourceList();
       // Guard IPC send with rendererReady check
       if (
         devicesChanged &&
@@ -4580,6 +4581,15 @@ interface BrowseSource {
 let sourceListCache: BrowseSource[] | null = null;
 let sourceListCacheAt = 0;
 let sourceListPromise: Promise<BrowseSource[]> | null = null;
+let sourceListGeneration = 0;
+
+/** Drops cached and in-flight source lists so the next request sees current devices. */
+function invalidateSourceList(): void {
+  sourceListGeneration += 1;
+  sourceListCache = null;
+  sourceListCacheAt = 0;
+  sourceListPromise = null;
+}
 
 function accessDisplayName(): string {
   return fullAccessEnabled() ? "Silo" : "Silo Demo";
@@ -4643,16 +4653,19 @@ async function listSources(): Promise<BrowseSource[]> {
     return sourceListCache.map((source) => ({ ...source }));
   if (sourceListPromise)
     return (await sourceListPromise).map((source) => ({ ...source }));
+  const generation = sourceListGeneration;
   const pending = buildSourceList().then((sources) =>
     applyDemoSourceLimit(sources, fullAccessEnabled(), DEMO_LIMITS.sources),
   );
   sourceListPromise = pending;
   try {
-    sourceListCache = await pending;
+    const sources = await pending;
+    if (generation !== sourceListGeneration) return listSources();
+    sourceListCache = sources;
     sourceListCacheAt = Date.now();
     return sourceListCache.map((source) => ({ ...source }));
   } finally {
-    sourceListPromise = null;
+    if (sourceListPromise === pending) sourceListPromise = null;
   }
 }
 
@@ -7441,8 +7454,7 @@ app.whenReady().then(async () => {
       phoneBackupLastStatus.set(key, progress.status);
       if (statusChanged && progress.status === "complete") {
         // A finished snapshot becomes a browseable source even after the phone is unplugged.
-        sourceListCache = null;
-        sourceListCacheAt = 0;
+        invalidateSourceList();
       }
       if (!mainWindow || mainWindow.isDestroyed()) return;
       mainWindow.webContents.send("phone-backup-progress", progress);
@@ -12155,6 +12167,7 @@ async function readyPhoneForBackup(deviceId: unknown, platform: unknown) {
   );
   if (known) return known;
   scannedPhoneDevices = await phoneManager.listDevices();
+  invalidateSourceList();
   const device = scannedPhoneDevices.find(
     (candidate) =>
       candidate.id === deviceId &&
@@ -12332,6 +12345,7 @@ ipcMain.handle(
         ? { ...device, name: savedName }
         : device,
     );
+    invalidateSourceList();
     sendToRenderer("phone-devices-changed", scannedPhoneDevices);
     return scannedPhoneDevices;
   },
@@ -12368,6 +12382,8 @@ ipcMain.handle(
     if (platform !== "ios" && platform !== "android") return null;
     const connected = await phoneManager.connect(deviceId, platform);
     scannedPhoneDevices = await phoneManager.listDevices();
+    invalidateSourceList();
+    sendToRenderer("phone-devices-changed", scannedPhoneDevices);
     if (connected.status === "ready" && connected.rootPath) {
       void phoneManager.backupDevice(connected);
       void indexNewSources([connected.rootPath], "phone-connected");
@@ -12385,6 +12401,8 @@ ipcMain.handle(
     scannedPhoneDevices = scannedPhoneDevices.filter(
       (device) => device.id !== deviceId || device.platform !== platform,
     );
+    invalidateSourceList();
+    sendToRenderer("phone-devices-changed", scannedPhoneDevices);
   },
 );
 

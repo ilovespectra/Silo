@@ -6,38 +6,13 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const packageJson = require('../package.json');
+const { parseSemver, compareVersions, bumpPatchVersion } = require('./release-version.cjs');
 
 const projectRoot = path.resolve(__dirname, '..');
 const repository = 'ilovespectra/Silo';
 const workflow = 'windows-exe.yml';
 const branch = 'main';
 const product = packageJson.build.productName;
-
-function parseSemver(value) {
-  if (typeof value !== 'string') return null;
-  const cleaned = value.trim().replace(/^v/i, '').replace(/[-_ ].*$/, '');
-  const match = /^([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:\.(?:[0-9]+))*$/.exec(cleaned);
-  if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3] ?? '0')];
-}
-
-function compareVersions(left, right) {
-  const a = parseSemver(left);
-  const b = parseSemver(right);
-  if (!a || !b) return 0;
-  for (let index = 0; index < 3; index += 1) {
-    if (a[index] === b[index]) continue;
-    return a[index] > b[index] ? 1 : -1;
-  }
-  return 0;
-}
-
-function bumpPatchVersion(value) {
-  const parsed = parseSemver(value);
-  if (!parsed) return value;
-  const [major, minor, patch] = parsed;
-  return `${major}.${minor}.${patch + 1}`;
-}
 
 function findLatestVersionInFolder(folder) {
   if (!folder || !fs.existsSync(folder)) return null;
@@ -76,7 +51,8 @@ const defaultDestinationFor = (value) => (explicitDestination
   : path.join(os.homedir(), 'Downloads', `SILO ${value} TEST`));
 
 // The release version always comes from package.json. When that version was
-// already packaged (in the destination) or published, bump the patch and
+// already packaged (in the destination) or published, increment (patch 9 rolls
+// into the next minor version) and
 // commit/push the bump so the Mac builds and Windows CI use the same version.
 function resolveReleaseVersion() {
   const current = packageJson.version;
