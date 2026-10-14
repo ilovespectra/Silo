@@ -8285,7 +8285,7 @@ function App() {
           <span className="app-footer-copyright">© 2026 Silo</span>
         </div>
         <nav aria-label="Silo links">
-          <a href="https://trysilo-seven.vercel.app/" target="_blank" rel="noreferrer">
+          <a href="https://trysilo.kolektivkrog.si/" target="_blank" rel="noreferrer">
             TrySilo <span aria-hidden="true">↗</span>
           </a>
           <a href="https://repo-six-inky-51.vercel.app/" target="_blank" rel="noreferrer">

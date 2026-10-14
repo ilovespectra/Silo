@@ -4,7 +4,7 @@ A local-first file browser built with Electron, React, and TypeScript. Browse dr
 
 ## Silo links
 
-- [Try Silo website](https://trysilo-seven.vercel.app/)
+- [Try Silo website](https://trysilo.kolektivkrog.si/)
 - [Silo Downloads](https://github.com/ilovespectra/silo-downloads/releases)
 - [Silo user guide](https://repo-six-inky-51.vercel.app/)
 - [Silo source on GitHub](https://github.com/ilovespectra/Silo)

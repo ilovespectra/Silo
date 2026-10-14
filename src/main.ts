@@ -6034,6 +6034,8 @@ async function createWindow() {
     }
     if (
       isOfficialGuideUrl ||
+      url === "https://trysilo.kolektivkrog.si" ||
+      url.startsWith("https://trysilo.kolektivkrog.si/") ||
       url === "https://repo-ilovespectras-projects.vercel.app" ||
       url.startsWith("https://repo-ilovespectras-projects.vercel.app/") ||
       url.startsWith(
