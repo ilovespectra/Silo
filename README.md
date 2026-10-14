@@ -111,6 +111,11 @@ untracked files, existing destination assets, or a local commit that does not
 match GitHub `main`. It prints SHA-256 hashes after copying. It does not publish
 a GitHub release; Mac builds remain ad-hoc signed and are not notarized.
 
+`npm run release:check` validates the compiled renderer before packaging.
+The Solana Pay check requires the payment section, QR container, and wallet
+action markers rather than matching the instructional headline, so copy changes
+do not incorrectly block a release.
+
 ## Optional CLIP-index image generator
 
 The standalone [Python generator](scripts/generate_from_silo_clip_index.py) reads

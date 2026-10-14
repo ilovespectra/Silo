@@ -42,6 +42,16 @@ function assertRequiredLicenseHandlers(electronMain) {
     throw new Error("The compiled main process is missing beta activation or payment handling.");
 }
 
+function assertSolanaPayPanel(rendererText) {
+  const requiredMarkers = [
+    "Pay with Solana Pay",
+    "lifetime-solana-qr",
+    "openLifetimePaymentLink",
+  ];
+  if (requiredMarkers.some((marker) => !rendererText.includes(marker)))
+    throw new Error("The built renderer is missing the Solana Pay QR panel or wallet action.");
+}
+
 function isPrivateKeyFileName(filePath) {
   return /(?:beta-license-private|private[-_].*key|signing[-_].*key).*\.pem$/i.test(
     filePath,
@@ -129,8 +139,7 @@ function checkRelease(projectRoot) {
     throw new Error("The built renderer must not expose beta-code paste activation.");
   if (!rendererText.includes("Send beta access request"))
     throw new Error("The built renderer is missing the beta request action.");
-  if (!rendererText.includes("Scan to pay with your Solana wallet"))
-    throw new Error("The built renderer is missing the Solana Pay QR panel.");
+  assertSolanaPayPanel(rendererText);
 
   const packagedInputs = [
     ...packagedTextFiles(path.join(projectRoot, "electron-dist")),
@@ -157,6 +166,7 @@ if (require.main === module) {
 module.exports = {
   assertNoPrivateKeyMaterial,
   assertRequiredLicenseHandlers,
+  assertSolanaPayPanel,
   containsPrivateKeyMaterial,
   isPrivateKeyFileName,
   normalizeBetaPublicKey,
