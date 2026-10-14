@@ -186,6 +186,7 @@ jobs:
           $resources = 'release/win-unpacked/resources'
           $required = @(
             $appExe,
+            "$resources/google.env",
             "$resources/clip-model-cache/Xenova/clip-vit-base-patch32/tokenizer.json",
             "$resources/clip-model-cache/Xenova/clip-vit-base-patch32/onnx/text_model_quantized.onnx",
             "$resources/clip-model-cache/Xenova/clip-vit-base-patch32/onnx/vision_model_quantized.onnx",

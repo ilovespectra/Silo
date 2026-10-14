@@ -88,6 +88,18 @@ jobs:
       - name: Package arm64 ad hoc DMG
         run: npx electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64 --publish never
 
+      - name: Verify Google sign-in config is bundled
+        shell: bash
+        run: |
+          set -euo pipefail
+          config=$(find release -path '*Silo.app/Contents/Resources/google.env' -print -quit)
+          if [ -z "$config" ]; then
+            echo "::error::google.env is missing. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET repository secrets."
+            exit 1
+          fi
+          grep -q '^GOOGLE_CLIENT_ID=.\+' "$config"
+          grep -q '^GOOGLE_CLIENT_SECRET=.\+' "$config"
+
       - name: Verify the macOS updater ZIP and manifest
         shell: bash
         run: |
@@ -249,6 +261,18 @@ jobs:
       - name: Package ad hoc arm64 DMG fallback
         if: steps.signing.outputs.mode == 'adhoc'
         run: npx electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64 --publish never
+
+      - name: Verify Google sign-in config is bundled
+        shell: bash
+        run: |
+          set -euo pipefail
+          config=$(find release -path '*Silo.app/Contents/Resources/google.env' -print -quit)
+          if [ -z "$config" ]; then
+            echo "::error::google.env is missing. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET repository secrets."
+            exit 1
+          fi
+          grep -q '^GOOGLE_CLIENT_ID=.\+' "$config"
+          grep -q '^GOOGLE_CLIENT_SECRET=.\+' "$config"
 
       - name: Verify the macOS updater ZIP and manifest
         shell: bash
