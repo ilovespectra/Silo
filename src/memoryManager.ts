@@ -26,6 +26,8 @@ export interface MemoryAudioFile {
  */
 export interface MemoryManagerDependencies {
   search(query: string): Promise<MemoryMedia[]>;
+  /** True when a story's movie is finished, so it can leave the editable set for the Memory Book. */
+  hasMovie?(card: MemorySuggestion): Promise<boolean>;
   /** Magic's ordered image filter removes shots above the duplicate-similarity threshold. */
   filterImages?(paths: string[]): Promise<string[]>;
   thumb(path: string): string | null | undefined | Promise<string | null | undefined>;
@@ -274,6 +276,15 @@ export class MemoryManager {
       if (seen.has(key)) continue;
       seen.add(key);
       result.push({ ...card, media });
+    }
+    return result;
+  }
+
+  private async unfinished(cards: MemorySuggestion[]): Promise<MemorySuggestion[]> {
+    if (!this.deps.hasMovie) return [];
+    const result: MemorySuggestion[] = [];
+    for (const card of cards) {
+      if (!await this.deps.hasMovie(card).catch(() => false)) result.push(card);
     }
     return result;
   }
@@ -596,19 +607,31 @@ export class MemoryManager {
       let visible: MemorySuggestion[];
       let nextReserve: MemorySuggestion[];
       let promoted = 0;
-      if (produced.length) {
-        // New stories go in front of the saved collection; existing memories are kept.
-        const fresh = produced.slice(0, customTopic ? 1 : NEW_PER_RUN);
-        visible = [...fresh, ...current].slice(0, MAX_CARDS);
+      if (produced.length && customTopic) {
+        // A requested topic joins the editable set without retiring anything.
+        visible = [produced[0], ...current].slice(0, MAX_CARDS);
         const placed = new Set(visible.map(card => card.id));
         nextReserve = [...produced, ...reserve].filter(card => !placed.has(card.id)).slice(0, RESERVE_CARDS);
-      } else if (!customTopic && replace && reserve.length) {
-        // Sources offline or exhausted: surface saved stories whose movies are already rendered.
-        const promote = reserve.slice(0, OFFLINE_PROMOTIONS);
-        promoted = promote.length;
-        visible = [...promote, ...current].slice(0, MAX_CARDS);
+      } else if (produced.length && !replace) {
+        // Automatic runs only top up the editable set; they never retire the user's cards.
+        visible = [...current, ...produced].slice(0, Math.max(current.length, NEW_PER_RUN));
         const placed = new Set(visible.map(card => card.id));
-        nextReserve = [...reserve, ...current].filter(card => !placed.has(card.id)).slice(0, RESERVE_CARDS);
+        nextReserve = [...produced, ...reserve].filter(card => !placed.has(card.id)).slice(0, RESERVE_CARDS);
+      } else if (produced.length || (replace && reserve.length)) {
+        // Generate retires the editable set: finished movies move to the Memory Book
+        // (the movie folder); unfinished stories wait in reserve so nothing is lost.
+        const unfinished = await this.unfinished(current);
+        let fresh: MemorySuggestion[];
+        if (produced.length) {
+          fresh = produced.slice(0, NEW_PER_RUN);
+        } else {
+          // Sources offline or exhausted: surface saved stories instead of an empty page.
+          fresh = reserve.slice(0, OFFLINE_PROMOTIONS);
+          promoted = fresh.length;
+        }
+        visible = fresh;
+        const placed = new Set(visible.map(card => card.id));
+        nextReserve = [...unfinished, ...produced, ...reserve].filter(card => !placed.has(card.id)).slice(0, RESERVE_CARDS);
       } else {
         visible = current;
         nextReserve = reserve;
@@ -628,7 +651,7 @@ export class MemoryManager {
             ? `Local search could not complete for “${customTopicTitle(customTopic)}”. Try again when indexing is ready.`
             : `Not enough distinct, strong photos matched “${customTopicTitle(customTopic)}”. Try another phrase or index more photos.`
         : produced.length
-          ? `${Math.min(produced.length, NEW_PER_RUN)} new memor${Math.min(produced.length, NEW_PER_RUN) === 1 ? "y" : "ies"} added${this.reserve.length ? `, ${this.reserve.length} saved for later` : ""}.`
+          ? `${Math.min(produced.length, NEW_PER_RUN)} new memor${Math.min(produced.length, NEW_PER_RUN) === 1 ? "y" : "ies"} ready to edit; finished ones moved to your Memory Book.`
           : promoted
             ? `Showing ${promoted} saved memor${promoted === 1 ? "y" : "ies"}; connect more sources for fresh ones.`
             : count

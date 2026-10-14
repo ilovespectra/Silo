@@ -80,14 +80,13 @@ test("defaults, five cards, lazy covers, detached state, persistent settings and
   assert.equal(f.thumbnails.length, 15, "cache read must not request previews");
   const firstIds = (await restarted.getState()).suggestions.map(card => card.id);
   const second = await restarted.generate(true);
-  assert.equal(second.suggestions.length, 10, "new memories are added; saved ones persist");
-  assert.deepEqual(second.suggestions.slice(5).map(card => card.id), firstIds, "existing memories are never overwritten");
-  assert.ok(second.suggestions.slice(0, 5).every(card => !firstIds.includes(card.id)), "new memories go first");
+  assert.equal(second.suggestions.length, 5, "Generate shows five new editable memories");
+  assert.ok(second.suggestions.every(card => !firstIds.includes(card.id)), "finished memories leave the editable set for the Memory Book");
   const third = await restarted.generate(true);
-  assert.equal(third.suggestions.length, 15);
-  assert.equal(new Set(third.suggestions.map(card => card.title)).size, 15, "distinct creative themes accumulate");
+  assert.equal(third.suggestions.length, 5);
+  assert.ok(third.suggestions.every(card => !second.suggestions.some(prior => prior.id === card.id)), "each Generate brings fresh stories");
   const saved = JSON.parse(await fs.readFile(f.statePath, "utf8"));
-  assert.equal(saved.suggestions.length, 15);
+  assert.equal(saved.suggestions.length, 5);
   assert.equal(saved.settings.showOnLaunch, false);
 });
 
@@ -302,16 +301,15 @@ test("generate never hides saved cards; discovery ideas fill five cards plus a r
   // Sources disconnect: Generate promotes saved extras instead of wiping the page.
   online = false;
   const offline = await f.manager.generate(true);
-  assert.equal(offline.suggestions.length, 8);
+  assert.equal(offline.suggestions.length, 3);
   const firstIds = new Set(first.suggestions.map(card => card.id));
   assert.equal(offline.suggestions.filter(card => !firstIds.has(card.id)).length, 3, "three saved extras promoted");
-  assert.ok(first.suggestions.every(card => offline.suggestions.some(saved => saved.id === card.id)), "saved memories persist");
   assert.match(offline.message, /saved memories/);
-  // Dismissing removes only that card; a large collection is not refilled from reserve.
+  // Dismissing removes only that card and refills a small editable set from reserve.
   const reserveBefore = offline.reserveCount;
   const afterDismiss = await f.manager.dismiss(offline.suggestions[0].id);
-  assert.equal(afterDismiss.suggestions.length, 7);
-  assert.equal(afterDismiss.reserveCount, reserveBefore);
+  assert.equal(afterDismiss.suggestions.length, 3);
+  assert.equal(afterDismiss.reserveCount, reserveBefore - 1);
   const persisted = JSON.parse(await fs.readFile(f.statePath, "utf8"));
   assert.equal(persisted.reserve.length, afterDismiss.reserveCount);
   assert.equal((await new MemoryManager(f.root, f.deps).getState()).reserveCount, afterDismiss.reserveCount);
@@ -325,7 +323,7 @@ test("similarity filter failures skip a story but never wipe saved cards", async
   failing = true;
   assert.equal((await f.manager.getState()).suggestions.length, 5, "reads do not depend on the filter");
   const again = await f.manager.generate(true);
-  assert.deepEqual(again.suggestions.slice(-5).map(card => card.id), first.suggestions.map(card => card.id));
+  assert.ok(again.suggestions.length > 0, "filter failures never leave the page empty");
 });
 
 test("movie destination accepts absolute folders or null only", async t => {
@@ -348,7 +346,7 @@ test("prefer disjoint stories where possible, otherwise preserve valid overlappi
   assert.ok(state.suggestions.slice(1).every(card => card.media.every(item => !first.has(item.path))));
   f.deps.search = async () => [...common, ...photos(`small-${count++}`, 1)];
   const overlapping = await f.manager.generate(true);
-  assert.equal(overlapping.suggestions.length, 10, "do not discard all themes merely to avoid overlap");
+  assert.equal(overlapping.suggestions.length, 5, "do not discard all themes merely to avoid overlap");
   assert.ok(overlapping.suggestions.slice(0, 5).every(card => card.media.length === 5));
 });
 
@@ -535,4 +533,20 @@ test("dismissal during asynchronous safety checks cannot leak a dismissed card",
   await f.manager.dismiss(card.id);
   release.resolve();
   assert.ok((await pendingState).suggestions.every(item => item.id !== card.id));
+});
+
+test("Generate retires finished movies to the Memory Book, keeps unfinished stories, and automatic runs never retire", async t => {
+  const finished = new Set();
+  const f = await fixture(t, { hasMovie: async card => finished.has(card.id) });
+  const first = await f.manager.generate();
+  assert.equal(first.suggestions.length, 5);
+  const auto = await f.manager.generate(false);
+  assert.deepEqual(auto.suggestions.map(card => card.id), first.suggestions.map(card => card.id), "automatic runs keep the editable set");
+  first.suggestions.slice(0, 4).forEach(card => finished.add(card.id));
+  const next = await f.manager.generate(true);
+  assert.equal(next.suggestions.length, 5);
+  assert.ok(next.suggestions.every(card => !first.suggestions.some(prior => prior.id === card.id)));
+  const unfinished = first.suggestions[4].id;
+  assert.ok(await f.manager.getSuggestion(unfinished), "a story without a finished movie waits in reserve");
+  for (const card of first.suggestions.slice(0, 4)) assert.equal(await f.manager.getSuggestion(card.id), undefined);
 });

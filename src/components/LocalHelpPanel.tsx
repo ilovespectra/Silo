@@ -295,7 +295,7 @@ const HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Memory story and export controls",
     keywords: "memories stories mood frame duration soundtrack music export download suggestion clear refresh",
     answer:
-      "Refresh updates the current cards; Generate or Find new memories searches the indexed archive when you choose. On a story, review its photos, mood, duration, and soundtrack, then choose Save memory to make an MP4 copy at a location you choose. Saved cards stay in your collection; Every memory stays in a three-column collection; new runs add cards rather than replacing them. Remove suggestion removes a card only, while original media is kept.",
+      "Refresh updates the current cards; Generate or Find new memories searches the indexed archive when you choose. On a story, review its photos, mood, duration, and soundtrack, then choose Save memory to make an MP4 copy at a location you choose. Saved cards stay in your collection; The newest five memories stay editable; Generate moves finished ones into the Memory Book below, which lists every movie in your memories folder. Remove suggestion removes a card only, while original media is kept.",
     section: "memories",
     target: '[data-tour="memory-controls"]',
     fallbackTarget: '[data-tour="memories-overview"]',

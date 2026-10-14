@@ -626,14 +626,14 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   };
   const busy = !ready || loading || Boolean(action) || Boolean(exporting);
   const memoryGenerationDisabled = busy || demoMode || state?.generating;
-  const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new memory stories from your indexed photos and clips. Silo also does this after startup indexing and every 24 hours.";
+  const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new editable memories. Finished ones move to your Memory Book below.";
   return <section className="memories-page" aria-label="Memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
       <div><span className="memories-eyebrow">silo / little time capsules</span><h1>Your life, in motion<span>.</span></h1>
         <p>Small stories from your library. Made by you, kept by you.</p></div>
       <div className="memories-header-actions">
         <span className="memories-button-wrap" title={generateMemoriesTitle}>
-          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Create 5 new memory stories from your indexed photos and clips. Silo also does this after startup indexing and every 24 hours."><FiFilm />{action === "Finding memories" ? "Finding memories…" : state?.suggestions.length ? "Find new memories" : "Generate memories"}</button>
+          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Create 5 new editable memories. Finished ones move to your Memory Book below."><FiFilm />{action === "Finding memories" ? "Finding memories…" : state?.suggestions.length ? "Find new memories" : "Generate memories"}</button>
         </span>
       </div>
     </header>
@@ -651,7 +651,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
       <small>{state.generationProgress.etaSeconds !== undefined ? `About ${formatEta(state.generationProgress.etaSeconds)} left` : "Estimating time…"}</small>
     </div>}
     {state?.generating && <p className="memories-hint">This uses photos and clips already indexed. Anything indexed later will be available the next time you generate.</p>}
-    {Boolean(state?.suggestions.length || savedMovies.length) && <p className="memories-collection-label">{(state?.suggestions.length ?? 0) + savedMovies.length} stories to rediscover <span>New memories are added to this collection.</span></p>}
+    {Boolean(state?.suggestions.length) && <p className="memories-collection-label">{state?.suggestions.length} {state?.suggestions.length === 1 ? "memory" : "memories"} to edit <span>Generating again moves finished ones to your Memory Book below.</span></p>}
     <div className="memories-grid" data-tour="memory-controls" data-help="Each story card lets you preview and save its movie, remove only the suggestion, tune photos, duration and soundtrack, and choose where the saved copy goes.">
       {(action === "Finding memories" || state?.generating) && Array.from({ length: 5 }, (_, index) => <article key={`pending-${index}`} className="memories-card memories-card-pending" aria-busy="true" aria-label="Memory being created">
         <div className="memories-cover-placeholder"><FiFilm /><span>{index === 0 ? state?.generationProgress?.label || "Finding a story…" : "Waiting for a story…"}</span></div>
@@ -662,8 +662,13 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
         onDismiss={() => { void run("Removing suggestion", () => api.dismissMemory(memory.id)); }}
         onExport={(selected, options) => setExporting((current) => current || { memory: selected, options })}
         onToast={setToast} />)}
-      {savedMovies.map((movie) => <SavedMovieCard key={movie.path} api={api} movie={movie} onToast={setToast} />)}
     </div>
+    {savedMovies.length > 0 && <section className="memories-book" aria-label="Memory Book">
+      <header className="memories-book-header"><h2>Memory Book</h2><span>{savedMovies.length} finished {savedMovies.length === 1 ? "memory" : "memories"} · saved in your memories folder</span></header>
+      <div className="memories-grid">
+        {savedMovies.map((movie) => <SavedMovieCard key={movie.path} api={api} movie={movie} onToast={setToast} />)}
+      </div>
+    </section>}
     {toast && <p className="memories-toast" role="status" aria-live="assertive">{toast}</p>}
     {ready && !loading && !state?.suggestions.length && !savedMovies.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>
       <h2>A little nostalgia goes a long way.</h2><p>Find themed stories in your indexed photos and clips, then choose the mood, frame and length of your movie.</p>

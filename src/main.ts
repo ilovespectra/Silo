@@ -7533,6 +7533,7 @@ app.whenReady().then(async () => {
   scheduleThumbnailPregeneration();
   memoryManager = new MemoryManager(app.getPath("userData"), {
     search: searchMemoryMedia,
+    hasMovie: async (card) => Boolean(await findMemoryMovie(card)),
     filterImages: filterMemoryPhotos,
     thumb: async (filePath) => getThumbnail(await resolveLocalPath(filePath), false, 200),
     listAudio: () => audioLibraryCache?.getSnapshot().files ?? [],
@@ -8087,9 +8088,9 @@ const AUTO_MEMORY_POLL_MS = 60 * 1000;
 let lastAutoMemoryRunAt = 0;
 let autoMemoryTimer: NodeJS.Timeout | null = null;
 
-/** Runs the memory generator (5 fresh cards) and pushes the new state to the page. */
+/** Tops up the editable memories (never retires them) and pushes the new state to the page. */
 async function runMemoryGenerator(reason: string) {
-  const state = await memoryManager.generate(true);
+  const state = await memoryManager.generate(false);
   runtimeLog("memory-generate", { reason, count: state.suggestions.length });
   if (state.suggestions.length)
     void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
@@ -8292,22 +8293,33 @@ async function memoryMovieDirectories(): Promise<string[]> {
   return Array.from(new Set([await memoryMovieDirectory(), MEMORY_DEFAULT_MOVIE_DIRECTORY()]));
 }
 
+/** The id fragment embedded in a movie name; every render of one story shares it. */
+function memoryMovieStoryKey(name: string): string | null {
+  return /-([a-z0-9]{1,6})-[a-f0-9]{4}\.mp4$/i.exec(name)?.[1].toLowerCase() ?? null;
+}
+
 ipcMain.handle("list-saved-memory-movies", async () => {
   const state = await memoryManager.getState();
   const cards = [...state.suggestions, ...await memoryManager.getReserve()];
   await rememberMemoryMovieTitles(cards).catch(() => undefined);
-  const cardFiles = new Set(state.suggestions.map(memoryPreviewFileName));
+  // Editable stories are shown as cards above; any render of them stays out of the book.
+  const editableKeys = new Set(state.suggestions.map((card) => memoryMovieStoryKey(memoryPreviewFileName(card))).filter(Boolean));
   const titles = await readMemoryMovieTitles();
   const movies = new Map<string, { path: string; title: string; modified: number; size: number }>();
   for (const directory of await memoryMovieDirectories()) {
     const names = await fsPromises.readdir(directory).catch(() => [] as string[]);
     for (const name of names) {
-      // Cards already show their own movie; hidden and in-progress files are skipped.
-      if (!/\.mp4$/i.test(name) || name.startsWith(".") || cardFiles.has(name) || movies.has(name)) continue;
+      if (!/\.mp4$/i.test(name) || name.startsWith(".")) continue;
+      const storyKey = memoryMovieStoryKey(name);
+      if (storyKey && editableKeys.has(storyKey)) continue;
       const moviePath = path.join(directory, name);
       const stat = await fsPromises.stat(moviePath).catch(() => null);
       if (!stat?.isFile() || stat.size === 0) continue;
-      movies.set(name, { path: moviePath, title: titles[name] || titleFromMemoryMovieName(name), modified: stat.mtimeMs, size: stat.size });
+      // One entry per story: the newest render wins.
+      const key = storyKey ? `story:${storyKey}` : `file:${name}`;
+      const existing = movies.get(key);
+      if (existing && existing.modified >= stat.mtimeMs) continue;
+      movies.set(key, { path: moviePath, title: titles[name] || titleFromMemoryMovieName(name), modified: stat.mtimeMs, size: stat.size });
     }
   }
   return Array.from(movies.values()).sort((a, b) => b.modified - a.modified);
