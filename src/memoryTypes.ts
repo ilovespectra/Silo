@@ -146,6 +146,8 @@ export interface SavedMemoryMovie {
   title: string;
   modified: number;
   size: number;
+  /** A story retired by Generate whose movie is still being prepared; `path` is empty until it is. */
+  pending?: MemorySuggestion;
 }
 
 export interface MemoriesAPI {

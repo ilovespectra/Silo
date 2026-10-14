@@ -170,9 +170,10 @@
 @media (prefers-reduced-motion: reduce) {
   .memories-page *, .memories-modal * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
-.memories-preparing { position: absolute; z-index: 4; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; background: #100b09b8; color: var(--memories-text); font-size: 12px; text-align: center; padding: 12px; }
+.memories-preparing { position: absolute; z-index: 4; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; background: linear-gradient(180deg, #100b0933 0%, #100b0999 100%); color: var(--memories-text); font-size: 12px; text-align: center; padding: 12px; text-shadow: 0 1px 3px #000c; }
 .memories-preparing strong { font-size: 13px; font-weight: 600; }
 .memories-preparing small { color: var(--memories-muted); }
+.memories-book-pending .memories-cover-button { position: relative; display: block; cursor: progress; }
 .memories-spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid #ffffff2a; border-top-color: var(--memories-orange); animation: memories-spin 0.9s linear infinite; }
 .memories-preparing-bar { width: min(160px, 70%); height: 4px; border-radius: 4px; background: #ffffff22; overflow: hidden; }
 .memories-preparing-bar > span { display: block; height: 100%; background: var(--memories-orange); transition: width 0.3s ease; }

@@ -535,6 +535,21 @@ function SavedMovieDialog({ movie, onClose }: { movie: SavedMemoryMovie; onClose
   </MemoriesDialog>;
 }
 
+/** A story moving into the Memory Book: its thumbnails stay visible while its movie is prepared. */
+function PendingBookCard({ memory, preview }: { memory: MemorySuggestion; preview?: MemoryPreviewStatus }) {
+  return <article className="memories-card memories-saved-movie memories-book-pending" aria-busy={preview?.status !== "failed"}>
+    <div className="memories-cover-button" role="group" aria-label={`Preparing memory: ${memory.title}`}>
+      <MemoryCover memory={memory} />
+      <PreparingOverlay preview={preview ?? { status: "queued" }} />
+    </div>
+    <div className="memories-card-body">
+      <div className="memories-card-heading"><div className="memories-card-badges"><span className="memories-saved-label"><FiFilm aria-hidden="true" />Moving to Memory Book</span></div></div>
+      <h2>{memory.title}</h2>
+      <div className="memories-meta"><span><FiImage />{memory.media.length} {memory.media.length === 1 ? "item" : "items"}</span></div>
+    </div>
+  </article>;
+}
+
 /** A finished movie from the memories folder whose story card is no longer kept. */
 function SavedMovieCard({ api, movie, onToast }: { api: MemoriesAPI; movie: SavedMemoryMovie; onToast: (message: string) => void }) {
   const [viewing, setViewing] = useState(false);
@@ -564,6 +579,8 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   const [state, setState] = useState<MemoryState | null>(null);
   const [demoMode, setDemoMode] = useState(false);
   const [savedMovies, setSavedMovies] = useState<SavedMemoryMovie[]>([]);
+  // Cards the user just retired with Generate; shown in the Memory Book until the backend lists them.
+  const [retiring, setRetiring] = useState<MemorySuggestion[]>([]);
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState("");
   const [error, setError] = useState("");
@@ -593,11 +610,16 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   const cardIds = state?.suggestions.map((memory) => memory.id).join("|") ?? "";
   const readyCount = Object.values(previews).filter((preview) => preview.status === "ready").length;
   useEffect(() => {
-    if (!ready || !api.listSavedMemoryMovies) return;
+    if (!ready || !api.listSavedMemoryMovies) { if (action !== "Finding memories") setRetiring((current) => current.length ? [] : current); return; }
     let disposed = false;
-    void api.listSavedMemoryMovies().then((movies) => { if (!disposed && Array.isArray(movies)) setSavedMovies(movies); }).catch(() => undefined);
+    const settled = action !== "Finding memories";
+    void api.listSavedMemoryMovies().then((movies) => {
+      if (disposed || !Array.isArray(movies)) return;
+      setSavedMovies(movies);
+      if (settled) setRetiring([]);
+    }).catch(() => { if (!disposed && settled) setRetiring([]); });
     return () => { disposed = true; };
-  }, [api, ready, cardIds, readyCount]);
+  }, [api, ready, cardIds, readyCount, action]);
   const renderingTitle = state?.suggestions.find((memory) => previews[memory.id]?.status === "rendering")?.title;
   const blockedView = (memory: MemorySuggestion) => setToast(previews[memory.id]?.status === "failed"
     ? `“${memory.title}” could not be prepared because some of its files are offline. Reconnect them and it will be prepared next time.`
@@ -659,7 +681,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
         <p>Small stories from your library. Made by you, kept by you.</p></div>
       <div className="memories-header-actions">
         <span className="memories-button-wrap" title={generateMemoriesTitle}>
-          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Create 5 new editable memories. Finished ones move to your Memory Book below."><FiFilm />{action === "Finding memories" ? "Generating Memories…" : "Generate Memories"}</button>
+          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { setRetiring(state?.suggestions ?? []); void run("Finding memories", () => api.generateMemories(true)); }} data-help="Create 5 new editable memories. Finished ones move to your Memory Book below."><FiFilm />{action === "Finding memories" ? "Generating Memories…" : "Generate Memories"}</button>
         </span>
       </div>
     </header>
@@ -688,12 +710,21 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
         <div className="memories-card-pending-body"><span /><span /></div>
       </article>)}
     </div>
-    {savedMovies.length > 0 && <section className="memories-book" aria-label="Memory Book">
-      <header className="memories-book-header"><h2>Memory Book</h2><span>{savedMovies.length} finished {savedMovies.length === 1 ? "memory" : "memories"} · saved in your memories folder</span></header>
-      <div className="memories-grid">
-        {savedMovies.map((movie) => <SavedMovieCard key={movie.path} api={api} movie={movie} onToast={setToast} />)}
-      </div>
-    </section>}
+    {(savedMovies.length > 0 || retiring.length > 0) && (() => {
+      const listedPending = new Set(savedMovies.flatMap((movie) => movie.pending ? [movie.pending.id] : []));
+      const editable = new Set(finding ? [] : (state?.suggestions ?? []).map((memory) => memory.id));
+      const moving = retiring.filter((memory) => !listedPending.has(memory.id) && !editable.has(memory.id));
+      const total = moving.length + savedMovies.length;
+      return <section className="memories-book" aria-label="Memory Book">
+        <header className="memories-book-header"><h2>Memory Book</h2><span>{total} {total === 1 ? "memory" : "memories"} · saved in your memories folder</span></header>
+        <div className="memories-grid">
+          {moving.map((memory) => <PendingBookCard key={`moving:${memory.id}`} memory={memory} preview={previews[memory.id]} />)}
+          {savedMovies.map((movie) => movie.pending
+            ? <PendingBookCard key={`pending:${movie.pending.id}`} memory={movie.pending} preview={previews[movie.pending.id]} />
+            : <SavedMovieCard key={movie.path} api={api} movie={movie} onToast={setToast} />)}
+        </div>
+      </section>;
+    })()}
     {toast && <p className="memories-toast" role="status" aria-live="assertive">{toast}</p>}
     {ready && !loading && !generating && !state?.suggestions.length && !savedMovies.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>
       <h2>A little nostalgia goes a long way.</h2><p>Find themed stories in your indexed photos and clips, then choose the mood, frame and length of your movie.</p>

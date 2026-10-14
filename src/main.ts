@@ -8134,8 +8134,24 @@ let lastAutoMemoryRunAt = 0;
 let autoMemoryTimer: NodeJS.Timeout | null = null;
 
 /** Tops up the editable memories (never retires them) and pushes the new state to the page. */
+/** Stories retired by Generate before their movie finished; listed in the Memory Book until it does. */
+const memoryBookPending = new Map<string, MemorySuggestion>();
+
+async function retireMemoriesToBook(before: MemorySuggestion[], after: MemorySuggestion[]) {
+  const kept = new Set(after.map((card) => card.id));
+  const retired = before.filter((card) => !kept.has(card.id));
+  if (!retired.length) return;
+  await rememberMemoryMovieTitles(retired).catch(() => undefined);
+  const unfinished: MemorySuggestion[] = [];
+  for (const card of retired) if (!await findMemoryMovie(card).catch(() => null)) unfinished.push(card);
+  for (const card of unfinished) memoryBookPending.set(card.id, card);
+  if (unfinished.length) void prepareMemoryPreviews(unfinished).catch(() => runtimeLog("memory-book-preview-error"));
+}
+
 async function runMemoryGenerator(reason: string, replace = false) {
+  const before = replace ? (await memoryManager.getState()).suggestions : [];
   const state = await memoryManager.generate(replace);
+  if (replace) await retireMemoriesToBook(before, state.suggestions).catch(() => undefined);
   runtimeLog("memory-generate", { reason, count: state.suggestions.length });
   if (state.suggestions.length)
     void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
@@ -8367,7 +8383,14 @@ ipcMain.handle("list-saved-memory-movies", async () => {
       movies.set(key, { path: moviePath, title: titles[name] || titleFromMemoryMovieName(name), modified: stat.mtimeMs, size: stat.size });
     }
   }
-  return Array.from(movies.values()).sort((a, b) => b.modified - a.modified);
+  const finished = Array.from(movies.values()).sort((a, b) => b.modified - a.modified);
+  const editableIds = new Set(state.suggestions.map((card) => card.id));
+  const pending: Array<{ path: string; title: string; modified: number; size: number; pending: MemorySuggestion }> = [];
+  for (const [id, card] of memoryBookPending) {
+    if (editableIds.has(id) || await findMemoryMovie(card).catch(() => null)) { memoryBookPending.delete(id); continue; }
+    pending.push({ path: "", title: card.title, modified: Date.now(), size: 0, pending: card });
+  }
+  return [...pending, ...finished];
 });
 
 ipcMain.handle("reveal-saved-memory-movie", async (_event, moviePath: unknown) => {
