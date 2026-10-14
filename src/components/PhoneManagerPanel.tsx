@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { FiEdit3, FiFolder, FiLink, FiLock, FiRefreshCw, FiSmartphone, FiX } from "react-icons/fi";
 
 interface PhoneManagerPanelProps {
@@ -27,7 +27,8 @@ interface PhoneManagementPanelProps {
   onConnect: (device: PhoneDevice) => void;
   onDisconnect: (device: PhoneDevice) => void;
   onRename: (device: PhoneDevice) => void;
-  onRenewBackup: (device: PhoneDevice) => void;
+  onRenewBackup: (device: PhoneDevice, includeTypes?: PhoneBackupFileType[]) => void;
+  onPreviewBackup: (device: PhoneDevice) => Promise<PhoneBackupPreview>;
   onChooseBackupDestination: () => void;
   onResetBackupDestination: () => void;
   onCreateRestoreArchive: (
@@ -435,6 +436,120 @@ function PhoneManagerPanel({
   );
 }
 
+const BACKUP_TYPE_LABELS: Array<{ type: PhoneBackupFileType; label: string }> = [
+  { type: "image", label: "Photos" },
+  { type: "video", label: "Videos" },
+  { type: "audio", label: "Audio" },
+  { type: "document", label: "Documents" },
+  { type: "other", label: "Other files" },
+];
+
+function PhoneBackupTypePicker({
+  device,
+  formatFileSize,
+  onPreviewBackup,
+  selected,
+  onSelectedChange,
+  onReady,
+}: {
+  device: PhoneDevice;
+  formatFileSize: (bytes: number) => string;
+  onPreviewBackup: (device: PhoneDevice) => Promise<PhoneBackupPreview>;
+  selected: PhoneBackupFileType[] | null;
+  onSelectedChange: (types: PhoneBackupFileType[]) => void;
+  onReady: (ready: boolean) => void;
+}) {
+  const [preview, setPreview] = useState<PhoneBackupPreview | null>(null);
+  const [error, setError] = useState("");
+  const [found, setFound] = useState<{ files: number; bytes: number }>({ files: 0, bytes: 0 });
+
+  useEffect(() => {
+    let active = true;
+    onReady(false);
+    const unsubscribe = window.electron?.onPhoneScanProgress?.((progress) => {
+      if (!active || progress.deviceId !== device.id || progress.platform !== device.platform) return;
+      setFound({ files: progress.filesFound, bytes: progress.bytesFound });
+    });
+    onPreviewBackup(device)
+      .then((result) => {
+        if (!active) return;
+        setPreview(result);
+        if (!selected) onSelectedChange(result.selectedTypes);
+      })
+      .catch((reason) => {
+        if (!active) return;
+        console.error("[PhoneBackup] Preview scan failed:", reason);
+        setError(reason instanceof Error ? reason.message : "Silo could not scan this device.");
+      })
+      .finally(() => {
+        if (active) onReady(true);
+      });
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+    // Scan once per opened dialog.
+  }, [device.id, device.platform]);
+
+  if (error) {
+    return (
+      <p className="phone-backup-types-error" role="alert">
+        {error} You can still back up with the previous file-type choices.
+      </p>
+    );
+  }
+  if (!preview) {
+    return (
+      <div className="phone-backup-types-loading" role="status" aria-live="polite">
+        <span className="phone-backup-spinner" aria-hidden="true" />
+        <span>
+          Scanning {device.name}…{" "}
+          {found.files > 0 &&
+            `${found.files.toLocaleString()} files · ${formatFileSize(found.bytes)}`}
+        </span>
+      </div>
+    );
+  }
+  const chosen = new Set(selected ?? preview.selectedTypes);
+  const selectedFiles = BACKUP_TYPE_LABELS.reduce(
+    (sum, { type }) => sum + (chosen.has(type) ? preview.types[type].count : 0),
+    0,
+  );
+  const selectedBytes = BACKUP_TYPE_LABELS.reduce(
+    (sum, { type }) => sum + (chosen.has(type) ? preview.types[type].bytes : 0),
+    0,
+  );
+  return (
+    <fieldset className="phone-backup-types">
+      <legend className="phone-backup-dialog-label">What to back up</legend>
+      {BACKUP_TYPE_LABELS.map(({ type, label }) => {
+        const bucket = preview.types[type];
+        return (
+          <label key={type} className={bucket.count === 0 ? "empty" : ""}>
+            <input
+              type="checkbox"
+              checked={chosen.has(type)}
+              onChange={(event) => {
+                const next = new Set(chosen);
+                if (event.target.checked) next.add(type);
+                else next.delete(type);
+                onSelectedChange(BACKUP_TYPE_LABELS.map((entry) => entry.type).filter((entry) => next.has(entry)));
+              }}
+            />
+            <span>{label}</span>
+            <small>{bucket.count.toLocaleString()} files</small>
+            <strong>{formatFileSize(bucket.bytes)}</strong>
+          </label>
+        );
+      })}
+      <p className="phone-backup-types-total">
+        {selectedFiles.toLocaleString()} of {preview.totalFiles.toLocaleString()} files ·{" "}
+        {formatFileSize(selectedBytes)}
+      </p>
+    </fieldset>
+  );
+}
+
 export function PhoneManagementPanel({
   devices,
   tooling,
@@ -449,6 +564,7 @@ export function PhoneManagementPanel({
   onDisconnect,
   onRename,
   onRenewBackup,
+  onPreviewBackup,
   onChooseBackupDestination,
   onResetBackupDestination,
   onCreateRestoreArchive,
@@ -457,12 +573,20 @@ export function PhoneManagementPanel({
   const [backupRequest, setBackupRequest] = useState<
     { device: PhoneDevice; mode: "connect" | "renew" } | null
   >(null);
+  const [backupTypes, setBackupTypes] = useState<PhoneBackupFileType[] | null>(null);
+  const [previewReady, setPreviewReady] = useState(false);
+  const openBackupRequest = (device: PhoneDevice, mode: "connect" | "renew") => {
+    setBackupTypes(null);
+    setPreviewReady(false);
+    setBackupRequest({ device, mode });
+  };
   const startBackup = () => {
     if (!backupRequest) return;
     const { device, mode } = backupRequest;
+    if (mode === "renew" && backupTypes && backupTypes.length === 0) return;
     setBackupRequest(null);
     if (mode === "connect") onConnect(device);
-    else onRenewBackup(device);
+    else onRenewBackup(device, backupTypes ?? undefined);
   };
   return (
     <section className="phone-management-panel" aria-label="Mobile manager" data-tour="mobile-devices">
@@ -478,10 +602,10 @@ export function PhoneManagementPanel({
                 restoreArchives={restoreArchives}
                 tooling={tooling}
                 onBrowse={onBrowse}
-                onConnect={(target) => setBackupRequest({ device: target, mode: "connect" })}
+                onConnect={(target) => openBackupRequest(target, "connect")}
                 onDisconnect={onDisconnect}
                 onRename={onRename}
-                onRenewBackup={(target) => setBackupRequest({ device: target, mode: "renew" })}
+                onRenewBackup={(target) => openBackupRequest(target, "renew")}
                 onCreateRestoreArchive={onCreateRestoreArchive}
                 onRestoreFromArchive={onRestoreFromArchive}
               />
@@ -558,14 +682,32 @@ export function PhoneManagementPanel({
                 </button>
               )}
             </div>
+            {backupRequest.mode === "renew" && (
+              <PhoneBackupTypePicker
+                device={backupRequest.device}
+                formatFileSize={formatFileSize}
+                onPreviewBackup={onPreviewBackup}
+                selected={backupTypes}
+                onSelectedChange={setBackupTypes}
+                onReady={setPreviewReady}
+              />
+            )}
             <p className="phone-source-help">
-              Browse the saved copy later in <strong>Files → Sources</strong>.
+              The saved copy appears in <strong>Files → Sources</strong> and stays there while this destination is connected.
             </p>
             <div className="dialog-actions">
               <button type="button" onClick={() => setBackupRequest(null)}>
                 Cancel
               </button>
-              <button type="submit" className="primary" autoFocus>
+              <button
+                type="submit"
+                className="primary"
+                autoFocus
+                disabled={
+                  backupRequest.mode === "renew" &&
+                  (!previewReady || (backupTypes !== null && backupTypes.length === 0))
+                }
+              >
                 Back up now
               </button>
             </div>

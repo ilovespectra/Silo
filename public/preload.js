@@ -73,7 +73,7 @@ contextBridge.exposeInMainWorld("electron", {
     return () =>
       ipcRenderer.removeListener("audio-library-cache-changed", listener);
   },
-  selectDirectory: () => ipcRenderer.invoke("select-directory"),
+  selectDirectory: (options) => ipcRenderer.invoke("select-directory", options),
   readInventoryPage: (token, offset) =>
     ipcRenderer.invoke("read-inventory-page", token, offset),
   releaseInventory: (token) => ipcRenderer.invoke("release-inventory", token),
@@ -422,8 +422,15 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("reject-name-file", name, filePath),
   getPhoneTooling: () => ipcRenderer.invoke("get-phone-tooling"),
   getPhoneBackupStates: () => ipcRenderer.invoke("get-phone-backup-states"),
-  renewPhoneBackup: (deviceId, platform) =>
-    ipcRenderer.invoke("renew-phone-backup", deviceId, platform),
+  renewPhoneBackup: (deviceId, platform, includeTypes) =>
+    ipcRenderer.invoke("renew-phone-backup", deviceId, platform, includeTypes),
+  previewPhoneBackup: (deviceId, platform) =>
+    ipcRenderer.invoke("preview-phone-backup", deviceId, platform),
+  onPhoneScanProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("phone-scan-progress", listener);
+    return () => ipcRenderer.removeListener("phone-scan-progress", listener);
+  },
   getPhoneRestoreArchives: () =>
     ipcRenderer.invoke("get-phone-restore-archives"),
   createPhoneRestoreArchive: (deviceId, platform, password) =>
@@ -539,8 +546,8 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("set-contact-name", phoneNumber, savedName),
   getContactName: (phoneNumber) =>
     ipcRenderer.invoke("get-contact-name", phoneNumber),
-  selectBackupDestination: () =>
-    ipcRenderer.invoke("select-backup-destination"),
+  selectBackupDestination: (current) =>
+    ipcRenderer.invoke("select-backup-destination", current),
   getIndexStorageRoot: () => ipcRenderer.invoke("get-index-storage-root"),
   getIndexStorageStatus: () => ipcRenderer.invoke("get-index-storage-status"),
   getLocalIndexFallbackEnabled: () =>

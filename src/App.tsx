@@ -2251,14 +2251,17 @@ function App() {
 
   const selectDirectory = useCallback(async () => {
     if (!electronAPI) return;
-    const directoryPath = await electronAPI.selectDirectory();
+    const directoryPath = await electronAPI.selectDirectory({
+      title: "Open folder",
+      defaultPath: currentPath || null,
+    });
     if (!directoryPath) return;
     setCurrentPath(directoryPath);
     setNavigationHistory([{ type: "path", value: directoryPath }]);
     setHistoryIndex(0);
     setActiveDigitalFolderId(null);
     await loadDirectory(directoryPath);
-  }, [electronAPI, loadDirectory]);
+  }, [currentPath, electronAPI, loadDirectory]);
 
   const scanForPhones = useCallback(async () => {
     if (!electronAPI) return;
@@ -2330,15 +2333,24 @@ function App() {
     [browsePhone, electronAPI],
   );
 
+  const previewPhoneBackup = useCallback(
+    async (device: PhoneDevice): Promise<PhoneBackupPreview> => {
+      if (!electronAPI) throw new Error("Phone backup is unavailable.");
+      return electronAPI.previewPhoneBackup(device.id, device.platform);
+    },
+    [electronAPI],
+  );
+
   const renewPhoneBackup = useCallback(
-    async (device: PhoneDevice) => {
+    async (device: PhoneDevice, includeTypes?: PhoneBackupFileType[]) => {
       if (!electronAPI) return;
       setPhoneBusyId(device.id);
-      setPhoneNotice(`Renewing ${device.name}’s browseable backup…`);
+      setPhoneNotice(`Backing up ${device.name}…`);
       try {
         const progress = await electronAPI.renewPhoneBackup(
           device.id,
           device.platform,
+          includeTypes,
         );
         setPhoneNotice(
           progress.status === "error"
@@ -2410,11 +2422,14 @@ function App() {
 
   const choosePhoneBackupDestination = useCallback(async () => {
     if (!electronAPI) return;
-    const path = await electronAPI.selectDirectory();
+    const path = await electronAPI.selectDirectory({
+      title: "Back up phones to…",
+      defaultPath: phoneBackupDestination,
+    });
     if (!path) return;
     await electronAPI.setPhoneBackupDestination(path);
     setPhoneBackupDestination(path);
-  }, [electronAPI]);
+  }, [electronAPI, phoneBackupDestination]);
 
   const resetPhoneBackupDestination = useCallback(async () => {
     if (!electronAPI) return;
@@ -7081,6 +7096,7 @@ function App() {
             onDisconnect={disconnectPhone}
             onRename={renamePhone}
             onRenewBackup={renewPhoneBackup}
+            onPreviewBackup={previewPhoneBackup}
             onChooseBackupDestination={() =>
               void choosePhoneBackupDestination()
             }

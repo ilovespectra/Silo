@@ -151,6 +151,25 @@ interface PhoneBackupProgress {
   lastBackupAt: number | null;
 }
 
+type PhoneBackupFileType = "image" | "video" | "audio" | "document" | "other";
+
+interface PhoneBackupPreview {
+  deviceId: string;
+  platform: PhonePlatform;
+  totalFiles: number;
+  totalBytes: number;
+  types: Record<PhoneBackupFileType, { count: number; bytes: number }>;
+  selectedTypes: PhoneBackupFileType[];
+}
+
+interface PhoneScanProgress {
+  deviceId: string;
+  platform: PhonePlatform;
+  filesFound: number;
+  bytesFound: number;
+  done: boolean;
+}
+
 interface PhoneRestoreArchive {
   id: string;
   deviceId: string;
@@ -826,7 +845,10 @@ interface Window {
       offset: number,
     ): Promise<{ items: FileInfo[]; nextOffset: number; done: boolean }>;
     releaseInventory(token: string): Promise<void>;
-    selectDirectory(): Promise<{ path: string; isTimeMachine: boolean } | null>;
+    selectDirectory(options?: {
+      title?: string;
+      defaultPath?: string | null;
+    }): Promise<{ path: string; isTimeMachine: boolean } | null>;
     getFiles(
       dirPath: string,
       exploded: boolean,
@@ -1317,7 +1339,15 @@ interface Window {
     renewPhoneBackup(
       deviceId: string,
       platform: PhonePlatform,
+      includeTypes?: PhoneBackupFileType[],
     ): Promise<PhoneBackupProgress>;
+    previewPhoneBackup(
+      deviceId: string,
+      platform: PhonePlatform,
+    ): Promise<PhoneBackupPreview>;
+    onPhoneScanProgress(
+      callback: (progress: PhoneScanProgress) => void,
+    ): () => void;
     disconnectPhone(deviceId: string, platform: PhonePlatform): Promise<void>;
     getMessageThreads(
       deviceId: string,
@@ -1354,7 +1384,7 @@ interface Window {
       savedName: string | null,
     ): Promise<{ ok: boolean; error?: string }>;
     getContactName(phoneNumber: string): Promise<string | null>;
-    selectBackupDestination(): Promise<string | null>;
+    selectBackupDestination(current?: string | null): Promise<string | null>;
     getGoogleState(): Promise<GoogleAccountsState>;
     googleAddAccount(): Promise<GoogleAccountsState>;
     googleRemoveAccount(accountId: string): Promise<GoogleAccountsState>;

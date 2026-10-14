@@ -401,7 +401,7 @@ export const MessageExportPanel: React.FC = () => {
   };
 
   const chooseDestination = async () => {
-    const selected = await electronAPI?.selectBackupDestination();
+    const selected = await electronAPI?.selectBackupDestination(outputDir);
     if (selected) setOutputDir(selected);
   };
 

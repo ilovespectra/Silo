@@ -4696,6 +4696,17 @@ async function buildSourceList(): Promise<BrowseSource[]> {
     });
   }
 
+  // Latest saved snapshot per phone stays browseable while its backup drive is reachable.
+  const latestPhoneBackups = new Map<string, Awaited<ReturnType<typeof phoneManager.getOfflineBackups>>[number]>();
+  for (const backup of await phoneManager.getOfflineBackups().catch((error) => {
+    console.error("[Sources] Could not list saved phone backups:", error);
+    return [];
+  })) {
+    const key = `${backup.platform}:${backup.id}`;
+    const current = latestPhoneBackups.get(key);
+    if (!current || backup.snapshotAt > current.snapshotAt) latestPhoneBackups.set(key, backup);
+  }
+
   for (const device of scannedPhoneDevices) {
     const id = device.rootPath || `${device.platform}:${device.id}`;
     const isReady = device.status === "ready" && Boolean(device.rootPath);
@@ -4703,6 +4714,7 @@ async function buildSourceList(): Promise<BrowseSource[]> {
     const explicitPhoneChoice = explicitPhoneChoiceByDevice.get(deviceKey);
     const cloned = cloneStatus[id];
     const backupState = phoneManager.getBackupStates().find((state) => state.deviceId === device.id && state.platform === device.platform);
+    const savedBackup = latestPhoneBackups.get(deviceKey);
     sources.push({
       id,
       kind: device.platform,
@@ -4712,10 +4724,39 @@ async function buildSourceList(): Promise<BrowseSource[]> {
       enabled:
         !disabled.has(id) &&
         isReady &&
-        (explicitPhoneChoice ? explicitPhoneChoice === id : true),
+        (explicitPhoneChoice
+          ? explicitPhoneChoice === id
+          : !savedBackup || disabled.has(savedBackup.rootPath)),
       available: isReady,
       message: device.status === "ready" ? "" : device.message,
       ...(backupState?.lastBackupAt ? { snapshotAt: backupState.lastBackupAt } : {}),
+      ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
+    });
+  }
+
+  for (const [deviceKey, backup] of latestPhoneBackups) {
+    const explicitPhoneChoice = explicitPhoneChoiceByDevice.get(deviceKey);
+    const cloned = cloneStatus[backup.rootPath];
+    const savedOn = new Date(backup.snapshotAt).toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+    sources.push({
+      id: backup.rootPath,
+      kind: backup.platform,
+      label: `${backup.name} · Copy from ${savedOn}`,
+      detail: `${backup.totalFiles.toLocaleString()} files in this saved copy`,
+      rootPath: backup.rootPath,
+      enabled:
+        !disabled.has(backup.rootPath) &&
+        (explicitPhoneChoice
+          ? Boolean(phoneManager.parsePhonePath(explicitPhoneChoice)?.offlineBackup)
+          : true),
+      available: true,
+      message: "",
+      offlineBackup: true,
+      snapshotAt: backup.snapshotAt,
       ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
     });
   }
@@ -7398,8 +7439,15 @@ app.whenReady().then(async () => {
       }
       const statusChanged = phoneBackupLastStatus.get(key) !== progress.status;
       phoneBackupLastStatus.set(key, progress.status);
+      if (statusChanged && progress.status === "complete") {
+        // A finished snapshot becomes a browseable source even after the phone is unplugged.
+        sourceListCache = null;
+        sourceListCacheAt = 0;
+      }
       if (!mainWindow || mainWindow.isDestroyed()) return;
       mainWindow.webContents.send("phone-backup-progress", progress);
+      if (statusChanged && progress.status === "complete")
+        mainWindow.webContents.send("phone-devices-changed", scannedPhoneDevices);
       // Per-file progress is frequent; log transitions only.
       if (!statusChanged) return;
       runtimeLog("phone-backup-progress", {
@@ -7413,6 +7461,8 @@ app.whenReady().then(async () => {
       });
     },
   );
+  phoneManager.onScanProgress = (progress) =>
+    sendToRenderer("phone-scan-progress", progress);
   await phoneManager.initialize();
   phoneManagerBackupDestination = await phoneManager.getBackupDestination();
   console.log(
@@ -8211,12 +8261,36 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
     void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
   return { ...(await memoryStateWithPreviews()), message: state.message };
 });
+/**
+ * Each destination picker opens at its own saved folder (or a neutral default) so the
+ * OS doesn't reopen whichever folder another picker used last.
+ */
+function destinationPickerOptions(
+  title: string,
+  current: unknown,
+  extra: Partial<Electron.OpenDialogOptions> = {},
+): Electron.OpenDialogOptions {
+  let defaultPath = app.getPath("documents");
+  if (typeof current === "string" && path.isAbsolute(current)) {
+    let candidate = path.resolve(current);
+    while (!fs.existsSync(candidate) && path.dirname(candidate) !== candidate)
+      candidate = path.dirname(candidate);
+    if (fs.existsSync(candidate)) defaultPath = candidate;
+  }
+  return {
+    title,
+    defaultPath,
+    ...extra,
+    properties: ["openDirectory", "createDirectory", "promptToCreate", ...(extra.properties ?? [])],
+  };
+}
+
 ipcMain.handle("select-memory-directory", async () => {
   if (!mainWindow || mainWindow.isDestroyed()) return memoryManager.getState();
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Save memory movies to…",
-    properties: ["openDirectory", "createDirectory"],
-  });
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions("Save memory movies to…", (await memoryManager.getState()).settings.movieDirectory),
+  );
   const chosen = result.filePaths[0];
   if (result.canceled || !chosen) return memoryManager.getState();
   const directory = path.resolve(chosen);
@@ -8467,12 +8541,19 @@ ipcMain.handle("release-inventory", (event, token: string) =>
   inventoryTransfers.release(token, event.sender.id),
 );
 
-ipcMain.handle("select-directory", async () => {
+ipcMain.handle("select-directory", async (_event, options: unknown) => {
   if (mainWindow === null) return null;
-
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ["openDirectory"],
-  });
+  const request = (options && typeof options === "object" ? options : {}) as {
+    title?: unknown;
+    defaultPath?: unknown;
+  };
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions(
+      typeof request.title === "string" ? request.title.slice(0, 120) : "Choose a folder",
+      request.defaultPath,
+    ),
+  );
 
   if (!result.canceled && result.filePaths.length > 0) {
     return result.filePaths[0];
@@ -8482,11 +8563,13 @@ ipcMain.handle("select-directory", async () => {
 
 ipcMain.handle("select-source-clone-destination", async () => {
   if (!mainWindow) return [];
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose one or more source-clone destinations",
-    buttonLabel: "Choose destinations",
-    properties: ["openDirectory", "multiSelections"],
-  });
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions("Choose one or more source-clone destinations", null, {
+      buttonLabel: "Choose destinations",
+      properties: ["multiSelections"],
+    }),
+  );
   return !result.canceled ? result.filePaths : [];
 });
 
@@ -10419,11 +10502,12 @@ ipcMain.handle("refresh-library-stats", async () => {
 });
 ipcMain.handle("select-shelter-destination", async () => {
   if (!mainWindow) return null;
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose Silo's primary shelter destination",
-    buttonLabel: "Use as shelter",
-    properties: ["openDirectory"],
-  });
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions("Choose Silo's primary shelter destination", await getShelterDestination(), {
+      buttonLabel: "Use as shelter",
+    }),
+  );
   if (result.canceled || !result.filePaths[0]) return getShelterDestination();
   return setShelterDestination(result.filePaths[0]);
 });
@@ -12055,27 +12139,67 @@ ipcMain.handle("get-access-identity", () => {
 ipcMain.handle("get-phone-tooling", () => phoneManager.getTooling());
 ipcMain.handle("get-phone-backup-states", () => phoneManager.getBackupStates());
 
+async function readyPhoneForBackup(deviceId: unknown, platform: unknown) {
+  if (
+    typeof deviceId !== "string" ||
+    !deviceId ||
+    (platform !== "ios" && platform !== "android")
+  )
+    throw new Error("Invalid phone backup request.");
+  const known = scannedPhoneDevices.find(
+    (candidate) =>
+      candidate.id === deviceId &&
+      candidate.platform === platform &&
+      candidate.status === "ready" &&
+      Boolean(candidate.rootPath),
+  );
+  if (known) return known;
+  scannedPhoneDevices = await phoneManager.listDevices();
+  const device = scannedPhoneDevices.find(
+    (candidate) =>
+      candidate.id === deviceId &&
+      candidate.platform === platform &&
+      candidate.status === "ready" &&
+      Boolean(candidate.rootPath),
+  );
+  if (!device)
+    throw new Error("Connect and trust the phone before backing it up.");
+  return device;
+}
+
+ipcMain.handle(
+  "preview-phone-backup",
+  async (_event, deviceId: unknown, platform: unknown) => {
+    const device = await readyPhoneForBackup(deviceId, platform);
+    const startedAt = Date.now();
+    try {
+      const preview = await phoneManager.previewBackup(device);
+      runtimeLog("phone-backup-preview", {
+        platform: device.platform,
+        totalFiles: preview.totalFiles,
+        totalBytes: preview.totalBytes,
+        durationMs: Date.now() - startedAt,
+      });
+      return preview;
+    } catch (error) {
+      runtimeLog("phone-backup-preview-failed", {
+        platform: device.platform,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  },
+);
+
 ipcMain.handle(
   "renew-phone-backup",
-  async (_event, deviceId: unknown, platform: unknown) => {
-    if (
-      typeof deviceId !== "string" ||
-      !deviceId ||
-      (platform !== "ios" && platform !== "android")
-    )
-      throw new Error("Invalid phone backup request.");
-
-    scannedPhoneDevices = await phoneManager.listDevices();
-    const device = scannedPhoneDevices.find(
-      (candidate) =>
-        candidate.id === deviceId &&
-        candidate.platform === platform &&
-        candidate.status === "ready" &&
-        Boolean(candidate.rootPath),
-    );
-    if (!device)
-      throw new Error("Connect and trust the phone before renewing its backup.");
-
+  async (_event, deviceId: unknown, platform: unknown, includeTypes: unknown) => {
+    const device = await readyPhoneForBackup(deviceId, platform);
+    const types = Array.isArray(includeTypes)
+      ? includeTypes.filter((type): type is string => typeof type === "string")
+      : undefined;
+    if (types)
+      await phoneManager.setBackupFileTypes(device.platform, device.id, types, device.name);
     return phoneManager.backupDevice(device);
   },
 );
@@ -12777,13 +12901,13 @@ ipcMain.handle("get-contact-name", async (_event, phoneNumber: string) => {
   return contactManager.getContactName(phoneNumber) || null;
 });
 
-ipcMain.handle("select-backup-destination", async () => {
+ipcMain.handle("select-backup-destination", async (_event, current: unknown) => {
   if (!mainWindow) return null;
 
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Select Backup Destination",
-    properties: ["openDirectory"],
-  });
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions("Save conversations to…", current),
+  );
 
   if (!result.canceled && result.filePaths[0]) {
     return result.filePaths[0];
@@ -12805,10 +12929,10 @@ ipcMain.handle("set-local-index-fallback-enabled", async (_event, enabled: boole
 
 ipcMain.handle("select-index-storage-root", async () => {
   if (!mainWindow) return { canceled: true };
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose Silo Cache Destination",
-    properties: ["openDirectory"],
-  });
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions("Choose Silo Cache Destination", selectedIndexStorageRoot),
+  );
   if (result.canceled || !result.filePaths[0]) return { canceled: true };
 
   const storageRoot = path.resolve(result.filePaths[0]);

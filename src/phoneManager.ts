@@ -134,6 +134,51 @@ interface PhoneBackupManifest {
   restoreArchives?: PhoneRestoreArchive[];
   progress: PhoneBackupProgress;
   cacheRoot?: string;
+  /** File types copied by backups; every type when unset. */
+  includeTypes?: PhoneBackupFileType[];
+}
+
+export const PHONE_BACKUP_FILE_TYPES = ["image", "video", "audio", "document", "other"] as const;
+export type PhoneBackupFileType = (typeof PHONE_BACKUP_FILE_TYPES)[number];
+
+export interface PhoneBackupPreview {
+  deviceId: string;
+  platform: PhonePlatform;
+  totalFiles: number;
+  totalBytes: number;
+  types: Record<PhoneBackupFileType, { count: number; bytes: number }>;
+  selectedTypes: PhoneBackupFileType[];
+}
+
+export interface PhoneScanProgress {
+  deviceId: string;
+  platform: PhonePlatform;
+  filesFound: number;
+  bytesFound: number;
+  done: boolean;
+}
+
+function backupFileType(file: { type: string }): PhoneBackupFileType {
+  return (PHONE_BACKUP_FILE_TYPES as readonly string[]).includes(file.type)
+    ? (file.type as PhoneBackupFileType)
+    : "other";
+}
+
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+
+/** Device paths can hold names Windows rejects (`:`, `?`, trailing dots); keep them writable. */
+function localRelativePath(remotePath: string): string {
+  const relative = remotePath.replace(/^\/+/, "");
+  if (process.platform !== "win32") return relative;
+  return relative
+    .split("/")
+    .map((segment) => {
+      // eslint-disable-next-line no-control-regex
+      let safe = segment.replace(/[<>:"\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/, (tail) => "_".repeat(tail.length));
+      if (WINDOWS_RESERVED_NAME.test(safe)) safe = `_${safe}`;
+      return safe;
+    })
+    .join("/");
 }
 
 /** Virtual prefix; kept absolute so existing path guards accept it. */
@@ -180,6 +225,10 @@ function shellQuote(value: string): string {
 // afcclient colourises its prompt even when stdout is a pipe.
 // eslint-disable-next-line no-control-regex
 const ANSI_PATTERN = /\u001b\[[0-9;]*[A-Za-z]/g;
+
+// afcclient `ls -l`: "-rw-r--r--    1 mobile mobile    123456 14 Oct 2026 10:18:08 IMG_0001.HEIC"
+const IOS_LONG_LISTING =
+  /^([-dlfbcs])[-rwx]{9}\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(\d{1,2} \S+ \d{4} \d{2}:\d{2}:\d{2}) (.+)$/;
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_PATTERN, "");
@@ -1037,6 +1086,131 @@ export class PhoneManager {
     return this.backupDestinationPath;
   }
 
+  /** Optional listener for live file counts while a device is scanned. */
+  onScanProgress: (progress: PhoneScanProgress) => void = () => undefined;
+
+  private readonly scanJobs = new Map<string, Promise<PhoneFileInfo[]>>();
+  private readonly scanCache = new Map<string, { at: number; files: PhoneFileInfo[] }>();
+
+  getBackupFileTypes(platform: PhonePlatform, deviceId: string): PhoneBackupFileType[] {
+    const saved = this.backupManifests.get(this.deviceKey(platform, deviceId))?.includeTypes;
+    return saved?.length ? [...saved] : [...PHONE_BACKUP_FILE_TYPES];
+  }
+
+  async setBackupFileTypes(
+    platform: PhonePlatform,
+    deviceId: string,
+    types: string[],
+    deviceName = deviceId,
+  ): Promise<PhoneBackupFileType[]> {
+    const selected = PHONE_BACKUP_FILE_TYPES.filter((type) => types.includes(type));
+    if (!selected.length) throw new Error("Choose at least one file type to back up.");
+    const key = this.deviceKey(platform, deviceId);
+    const manifest = this.backupManifests.get(key) ?? {
+      files: {},
+      progress: this.emptyBackupProgress({ id: deviceId, platform, name: deviceName } as PhoneDevice),
+    };
+    manifest.includeTypes =
+      selected.length === PHONE_BACKUP_FILE_TYPES.length ? undefined : selected;
+    this.backupManifests.set(key, manifest);
+    await this.persistBackupState();
+    return this.getBackupFileTypes(platform, deviceId);
+  }
+
+  /** Lists every readable file on a ready device, reporting live counts. Recent scans are reused. */
+  private scanDeviceFiles(device: PhoneDevice, reuseForMs = 0): Promise<PhoneFileInfo[]> {
+    const key = this.deviceKey(device.platform, device.id);
+    const cached = this.scanCache.get(key);
+    if (cached && reuseForMs > 0 && Date.now() - cached.at < reuseForMs)
+      return Promise.resolve(cached.files);
+    const active = this.scanJobs.get(key);
+    if (active) return active;
+    if (device.status !== "ready" || !device.rootPath)
+      return Promise.reject(new Error("The phone is not trusted and ready for backup."));
+    const startedAt = Date.now();
+    const job = (async () => {
+      const files: PhoneFileInfo[] = [];
+      let bytes = 0;
+      let lastReport = 0;
+      const report = (done: boolean) =>
+        this.onScanProgress({
+          deviceId: device.id,
+          platform: device.platform,
+          filesFound: files.length,
+          bytesFound: bytes,
+          done,
+        });
+      const seen = new Set<string>();
+      const listed = await this.listPhoneFilesRecursively(device.rootPath!, (file) => {
+        if (file.isDirectory || seen.has(file.path)) return;
+        seen.add(file.path);
+        files.push(file);
+        bytes += file.size;
+        const now = Date.now();
+        if (now - lastReport > 400) {
+          lastReport = now;
+          report(false);
+          const manifest = this.backupManifests.get(key);
+          if (manifest?.progress.status === "scanning")
+            this.updateBackup(manifest, {
+              message: `Scanning ${device.name}… ${files.length.toLocaleString()} files found`,
+            });
+        }
+      });
+      for (const file of listed ?? []) {
+        if (file.isDirectory || seen.has(file.path)) continue;
+        seen.add(file.path);
+        files.push(file);
+        bytes += file.size;
+      }
+      report(true);
+      this.log(
+        `scanDeviceFiles: ${device.platform} ${device.id} listed ${files.length} files (${this.formatBytes(bytes)}) in ${Math.round((Date.now() - startedAt) / 1000)} s`,
+      );
+      this.scanCache.set(key, { at: Date.now(), files });
+      return files;
+    })().finally(() => this.scanJobs.delete(key));
+    this.scanJobs.set(key, job);
+    return job;
+  }
+
+  async previewBackup(device: PhoneDevice): Promise<PhoneBackupPreview> {
+    const files = await this.scanDeviceFiles(device);
+    const types = Object.fromEntries(
+      PHONE_BACKUP_FILE_TYPES.map((type) => [type, { count: 0, bytes: 0 }]),
+    ) as PhoneBackupPreview["types"];
+    let totalBytes = 0;
+    for (const file of files) {
+      const bucket = types[backupFileType(file)];
+      bucket.count += 1;
+      bucket.bytes += file.size;
+      totalBytes += file.size;
+    }
+    return {
+      deviceId: device.id,
+      platform: device.platform,
+      totalFiles: files.length,
+      totalBytes,
+      types,
+      selectedTypes: this.getBackupFileTypes(device.platform, device.id),
+    };
+  }
+
+  /** Confirms Silo can create folders and files at a backup destination. */
+  private async probeWritableDirectory(directory: string): Promise<string | null> {
+    const probe = path.join(directory, `.silo-write-test-${process.pid}-${Date.now()}`);
+    try {
+      await fsPromises.mkdir(directory, { recursive: true });
+      await fsPromises.writeFile(probe, "ok");
+      await fsPromises.rm(probe, { force: true });
+      return null;
+    } catch (error) {
+      await fsPromises.rm(probe, { force: true }).catch(() => undefined);
+      const err = error as NodeJS.ErrnoException;
+      return `${err.code ?? "error"}: ${err.message}`;
+    }
+  }
+
   backupDevice(device: PhoneDevice): Promise<PhoneBackupProgress> {
     this.log(
       `backupDevice called for ${device.platform}:${device.id} (${device.name})`,
@@ -1068,20 +1242,45 @@ export class PhoneManager {
       files: {},
       progress: this.emptyBackupProgress(device),
     };
-    const backupDir = manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot;
-    manifest.cacheRoot = backupDir;
+    let backupDir = manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot;
     this.backupManifests.set(key, manifest);
-    this.invalidateListingIndexes();
     try {
+      const writeError = await this.probeWritableDirectory(backupDir);
+      if (writeError) {
+        const fallback = this.backupDestinationPath ?? this.pullCacheRoot;
+        this.logError(`runBackup: cannot write to ${backupDir} (${writeError})`);
+        if (fallback === backupDir || (await this.probeWritableDirectory(fallback)))
+          throw new Error(
+            `Silo cannot write to the phone backup destination (${backupDir}). Choose another destination or check that the drive is connected and writable.`,
+          );
+        this.log(`runBackup: earlier destination unavailable, using ${fallback}`);
+        backupDir = fallback;
+      }
+      manifest.cacheRoot = backupDir;
+      this.invalidateListingIndexes();
       this.log(`runBackup: updating status to scanning for ${key}`);
       this.updateBackup(manifest, {
         status: "scanning",
         currentFile: null,
+        totalFiles: 0,
+        completedFiles: 0,
+        totalBytes: 0,
+        completedBytes: 0,
         message: `Scanning ${device.name} for files...`,
       });
-      const files = (await this.listPhoneFilesRecursively(device.rootPath)).filter(
-        (file) => !file.isDirectory,
+      const selectedTypes = new Set(this.getBackupFileTypes(device.platform, device.id));
+      const scanned = await this.scanDeviceFiles(device, 5 * 60 * 1000);
+      this.scanCache.delete(key);
+      const files = scanned.filter(
+        (file) => !file.isDirectory && selectedTypes.has(backupFileType(file)),
       );
+      this.log(
+        `runBackup: ${files.length} of ${scanned.length} files match ${[...selectedTypes].join(", ")}`,
+      );
+      if (scanned.length === 0)
+        throw new Error(
+          `Silo could not read any files from ${device.name}. Unlock it, keep it connected, and try again.`,
+        );
       const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
       const remainingBytes = files.reduce((sum, file) => {
         const signature = `${file.size}:${file.modified}`;
@@ -1092,14 +1291,17 @@ export class PhoneManager {
       this.log(
         `runBackup: Checking disk space on ${backupDir} for ${this.formatBytes(remainingBytes)} of new data`,
       );
-      const disk = await fsPromises.statfs(backupDir);
-      const freeBytes = disk.bavail * disk.bsize;
+      const disk = await fsPromises.statfs(backupDir).catch((error) => {
+        this.logError(`runBackup: could not read free space on ${backupDir}:`, error);
+        return null;
+      });
+      const freeBytes = disk ? disk.bavail * disk.bsize : Number.POSITIVE_INFINITY;
       const reserveBytes = 5 * 1024 * 1024 * 1024;
 
       if (remainingBytes > Math.max(0, freeBytes - reserveBytes)) {
         const location = this.backupDestinationPath
           ? `external drive (${this.backupDestinationPath})`
-          : "Mac storage";
+          : "this computer";
         throw new Error(
           `Not enough free disk space on ${location} to back up ${device.name}. ` +
             `${this.formatBytes(remainingBytes)} is needed while preserving a 5 GB safety reserve. ` +
@@ -1166,6 +1368,7 @@ export class PhoneManager {
       this.onBackupProgress({ ...manifest.progress });
       return { ...manifest.progress };
     } catch (error) {
+      this.logError(`runBackup failed for ${key}:`, error);
       manifest.progress.status = "error";
       manifest.progress.currentFile = null;
       manifest.progress.message =
@@ -1239,7 +1442,7 @@ export class PhoneManager {
     try {
       let fallbackCopyBytes = 0;
       for (const { remotePath, source } of sourceFiles) {
-        const relative = remotePath.replace(/^\/+/, "");
+        const relative = localRelativePath(remotePath);
         const destination = path.resolve(stageRoot, relative);
         const pathFromRoot = path.relative(stageRoot, destination);
         if (pathFromRoot.startsWith("..") || path.isAbsolute(pathFromRoot)) {
@@ -1346,14 +1549,14 @@ export class PhoneManager {
         parsed.deviceId,
         "snapshots",
         parsed.snapshotId,
-        parsed.remotePath.replace(/^\//, ""),
+        localRelativePath(parsed.remotePath),
       );
     }
     return path.join(
       root,
       parsed.platform,
       parsed.deviceId,
-      parsed.remotePath.replace(/^\//, ""),
+      localRelativePath(parsed.remotePath),
     );
   }
 
@@ -2259,10 +2462,25 @@ export class PhoneManager {
     onFile?: (file: PhoneFileInfo) => void,
     isCancelled: () => boolean = () => false,
   ): Promise<PhoneFileInfo[]> {
-    if (!this.parsePhonePath(virtualPath)) return [];
+    const parsed = this.parsePhonePath(virtualPath);
+    if (!parsed) return [];
+    const files: PhoneFileInfo[] = [];
+    if (
+      parsed.platform === "android" &&
+      !parsed.offlineBackup &&
+      this.connectedDeviceKeys.has(this.deviceKey("android", parsed.deviceId))
+    ) {
+      const scanned = await this.scanAndroidFiles(
+        parsed.deviceId,
+        parsed.remotePath,
+        (file) => (onFile ? onFile(file) : files.push(file)),
+        isCancelled,
+      );
+      if (scanned || isCancelled()) return files;
+      this.log(`listPhoneFilesRecursively: falling back to a folder walk for ${parsed.deviceId}`);
+    }
     const stack = [{ path: virtualPath, relativePath: "" }];
     const visited = new Set<string>();
-    const files: PhoneFileInfo[] = [];
     while (stack.length > 0) {
       if (isCancelled()) break;
       const current = stack.pop()!;
@@ -2282,6 +2500,140 @@ export class PhoneManager {
     return files;
   }
 
+  private androidStorageRoots = new Map<string, string>();
+
+  private async resolveAndroidStorageRoot(serial: string): Promise<string> {
+    const known = this.androidStorageRoots.get(serial);
+    if (known) return known;
+    const probe = await this.run(
+      "adb",
+      ["-s", serial, "shell", "ls /storage/emulated/0 2>/dev/null | head -1"],
+      10000,
+    );
+    const root = probe.ok && probe.stdout.trim() ? "/storage/emulated/0" : ANDROID_STORAGE_ROOT;
+    if (probe.ok) this.androidStorageRoots.set(serial, root);
+    return root;
+  }
+
+  /**
+   * Streams a long-running command line by line. The idle timeout only fires when the
+   * tool stops producing output, so large phones are not cut off mid-scan.
+   */
+  private async streamCommandLines(
+    binaryName: string,
+    args: string[],
+    onLine: (line: string) => void,
+    idleTimeoutMs: number,
+    isCancelled: () => boolean = () => false,
+  ): Promise<{ ok: boolean; stderr: string }> {
+    return this.queueRun(async () => {
+      const binary = await this.resolveBinary(binaryName);
+      if (!binary) return { ok: false, stderr: `${binaryName} not installed` };
+      return new Promise((resolve) => {
+        const child = spawn(binary, args, {
+          env: { ...process.env, NO_COLOR: "1", TERM: "dumb" },
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
+        let pending = "";
+        let stderr = "";
+        let settled = false;
+        let idleTimer: NodeJS.Timeout | null = null;
+        const finish = (ok: boolean, reason?: string) => {
+          if (settled) return;
+          settled = true;
+          if (idleTimer) clearTimeout(idleTimer);
+          if (pending) onLine(pending.replace(/\r$/, ""));
+          pending = "";
+          resolve({ ok, stderr: reason ? `${reason} ${stderr}`.trim() : stderr });
+        };
+        const armIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            child.kill();
+            finish(false, `${binaryName} stopped responding for ${Math.round(idleTimeoutMs / 1000)} s.`);
+          }, idleTimeoutMs);
+        };
+        armIdle();
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+          armIdle();
+          if (isCancelled()) {
+            child.kill();
+            finish(false, "cancelled");
+            return;
+          }
+          pending += chunk;
+          const lines = pending.split("\n");
+          pending = lines.pop() ?? "";
+          for (const line of lines) onLine(line.replace(/\r$/, ""));
+        });
+        child.stderr.on("data", (chunk: Buffer) => {
+          stderr = `${stderr}${chunk.toString()}`.slice(-4000);
+        });
+        child.once("error", (error) => finish(false, error.message));
+        child.once("close", (code) => finish(code === 0));
+      });
+    });
+  }
+
+  /** One streamed `find` lists every file under Android shared storage. */
+  private async scanAndroidFiles(
+    serial: string,
+    remotePath: string,
+    onFile: (file: PhoneFileInfo) => void,
+    isCancelled: () => boolean,
+  ): Promise<boolean> {
+    const root =
+      remotePath === ANDROID_STORAGE_ROOT
+        ? await this.resolveAndroidStorageRoot(serial)
+        : remotePath;
+    let emitted = 0;
+    const result = await this.streamCommandLines(
+      "adb",
+      [
+        "-s",
+        serial,
+        "shell",
+        `find ${shellQuote(root)} -type f -exec stat -c '%s|%Y|%n' {} + 2>/dev/null`,
+      ],
+      (line) => {
+        const first = line.indexOf("|");
+        const second = line.indexOf("|", first + 1);
+        if (first < 0 || second < 0) return;
+        const fullRemotePath = path.posix.normalize(line.slice(second + 1));
+        const name = fullRemotePath.split("/").filter(Boolean).pop();
+        if (!name) return;
+        const virtualPath = this.virtualPath("android", serial, fullRemotePath);
+        if (isPhoneDerivativePath(virtualPath)) return;
+        const size = Number(line.slice(0, first));
+        const modifiedSeconds = Number(line.slice(first + 1, second));
+        emitted += 1;
+        onFile({
+          name,
+          path: virtualPath,
+          relativePath: fullRemotePath.startsWith(`${root}/`)
+            ? fullRemotePath.slice(root.length + 1)
+            : name,
+          size: Number.isFinite(size) ? size : 0,
+          modified: Number.isFinite(modifiedSeconds) ? modifiedSeconds * 1000 : 0,
+          isDirectory: false,
+          type: classifyPhoneFile(name, false),
+          extension: path.extname(name).toLowerCase(),
+        });
+      },
+      120000,
+      isCancelled,
+    );
+    if (!result.ok)
+      this.logError(
+        `scanAndroidFiles: find on ${serial} ended early after ${emitted} files: ${result.stderr.slice(0, 300)}`,
+      );
+    // toybox find exits non-zero when some folders are unreadable; keep what it listed.
+    // An empty result falls back to the folder walk, which can see more on some devices.
+    return emitted > 0;
+  }
+
   private async listAndroidFiles(
     serial: string,
     remotePath: string,
@@ -2291,87 +2643,75 @@ export class PhoneManager {
       `[PhoneManager] listAndroidFiles: Listing files on device ${serial} at ${remotePath}, exploded: ${exploded}`,
     );
 
-    // First, let's test if we can access the path
-    debugLog(
-      `[PhoneManager] listAndroidFiles: Testing access to ${remotePath}`,
-    );
-    const testResult = await this.run(
-      "adb",
-      [
-        "-s",
-        serial,
-        "shell",
-        `ls ${shellQuote(remotePath)} 2>/dev/null | head -1`,
-      ],
-      10000,
-    );
-    debugLog(
-      `[PhoneManager] listAndroidFiles: Test access result: ${testResult.ok}, sample: ${testResult.stdout.slice(0, 100)}`,
-    );
-
-    // Resolve /sdcard symlink to /storage/emulated/0 if needed
+    // /sdcard is a symlink; `find` needs the real storage root to descend into it.
     let actualPath = remotePath;
-    if (remotePath === "/sdcard") {
-      debugLog(
-        `[PhoneManager] listAndroidFiles: /sdcard is a symlink, trying /storage/emulated/0 instead`,
-      );
-      // Check if /storage/emulated/0 has content
-      const emulatedTest = await this.run(
-        "adb",
-        ["-s", serial, "shell", `ls /storage/emulated/0 2>/dev/null | head -1`],
-        10000,
-      );
-      if (emulatedTest.ok && emulatedTest.stdout) {
-        actualPath = "/storage/emulated/0";
-        debugLog(
-          `[PhoneManager] listAndroidFiles: Resolved /sdcard to ${actualPath}`,
-        );
-      }
+    if (remotePath === ANDROID_STORAGE_ROOT) {
+      actualPath = await this.resolveAndroidStorageRoot(serial);
     }
 
-    // Log the device's storage paths
-    debugLog(`[PhoneManager] listAndroidFiles: Checking device storage...`);
-    const storageResult = await this.run(
-      "adb",
-      [
-        "-s",
-        serial,
-        "shell",
-        "df -h 2>/dev/null | grep -E '(sdcard|storage|emulated|data)'",
-      ],
-      10000,
-    );
-    debugLog(
-      `[PhoneManager] listAndroidFiles: Device storage info:`,
-      storageResult.stdout.slice(0, 500),
-    );
+    if (PHONE_DEBUG) {
+      // First, let's test if we can access the path
+      debugLog(
+        `[PhoneManager] listAndroidFiles: Testing access to ${remotePath}`,
+      );
+      const testResult = await this.run(
+        "adb",
+        [
+          "-s",
+          serial,
+          "shell",
+          `ls ${shellQuote(remotePath)} 2>/dev/null | head -1`,
+        ],
+        10000,
+      );
+      debugLog(
+        `[PhoneManager] listAndroidFiles: Test access result: ${testResult.ok}, sample: ${testResult.stdout.slice(0, 100)}`,
+      );
 
-    // Also check what's in /sdcard
-    const sdcardResult = await this.run(
-      "adb",
-      ["-s", serial, "shell", "ls -la /sdcard 2>/dev/null | head -20"],
-      10000,
-    );
-    debugLog(
-      `[PhoneManager] listAndroidFiles: /sdcard contents (first 20):`,
-      sdcardResult.stdout,
-    );
+      // Log the device's storage paths
+      debugLog(`[PhoneManager] listAndroidFiles: Checking device storage...`);
+      const storageResult = await this.run(
+        "adb",
+        [
+          "-s",
+          serial,
+          "shell",
+          "df -h 2>/dev/null | grep -E '(sdcard|storage|emulated|data)'",
+        ],
+        10000,
+      );
+      debugLog(
+        `[PhoneManager] listAndroidFiles: Device storage info:`,
+        storageResult.stdout.slice(0, 500),
+      );
 
-    // Also try /storage/emulated/0 which is another common path
-    const emulatedResult = await this.run(
-      "adb",
-      [
-        "-s",
-        serial,
-        "shell",
-        "ls -la /storage/emulated/0 2>/dev/null | head -20",
-      ],
-      10000,
-    );
-    debugLog(
-      `[PhoneManager] listAndroidFiles: /storage/emulated/0 contents (first 20):`,
-      emulatedResult.stdout,
-    );
+      // Also check what's in /sdcard
+      const sdcardResult = await this.run(
+        "adb",
+        ["-s", serial, "shell", "ls -la /sdcard 2>/dev/null | head -20"],
+        10000,
+      );
+      debugLog(
+        `[PhoneManager] listAndroidFiles: /sdcard contents (first 20):`,
+        sdcardResult.stdout,
+      );
+
+      // Also try /storage/emulated/0 which is another common path
+      const emulatedResult = await this.run(
+        "adb",
+        [
+          "-s",
+          serial,
+          "shell",
+          "ls -la /storage/emulated/0 2>/dev/null | head -20",
+        ],
+        10000,
+      );
+      debugLog(
+        `[PhoneManager] listAndroidFiles: /storage/emulated/0 contents (first 20):`,
+        emulatedResult.stdout,
+      );
+    }
 
     const findArgs = exploded
       ? `find ${shellQuote(actualPath)} -mindepth 1`
@@ -2493,6 +2833,68 @@ export class PhoneManager {
     return names;
   }
 
+  /**
+   * `afcclient ls -l` returns names, types, sizes and dates in one non-interactive call.
+   * Older afcclient builds without `-l` fall back to plain names.
+   */
+  private async iosListDetailed(
+    udid: string,
+    remotePath: string,
+  ): Promise<
+    Array<{
+      name: string;
+      stat: { size: number; modified: number; isDirectory: boolean } | null;
+    }>
+  > {
+    const result = await this.run(
+      "afcclient",
+      ["-u", udid, "ls", "-l", remotePath],
+      60000,
+    );
+    const output = stripAnsi(result.stdout);
+    if (/Failed to list '-l'/.test(output)) {
+      return (await this.iosListNames(udid, remotePath)).map((name) => ({
+        name,
+        stat: null,
+      }));
+    }
+    if (!result.ok && !output.trim()) {
+      this.logError(
+        `iosListDetailed: afcclient ls -l failed for ${remotePath}, using name listing: ${result.stderr.slice(0, 300)}`,
+      );
+      return (await this.iosListNames(udid, remotePath)).map((name) => ({
+        name,
+        stat: null,
+      }));
+    }
+    const entries: Array<{
+      name: string;
+      stat: { size: number; modified: number; isDirectory: boolean } | null;
+    }> = [];
+    for (const rawLine of output.split("\n")) {
+      const line = rawLine.replace(/\r$/, "");
+      if (!line.trim() || line.startsWith("Error:")) continue;
+      const match = IOS_LONG_LISTING.exec(line);
+      if (!match) {
+        const name = line.trim();
+        if (name !== "." && name !== "..") entries.push({ name, stat: null });
+        continue;
+      }
+      const [, kind, sizeText, dateText, name] = match;
+      if (name === "." || name === "..") continue;
+      const modified = Date.parse(dateText);
+      entries.push({
+        name,
+        stat: {
+          size: Number(sizeText) || 0,
+          modified: Number.isFinite(modified) ? modified : 0,
+          isDirectory: kind === "d",
+        },
+      });
+    }
+    return entries;
+  }
+
   /** One afcclient session answers every stat in a directory, avoiding N spawns. */
   private async iosStatBatch(
     udid: string,
@@ -2607,24 +3009,29 @@ export class PhoneManager {
       `[PhoneManager] listIosFiles: Listing iOS files on ${udid} at ${remotePath}, exploded: ${exploded}, rootPath: ${rootPath}, depth: ${depth}`,
     );
 
-    const names = await this.iosListNames(udid, remotePath);
-    if (names.length === 0) {
+    const listing = await this.iosListDetailed(udid, remotePath);
+    if (listing.length === 0) {
       debugLog(
         `[PhoneManager] listIosFiles: No names found at ${remotePath}`,
       );
       return [];
     }
-    debugLog(
-      `[PhoneManager] listIosFiles: Got ${names.length} names from afcclient`,
-    );
-
+    const names = listing.map((entry) => entry.name);
     const fullPaths = names.map((name) => joinRemote(remotePath, name));
-    debugLog(
-      `[PhoneManager] listIosFiles: Full paths:`,
-      fullPaths.slice(0, 5),
-    );
-
-    const stats = await this.iosStatBatch(udid, fullPaths);
+    const stats = new Map<
+      string,
+      { size: number; modified: number; isDirectory: boolean }
+    >();
+    const unresolved: string[] = [];
+    listing.forEach((entry, index) => {
+      if (entry.stat) stats.set(fullPaths[index], entry.stat);
+      else unresolved.push(fullPaths[index]);
+    });
+    // Interactive afcclient sessions read the Windows console, not a pipe, so only batch elsewhere.
+    if (unresolved.length && process.platform !== "win32") {
+      for (const [remote, stat] of await this.iosStatBatch(udid, unresolved))
+        stats.set(remote, stat);
+    }
     debugLog(
       `[PhoneManager] listIosFiles: Got ${stats.size} stats back for ${fullPaths.length} paths`,
     );
@@ -2810,8 +3217,15 @@ export class PhoneManager {
       debugLog(
         `[PhoneManager] statPhoneFile: Getting iOS stat for ${remotePath}`,
       );
-      const stats = await this.iosStatBatch(deviceId, [remotePath]);
-      const stat = stats.get(remotePath);
+      const listing = await this.iosListDetailed(deviceId, remotePath);
+      let stat =
+        listing.length === 1 && listing[0].name === name
+          ? listing[0].stat ?? undefined
+          : undefined;
+      if (!stat && listing.length > 0 && !(listing.length === 1 && listing[0].name === name))
+        stat = { size: 0, modified: 0, isDirectory: true };
+      if (!stat && process.platform !== "win32")
+        stat = (await this.iosStatBatch(deviceId, [remotePath])).get(remotePath);
       if (!stat) {
         debugLog(
           `[PhoneManager] statPhoneFile: No stat found for ${remotePath}`,
