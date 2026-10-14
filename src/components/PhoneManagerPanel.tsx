@@ -135,13 +135,14 @@ function PhoneDeviceCard({
         {device.status === "ready" && device.rootPath ? (
           <>
             <button
-              className="phone-renew-backup-button"
+              className={`phone-icon-button ${busy ? "busy" : ""}`}
               onClick={() => onRenewBackup(device)}
               disabled={busy}
-              title="Back up this phone into Silo; the phone’s files are unchanged"
+              title={busy ? "Backing up…" : "Backs up automatically on connect. Click to back up now or choose file types."}
+              aria-label={busy ? `Backing up ${device.name}` : `Back up ${device.name} now`}
               data-help="Copy this connected phone’s photos, messages, and readable files into a dated browseable snapshot in Silo. This does not change files on the phone."
             >
-              <FiRefreshCw /> {busy ? "Backing up…" : "Back up"}
+              <FiRefreshCw className={busy ? "spinning" : ""} />
             </button>
             <button
               className="phone-icon-button"
@@ -630,7 +631,7 @@ export function PhoneManagementPanel({
       ) : (
         <div className="phone-device-empty">
           <FiSmartphone aria-hidden="true" />
-          <span>Scan for a connected phone or tablet to manage it here.</span>
+          <span>Plug in a phone or tablet. It is backed up automatically when it connects.</span>
         </div>
       )}
       {backupRequest && (

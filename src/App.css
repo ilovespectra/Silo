@@ -2495,6 +2495,16 @@ body {
   padding: 0;
 }
 
+.phone-device-actions .phone-icon-button.busy {
+  border-color: var(--orange);
+  color: var(--orange-bright);
+  opacity: 1;
+}
+
+.phone-device-actions .phone-icon-button svg.spinning {
+  animation: stats-spin 1s linear infinite;
+}
+
 .phone-device-actions .phone-icon-button.active {
   border-color: var(--orange);
   color: var(--orange-bright);
@@ -8273,7 +8283,7 @@ input[type="range"]::-moz-range-progress {
   height: max(760px, calc(100vh - 120px));
   min-height: 760px;
   flex-direction: column;
-  margin: 0 clamp(12px, 2vw, 24px) 18px;
+  margin: clamp(12px, 2vw, 18px) clamp(12px, 2vw, 24px) 18px;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;

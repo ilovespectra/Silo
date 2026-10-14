@@ -473,6 +473,11 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.on("phone-devices-changed", listener);
     return () => ipcRenderer.removeListener("phone-devices-changed", listener);
   },
+  onPhoneMessagesUpdated: (callback) => {
+    const listener = (_event, update) => callback(update);
+    ipcRenderer.on("phone-messages-updated", listener);
+    return () => ipcRenderer.removeListener("phone-messages-updated", listener);
+  },
   listPhones: () => ipcRenderer.invoke("list-phones"),
   renamePhone: (deviceId, platform, name) =>
     ipcRenderer.invoke("rename-phone", deviceId, platform, name),

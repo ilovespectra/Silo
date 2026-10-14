@@ -805,6 +805,8 @@ function App() {
       }
     }
   };
+  const [constructionDontShowAgain, setConstructionDontShowAgain] = useState(false);
+  const [performanceDontShowAgain, setPerformanceDontShowAgain] = useState(false);
   const [performanceNoticeHidden, setPerformanceNoticeHidden] = useState(false);
   const [hidePerformanceNoticePermanently, setHidePerformanceNoticePermanently] = useState(() => {
     try {
@@ -5279,9 +5281,8 @@ function App() {
             <label className="preview-construction-dismiss-choice">
               <input
                 type="checkbox"
-                onChange={(event) => {
-                  if (event.target.checked) dismissConstructionBanner(true);
-                }}
+                checked={constructionDontShowAgain}
+                onChange={(event) => setConstructionDontShowAgain(event.target.checked)}
               />
               Don’t show again
             </label>
@@ -5290,7 +5291,7 @@ function App() {
               type="button"
               aria-label="Dismiss under construction notice"
               title="Dismiss notice"
-              onClick={() => dismissConstructionBanner(false)}
+              onClick={() => dismissConstructionBanner(constructionDontShowAgain)}
             >
               <FiX aria-hidden="true" />
             </button>
@@ -5338,9 +5339,8 @@ function App() {
               <label className="indexing-performance-dismiss-choice">
                 <input
                   type="checkbox"
-                  onChange={(event) => {
-                    if (event.target.checked) dismissPerformanceNotice(true);
-                  }}
+                  checked={performanceDontShowAgain}
+                  onChange={(event) => setPerformanceDontShowAgain(event.target.checked)}
                 />
                 Don’t show again
               </label>
@@ -5348,8 +5348,8 @@ function App() {
                 className="indexing-performance-dismiss"
                 type="button"
                 aria-label="Dismiss background processing notice"
-                title="Dismiss until background processing is idle"
-                onClick={() => dismissPerformanceNotice(false)}
+                title={performanceDontShowAgain ? "Dismiss and don’t show again" : "Dismiss until background processing is idle"}
+                onClick={() => dismissPerformanceNotice(performanceDontShowAgain)}
               >
                 <FiX aria-hidden="true" />
               </button>
@@ -7081,46 +7081,39 @@ function App() {
         />
       ) : appSection === "mobile" ? (
         <main className="mobile-page" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
-          <PhoneManagementPanel
-            devices={phoneDevices}
-            tooling={phoneTooling}
-            busyDeviceId={phoneBusyId}
-            activeDeviceKey={
-              connectedPhone
-                ? `${connectedPhone.platform}:${connectedPhone.id}`
-                : null
-            }
-            backups={phoneBackups}
-            backupDestination={phoneBackupDestination}
-            formatFileSize={formatFileSize}
-            restoreArchives={phoneRestoreArchives}
-            onBrowse={browsePhone}
-            onConnect={connectPhone}
-            onDisconnect={disconnectPhone}
-            onRename={renamePhone}
-            onRenewBackup={renewPhoneBackup}
-            onPreviewBackup={previewPhoneBackup}
-            onChooseBackupDestination={() =>
-              void choosePhoneBackupDestination()
-            }
-            onResetBackupDestination={() =>
-              void resetPhoneBackupDestination()
-            }
-            onCreateRestoreArchive={createPhoneRestoreArchive}
-            onRestoreFromArchive={restorePhoneFromArchive}
-          />
-          <section
-            className="mobile-messages-section"
-            aria-labelledby="mobile-messages-title"
-          >
-            <header className="mobile-messages-heading">
-              <div>
-                <span className="sidebar-kicker">Messages</span>
-                <h2 id="mobile-messages-title">Messages</h2>
-                <p>Browse, search, and export message threads from a saved or connected phone.</p>
-              </div>
-            </header>
-            <MessageExportPanel />
+          <section className="mobile-messages-section" aria-label="Mobile manager">
+            <MessageExportPanel
+              devicePanel={
+                <PhoneManagementPanel
+                  devices={phoneDevices}
+                  tooling={phoneTooling}
+                  busyDeviceId={phoneBusyId}
+                  activeDeviceKey={
+                    connectedPhone
+                      ? `${connectedPhone.platform}:${connectedPhone.id}`
+                      : null
+                  }
+                  backups={phoneBackups}
+                  backupDestination={phoneBackupDestination}
+                  formatFileSize={formatFileSize}
+                  restoreArchives={phoneRestoreArchives}
+                  onBrowse={browsePhone}
+                  onConnect={connectPhone}
+                  onDisconnect={disconnectPhone}
+                  onRename={renamePhone}
+                  onRenewBackup={renewPhoneBackup}
+                  onPreviewBackup={previewPhoneBackup}
+                  onChooseBackupDestination={() =>
+                    void choosePhoneBackupDestination()
+                  }
+                  onResetBackupDestination={() =>
+                    void resetPhoneBackupDestination()
+                  }
+                  onCreateRestoreArchive={createPhoneRestoreArchive}
+                  onRestoreFromArchive={restorePhoneFromArchive}
+                />
+              }
+            />
           </section>
         </main>
       ) : (

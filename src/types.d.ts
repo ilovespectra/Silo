@@ -1326,6 +1326,9 @@ interface Window {
     onPhoneDevicesChanged(
       callback: (devices: PhoneDevice[]) => void,
     ): () => void;
+    onPhoneMessagesUpdated(
+      callback: (update: { deviceId: string; platform: PhonePlatform }) => void,
+    ): () => void;
     listPhones(): Promise<PhoneDevice[]>;
     renamePhone(
       deviceId: string,

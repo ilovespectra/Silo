@@ -216,7 +216,9 @@ function formatDivider(time: number, platform: "ios" | "android") {
 
 const DIVIDER_GAP_MS = 60 * 60 * 1000;
 
-export const MessageExportPanel: React.FC = () => {
+export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = ({
+  devicePanel,
+}) => {
   const electronAPI = window.electron;
   const [devices, setDevices] = useState<PhoneDevice[]>([]);
   const [historyEntries, setHistoryEntries] = useState<MessageHistoryEntry[]>(
@@ -355,6 +357,23 @@ export const MessageExportPanel: React.FC = () => {
     };
   }, [electronAPI]);
 
+  const loadMessagesRef = React.useRef<(refresh?: boolean, identity?: typeof selectedIdentity) => Promise<void>>();
+  const selectedKeyRef = React.useRef(selectedDeviceKey);
+  selectedKeyRef.current = selectedDeviceKey;
+
+  React.useEffect(() => {
+    if (!electronAPI?.onPhoneMessagesUpdated) return;
+    return electronAPI.onPhoneMessagesUpdated(async (update) => {
+      const key = `${update.platform}:${update.deviceId}`;
+      const entries = await electronAPI.listMessageHistory().catch(() => null);
+      if (entries) setHistoryEntries(entries);
+      const entry = entries?.find((item) => `${item.platform}:${item.deviceId}` === key);
+      if (!entry || (selectedKeyRef.current && selectedKeyRef.current !== key)) return;
+      setSelectedDeviceKey(key);
+      void loadMessagesRef.current?.(false, entry);
+    });
+  }, [electronAPI]);
+
   const loadMessages = async (refresh = false, identity = selectedIdentity) => {
     if (!electronAPI || !identity) return;
     const connected = devices.find(
@@ -399,6 +418,8 @@ export const MessageExportPanel: React.FC = () => {
       setLoadingMessages(false);
     }
   };
+
+  loadMessagesRef.current = loadMessages;
 
   const chooseDestination = async () => {
     const selected = await electronAPI?.selectBackupDestination(outputDir);
@@ -460,15 +481,9 @@ export const MessageExportPanel: React.FC = () => {
   return (
     <main className={`messages-browser platform-${platform}`} data-tour="mobile-messages" data-help="Select a connected phone or saved message history, load and review a conversation, then choose an export folder and format. Refresh and update actions can read device history, so use them only when you intend to.">
       <header className="messages-toolbar">
-        <div>
-          <span className="sidebar-kicker">Mobile manager</span>
-          <h2>Messages</h2>
-        </div>
-        <button onClick={() => void scanDevices()} disabled={loadingDevices}
-          data-help="Refresh connected-device and saved-message-backup choices.">
-          <FiSmartphone /> {loadingDevices ? "Scanning..." : "Scan devices"}
-        </button>
+        <h2>Mobile manager</h2>
         <select
+          aria-label="Phone message history"
           value={selectedDeviceKey}
           onChange={(event) => {
             setSelectedDeviceKey(event.target.value);
@@ -528,35 +543,37 @@ export const MessageExportPanel: React.FC = () => {
           ))}
         </select>
         <button
-          disabled={!selectedIdentity || loadingMessages}
-          onClick={() => void loadMessages(false)}
+          className="messages-icon-button"
+          onClick={() => void scanDevices()}
+          disabled={loadingDevices}
+          title={loadingDevices ? "Scanning for phones…" : "Scan for phones"}
+          aria-label="Scan for phones"
+          data-help="Refresh connected-device and saved-message-backup choices."
         >
-          <FiMessageSquare />{" "}
-          {loadingMessages ? "Loading history..." : "Load saved history"}
+          <FiSmartphone className={loadingDevices ? "spinning" : ""} />
         </button>
         <button
-          className="primary"
+          className="messages-icon-button"
           disabled={
             !selectedDevice ||
             selectedDevice.status !== "ready" ||
             loadingMessages
           }
           onClick={() => void loadMessages(true)}
-          title="Read phone history and refresh its saved Silo copy; requires a trusted phone"
+          title="Messages update automatically when the phone connects. Click to update now."
+          aria-label="Update messages from phone now"
         >
-          <FiRefreshCw /> {loadingMessages ? "Updating..." : "Update backup"}
+          <FiRefreshCw className={loadingMessages ? "spinning" : ""} />
         </button>
       </header>
+
+      {devicePanel && <div className="mobile-manager-devices">{devicePanel}</div>}
 
       {(error || notice) && (
         <div className={`messages-notice ${error ? "error" : ""}`}>
           {error || notice}
         </div>
       )}
-
-      <div className="mobile-manager-note">
-        Browseable snapshots keep dated USB-accessible copies of photos, docs, and messages. Update a backup to refresh a saved source.
-      </div>
 
       <section className="messages-layout">
         <aside className="conversation-directory">

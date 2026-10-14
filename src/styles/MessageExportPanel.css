@@ -147,10 +147,10 @@
 
 .messages-toolbar {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) auto minmax(220px, 320px) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 280px) auto auto;
   align-items: center;
-  gap: 10px;
-  padding: 12px 18px;
+  gap: 8px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
@@ -219,11 +219,28 @@
   overflow: hidden;
 }
 
-.mobile-manager-note {
-  padding: 8px 18px 0;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.45;
+.messages-toolbar .messages-icon-button {
+  width: 34px;
+  padding: 0;
+}
+
+.messages-toolbar .messages-icon-button svg.spinning {
+  animation: stats-spin 1s linear infinite;
+}
+
+.mobile-manager-devices {
+  flex-shrink: 0;
+  max-height: 40%;
+  overflow: auto;
+  border-bottom: 1px solid var(--line);
+}
+
+.mobile-manager-devices .phone-management-panel {
+  margin: 0;
+  padding: 10px 16px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 /* Conversation list */
@@ -964,9 +981,10 @@
 
 @media (max-width: 900px) {
   .messages-toolbar {
-    grid-template-columns: 1fr auto;
+    grid-template-columns: 1fr auto auto;
   }
   .messages-toolbar select {
-    grid-column: 1 / 2;
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 }

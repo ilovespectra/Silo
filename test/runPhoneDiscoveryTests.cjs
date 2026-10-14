@@ -64,6 +64,7 @@ async function run() {
     backups = [];
   const m = { exports: null };
   let invalidations = 0;
+  const messageRefreshes = [];
   new Function(
     "phoneManager",
     "indexNewSources",
@@ -77,6 +78,8 @@ async function run() {
     "console",
     "module",
     "invalidateSourceList",
+    "refreshPhoneMessagesInBackground",
+    "requestIndexRecoveryStages",
     code,
   )(
     {
@@ -111,6 +114,8 @@ async function run() {
     () => {
       invalidations += 1;
     },
+    (device) => messageRefreshes.push(device.id),
+    () => {},
   );
   await m.exports();
   assert.equal(
@@ -147,6 +152,19 @@ async function run() {
   await m.exports();
   assert.deepEqual(events.at(-1), [], "disconnect updates the source list");
   assert.equal(invalidations, events.length, "each device change drops the cached source list so the picker updates instantly");
+  const readyDevice = {
+    id: "test",
+    platform: "android",
+    name: "Saga",
+    status: "ready",
+    rootPath: "/__phone__/android/test/sdcard",
+  };
+  const backupsBeforeReconnect = backups.length;
+  listed = [readyDevice];
+  await m.exports();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(backups.length, backupsBeforeReconnect + 1, "reconnecting a phone starts a backup automatically");
+  assert.ok(messageRefreshes.includes("test"), "a newly connected phone refreshes its messages in the background");
   console.log(
     "Phone discovery tests passed: priority queue, automatic authorization/source indexing, unchanged-event suppression, and disconnect notifications.",
   );

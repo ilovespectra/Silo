@@ -3596,6 +3596,30 @@ function runDerivedIndexes(): Promise<void> {
   */
 }
 
+const phoneMessageRefreshJobs = new Set<string>();
+
+/** Refreshes a connected phone's saved message history after its file backup, then tells the Messages view. */
+function refreshPhoneMessagesInBackground(device: PhoneDevice): void {
+  const key = `${device.platform}:${device.id}`;
+  if (phoneMessageRefreshJobs.has(key) || typeof messageExportCoordinator === "undefined") return;
+  phoneMessageRefreshJobs.add(key);
+  void (async () => {
+    try {
+      messageExportCoordinator.setBackupDestination(await phoneManager.getBackupDestination());
+      const threads = await messageExportCoordinator.getDeviceThreads(device.id, device.platform, true, device.name);
+      runtimeLog("phone-messages-auto-refreshed", { platform: device.platform, threads: threads.length });
+      sendToRenderer("phone-messages-updated", { deviceId: device.id, platform: device.platform });
+    } catch (error) {
+      runtimeLog("phone-messages-auto-refresh-failed", {
+        platform: device.platform,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      phoneMessageRefreshJobs.delete(key);
+    }
+  })();
+}
+
 function discoverAndBackupPhones(): Promise<void> {
   if (phoneDiscoveryPromise) return phoneDiscoveryPromise;
   phoneDiscoveryPromise = (async () => {
@@ -3660,24 +3684,22 @@ function discoverAndBackupPhones(): Promise<void> {
         if (device.status !== "ready" || !device.rootPath) continue;
         const key = `${device.platform}:${device.id}`;
         const previous = backupStates.get(key);
-        // Only start backup if:
-        // 1. No previous backup exists (!previous), OR
-        // 2. Previous backup failed with error, OR
-        // 3. Previous backup completed successfully AND it's been 10+ minutes
-        // Do NOT auto-restart interrupted backups (idle/backing-up status)
-        const isCompletedBackup = previous?.status === "complete";
+        // Every connection or reconnection starts a backup (an active job is reused).
+        // While a phone stays connected, retry failures and refresh every 10 minutes.
+        const newlyConnected = !seenReadyPhoneKeys.has(key);
         const refreshDue =
-          isCompletedBackup &&
-          (!previous?.lastBackupAt ||
+          previous?.status === "complete" &&
+          (!previous.lastBackupAt ||
             Date.now() - previous.lastBackupAt >= 10 * 60 * 1000);
         const shouldStart =
-          !previous || previous.status === "error" || refreshDue;
+          newlyConnected || !previous || previous.status === "error" || refreshDue;
         console.log(
-          `[PHONE-DISCOVERY] Device ${key}: shouldStart=${shouldStart}, hasPrevious=${!!previous}, status=${previous?.status}, isCompletedBackup=${isCompletedBackup}, refreshDue=${refreshDue}`,
+          `[PHONE-DISCOVERY] Device ${key}: shouldStart=${shouldStart}, newlyConnected=${newlyConnected}, status=${previous?.status}, refreshDue=${refreshDue}`,
         );
         if (!shouldStart) continue;
         console.log(`[PHONE-DISCOVERY] Triggering backup for ${key}`);
         void phoneManager.backupDevice(device).then((progress) => {
+          if (newlyConnected) refreshPhoneMessagesInBackground(device);
           console.log(
             `[PHONE-DISCOVERY] Backup finished for ${key}:`,
             progress.status,
@@ -3689,6 +3711,12 @@ function discoverAndBackupPhones(): Promise<void> {
             completedFiles: progress.completedFiles,
             totalFiles: progress.totalFiles,
           });
+        }).catch((error) => {
+          runtimeLog("phone-backup-failed", {
+            platform: device.platform,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          if (newlyConnected) refreshPhoneMessagesInBackground(device);
         });
       }
       await getEnabledIndexSources();
@@ -12385,7 +12413,10 @@ ipcMain.handle(
     invalidateSourceList();
     sendToRenderer("phone-devices-changed", scannedPhoneDevices);
     if (connected.status === "ready" && connected.rootPath) {
-      void phoneManager.backupDevice(connected);
+      void phoneManager
+        .backupDevice(connected)
+        .catch(() => undefined)
+        .then(() => refreshPhoneMessagesInBackground(connected));
       void indexNewSources([connected.rootPath], "phone-connected");
     }
     return connected;
