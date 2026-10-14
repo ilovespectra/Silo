@@ -7428,13 +7428,23 @@ app.whenReady().then(async () => {
       runtimeLog("search-index-loaded", { elapsedMs: Date.now() - startupStartedAt });
     },
     (error) => {
+      runtimeLog("startup-load-error", { message: String(error) });
+      if (semanticIndexer?.usesExactVectorSearch()) {
+        // The ANN index is only an accelerator; exact vector search still answers queries.
+        updateSearchIndexReadiness({
+          status: "ready",
+          percentage: 100,
+          records: loadedSearchRecords,
+          message: "Search index ready.",
+        });
+        return;
+      }
       updateSearchIndexReadiness({
         status: "error",
         percentage: searchIndexReadiness.percentage,
         records: searchIndexReadiness.records,
         message: searchPreparationFailureMessage,
       });
-      runtimeLog("startup-load-error", { message: String(error) });
     },
   );
   const loadResults = await Promise.allSettled([
@@ -7514,6 +7524,9 @@ app.whenReady().then(async () => {
     thumb: async (filePath) => getThumbnail(await resolveLocalPath(filePath), false, 200),
     listAudio: () => audioLibraryCache?.getSnapshot().files ?? [],
     discover: discoverMemoryIdeas,
+    onSearchError: (stage, error) => runtimeLog("memory-search-error", {
+      stage, message: error instanceof Error ? error.message : String(error),
+    }),
     isAllowed: memoryAllowed,
     findLiveVideo: memoryLiveVideo,
   });

@@ -34,6 +34,8 @@ export interface MemoryManagerDependencies {
   findLiveVideo?(file: MemoryMedia): Promise<string | null | undefined>;
   /** Story ideas mined from the library (time, places, people, pets, subjects, folders). */
   discover?(): Promise<MemoryStoryCandidate[]>;
+  /** Records why a search step failed; failures are otherwise swallowed per step. */
+  onSearchError?(stage: string, error: unknown): void;
 }
 
 export interface MemoryStoryCandidate {
@@ -82,7 +84,10 @@ const MOOD_WORDS: Record<MemoryMood, readonly string[]> = {
   dramatic: ["dramatic", "cinematic", "epic", "orchestral", "storm", "intense"],
 };
 const DEFAULT_SETTINGS: MemorySettings = { showOnLaunch: true, movieDirectory: null };
-const MAX_CARDS = 5;
+/** Saved memories persist across runs; new generations are added in front, never replacing them. */
+const MAX_CARDS = 60;
+/** Fresh stories one generation run adds to the saved collection. */
+const NEW_PER_RUN = 5;
 /** Saved extras whose movies are pre-rendered, so they play while sources are offline. */
 const RESERVE_CARDS = 5;
 const OFFLINE_PROMOTIONS = 3;
@@ -486,8 +491,8 @@ export class MemoryManager {
       const want = customTopic
         ? 1
         : replace
-          ? MAX_CARDS + RESERVE_CARDS
-          : Math.max(0, MAX_CARDS + RESERVE_CARDS - current.length - reserve.length);
+          ? NEW_PER_RUN + Math.max(0, RESERVE_CARDS - reserve.length)
+          : Math.max(0, NEW_PER_RUN + RESERVE_CARDS - current.length - reserve.length);
       const signatures = new Set([...current, ...reserve].map(card => signature(card.media)));
       const usedKeys = new Set([...this.recentKeys,
         ...[...current, ...reserve].map(card => card.storyKey).filter((key): key is string => Boolean(key))]);
@@ -523,13 +528,12 @@ export class MemoryManager {
           ...tokenQueries.map((word) => `photo of ${word}`),
           ...tokenQueries.map((word) => `${word} photos`),
         ].filter((query) => query.length >= 3 && query.length <= 160))).slice(0, 12);
-        let triedAny = false;
+        let searchErrors = 0;
         const mergedHits: MemoryMedia[] = [];
         const mergeSeen = new Set<string>();
         for (let index = 0; index < broadQueries.length; index++) {
           const query = broadQueries[index];
           try {
-            triedAny = true;
             const topicTitle = customTopicTitle(customTopic);
             advance("scanning", `Searching “${topicTitle}” (${index + 1}/${broadQueries.length})`, 1);
             const hits = await this.deps.search(query);
@@ -552,14 +556,17 @@ export class MemoryManager {
               advance("matching", `Found a memory for “${topicTitle}”`, 1);
               break;
             }
-          } catch {
+          } catch (error) {
+            searchErrors += 1;
+            this.deps.onSearchError?.("custom-topic", error);
             continue;
           }
         }
-        if (!triedAny || !produced.length) searchFailed = true;
+        // Only report search as unavailable when every query actually failed.
+        if (!produced.length && searchErrors > 0 && searchErrors === broadQueries.length) searchFailed = true;
       } else if (want > 0 && this.deps.discover) {
         let ideas: MemoryStoryCandidate[] = [];
-        try { ideas = await this.deps.discover(); } catch { searchFailed = true; }
+        try { ideas = await this.deps.discover(); } catch (error) { searchFailed = true; this.deps.onSearchError?.("discover", error); }
         if (!Array.isArray(ideas)) ideas = [];
         const valid = ideas.filter(idea => idea && text(idea.key, 1000) && text(idea.title, 200)
           && text(idea.description, 1000) && text(idea.query, 1000)
@@ -570,11 +577,10 @@ export class MemoryManager {
           const idea = ordered[attempt];
           advance("matching", `Reviewing story ideas (${attempt + 1}/${ideaSteps})`, 1);
           let hits: unknown;
-          try { hits = await idea.load(); } catch { continue; }
+          try { hits = await idea.load(); } catch (error) { this.deps.onSearchError?.("idea", error); continue; }
           const card = await this.buildCard(idea, hits, signatures, usedPaths);
           take(card);
         }
-        if (!produced.length && !searchFailed) searchFailed = true;
       }
       // Fixed-theme semantic search covers libraries the miners know little about.
       for (let attempt = 0; !customTopic && attempt < 5 && produced.length < want; attempt++) {
@@ -582,7 +588,7 @@ export class MemoryManager {
         this.cursor = (this.cursor + 1) % THEMES.length;
         advance("assembling", `Finding ${theme.title.toLowerCase()} moments (${attempt + 1}/5)`, 1);
         let hits: MemoryMedia[];
-        try { hits = await this.deps.search(theme.query); } catch { searchFailed = true; continue; }
+        try { hits = await this.deps.search(theme.query); } catch (error) { searchFailed = true; this.deps.onSearchError?.("theme", error); continue; }
         take(await this.buildCard({ ...theme, key: `theme:${theme.title}`,
           description: `A ${theme.mood} story inspired by ${theme.title.toLowerCase()}.` }, hits, signatures, usedPaths));
       }
@@ -591,14 +597,11 @@ export class MemoryManager {
       let nextReserve: MemorySuggestion[];
       let promoted = 0;
       if (produced.length) {
-        visible = customTopic
-          ? [produced[0], ...current].slice(0, MAX_CARDS)
-          : replace ? produced.slice(0, MAX_CARDS) : [...current, ...produced].slice(0, MAX_CARDS);
+        // New stories go in front of the saved collection; existing memories are kept.
+        const fresh = produced.slice(0, customTopic ? 1 : NEW_PER_RUN);
+        visible = [...fresh, ...current].slice(0, MAX_CARDS);
         const placed = new Set(visible.map(card => card.id));
-        const leftovers = [...produced, ...(replace || customTopic ? current : []), ...reserve].filter(card => !placed.has(card.id));
-        // Old cards refill empty slots before going to reserve; nothing is discarded silently.
-        while (visible.length < MAX_CARDS && leftovers.length) visible.push(leftovers.shift()!);
-        nextReserve = leftovers.slice(0, RESERVE_CARDS);
+        nextReserve = [...produced, ...reserve].filter(card => !placed.has(card.id)).slice(0, RESERVE_CARDS);
       } else if (!customTopic && replace && reserve.length) {
         // Sources offline or exhausted: surface saved stories whose movies are already rendered.
         const promote = reserve.slice(0, OFFLINE_PROMOTIONS);
@@ -625,7 +628,7 @@ export class MemoryManager {
             ? `Local search could not complete for “${customTopicTitle(customTopic)}”. Try again when indexing is ready.`
             : `Not enough distinct, strong photos matched “${customTopicTitle(customTopic)}”. Try another phrase or index more photos.`
         : produced.length
-          ? `${produced.length} new memor${produced.length === 1 ? "y" : "ies"} found${this.reserve.length ? `, ${this.reserve.length} saved for later` : ""}.`
+          ? `${Math.min(produced.length, NEW_PER_RUN)} new memor${Math.min(produced.length, NEW_PER_RUN) === 1 ? "y" : "ies"} added${this.reserve.length ? `, ${this.reserve.length} saved for later` : ""}.`
           : promoted
             ? `Showing ${promoted} saved memor${promoted === 1 ? "y" : "ies"}; connect more sources for fresh ones.`
             : count
@@ -667,7 +670,7 @@ export class MemoryManager {
       this.reserve = this.reserve.filter(card => card.id !== id);
       // A saved extra takes the dismissed card's place.
       const reserve = await this.visibleReserve();
-      if (reserve.length && this.state.suggestions.length < MAX_CARDS) {
+      if (reserve.length && this.state.suggestions.length < NEW_PER_RUN) {
         this.state.suggestions.push(reserve[0]);
         this.reserve = this.reserve.filter(card => card.id !== reserve[0].id);
       }

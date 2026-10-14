@@ -53,6 +53,12 @@
 .memories-collection-label { font-size: 13px; margin: 28px 0 18px; }
 .memories-collection-label > span { color: var(--memories-muted); margin-left: 12px; font-size: 11px; }
 .memories-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr)); gap: 22px; align-items: start; }
+.memories-card-pending .memories-cover-placeholder { aspect-ratio: 16 / 10; animation: memories-pending-pulse 1.6s ease-in-out infinite; }
+.memories-card-pending-body { display: grid; gap: 8px; padding: 16px; }
+.memories-card-pending-body span { height: 12px; border-radius: 6px; background: color-mix(in srgb, var(--memories-border) 70%, transparent); }
+.memories-card-pending-body span:last-child { width: 60%; }
+@keyframes memories-pending-pulse { 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { .memories-card-pending .memories-cover-placeholder { animation: none; } }
 .memories-card { min-width: 0; border: 1px solid var(--memories-border); border-radius: 18px; overflow: hidden; background: var(--memories-panel); }
 .memories-cover-button { position: relative; width: 100%; display: block; border: 0; padding: 0; background: var(--memories-panel); text-align: left; color: var(--memories-text); }
 .memories-cover { position: relative; isolation: isolate; height: 210px; display: grid; grid-template-columns: 2fr 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 3px; overflow: hidden; background: linear-gradient(130deg, color-mix(in srgb, var(--memories-orange) 28%, var(--memories-panel)), var(--memories-panel) 70%); }

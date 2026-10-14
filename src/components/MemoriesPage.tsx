@@ -616,8 +616,12 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
       <small>{state.generationProgress.etaSeconds !== undefined ? `About ${formatEta(state.generationProgress.etaSeconds)} left` : "Estimating time…"}</small>
     </div>}
     {state?.generating && <p className="memories-hint">This uses photos and clips already indexed. Anything indexed later will be available the next time you generate.</p>}
-    {Boolean(state?.suggestions.length) && <p className="memories-collection-label">{state?.suggestions.length} stories to rediscover <span>New suggestions replace this collection.</span></p>}
+    {Boolean(state?.suggestions.length) && <p className="memories-collection-label">{state?.suggestions.length} stories to rediscover <span>New memories are added to this collection.</span></p>}
     <div className="memories-grid" data-tour="memory-controls" data-help="Each story card lets you preview and save its movie, remove only the suggestion, tune photos, duration and soundtrack, and choose where the saved copy goes.">
+      {(action === "Finding memories" || state?.generating) && Array.from({ length: 5 }, (_, index) => <article key={`pending-${index}`} className="memories-card memories-card-pending" aria-busy="true" aria-label="Memory being created">
+        <div className="memories-cover-placeholder"><FiFilm /><span>{index === 0 ? state?.generationProgress?.label || "Finding a story…" : "Waiting for a story…"}</span></div>
+        <div className="memories-card-pending-body"><span /><span /></div>
+      </article>)}
       {state?.suggestions.filter((memory) => previews[memory.id]?.status !== "failed").map((memory) => <MemoryCard key={memory.id} api={api} memory={memory} disabled={busy || state.generating}
         preview={previews[memory.id]} onBlockedView={() => blockedView(memory)} onState={(next) => { if (mounted.current) setState(next); }}
         onDismiss={() => { void run("Removing suggestion", () => api.dismissMemory(memory.id)); }}

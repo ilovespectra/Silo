@@ -281,6 +281,8 @@ export class SemanticIndexer {
   private vectorIndexReady!: Promise<void>;
   private resolveVectorIndexReady!: () => void;
   private vectorIndexReadyState = false;
+  /** Set when the native ANN index cannot be built; searches then scan vectors exactly. */
+  private vectorIndexFailed = false;
   private readonly textRecordIds = new Map<string, number>();
   private readonly textRecordPaths: string[] = [];
   private readonly textRecordTerms: Array<Set<string>> = [];
@@ -645,16 +647,23 @@ export class SemanticIndexer {
     const failedIndex = this.persistedVectorIndex;
     try {
       await failedIndex.initialize(groups);
+      this.vectorIndexFailed = false;
       this.vectorIndexReadyState = true;
       this.resolveVectorIndexReady();
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(String(error));
       this.persistedVectorIndex = null;
+      this.vectorIndexFailed = true;
       this.resolveVectorIndexReady();
       this.resetVectorIndexReady();
       await failedIndex.shutdown(1000).catch(() => undefined);
       throw normalized;
     }
+  }
+
+  /** True when semantic search runs as an exact vector scan because the ANN index failed. */
+  usesExactVectorSearch(): boolean {
+    return this.vectorIndexFailed;
   }
 
   async flushVectorSearch(): Promise<void> {
@@ -2046,15 +2055,25 @@ export class SemanticIndexer {
     }
     if (isCancelled()) return [];
 
-    if (!(await this.waitForVectorIndexReady(isCancelled))) return [];
     const indexedRecordCount = this.latestRecordsByVectorKey.size;
-    onSearchProgress?.([], 0, indexedRecordCount, "ann");
-    const hits = await this.persistedVectorIndex!.search(
-      sourcePaths,
-      searchEmbeddings.image,
-      searchEmbeddings.document,
-      SEARCH_RESULTS_PER_TYPE,
-    );
+    let hits: Array<{ key: number; confidence: number }>;
+    if (this.vectorIndexFailed) {
+      hits = await this.exactVectorSearch(
+        sourcePaths,
+        searchEmbeddings.image,
+        searchEmbeddings.document,
+        isCancelled,
+      );
+    } else {
+      if (!(await this.waitForVectorIndexReady(isCancelled))) return [];
+      onSearchProgress?.([], 0, indexedRecordCount, "ann");
+      hits = await this.persistedVectorIndex!.search(
+        sourcePaths,
+        searchEmbeddings.image,
+        searchEmbeddings.document,
+        SEARCH_RESULTS_PER_TYPE,
+      );
+    }
     if (isCancelled()) return [];
 
     const results: SearchResult[] = [];
@@ -2083,6 +2102,64 @@ export class SemanticIndexer {
     if (!isCancelled())
       onSearchProgress?.(results, hits.length, indexedRecordCount, "ann");
     return isCancelled() ? [] : results;
+  }
+
+  /**
+   * Brute-force cosine scan of vectors.bin, used when the native ANN index is
+   * unavailable (for example a missing native addon) so semantic results and
+   * memories still work. Confidence matches the ANN worker's exact re-ranking.
+   */
+  private async exactVectorSearch(
+    sourcePaths: string[],
+    imageQuery: Float32Array,
+    documentQuery: Float32Array,
+    isCancelled: () => boolean,
+  ): Promise<Array<{ key: number; confidence: number }>> {
+    const sources = new Set(sourcePaths);
+    const wanted = new Map<number, boolean>();
+    for (const [key, record] of this.latestRecordsByVectorKey)
+      if (sources.has(record.sourcePath) && record.vectorOffset >= 0)
+        wanted.set(key, record.type === "image");
+    if (!wanted.size) return [];
+    const handle = await fsPromises.open(this.vectorsPath, "r").catch(() => null);
+    if (!handle) return [];
+    const imageHits: Array<{ key: number; confidence: number }> = [];
+    const documentHits: Array<{ key: number; confidence: number }> = [];
+    const chunkVectors = 2048;
+    const buffer = Buffer.allocUnsafeSlow(chunkVectors * VECTOR_BYTES);
+    try {
+      const keys = Array.from(wanted.keys()).sort((first, second) => first - second);
+      let index = 0;
+      while (index < keys.length) {
+        if (isCancelled()) return [];
+        const firstKey = keys[index];
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, firstKey * VECTOR_BYTES);
+        if (bytesRead < VECTOR_BYTES) break;
+        while (index < keys.length) {
+          const key = keys[index];
+          const localOffset = (key - firstKey) * VECTOR_BYTES;
+          if (localOffset + VECTOR_BYTES > bytesRead) break;
+          index += 1;
+          const isImage = wanted.get(key)!;
+          const query = isImage ? imageQuery : documentQuery;
+          const vector = new Float32Array(buffer.buffer, buffer.byteOffset + localOffset, VECTOR_SIZE);
+          let similarity = 0;
+          for (let dimension = 0; dimension < VECTOR_SIZE; dimension += 1)
+            similarity += query[dimension] * vector[dimension];
+          if (!Number.isFinite(similarity)) continue;
+          (isImage ? imageHits : documentHits).push({
+            key,
+            confidence: Math.max(0, Math.min(100, similarity * 100)),
+          });
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    } finally {
+      await handle.close();
+    }
+    const top = (hits: Array<{ key: number; confidence: number }>) =>
+      hits.sort((first, second) => second.confidence - first.confidence).slice(0, SEARCH_RESULTS_PER_TYPE);
+    return [...top(imageHits), ...top(documentHits)];
   }
 
   private async waitForVectorIndexReady(
