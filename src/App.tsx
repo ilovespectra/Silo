@@ -5646,7 +5646,10 @@ function App() {
               className="header-tools-toggle"
               type="button"
               aria-expanded={!headerToolsCollapsed}
-              onClick={() => setHeaderToolsCollapsed((current) => !current)}
+              onClick={() => {
+                if (!headerToolsCollapsed) setShowFilters(false);
+                setHeaderToolsCollapsed(!headerToolsCollapsed);
+              }}
               title={headerToolsCollapsed ? "Show search and toolbar controls" : "Collapse search and toolbar controls"}
             >
               <FiChevronDown aria-hidden="true" />
@@ -6031,7 +6034,7 @@ function App() {
         </div>
       )}
 
-      {appSection === "files" && showFilters && (
+      {appSection === "files" && showFilters && !headerToolsCollapsed && (
         <div className="filters-panel">
           <div className="filter-section">
             <h3>Show</h3>
