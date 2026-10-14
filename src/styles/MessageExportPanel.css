@@ -512,21 +512,23 @@
   overflow: hidden;
   align-items: center;
   justify-content: center;
-  padding: 12px;
+  padding: 20px 12px;
   background: var(--surface-inset);
 }
 
+/* Compact, classic-iPhone proportions that always fit inside the grey stage. */
 .phone-frame {
   display: flex;
-  width: min(390px, calc(100% - 12px));
-  height: min(820px, calc(100% - 8px));
-  min-height: 620px;
-  max-height: 880px;
+  height: min(600px, 100%);
+  width: auto;
+  max-width: 100%;
+  min-height: 0;
   flex-direction: column;
+  flex-shrink: 0;
   overflow: hidden;
   border: 10px solid #1d1d1f;
-  border-radius: 44px;
-  aspect-ratio: 9 / 18;
+  border-radius: 40px;
+  aspect-ratio: 9 / 16;
   background: var(--msg-thread-bg);
   box-shadow:
     0 0 0 2px #3a3a3c,
@@ -540,10 +542,10 @@
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
   flex-shrink: 0;
-  height: 44px;
-  padding: 0 26px;
+  height: 36px;
+  padding: 0 20px;
   background: var(--msg-header-bg);
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
 }
 
@@ -556,8 +558,8 @@
 
 .phone-camera {
   display: block;
-  width: 110px;
-  height: 30px;
+  width: 84px;
+  height: 24px;
   border-radius: 20px;
   background: #000;
 }

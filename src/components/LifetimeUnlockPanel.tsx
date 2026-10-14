@@ -237,6 +237,14 @@ export default function LifetimeUnlockPanel({
     };
   }, [license.isLicensed, onVerified, walletPurchase]);
 
+  // A payment or activation completed while this modal was open: close it automatically.
+  const licensedAtOpen = useRef(license.isLicensed);
+  useEffect(() => {
+    if (licensedAtOpen.current || !license.isLicensed) return;
+    setPaymentOpen(false);
+    onClose();
+  }, [license.isLicensed, onClose]);
+
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
@@ -520,7 +528,7 @@ export default function LifetimeUnlockPanel({
               <div className="lifetime-unlock-step">
                 <span>01</span>
                 <div>
-                  <strong>Scan to pay with your Solana wallet</strong>
+                  <strong>Scan with your phone’s camera to pay</strong>
                   <p>
                     Approve the $25 USDC one-time payment in your wallet. Silo
                     will confirm it on-chain and unlock automatically.
@@ -544,9 +552,10 @@ export default function LifetimeUnlockPanel({
                 )}
               </div>
               <p className="lifetime-solana-instructions">
-                Scan with a Solana wallet on your phone. If your USDC is on
-                another network, bridge it to Solana first; Silo never moves or
-                bridges funds.
+                Scan with your phone’s regular camera app; it opens your Solana
+                wallet with the payment filled in. Don’t use a wallet’s built-in
+                scanner. If your USDC is on another network, bridge it to Solana
+                first; Silo never moves or bridges funds.
               </p>
               {paymentRequest && walletPurchase && (
                 <>
@@ -577,7 +586,7 @@ export default function LifetimeUnlockPanel({
                   </div>
                   {paymentLinkCopyState === "error" && (
                     <p className="lifetime-unlock-inline-note" role="status">
-                      No wallet app opened. Scan the QR code, or send exactly 25 USDC
+                      No wallet app opened. Scan the QR code with your camera, or send exactly 25 USDC
                       on Solana to the address above and verify the signature below.
                     </p>
                   )}
@@ -808,9 +817,10 @@ export default function LifetimeUnlockPanel({
               </button>
             </header>
             <p className="lifetime-action-payment-intro">
-              Each $25 lifetime license unlocks this computer. Scan with a Solana
-              wallet to send USDC directly to Silo. Silo activates the license
-              after verifying the payment.
+              Each $25 lifetime license unlocks this computer. Scan the code with
+              your phone’s regular camera app (not a wallet’s scanner); it opens
+              your Solana wallet to send USDC directly to Silo. Silo activates the
+              license after verifying the payment.
             </p>
             <div className="lifetime-solana-qr">
               {paymentRequest && walletPurchase ? (
@@ -857,7 +867,7 @@ export default function LifetimeUnlockPanel({
                 </div>
                 {paymentLinkCopyState === "error" && (
                   <p className="lifetime-unlock-inline-note" role="status">
-                    No wallet app opened. Scan the QR code, or send exactly 25 USDC
+                    No wallet app opened. Scan the QR code with your camera, or send exactly 25 USDC
                     on Solana to the address above and verify the signature below.
                   </p>
                 )}

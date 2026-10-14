@@ -2441,20 +2441,44 @@ body {
 }
 
 .phone-device-actions {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
+}
+
+.phone-device-actions .phone-icon-button {
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+}
+
+.phone-device-actions .phone-icon-button.active {
+  border-color: var(--orange);
+  color: var(--orange-bright);
+}
+
+.phone-backup-dialog .backup-dest-display {
+  padding: 0;
+}
+
+.phone-backup-dialog-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .phone-device-actions button {
   display: inline-flex;
   min-width: 0;
-  min-height: 30px;
+  min-height: 28px;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 5px 8px;
+  gap: 5px;
+  padding: 4px 10px;
   border: 1px solid var(--border-soft);
   border-radius: 6px;
   background: var(--surface-control);
@@ -8028,7 +8052,10 @@ input[type="range"]::-moz-range-progress {
 }
 
 .phone-device-list .phone-device {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   margin: 0;
+  border-radius: 10px;
 }
 
 .phone-tooling-notices {
@@ -8104,8 +8131,8 @@ input[type="range"]::-moz-range-progress {
 
 .mobile-messages-section {
   display: flex;
-  height: min(860px, max(720px, calc(100vh - 220px)));
-  min-height: 720px;
+  height: max(760px, calc(100vh - 120px));
+  min-height: 760px;
   flex-direction: column;
   margin: 0 clamp(12px, 2vw, 24px) 18px;
   overflow: hidden;

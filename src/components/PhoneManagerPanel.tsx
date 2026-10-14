@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { FiEdit3, FiRefreshCw, FiSmartphone, FiX } from "react-icons/fi";
+import { FiEdit3, FiFolder, FiLink, FiLock, FiRefreshCw, FiSmartphone, FiX } from "react-icons/fi";
 
 interface PhoneManagerPanelProps {
   devices: PhoneDevice[];
@@ -83,6 +83,8 @@ function PhoneDeviceCard({
   const [restorePassword, setRestorePassword] = useState("");
   const [restoreBusy, setRestoreBusy] = useState(false);
   const [restoreNotice, setRestoreNotice] = useState("");
+  const [showArchives, setShowArchives] = useState(false);
+  const busy = busyDeviceId === device.id;
   const createRestoreArchive = async () => {
     if (backupPassword.length < 8 || backupPassword !== confirmPassword) {
       setRestoreNotice("Enter a matching password with at least 8 characters.");
@@ -128,56 +130,71 @@ function PhoneDeviceCard({
           {device.message}
         </small>
       </div>
-      <div className="phone-device-actions" data-tour="mobile-device-actions" data-help="Rename, browse, connect, unmount, or renew a phone’s browseable backup. Renewing updates Silo’s saved copy without changing files on the phone.">
+      <div className="phone-device-actions" role="toolbar" aria-label={`${device.name} actions`} data-tour="mobile-device-actions" data-help="Rename, browse, connect, unmount, or back up a phone. Backing up updates Silo’s saved copy without changing files on the phone.">
+        {device.status === "ready" && device.rootPath ? (
+          <>
+            <button
+              className="phone-renew-backup-button"
+              onClick={() => onRenewBackup(device)}
+              disabled={busy}
+              title="Back up this phone into Silo; the phone’s files are unchanged"
+              data-help="Copy this connected phone’s photos, messages, and readable files into a dated browseable snapshot in Silo. This does not change files on the phone."
+            >
+              <FiRefreshCw /> {busy ? "Backing up…" : "Back up"}
+            </button>
+            <button
+              className="phone-icon-button"
+              onClick={() => onBrowse(device)}
+              disabled={busy}
+              title="Browse files exposed by this device"
+              aria-label={`Browse ${device.name}`}
+            >
+              <FiFolder />
+            </button>
+          </>
+        ) : (
+          <button
+            className="phone-renew-backup-button"
+            onClick={() => onConnect(device)}
+            disabled={busy}
+            title="Connect and save a dated snapshot in Silo"
+            data-help="Connecting starts or updates a dated local snapshot of accessible files. It does not change files on the device."
+          >
+            <FiLink /> {busy ? "Connecting…" : "Connect"}
+          </button>
+        )}
         <button
+          className="phone-icon-button"
           onClick={() => onRename(device)}
           title={`Rename ${device.name} in Silo only`}
           aria-label={`Rename ${device.name} in Silo only`}
         >
-          <FiEdit3 /> Rename
+          <FiEdit3 />
         </button>
-        {device.status === "ready" && device.rootPath ? (
-          <>
-            <button
-              onClick={() => onBrowse(device)}
-              disabled={busyDeviceId === device.id}
-              title="Browse files exposed by this device"
-              data-help="Browse accessible files without changing the connected device."
-            >
-              Browse
-            </button>
-            <button
-              className="phone-renew-backup-button"
-              onClick={() => onRenewBackup(device)}
-              disabled={busyDeviceId === device.id}
-              title="Update this phone’s browseable snapshot in Silo; the phone’s files are unchanged"
-              data-help="Scan this connected phone and update its browseable snapshot in Silo. This does not change files on the phone."
-            >
-              <FiRefreshCw /> {busyDeviceId === device.id ? "Updating…" : "Update backup"}
-            </button>
-            {device.platform === "ios" && (
-              <button
-                onClick={() => onDisconnect(device)}
-                disabled={busyDeviceId === device.id}
-                title="Unmount device without changing its contents"
-                aria-label={`Disconnect ${device.name}`}
-              >
-                <FiX /> Disconnect
-              </button>
-            )}
-          </>
-        ) : (
+        {device.platform === "ios" && device.status === "ready" && (
           <button
-            onClick={() => onConnect(device)}
-            disabled={busyDeviceId === device.id}
-            title="Connect and save a dated snapshot in Silo"
-            data-help="Connecting starts or updates a dated local snapshot of accessible files. It does not change files on the device."
+            className={`phone-icon-button ${showArchives ? "active" : ""}`}
+            onClick={() => setShowArchives((value) => !value)}
+            aria-pressed={showArchives}
+            title="Encrypted restore archives"
+            aria-label="Encrypted restore archives"
           >
-            {busyDeviceId === device.id ? "Connecting…" : "Connect"}
+            <FiLock />
+          </button>
+        )}
+        {device.platform === "ios" && device.status === "ready" && device.rootPath && (
+          <button
+            className="phone-icon-button"
+            onClick={() => onDisconnect(device)}
+            disabled={busy}
+            title="Unmount device without changing its contents"
+            aria-label={`Disconnect ${device.name}`}
+          >
+            <FiX />
           </button>
         )}
       </div>
-      {device.platform === "ios" && device.status === "ready" && (
+      {showArchives && device.platform === "ios" && device.status === "ready" && (
         <div className="phone-restore-controls">
           <strong>Encrypted restore archives</strong>
           <label htmlFor={`phone-backup-password-${deviceKey}`}>
@@ -437,46 +454,18 @@ export function PhoneManagementPanel({
   onCreateRestoreArchive,
   onRestoreFromArchive,
 }: PhoneManagementPanelProps) {
+  const [backupRequest, setBackupRequest] = useState<
+    { device: PhoneDevice; mode: "connect" | "renew" } | null
+  >(null);
+  const startBackup = () => {
+    if (!backupRequest) return;
+    const { device, mode } = backupRequest;
+    setBackupRequest(null);
+    if (mode === "connect") onConnect(device);
+    else onRenewBackup(device);
+  };
   return (
-    <section className="phone-management-panel" aria-labelledby="phone-management-title">
-      <header className="mobile-section-heading" data-tour="mobile-phone-management">
-        <div>
-          <span className="sidebar-kicker">Phone manager</span>
-          <h2 id="phone-management-title">Mobile manager</h2>
-          <p>Choose a phone, refresh its saved copy, and browse the exported files.</p>
-        </div>
-      </header>
-
-      <div className="phone-backup-settings" data-tour="mobile-backup-settings" data-help="Connecting creates or updates dated browseable copies in local storage; source files on the phone are unchanged. DEVICE WRITE: Restoring an iOS archive writes to the connected device and may replace current content.">
-        <small className="phone-backup-scope">
-          Silo saves a dated snapshot of the photos, messages, and other files it can read from each device. Update a backup to refresh the saved source.
-        </small>
-        <label>Browseable-copy destination</label>
-        <div className="backup-dest-display">
-          <small title={backupDestination || "Default (local storage)"}>
-            {backupDestination || "Default (local storage)"}
-          </small>
-          <button className="small-button" onClick={onChooseBackupDestination} title="Set the destination for future phone snapshots" data-help="Save the destination preference in Silo. This only chooses where future phone snapshots are stored.">
-            {backupDestination ? "Change" : "Choose"} destination
-          </button>
-          {backupDestination && (
-            <button
-              className="small-button"
-              onClick={onResetBackupDestination}
-              title="Reset phone snapshot destination to default"
-              aria-label="Reset phone snapshot destination to default"
-              data-help="Use Silo’s default local-storage folder for future browseable copies."
-            >
-              <FiX />
-            </button>
-          )}
-        </div>
-      </div>
-
-      <p className="phone-source-help">
-        Browse a saved copy in <strong>Files → Sources</strong> and select that phone or tablet.
-      </p>
-
+    <section className="phone-management-panel" aria-label="Mobile manager" data-tour="mobile-devices">
       {devices.length > 0 ? (
         <>
           <div className="phone-device-list">
@@ -489,10 +478,10 @@ export function PhoneManagementPanel({
                 restoreArchives={restoreArchives}
                 tooling={tooling}
                 onBrowse={onBrowse}
-                onConnect={onConnect}
+                onConnect={(target) => setBackupRequest({ device: target, mode: "connect" })}
                 onDisconnect={onDisconnect}
                 onRename={onRename}
-                onRenewBackup={onRenewBackup}
+                onRenewBackup={(target) => setBackupRequest({ device: target, mode: "renew" })}
                 onCreateRestoreArchive={onCreateRestoreArchive}
                 onRestoreFromArchive={onRestoreFromArchive}
               />
@@ -518,6 +507,69 @@ export function PhoneManagementPanel({
         <div className="phone-device-empty">
           <FiSmartphone aria-hidden="true" />
           <span>Scan for a connected phone or tablet to manage it here.</span>
+        </div>
+      )}
+      {backupRequest && (
+        <div
+          className="dialog-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setBackupRequest(null);
+          }}
+        >
+          <form
+            className="app-dialog phone-backup-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="phone-backup-dialog-title"
+            data-tour="mobile-backup-settings"
+            onSubmit={(event) => {
+              event.preventDefault();
+              startBackup();
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setBackupRequest(null);
+              }
+            }}
+          >
+            <h2 id="phone-backup-dialog-title">Back up {backupRequest.device.name}</h2>
+            <p>
+              Silo saves a dated snapshot of the photos, messages, and other files it can read from this device. Files on the phone are not changed.
+            </p>
+            <label className="phone-backup-dialog-label">Save to</label>
+            <div className="backup-dest-display">
+              <small title={backupDestination || "Default (local storage)"}>
+                {backupDestination || "Default (local storage)"}
+              </small>
+              <button type="button" className="small-button" onClick={onChooseBackupDestination}>
+                {backupDestination ? "Change" : "Choose"}
+              </button>
+              {backupDestination && (
+                <button
+                  type="button"
+                  className="small-button"
+                  onClick={onResetBackupDestination}
+                  title="Reset phone snapshot destination to default"
+                  aria-label="Reset phone snapshot destination to default"
+                >
+                  <FiX />
+                </button>
+              )}
+            </div>
+            <p className="phone-source-help">
+              Browse the saved copy later in <strong>Files → Sources</strong>.
+            </p>
+            <div className="dialog-actions">
+              <button type="button" onClick={() => setBackupRequest(null)}>
+                Cancel
+              </button>
+              <button type="submit" className="primary" autoFocus>
+                Back up now
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </section>
