@@ -2350,15 +2350,20 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   if (!semanticIndexer || !faceIndexer)
     throw new Error("Memory search is not ready yet. Try again shortly.");
   const roots = await getAllIndexSources();
-  if (roots.length === 0) return [];
+  if (roots.length === 0) {
+    runtimeLog("memory-search-trace", { stage: "no-index-sources" });
+    return [];
+  }
   // Confidence is similarity * 100; MemoryManager reads only the first 50 hits.
   const matches = await semanticIndexer.search(query, 24, roots);
   const photoCandidates: ScoredMemoryMedia[] = [];
   const musicDirectories = memoryMusicDirectories();
+  const dropped = { notImage: 0, notAllowed: 0, notPersonal: 0 };
   for (const file of matches) {
     if (photoCandidates.length >= 120) break;
-    if (file.type !== "image" || !memoryAllowed(file.path) ||
-      !isPersonalPhotoPath(file.path, file.size, musicDirectories)) continue;
+    if (file.type !== "image") { dropped.notImage++; continue; }
+    if (!memoryAllowed(file.path)) { dropped.notAllowed++; continue; }
+    if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) { dropped.notPersonal++; continue; }
     photoCandidates.push({ path: file.path, name: file.name, type: "image",
       modified: file.modified, size: file.size, score: file.confidence });
   }
@@ -2376,6 +2381,9 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   });
   const qualityPhotos = await applyMemoryPhotoQuality(rankedPhotos);
   const photos = selectMemoryPhotoCandidates(qualityPhotos).map(({ magicScore, ...photo }) => photo);
+  runtimeLog("memory-search-trace", { stage: "photos", roots: roots.length, matches: matches.length, ...dropped,
+    candidates: photoCandidates.length, distinct: magic.order.length, analyzed: magic.analyzed,
+    ranked: rankedPhotos.length, quality: qualityPhotos.length, selected: photos.length });
   // Clips beside matched photos; first frames are classified on demand, never a library rescan.
   const directories = Array.from(new Set(photos
     .filter((file) => !isRemotePath(file.path))
@@ -2593,10 +2601,15 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   const personal = personalMemoryPhotoFilter();
   const profile = getMemoryTopicProfile();
   await profile.refresh();
-  const images = semanticIndexer.getIndexedImages(roots)
+  const indexedImages = semanticIndexer.getIndexedImages(roots);
+  const images = indexedImages
     .filter(personal)
     .map(({ path: filePath, modified }) => ({ path: filePath, modified, captured: profile.captureTimeOf(filePath) }));
-  if (images.length < 4) return [];
+  if (images.length < 4) {
+    runtimeLog("memory-discover-trace", { roots: roots.length, indexedImages: indexedImages.length,
+      personalImages: images.length, ideas: 0, reason: "fewer-than-4-personal-photos" });
+    return [];
+  }
   const modified = new Map(images.map((image) => [image.path, image.captured ?? image.modified]));
   const topics = profile.getSnapshot()?.topics ?? [];
   const concepts: DiscoveredConcept[] = topics.filter((topic) => topic.estimatedCount >= 5).slice(0, 18)
@@ -2619,7 +2632,11 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   const pets = petIndexer
     ? petIndexer.getClusters().map((cluster) => ({ name: cluster.name, paths: petIndexer.getClusterPhotos(cluster.id) }))
     : [];
-  return discoverMemoryStories({ images, places, people, pets, concepts, topics: signals })
+  const ideas = discoverMemoryStories({ images, places, people, pets, concepts, topics: signals });
+  runtimeLog("memory-discover-trace", { roots: roots.length, indexedImages: indexedImages.length,
+    personalImages: images.length, topics: topics.length, concepts: concepts.length, places: places.length,
+    people: people.length, pets: pets.length, ideas: ideas.length });
+  return ideas
     .map((idea) => ({
       key: idea.key, title: idea.title, description: idea.description, query: idea.query, mood: idea.mood,
       load: () => loadMemoryIdeaMedia(idea.paths, modified),
@@ -7545,6 +7562,7 @@ app.whenReady().then(async () => {
     onSearchError: (stage, error) => runtimeLog("memory-search-error", {
       stage, message: error instanceof Error ? error.message : String(error),
     }),
+    onTrace: (event, details) => runtimeLog(event, details),
     isAllowed: memoryAllowed,
     findLiveVideo: memoryLiveVideo,
   });
@@ -8099,8 +8117,8 @@ let lastAutoMemoryRunAt = 0;
 let autoMemoryTimer: NodeJS.Timeout | null = null;
 
 /** Tops up the editable memories (never retires them) and pushes the new state to the page. */
-async function runMemoryGenerator(reason: string) {
-  const state = await memoryManager.generate(false);
+async function runMemoryGenerator(reason: string, replace = false) {
+  const state = await memoryManager.generate(replace);
   runtimeLog("memory-generate", { reason, count: state.suggestions.length });
   if (state.suggestions.length)
     void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
@@ -8119,7 +8137,7 @@ function scheduleAutomaticMemories() {
     const reason = lastAutoMemoryRunAt === 0 ? "startup" : "scheduled";
     lastAutoMemoryRunAt = Date.now();
     void runMemoryGenerator(reason)
-      .catch(() => runtimeLog("memory-auto-generate-error"));
+      .catch((error) => runtimeLog("memory-auto-generate-error", { message: error instanceof Error ? error.message : String(error) }));
   };
   autoMemoryTimer = setInterval(tick, AUTO_MEMORY_POLL_MS);
   setTimeout(tick, 15000);
@@ -8141,9 +8159,9 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
   }
   if (customTopic === undefined) {
     try {
-      return await runMemoryGenerator("on-demand");
-    } catch {
-      runtimeLog("memory-generate-error");
+      return await runMemoryGenerator("on-demand", replace === true);
+    } catch (error) {
+      runtimeLog("memory-generate-error", { message: error instanceof Error ? error.message : String(error) });
       const current = await memoryStateWithPreviews();
       return { ...current, message: "Memory generation hit a problem; your saved memories are unchanged." };
     }
@@ -8151,8 +8169,8 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
   let state;
   try {
     state = await memoryManager.generate(replace === true, customTopic);
-  } catch {
-    runtimeLog("memory-generate-error");
+  } catch (error) {
+    runtimeLog("memory-generate-error", { message: error instanceof Error ? error.message : String(error) });
     const current = await memoryStateWithPreviews();
     return { ...current, message: "Memory generation hit a problem; your saved memories are unchanged." };
   }

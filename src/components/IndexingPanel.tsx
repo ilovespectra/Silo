@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { FiAlertCircle, FiRefreshCw } from "react-icons/fi";
+import { FiAlertCircle, FiChevronDown, FiRefreshCw } from "react-icons/fi";
 import { describeIndexingConnectionError } from "../utils/indexingConnection";
 
 const activeStatuses = new Set([
@@ -31,10 +31,12 @@ const stageDescriptions: Record<string, string> = {
 
 interface IndexingPanelProps {
   onStagesChange?: (stages: IndexingStageProgress[]) => void;
+  collapsed?: boolean;
+  onToggleCollapsed?: () => void;
 }
 
 /** Count-only polling is isolated here so progress never rerenders the file grid. */
-export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
+export default function IndexingPanel({ onStagesChange, collapsed = false, onToggleCollapsed }: IndexingPanelProps) {
   const [stages, setStages] = useState<IndexingStageProgress[]>([]);
   const [error, setError] = useState<
     (ReturnType<typeof describeIndexingConnectionError> & { waiting?: boolean }) | null
@@ -132,7 +134,25 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
   }, []);
   return (
     <section className="indexing-panel" aria-label="Indexing progress">
-      <h3>Library indexing</h3>
+      {onToggleCollapsed ? (
+        <div className="sidebar-heading">
+          <button
+            type="button"
+            className="sidebar-collapse-toggle"
+            aria-expanded={!collapsed}
+            onClick={onToggleCollapsed}
+            title={collapsed ? "Show library indexing" : "Hide library indexing"}
+          >
+            <h3>
+              Library indexing
+              <FiChevronDown className="sidebar-collapse-chevron" aria-hidden="true" />
+            </h3>
+          </button>
+        </div>
+      ) : (
+        <h3>Library indexing</h3>
+      )}
+      {!collapsed && <>
       {/* Retries are automatic; brief hiccups stay quiet and only persistent failures explain themselves. */}
       {error && (error.waiting || attempts < 3) && (
         <p className="indexing-panel-status" role="status">
@@ -290,6 +310,7 @@ export default function IndexingPanel({ onStagesChange }: IndexingPanelProps) {
           </div>
         );
       })}
+      </>}
     </section>
   );
 }

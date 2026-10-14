@@ -1587,6 +1587,14 @@ body {
   color: var(--text);
   font-size: 12px;
 }
+.indexing-panel > .sidebar-heading {
+  margin: 0;
+}
+.indexing-panel .sidebar-collapse-toggle h3 {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
 .indexing-retry-button {
   justify-self: start;
   padding: 4px 8px;

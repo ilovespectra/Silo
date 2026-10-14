@@ -1090,15 +1090,15 @@ function App() {
     sessionId: string;
   } | null>(null);
 
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<{ sources: boolean; folders: boolean }>(() => {
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<{ sources: boolean; folders: boolean; indexing: boolean }>(() => {
     try {
       const saved = JSON.parse(localStorage.getItem("silo.sidebarCollapsed") || "{}");
-      return { sources: saved.sources === true, folders: saved.folders === true };
+      return { sources: saved.sources === true, folders: saved.folders === true, indexing: saved.indexing === true };
     } catch {
-      return { sources: false, folders: false };
+      return { sources: false, folders: false, indexing: false };
     }
   });
-  const toggleSidebarSection = (section: "sources" | "folders") => {
+  const toggleSidebarSection = (section: "sources" | "folders" | "indexing") => {
     setSidebarCollapsed((current) => {
       const next = { ...current, [section]: !current[section] };
       try {
@@ -7603,7 +7603,10 @@ function App() {
               data-tour="indexing-progress"
               data-help="Review indexing stages and progress. File indexing prepares local search; face indexing is a separate optional task in People."
             >
-              <IndexingPanel />
+              <IndexingPanel
+                collapsed={sidebarCollapsed.indexing}
+                onToggleCollapsed={() => toggleSidebarSection("indexing")}
+              />
             </section>
           </aside>
           <div

@@ -38,6 +38,8 @@ export interface MemoryManagerDependencies {
   discover?(): Promise<MemoryStoryCandidate[]>;
   /** Records why a search step failed; failures are otherwise swallowed per step. */
   onSearchError?(stage: string, error: unknown): void;
+  /** Path-free counts explaining each generation step, for diagnostics. */
+  onTrace?(event: string, details: Record<string, unknown>): void;
 }
 
 export interface MemoryStoryCandidate {
@@ -258,9 +260,14 @@ export class MemoryManager {
     try {
       const kept = await this.deps.filterImages(paths);
       return Array.isArray(kept) ? new Set(kept) : null;
-    } catch {
+    } catch (error) {
+      this.trace("memory-duplicate-check-failed", { message: error instanceof Error ? error.message : String(error) });
       return null;
     }
+  }
+
+  private trace(event: string, details: Record<string, unknown>) {
+    try { this.deps.onTrace?.(event, details); } catch { /* Diagnostics never affect generation. */ }
   }
 
   /** Stored cards were de-duplicated when built; only safety is re-checked, so a
@@ -435,7 +442,11 @@ export class MemoryManager {
     signatures: Set<string>,
     usedPaths: Set<string>,
   ): Promise<MemorySuggestion | null> {
-    if (!Array.isArray(hits)) return null;
+    const reject = (reason: string, counts: Record<string, number> = {}) => {
+      this.trace("memory-story-rejected", { story: idea.key?.split(":")[0] ?? "theme", reason, ...counts });
+      return null;
+    };
+    if (!Array.isArray(hits)) return reject("search-returned-no-list");
     const candidates: { media: MemoryMedia; score: number }[] = [];
     const seen = new Set<string>();
     const limit = Math.min(hits.length, 200);
@@ -450,16 +461,17 @@ export class MemoryManager {
     const fresh = candidates.filter(item => !usedPaths.has(item.media.path));
     const pool = fresh.filter(item => item.media.type === "image").length >= 4 ? fresh : candidates;
     const ranked = pool.filter(item => item.media.type === "image").sort((a, b) => b.score - a.score);
-    if (ranked.length < 4) return null;
+    const counts = { hits: hits.length, allowed: candidates.length, fresh: fresh.length, images: ranked.length };
+    if (ranked.length < 4) return reject(hits.length ? "too-few-allowed-photos" : "no-search-hits", counts);
     // Best shot of each near-identical cluster survives; unverifiable sets are skipped, not wiped.
     const distinct = await this.distinctImages(ranked.map(item => item.media.path));
-    if (!distinct) return null;
+    if (!distinct) return reject("duplicate-check-unavailable", counts);
     const photos = ranked.filter(item => distinct.has(item.media.path));
-    if (photos.length < 4) return null;
+    if (photos.length < 4) return reject("too-few-distinct-photos", { ...counts, distinct: photos.length });
     const videos = diverse(pool.filter(item => item.media.type === "video"), Math.min(6, MAX_MEDIA - Math.min(photos.length, 18)));
     const media = [...diverse(photos, MAX_MEDIA - videos.length), ...videos]
       .sort((a, b) => a.modified - b.modified || a.path.localeCompare(b.path));
-    if (signatures.has(signature(media))) return null;
+    if (signatures.has(signature(media))) return reject("same-photos-as-existing-story", counts);
     for (let i = 0; i < media.length; i++) {
       const item = media[i];
       if (item.liveVideoPath && !await this.allowed(item.liveVideoPath)) delete item.liveVideoPath;
@@ -478,7 +490,9 @@ export class MemoryManager {
       }
     }
     const safe = await this.safeMedia(media, MAX_MEDIA);
-    if (safe.filter(item => item.type === "image").length < 4 || signatures.has(signature(safe))) return null;
+    const safeImages = safe.filter(item => item.type === "image").length;
+    if (safeImages < 4) return reject("too-few-safe-photos", { ...counts, distinct: photos.length, safe: safeImages });
+    if (signatures.has(signature(safe))) return reject("same-photos-as-existing-story", counts);
     signatures.add(signature(safe));
     return {
       id: randomUUID(), title: idea.title, query: idea.query, mood: idea.mood,
@@ -504,6 +518,8 @@ export class MemoryManager {
         : replace
           ? NEW_PER_RUN + Math.max(0, RESERVE_CARDS - reserve.length)
           : Math.max(0, NEW_PER_RUN + RESERVE_CARDS - current.length - reserve.length);
+      this.trace("memory-generate-start", { replace, customTopic: Boolean(customTopic), want,
+        current: current.length, reserve: reserve.length, savedCards: this.state.suggestions.length, savedReserve: this.reserve.length });
       const signatures = new Set([...current, ...reserve].map(card => signature(card.media)));
       const usedKeys = new Set([...this.recentKeys,
         ...[...current, ...reserve].map(card => card.storyKey).filter((key): key is string => Boolean(key))]);
@@ -583,6 +599,7 @@ export class MemoryManager {
           && text(idea.description, 1000) && text(idea.query, 1000)
           && Object.prototype.hasOwnProperty.call(MOOD_WORDS, idea.mood) && typeof idea.load === "function");
         const ordered = [...valid.filter(idea => !usedKeys.has(idea.key)), ...valid.filter(idea => usedKeys.has(idea.key))];
+        this.trace("memory-ideas", { ideas: ideas.length, valid: valid.length, alreadyUsed: valid.length - valid.filter(idea => !usedKeys.has(idea.key)).length });
         const ideaSteps = Math.min(ordered.length, MAX_IDEA_ATTEMPTS);
         for (let attempt = 0; attempt < ideaSteps && produced.length < want; attempt++) {
           const idea = ordered[attempt];
@@ -644,6 +661,8 @@ export class MemoryManager {
       this.reserve = await this.visibleReserve();
       await this.persist();
       const count = this.state.suggestions.length;
+      this.trace("memory-generate-result", { produced: produced.length, visible: count, reserve: this.reserve.length,
+        promoted, searchFailed, elapsedMs: Date.now() - startedAt });
       this.state.message = customTopic
         ? produced.length
           ? `Created a memory for “${customTopicTitle(customTopic)}”.`
