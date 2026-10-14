@@ -1277,7 +1277,11 @@ function monitorIndexing(progress: IndexProgress, now = Date.now()) {
 
   const hasCounterMismatch =
     progress.total !== progress.indexed + progress.remaining + progress.errors;
-  if (progress.status === "complete" && (progress.errors > 0 || hasCounterMismatch)) {
+  // A few damaged/mislabeled files are normal; only a high failure rate suggests a decoder bug.
+  const attempted = progress.indexed + progress.errors;
+  const systemicFileErrors =
+    progress.errors >= 20 && progress.errors >= attempted * 0.1;
+  if (progress.status === "complete" && (systemicFileErrors || hasCounterMismatch)) {
     if (
       indexingMonitor?.status === "complete" &&
       indexingMonitor.total === progress.total &&
@@ -7533,7 +7537,7 @@ app.whenReady().then(async () => {
   scheduleThumbnailPregeneration();
   memoryManager = new MemoryManager(app.getPath("userData"), {
     search: searchMemoryMedia,
-    hasMovie: async (card) => Boolean(await findMemoryMovie(card)),
+    hasMovie: async (card: MemorySuggestion) => Boolean(await findMemoryMovie(card)),
     filterImages: filterMemoryPhotos,
     thumb: async (filePath) => getThumbnail(await resolveLocalPath(filePath), false, 200),
     listAudio: () => audioLibraryCache?.getSnapshot().files ?? [],
@@ -8053,6 +8057,9 @@ app.on("before-quit", (event) => {
   if (phoneDiscoveryTimer) clearInterval(phoneDiscoveryTimer);
   if (quitFlushed) return;
   runtimeLog("before-quit");
+  // An intentional quit is never a crash, even if the flush below is cut short.
+  clearActiveSessionMarker();
+  for (const window of BrowserWindow.getAllWindows()) window.hide();
   void semanticIndexer?.stopWatching();
   void phoneManager?.unmountAll();
   if (!semanticIndexer) return;
@@ -8067,7 +8074,7 @@ app.on("before-quit", (event) => {
   const deadline = new Promise((resolve) => setTimeout(resolve, 8000));
   void Promise.race([flush, deadline]).finally(() => app.quit());
 });
-app.on("will-quit", () => {
+function clearActiveSessionMarker() {
   try {
     fs.rmSync(activeSessionMarkerPath, { force: true });
   } catch (error) {
@@ -8075,7 +8082,10 @@ app.on("will-quit", () => {
       message: error instanceof Error ? error.message : String(error),
     });
   }
-});
+}
+app.on("will-quit", clearActiveSessionMarker);
+for (const signal of ["SIGTERM", "SIGINT"] as const)
+  process.on(signal, () => app.quit());
 
 app.on("activate", () => {
   if (mainWindow === null) {

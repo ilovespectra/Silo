@@ -21,6 +21,14 @@ import { promisify } from "util";
 const execFileAsync = promisify(execFile);
 const SLOW_EMBEDDING_REQUEST_WARNING_MS = 90_000;
 
+class UnreadableImageError extends Error {
+  constructor() {
+    super(
+      "This file could not be read as an image; it may be damaged or have the wrong extension.",
+    );
+  }
+}
+
 class EmbeddingProcessError extends Error {
   constructor(
     message: string,
@@ -3051,7 +3059,11 @@ export class SemanticIndexer {
 
   private async embedImage(filePath: string, runtime: ClipRuntime) {
     return this.runInference(async () => {
+      // Intel builds of libheif lack HEVC, so macOS converts HEIC with sips first.
+      const heifFirst =
+        process.platform === "darwin" && /\.(heic|heif)$/i.test(filePath);
       try {
+        if (heifFirst) throw new Error("HEIC is decoded by macOS.");
         return await this.embedImageFile(filePath, runtime);
       } catch (originalError) {
         if (originalError instanceof EmbeddingProcessError) throw originalError;
@@ -3069,10 +3081,20 @@ export class SemanticIndexer {
             filePath,
             "--out",
             convertedPath,
-          ]);
+          ]).catch(() => undefined);
+          const converted = await fsPromises
+            .stat(convertedPath)
+            .then((stat) => stat.size > 0)
+            .catch(() => false);
+          if (!converted) {
+            if (heifFirst) return await this.embedImageFile(filePath, runtime);
+            throw new UnreadableImageError();
+          }
           return await this.embedImageFile(convertedPath, runtime);
         } catch (conversionError) {
-          if (conversionError instanceof EmbeddingProcessError)
+          if (conversionError instanceof EmbeddingProcessError || heifFirst)
+            throw conversionError;
+          if (conversionError instanceof UnreadableImageError)
             throw conversionError;
           const originalMessage =
             originalError instanceof Error

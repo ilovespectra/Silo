@@ -1,7 +1,7 @@
 import React, { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { IconBaseProps } from "react-icons";
-import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
+import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
 import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
 import {
   MEMORY_DEFAULT_SELECTION_COUNT,
@@ -13,9 +13,9 @@ import "../styles/Memories.css";
 // react-icons uses the newer ReactNode component signature; this project uses TS 4.9.
 export const MemoryIcons = {
   FiArrowRight: ArrowRight, FiCheck: Check, FiChevronRight: ChevronRight, FiDownload: Download, FiFilm: Film, FiFolder: Folder,
-  FiImage: Image, FiMusic: Music, FiPause: Pause, FiPlay: Play, FiRefreshCw: RefreshCw, FiSearch: Search, FiTrash2: Trash2, FiX: X,
-} as unknown as Record<"FiArrowRight" | "FiCheck" | "FiChevronRight" | "FiDownload" | "FiFilm" | "FiFolder" | "FiImage" | "FiMusic" | "FiPause" | "FiPlay" | "FiRefreshCw" | "FiSearch" | "FiTrash2" | "FiX", React.FC<IconBaseProps>>;
-const { FiArrowRight, FiCheck, FiChevronRight, FiDownload, FiFilm, FiFolder, FiImage, FiMusic, FiPause, FiPlay, FiRefreshCw, FiSearch, FiTrash2, FiX } = MemoryIcons;
+  FiImage: Image, FiMaximize: Maximize, FiMinimize: Minimize, FiMusic: Music, FiPause: Pause, FiPlay: Play, FiRefreshCw: RefreshCw, FiSearch: Search, FiTrash2: Trash2, FiX: X,
+} as unknown as Record<"FiArrowRight" | "FiCheck" | "FiChevronRight" | "FiDownload" | "FiFilm" | "FiFolder" | "FiImage" | "FiMaximize" | "FiMinimize" | "FiMusic" | "FiPause" | "FiPlay" | "FiRefreshCw" | "FiSearch" | "FiTrash2" | "FiX", React.FC<IconBaseProps>>;
+const { FiArrowRight, FiCheck, FiChevronRight, FiDownload, FiFilm, FiFolder, FiImage, FiMaximize, FiMinimize, FiMusic, FiPause, FiPlay, FiRefreshCw, FiSearch, FiTrash2, FiX } = MemoryIcons;
 
 export interface MemoriesPageProps {
   api: MemoriesAPI;
@@ -49,6 +49,20 @@ function MemoryVideoPlayer({ src, label, autoPlay = false }: {
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(autoPlay);
+  const playerRef = useRef<HTMLDivElement>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    const sync = () => setFullscreen(document.fullscreenElement === playerRef.current);
+    document.addEventListener("fullscreenchange", sync);
+    return () => {
+      document.removeEventListener("fullscreenchange", sync);
+      if (document.fullscreenElement === playerRef.current) void document.exitFullscreen().catch(() => undefined);
+    };
+  }, []);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    else void playerRef.current?.requestFullscreen().catch(() => undefined);
+  };
   const syncDuration = () => {
     const actual = videoRef.current?.duration ?? 0;
     setDuration(Number.isFinite(actual) && actual > 0 ? actual : 0);
@@ -63,7 +77,7 @@ function MemoryVideoPlayer({ src, label, autoPlay = false }: {
     video.currentTime = Math.max(0, Math.min(value, duration));
     setCurrentTime(video.currentTime);
   };
-  return <div className="memories-video-player">
+  return <div ref={playerRef} className={`memories-video-player${fullscreen ? " is-fullscreen" : ""}`}>
     <video
       ref={videoRef}
       className="memories-export-video"
@@ -79,6 +93,7 @@ function MemoryVideoPlayer({ src, label, autoPlay = false }: {
       onPlay={() => setPlaying(true)}
       onPause={() => setPlaying(false)}
       onEnded={() => setPlaying(false)}
+      onDoubleClick={toggleFullscreen}
     />
     <div className="memories-playback-controls">
       <button type="button" className="memories-playback-toggle" onClick={() => {
@@ -88,6 +103,9 @@ function MemoryVideoPlayer({ src, label, autoPlay = false }: {
         else video.pause();
       }}>{playing ? "Pause" : "Play"}</button>
       <output aria-live="off" className="memories-playback-time">{formatPlaybackTime(currentTime)} / {formatPlaybackTime(duration)}</output>
+      <button type="button" className="memories-fullscreen-toggle" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit full screen" : "Full screen"} title={fullscreen ? "Exit full screen" : "Full screen"}>
+        {fullscreen ? <FiMinimize aria-hidden="true" /> : <FiMaximize aria-hidden="true" />}
+      </button>
     </div>
     <input
       className="memories-playback-slider"
