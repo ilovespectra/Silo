@@ -126,6 +126,26 @@ function assertPackagedNativeAddons(appPath, arch) {
   }
 }
 
+const phoneTools = ["idevice_id", "ideviceinfo", "idevicepair", "afcclient", "idevicebackup2", "adb"];
+
+function ensurePhoneTools(arch) {
+  run("bash", [path.join(projectRoot, "scripts", "build-phone-tools.sh"), arch]);
+}
+
+function assertPackagedPhoneTools(appPath, arch) {
+  const directory = path.join(appPath, "Contents", "Resources", "phone-tools");
+  for (const tool of phoneTools) {
+    const toolPath = path.join(directory, tool);
+    if (!fs.existsSync(toolPath)) {
+      throw new Error(`Packaged app is missing ${tool}; ${arch} phones could not connect.`);
+    }
+    if ((fs.statSync(toolPath).mode & 0o111) === 0) {
+      throw new Error(`Packaged ${tool} is not executable.`);
+    }
+    assertMachOArchitecture(fs.readFileSync(toolPath), arch, `Packaged ${tool}`);
+  }
+}
+
 function assertPackagedMacApp(appPath, expectedArchitecture) {
   const productName = packageJson.build.productName;
   const executablePath = path.join(appPath, "Contents", "MacOS", productName);
@@ -152,6 +172,7 @@ function assertPackagedMacApp(appPath, expectedArchitecture) {
     }
   }
   assertPackagedNativeAddons(appPath, expectedArchitecture);
+  assertPackagedPhoneTools(appPath, expectedArchitecture);
   const minimumVersion = packageJson.build.mac.minimumSystemVersion;
   if (info.LSMinimumSystemVersion !== minimumVersion) {
     throw new Error(
@@ -170,6 +191,7 @@ function buildMac() {
   }
 
   ensureNativeOptionalPackages(architecture);
+  ensurePhoneTools(architecture);
   run("npm", ["run", "build"]);
   run("npm", ["run", "release:check"]);
 

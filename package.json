@@ -149,6 +149,14 @@
         "to": "face-models"
       },
       {
+        "from": "vendor/phone-tools/${platform}-${arch}",
+        "to": "phone-tools",
+        "filter": [
+          "**/*",
+          "!.silo-phone-tools"
+        ]
+      },
+      {
         "from": "node_modules/@tensorflow/tfjs-backend-wasm/dist",
         "to": "face-wasm",
         "filter": [

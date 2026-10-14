@@ -659,7 +659,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
         <p>Small stories from your library. Made by you, kept by you.</p></div>
       <div className="memories-header-actions">
         <span className="memories-button-wrap" title={generateMemoriesTitle}>
-          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Create 5 new editable memories. Finished ones move to your Memory Book below."><FiFilm />{action === "Finding memories" ? "Finding memories…" : state?.suggestions.length ? "Find new memories" : "Generate memories"}</button>
+          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { void run("Finding memories", () => api.generateMemories(true)); }} data-help="Create 5 new editable memories. Finished ones move to your Memory Book below."><FiFilm />{action === "Finding memories" ? "Generating Memories…" : "Generate Memories"}</button>
         </span>
       </div>
     </header>
@@ -697,7 +697,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     {toast && <p className="memories-toast" role="status" aria-live="assertive">{toast}</p>}
     {ready && !loading && !generating && !state?.suggestions.length && !savedMovies.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>
       <h2>A little nostalgia goes a long way.</h2><p>Find themed stories in your indexed photos and clips, then choose the mood, frame and length of your movie.</p>
-      <p className="memories-hint">Nothing runs until you choose Generate memories. It uses what is indexed now, even while indexing continues. Each movie is then prepared in the background, one at a time, with progress shown on its card.</p>
+      <p className="memories-hint">Nothing runs until you choose Generate Memories. It uses what is indexed now, even while indexing continues. Each movie is then prepared in the background, one at a time, with progress shown on its card.</p>
     </div>}
     {exporting && <ExportDialog api={api} memory={exporting.memory} options={exporting.options} onClose={() => setExporting(null)} onDownloaded={refreshAfterDownload} />}
   </section>;

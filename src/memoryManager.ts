@@ -228,6 +228,7 @@ export class MemoryManager {
   private dismissed = new Set<string>();
   private initialization?: Promise<void>;
   private generation?: Promise<MemoryState>;
+  private generationReplaces = false;
   private generationExpected = 0;
   private writes: Promise<void> = Promise.resolve();
 
@@ -428,11 +429,19 @@ export class MemoryManager {
   }
 
   generate(replace = false, customTopic?: string): Promise<MemoryState> {
-    if (this.generation) return this.generation;
+    if (this.generation) {
+      // An automatic top-up is running: let it finish, then honour the user's Generate.
+      if (replace && !this.generationReplaces) {
+        const queued = this.generation.catch(() => undefined).then(() => this.generate(replace, customTopic));
+        return queued;
+      }
+      return this.generation;
+    }
     const normalizedTopic = customTopic === undefined ? undefined : normalizeCustomTopic(customTopic);
     if (normalizedTopic !== undefined && (normalizedTopic.length < 3 || normalizedTopic.length > MAX_CUSTOM_TOPIC_LENGTH))
       return this.getState().then(state => ({ ...state, message: `Enter a topic between 3 and ${MAX_CUSTOM_TOPIC_LENGTH} characters.` }));
-    this.generation = this.generateOnce(replace, normalizedTopic).finally(() => { this.generation = undefined; });
+    this.generationReplaces = replace;
+    this.generation = this.generateOnce(replace, normalizedTopic).finally(() => { this.generation = undefined; this.generationReplaces = false; });
     return this.generation;
   }
 
@@ -689,7 +698,7 @@ export class MemoryManager {
           : promoted
             ? `Showing ${promoted} saved memor${promoted === 1 ? "y" : "ies"}; connect more sources for fresh ones.`
             : count
-              ? `No new stories right now; your ${count} existing memor${count === 1 ? "y is" : "ies are"} still here.`
+              ? ""
               : searchFailed
                 ? "Search is not ready or unavailable. Try again when indexing is ready."
                 : "No matching memories yet. Each story needs at least four distinct, allowed photos.";

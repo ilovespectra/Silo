@@ -401,14 +401,14 @@ function PhoneManagerPanel({
         <div className="phone-tooling-notices">
           {!tooling.ios.available && (
             <p className="sidebar-empty tooling-hint">
-              iPhone support needs <code>{tooling.ios.missing.join(", ")}</code>.
-              Install with <code>{tooling.ios.installHint}</code>
+              iPhone support needs <code>{tooling.ios.missing.join(", ")}</code>.{" "}
+              {tooling.ios.installHint}
             </p>
           )}
           {!tooling.android.available && (
             <p className="sidebar-empty tooling-hint">
-              Android support needs <code>{tooling.android.missing.join(", ")}</code>.
-              Install with <code>{tooling.android.installHint}</code>
+              Android support needs <code>{tooling.android.missing.join(", ")}</code>.{" "}
+              {tooling.android.installHint}
             </p>
           )}
         </div>

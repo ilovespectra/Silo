@@ -1,3 +1,4 @@
+import { resolvePhoneTool } from "./phoneTools";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
 import { execFile } from "child_process";
@@ -168,21 +169,10 @@ export class MessageManager {
   private async resolveAdb(): Promise<string> {
     if (this.adbPath) return this.adbPath;
 
-    const paths = [
-      "/opt/homebrew/bin/adb",
-      "/usr/local/bin/adb",
-      "/usr/bin/adb",
-      "adb",
-    ];
-
-    for (const p of paths) {
-      try {
-        await execFileAsync(p, ["--version"]);
-        this.adbPath = p;
-        return this.adbPath;
-      } catch {
-        continue;
-      }
+    const resolved = await resolvePhoneTool("adb");
+    if (resolved) {
+      this.adbPath = resolved;
+      return this.adbPath;
     }
 
     throw new Error("adb not found");
@@ -832,8 +822,12 @@ export class MessageManager {
       );
       await fsPromises.mkdir(backupRoot, { recursive: true });
       try {
+        const idevicebackup2 = await resolvePhoneTool("idevicebackup2");
+        if (!idevicebackup2) {
+          throw new Error("idevicebackup2 is not available in this Silo build.");
+        }
         await execFileAsync(
-          "idevicebackup2",
+          idevicebackup2,
           ["-u", deviceId, "backup", backupRoot],
           {
             timeout: 20 * 60 * 1000,
@@ -948,16 +942,33 @@ export class MessageManager {
     );
   }
 
+  // Uses Electron's built-in SQLite so Windows (no sqlite3 CLI) reads iPhone
+  // backups too. Returns the first column of each row, one per line, matching
+  // the sqlite3 CLI output these queries were written against.
   private async sqliteValue(databasePath: string, query: string) {
-    const { stdout } = await execFileAsync(
-      "/usr/bin/sqlite3",
-      [databasePath, query],
-      {
-        timeout: 120000,
-        maxBuffer: 100 * 1024 * 1024,
-      },
-    );
-    return stdout;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require("node:sqlite") as {
+      DatabaseSync: new (
+        file: string,
+        options?: { readOnly?: boolean },
+      ) => {
+        prepare(sql: string): { all(): Record<string, unknown>[] };
+        close(): void;
+      };
+    };
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      return database
+        .prepare(query)
+        .all()
+        .map((row) => {
+          const value = Object.values(row)[0];
+          return value === null || value === undefined ? "" : String(value);
+        })
+        .join("\n");
+    } finally {
+      database.close();
+    }
   }
 
   private appleMessageDate(value: number) {

@@ -57,6 +57,43 @@ jobs:
           $env:SILO_REAL_SEMANTIC_SMOKE = '1'
           node test/runSemanticIsolationTests.cjs
 
+      - name: Restore cached phone tools
+        id: phone-tools-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/phone-tools/win32-x64
+          key: phone-tools-win32-x64-${{ hashFiles('scripts/build-phone-tools.sh') }}
+
+      - name: Set up MSYS2 for phone tools
+        if: steps.phone-tools-cache.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            perl
+            unzip
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Build bundled iPhone and Android tools
+        if: steps.phone-tools-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: bash scripts/build-phone-tools.sh x64
+
+      - name: Verify bundled phone tools
+        shell: pwsh
+        run: |
+          $dir = 'vendor/phone-tools/win32-x64'
+          foreach ($tool in 'adb.exe','AdbWinApi.dll','idevice_id.exe','ideviceinfo.exe','idevicepair.exe','afcclient.exe','idevicebackup2.exe') {
+            if (-not (Test-Path (Join-Path $dir $tool))) { throw "Missing bundled phone tool: $tool" }
+          }
+          & (Join-Path $dir 'adb.exe') version
+          & (Join-Path $dir 'idevice_id.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'idevice_id.exe does not run outside MSYS2 (missing DLL?)' }
+
       - name: Package and verify NSIS installer
         shell: pwsh
         run: |

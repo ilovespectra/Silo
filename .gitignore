@@ -151,3 +151,6 @@ runtime.jsonl
 
 # Downloaded COCO search-evaluation fixture and isolated index
 /work/search-eval/
+
+# Bundled phone tools (built by scripts/build-phone-tools.sh)
+/vendor/

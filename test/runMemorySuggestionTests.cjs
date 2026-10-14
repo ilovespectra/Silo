@@ -184,14 +184,18 @@ test("single-flight searches, generating state, and concurrent dismiss/settings 
   } });
   await f.manager.initialize();
   const first = f.manager.generate();
-  const second = f.manager.generate(true);
+  const second = f.manager.generate();
   assert.strictEqual(first, second);
+  let replaceStarted = false;
+  const queuedReplace = f.manager.generate(true).then(state => { replaceStarted = true; return state; });
   await started.promise;
   assert.equal((await f.manager.getState()).generating, true);
   await f.manager.updateSettings({ showOnLaunch: false });
   release.resolve();
-  const ready = await first;
-  assert.equal(searches, 5);
+  await first;
+  const ready = await queuedReplace;
+  assert.equal(replaceStarted, true);
+  assert.ok(searches > 5, "Generate queued behind the automatic run performs its own search");
   const id = ready.suggestions[0].id;
   await Promise.all([
     f.manager.dismiss(id),
@@ -278,7 +282,7 @@ test("first 200 matches only, chronological diversity, score preference, bounded
   const unchanged = await f.manager.generate(true);
   assert.deepEqual(unchanged.suggestions.map(card => card.id), state.suggestions.map(card => card.id),
     "a generate that finds nothing must keep existing cards");
-  assert.match(unchanged.message, /existing memories are still here/);
+  assert.equal(unchanged.message, "");
 });
 
 test("generate never hides saved cards; discovery ideas fill five cards plus a reserve that covers offline sources", async t => {

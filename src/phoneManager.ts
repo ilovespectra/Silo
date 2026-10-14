@@ -4,6 +4,12 @@ import * as path from "path";
 import * as fsPromises from "fs/promises";
 import { constants as fsConstants } from "fs";
 import { isAudioFile } from "./utils/audioTypes";
+import {
+  ANDROID_INSTALL_HINT,
+  IOS_INSTALL_HINT,
+  appleDeviceServiceAvailable,
+  resolvePhoneTool,
+} from "./phoneTools";
 import { isPathWithin, isPhoneDerivativePath } from "./indexingPathPolicy";
 
 const mime = require("mime") as { getType(filePath: string): string | null };
@@ -162,14 +168,6 @@ const VIDEO_EXTENSIONS = new Set([
   ".wmv",
 ]);
 
-const BINARY_SEARCH_PATHS = [
-  "/opt/homebrew/bin",
-  "/usr/local/bin",
-  "/usr/bin",
-  "/bin",
-  path.join(process.env.HOME || "", "Library/Android/sdk/platform-tools"),
-  path.join(process.env.HOME || "", "Android/Sdk/platform-tools"),
-];
 
 // afcclient talks the AFC protocol directly, so iOS needs no FUSE layer.
 const IOS_BINARIES = ["idevice_id", "ideviceinfo", "idevicepair", "afcclient", "idevicebackup2"];
@@ -1381,23 +1379,18 @@ export class PhoneManager {
       return cached!;
     }
 
-    this.trace(
-      `resolveBinary: Searching for ${name} in ${BINARY_SEARCH_PATHS.length} paths`,
-    );
-    for (const directory of BINARY_SEARCH_PATHS) {
-      if (!directory) continue;
-      const candidate = path.join(directory, name);
-      try {
-        await fsPromises.access(candidate, fsConstants.X_OK);
-        this.trace(`resolveBinary: Found ${name} at ${candidate}`);
-        this.binaries.set(name, candidate);
-        return candidate;
-      } catch {
-        // Continue searching
-      }
+    const candidates: string[] = [];
+    const found = await resolvePhoneTool(name, (candidate, exists) => {
+      if (!exists) candidates.push(candidate);
+    });
+    if (found) {
+      this.trace(`resolveBinary: Found ${name} at ${found}`);
+      this.binaries.set(name, found);
+      return found;
     }
-    debugLog(
-      `[PhoneManager] resolveBinary: ${name} not found in any search path`,
+    this.logError(
+      `resolveBinary: ${name} not found (${process.platform}-${process.arch}); checked ${candidates.length} locations:`,
+      candidates.slice(0, 12),
     );
     this.binaries.set(name, null);
     return null;
@@ -1544,16 +1537,23 @@ export class PhoneManager {
       }
     }
 
+    if (!missingIos.length && !(await appleDeviceServiceAvailable())) {
+      this.logError(
+        "getTooling: Apple Mobile Device Service is not reachable on 127.0.0.1:27015",
+      );
+      missingIos.push("Apple Mobile Device Service");
+    }
+
     const result = {
       ios: {
         available: missingIos.length === 0,
         missing: missingIos,
-        installHint: "brew install libimobiledevice",
+        installHint: IOS_INSTALL_HINT,
       },
       android: {
         available: missingAndroid.length === 0,
         missing: missingAndroid,
-        installHint: "brew install --cask android-platform-tools",
+        installHint: ANDROID_INSTALL_HINT,
       },
     };
     debugLog(

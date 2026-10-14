@@ -204,7 +204,7 @@ async function run() {
   assert.equal(video.autoplay, false); assert.equal(video.controls, false);
   assert.equal(document.querySelectorAll(".memories-card").length, 1, "Saving a movie keeps its memory card in the collection");
   await click("Done"); assert.equal(page.calls.unsubscriptions, 1);
-  await click("Find new memories"); assert.deepEqual(page.calls.generations, [true]);
+  await click("Generate Memories"); assert.deepEqual(page.calls.generations, [true]);
   await change(checkbox("Show on launch"), false);
   assert.deepEqual(page.calls.settings, [{ showOnLaunch: false }]);
   assert.equal(document.body.textContent.includes("Clear suggestions"), false, "there is no bulk clear button");
