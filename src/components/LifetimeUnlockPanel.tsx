@@ -2,6 +2,7 @@ import React, { FormEvent, useEffect, useRef, useState } from "react";
 import {
   FiCheck,
   FiCopy,
+  FiExternalLink,
   FiLock,
   FiMail,
   FiX,
@@ -253,14 +254,12 @@ export default function LifetimeUnlockPanel({
     }
   };
 
-  const copyPaymentLink = async () => {
+  const openPaymentLink = async () => {
     if (!paymentRequest || !walletPurchase) return;
-    try {
-      await navigator.clipboard.writeText(paymentRequest.uri);
-      setPaymentLinkCopyState("copied");
-    } catch {
-      setPaymentLinkCopyState("error");
-    }
+    const opened = await window.electron
+      ?.openLifetimePaymentLink?.(paymentRequest.reference)
+      .catch(() => false);
+    setPaymentLinkCopyState(opened ? "copied" : "error");
   };
 
   const verifyPayment = async (event: FormEvent<HTMLFormElement>) => {
@@ -550,18 +549,39 @@ export default function LifetimeUnlockPanel({
                 bridges funds.
               </p>
               {paymentRequest && walletPurchase && (
-                <button
-                  className="lifetime-solana-copy-link"
-                  type="button"
-                  onClick={() => void copyPaymentLink()}
-                >
-                  {paymentLinkCopyState === "copied" ? <FiCheck /> : <FiCopy />}
-                  {paymentLinkCopyState === "copied"
-                    ? "Payment link copied"
-                    : paymentLinkCopyState === "error"
-                      ? "Copy failed"
-                      : "Copy Solana Pay link"}
-                </button>
+                <>
+                  <p className="lifetime-solana-instructions">
+                    25 USDC (Solana) to <code>{LIFETIME_PAYMENT_ADDRESS}</code>
+                  </p>
+                  <div className="lifetime-solana-actions">
+                    <button
+                      className="lifetime-solana-copy-link"
+                      type="button"
+                      onClick={() => void openPaymentLink()}
+                    >
+                      <FiExternalLink />
+                      Open in wallet app
+                    </button>
+                    <button
+                      className="lifetime-solana-copy-link"
+                      type="button"
+                      onClick={() => void copyAddress()}
+                    >
+                      {copyState === "copied" ? <FiCheck /> : <FiCopy />}
+                      {copyState === "copied"
+                        ? "Address copied"
+                        : copyState === "error"
+                          ? "Copy failed"
+                          : "Copy address"}
+                    </button>
+                  </div>
+                  {paymentLinkCopyState === "error" && (
+                    <p className="lifetime-unlock-inline-note" role="status">
+                      No wallet app opened. Scan the QR code, or send exactly 25 USDC
+                      on Solana to the address above and verify the signature below.
+                    </p>
+                  )}
+                </>
               )}
               {paymentNotice && (
                 <p
@@ -616,7 +636,8 @@ export default function LifetimeUnlockPanel({
                     <strong>Verify your transaction</strong>
                   </label>
                   <p>
-                    Paste the transaction signature from your wallet.
+                    Paste the transaction signature or explorer link from your
+                    wallet.
                   </p>
                   <input
                     id="lifetime-unlock-signature"
@@ -628,7 +649,7 @@ export default function LifetimeUnlockPanel({
                       setVerificationNotice("");
                       setVerificationStatus("idle");
                     }}
-                    placeholder="Solana transaction signature"
+                    placeholder="Transaction signature or Solscan link"
                     disabled={verifying}
                   />
                   <button
@@ -808,18 +829,39 @@ export default function LifetimeUnlockPanel({
               )}
             </div>
             {paymentRequest && walletPurchase && (
-              <button
-                className="lifetime-solana-copy-link"
-                type="button"
-                onClick={() => void copyPaymentLink()}
-              >
-                {paymentLinkCopyState === "copied" ? <FiCheck /> : <FiCopy />}
-                {paymentLinkCopyState === "copied"
-                  ? "Payment link copied"
-                  : paymentLinkCopyState === "error"
-                    ? "Copy failed"
-                    : "Copy Solana Pay link"}
-              </button>
+              <>
+                <p className="lifetime-solana-instructions">
+                  25 USDC (Solana) to <code>{LIFETIME_PAYMENT_ADDRESS}</code>
+                </p>
+                <div className="lifetime-solana-actions">
+                  <button
+                    className="lifetime-solana-copy-link"
+                    type="button"
+                    onClick={() => void openPaymentLink()}
+                  >
+                    <FiExternalLink />
+                    Open in wallet app
+                  </button>
+                  <button
+                    className="lifetime-solana-copy-link"
+                    type="button"
+                    onClick={() => void copyAddress()}
+                  >
+                    {copyState === "copied" ? <FiCheck /> : <FiCopy />}
+                    {copyState === "copied"
+                      ? "Address copied"
+                      : copyState === "error"
+                        ? "Copy failed"
+                        : "Copy address"}
+                  </button>
+                </div>
+                {paymentLinkCopyState === "error" && (
+                  <p className="lifetime-unlock-inline-note" role="status">
+                    No wallet app opened. Scan the QR code, or send exactly 25 USDC
+                    on Solana to the address above and verify the signature below.
+                  </p>
+                )}
+              </>
             )}
             <p className="lifetime-payment-safety-note">
               Never enter a seed phrase or private key in Silo.

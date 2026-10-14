@@ -65,6 +65,67 @@ function withTemporaryFfmpegBinary(originalPath, stagedPath, build) {
   }
 }
 
+// npm only installs the native optional package for the build machine's CPU, so
+// an Apple silicon build host has no Intel NumKong addon unless it is staged here.
+const nativeOptionalPackages = (arch) => [
+  { name: `@numkong/darwin-${arch}`, binary: "numkong.node" },
+  { name: `@img/sharp-darwin-${arch}`, binary: `lib/sharp-darwin-${arch}.node` },
+];
+
+function lockedPackage(name) {
+  const lock = JSON.parse(fs.readFileSync(path.join(projectRoot, "package-lock.json"), "utf8"));
+  const entry = lock.packages?.[`node_modules/${name}`];
+  if (!entry?.version || !entry.resolved) {
+    throw new Error(`${name} is missing from package-lock.json.`);
+  }
+  return entry;
+}
+
+function ensureNativeOptionalPackages(arch) {
+  for (const { name, binary } of nativeOptionalPackages(arch)) {
+    const packageDirectory = path.join(projectRoot, "node_modules", ...name.split("/"));
+    const binaryPath = path.join(packageDirectory, binary);
+    const locked = lockedPackage(name);
+    const installedVersion = fs.existsSync(path.join(packageDirectory, "package.json"))
+      ? JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")).version
+      : null;
+    if (installedVersion === locked.version && fs.existsSync(binaryPath)) {
+      assertMachOArchitecture(fs.readFileSync(binaryPath), arch, name);
+      continue;
+    }
+    const downloadDirectory = fs.mkdtempSync(path.join(projectRoot, "node_modules", ".silo-native-"));
+    try {
+      run("npm", ["pack", `${name}@${locked.version}`, "--pack-destination", downloadDirectory]);
+      const tarball = fs.readdirSync(downloadDirectory).find((file) => file.endsWith(".tgz"));
+      if (!tarball) throw new Error(`npm pack did not produce ${name}.`);
+      if (locked.integrity) {
+        const digest = require("crypto").createHash(locked.integrity.split("-")[0])
+          .update(fs.readFileSync(path.join(downloadDirectory, tarball))).digest("base64");
+        if (`${locked.integrity.split("-")[0]}-${digest}` !== locked.integrity) {
+          throw new Error(`${name} does not match package-lock.json integrity.`);
+        }
+      }
+      fs.rmSync(packageDirectory, { recursive: true, force: true });
+      fs.mkdirSync(packageDirectory, { recursive: true });
+      run("tar", ["-xzf", path.join(downloadDirectory, tarball), "-C", packageDirectory, "--strip-components=1"]);
+    } finally {
+      fs.rmSync(downloadDirectory, { recursive: true, force: true });
+    }
+    assertMachOArchitecture(fs.readFileSync(binaryPath), arch, name);
+  }
+}
+
+function assertPackagedNativeAddons(appPath, arch) {
+  const unpacked = path.join(appPath, "Contents", "Resources", "app.asar.unpacked", "node_modules");
+  for (const { name, binary } of nativeOptionalPackages(arch)) {
+    const binaryPath = path.join(unpacked, ...name.split("/"), binary);
+    if (!fs.existsSync(binaryPath)) {
+      throw new Error(`Packaged app is missing ${name}; ${arch} search indexing would fail.`);
+    }
+    assertMachOArchitecture(fs.readFileSync(binaryPath), arch, `Packaged ${name}`);
+  }
+}
+
 function assertPackagedMacApp(appPath, expectedArchitecture) {
   const productName = packageJson.build.productName;
   const executablePath = path.join(appPath, "Contents", "MacOS", productName);
@@ -90,6 +151,7 @@ function assertPackagedMacApp(appPath, expectedArchitecture) {
       throw new Error(`Packaged ${key} must be "${productName}", received "${info[key]}".`);
     }
   }
+  assertPackagedNativeAddons(appPath, expectedArchitecture);
   const minimumVersion = packageJson.build.mac.minimumSystemVersion;
   if (info.LSMinimumSystemVersion !== minimumVersion) {
     throw new Error(
@@ -107,6 +169,7 @@ function buildMac() {
     throw new Error("Choose an architecture explicitly: x64 or arm64.");
   }
 
+  ensureNativeOptionalPackages(architecture);
   run("npm", ["run", "build"]);
   run("npm", ["run", "release:check"]);
 

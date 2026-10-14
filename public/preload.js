@@ -175,6 +175,8 @@ contextBridge.exposeInMainWorld("electron", {
   getBetaActivationInfo: () => ipcRenderer.invoke("get-beta-activation-info"),
   submitBetaActivationRequest: () =>
     ipcRenderer.invoke("submit-beta-activation-request"),
+  openLifetimePaymentLink: (reference) =>
+    ipcRenderer.invoke("open-lifetime-payment-link", reference),
   verifyLifetimePayment: (signature) =>
     ipcRenderer.invoke("verify-lifetime-payment", signature),
   getContentSettings: () => ipcRenderer.invoke("get-content-settings"),

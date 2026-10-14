@@ -47,14 +47,18 @@ export function createLifetimeSolanaPayUri(reference: string): string {
   if (!isSolanaPayReference(reference))
     throw new Error("The Solana Pay reference is invalid.");
 
-  const query = new URLSearchParams({
+  // Solana Pay requires RFC 3986 percent-encoding; URLSearchParams would emit
+  // "+" for spaces, which several wallets reject.
+  const query = Object.entries({
     amount: "25",
     "spl-token": LIFETIME_USDC_MINT,
     reference,
     label: "Silo Lifetime Access",
     message: "One-time lifetime license",
-  });
-  return `solana:${LIFETIME_PAYMENT_ADDRESS}?${query.toString()}`;
+  })
+    .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+    .join("&");
+  return `solana:${LIFETIME_PAYMENT_ADDRESS}?${query}`;
 }
 
 export type LifetimePaymentStatus =
@@ -151,6 +155,35 @@ export function isSolanaTransactionSignature(value: string): boolean {
   return value.length >= 80 &&
     value.length <= 90 &&
     /^[1-9A-HJ-NP-Za-km-z]+$/.test(value);
+}
+
+/** Accepts a raw signature or an explorer/wallet link that contains one. */
+export function extractSolanaTransactionSignature(value: string): string | null {
+  const trimmed = value.trim();
+  if (isSolanaTransactionSignature(trimmed)) return trimmed;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  const candidates = [
+    ...url.pathname.split("/").reverse(),
+    ...["signature", "tx", "txid", "transaction"].map(
+      (key) => url.searchParams.get(key) ?? "",
+    ),
+  ];
+  for (const candidate of candidates) {
+    let decoded = candidate;
+    try {
+      decoded = decodeURIComponent(candidate);
+    } catch {
+      continue;
+    }
+    if (isSolanaTransactionSignature(decoded)) return decoded;
+  }
+  return null;
 }
 
 export function verifyParsedLifetimePayment(

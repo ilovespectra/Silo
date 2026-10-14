@@ -441,6 +441,21 @@
   cursor: pointer;
 }
 
+.lifetime-solana-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+}
+
+.lifetime-solana-actions .lifetime-solana-copy-link {
+  margin: 8px 0 0;
+}
+
+.lifetime-solana-instructions code {
+  word-break: break-all;
+  user-select: all;
+}
+
 .lifetime-unlock-manual {
   margin-top: 11px;
   padding: 12px 14px;

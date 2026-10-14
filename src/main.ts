@@ -58,7 +58,9 @@ import { InventoryFingerprint } from "./inventoryFingerprint";
 import { isAudioFile } from "./utils/audioTypes";
 import {
   isSolanaPayReference,
+  createLifetimeSolanaPayUri,
   isSolanaTransactionSignature,
+  extractSolanaTransactionSignature,
   LIFETIME_PAYMENT_SUPPORT_GUIDANCE,
   type LifetimeLicenseState,
   type LifetimePaymentVerification,
@@ -11543,12 +11545,17 @@ async function handlePendingBetaActivationUrls() {
 
 void handlePendingBetaActivationUrls();
 async function verifyAndSaveLifetimePayment(
-  signatureValue: unknown,
+  rawSignatureValue: unknown,
 ): Promise<LifetimePaymentVerification> {
-  if (typeof signatureValue !== "string" || !isSolanaTransactionSignature(signatureValue))
+  const signatureValue =
+    typeof rawSignatureValue === "string"
+      ? extractSolanaTransactionSignature(rawSignatureValue)
+      : null;
+  if (!signatureValue)
     return {
       status: "invalid",
-      message: "Paste the transaction signature shown by your Solana wallet.",
+      message:
+        "Paste the transaction signature or explorer link shown by your Solana wallet.",
     };
 
   const existingLicense = await readLifetimeLicense();
@@ -11639,6 +11646,19 @@ ipcMain.handle(
   "verify-lifetime-payment",
   async (_event, signatureValue: unknown): Promise<LifetimePaymentVerification> =>
     verifyAndSaveLifetimePayment(signatureValue),
+);
+ipcMain.handle(
+  "open-lifetime-payment-link",
+  async (_event, reference: unknown): Promise<boolean> => {
+    if (typeof reference !== "string" || !isSolanaPayReference(reference))
+      return false;
+    try {
+      await shell.openExternal(createLifetimeSolanaPayUri(reference));
+      return true;
+    } catch {
+      return false;
+    }
+  },
 );
 ipcMain.handle("is-dev", () => isDev);
 ipcMain.handle("get-app-update-state", () => appUpdateState);

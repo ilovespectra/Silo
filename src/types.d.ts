@@ -798,6 +798,7 @@ interface Window {
     onLifetimeAccessChanged?(
       callback: (access: { fullAccess: boolean; name: string }) => void,
     ): () => void;
+    openLifetimePaymentLink?(reference: string): Promise<boolean>;
     verifyLifetimePayment(
       signature: string,
     ): Promise<import("./lifetimePayment").LifetimePaymentVerification>;
