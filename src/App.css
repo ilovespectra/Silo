@@ -1433,6 +1433,39 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
+.sidebar-heading > button.sidebar-collapse-toggle,
+.sidebar-heading > button.sidebar-collapse-toggle:hover {
+  display: grid;
+  place-items: initial;
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  justify-items: start;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-collapse-toggle h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sidebar-collapse-chevron {
+  transition: transform 150ms ease;
+  opacity: 0.7;
+}
+
+.sidebar-collapse-toggle[aria-expanded="false"] .sidebar-collapse-chevron {
+  transform: rotate(-90deg);
+}
+
 .cloud-accounts > .sidebar-heading {
   list-style: none;
   cursor: pointer;
@@ -3907,6 +3940,27 @@ input[type="range"]::-moz-range-progress {
   to {
     opacity: 1;
   }
+}
+
+/* Until a thumbnail exists, a marker is just its count pill (no empty circle). */
+.geo-marker.pending .geo-marker-image {
+  display: none;
+}
+
+.geo-marker.pending .geo-marker-count {
+  position: static;
+  display: inline-block;
+  min-width: 30px;
+  padding: 4px 10px;
+  border: 2px solid #f4f1ed;
+  border-radius: 999px;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.65);
+  font-size: 12px;
+  text-align: center;
+}
+
+.geo-marker.map-selected.pending .geo-marker-count {
+  border-color: var(--orange);
 }
 
 .geo-marker-count {

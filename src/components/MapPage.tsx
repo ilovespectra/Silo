@@ -1183,6 +1183,7 @@ export default function MapPage({
         if (thumbnail) image.style.backgroundImage = `url("${thumbnail}")`;
         else {
           image.classList.add("loading");
+          button.classList.add("pending");
           markerImagesRef.current.set(cluster.id, image);
         }
         const count = document.createElement("span");
@@ -1261,6 +1262,7 @@ export default function MapPage({
           const image = markerImagesRef.current.get(cluster.id);
           if (image && !cancelled) {
             image.classList.remove("loading");
+            image.parentElement?.classList.remove("pending");
             image.style.backgroundImage = `url("${url}")`;
             markerImagesRef.current.delete(cluster.id);
           }

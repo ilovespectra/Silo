@@ -575,6 +575,7 @@ function cachedImagePreview(file: FileInfo): FilePreview | null {
   };
 }
 
+const GOOGLE_SOURCES_IN_SIDEBAR = false;
 const FAST_FILE_SEARCH_RESULT_LIMIT = 5000;
 const FAST_FILE_SEARCH_CHUNK_SIZE = 512;
 const FAST_FILE_SEARCH_CHUNK_DELAY_MS = 24;
@@ -1088,6 +1089,26 @@ function App() {
     accountId: string;
     sessionId: string;
   } | null>(null);
+
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<{ sources: boolean; folders: boolean }>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("silo.sidebarCollapsed") || "{}");
+      return { sources: saved.sources === true, folders: saved.folders === true };
+    } catch {
+      return { sources: false, folders: false };
+    }
+  });
+  const toggleSidebarSection = (section: "sources" | "folders") => {
+    setSidebarCollapsed((current) => {
+      const next = { ...current, [section]: !current[section] };
+      try {
+        localStorage.setItem("silo.sidebarCollapsed", JSON.stringify(next));
+      } catch {
+        // Keep the current-session preference if storage is unavailable.
+      }
+      return next;
+    });
+  };
 
   const changeGoogleSourcesVisibility = (hidden: boolean) => {
     setGoogleSourcesHidden(hidden);
@@ -7097,10 +7118,19 @@ function App() {
           <aside className="library-sidebar">
             <section className="sidebar-section volumes" data-tour="source-controls" data-help="Choose which local, cloud, or saved-device sources are included in Files. Available sources can be browsed; adding a folder starts indexing.">
               <div className="sidebar-heading">
-                <div>
+                <button
+                  type="button"
+                  className="sidebar-collapse-toggle"
+                  aria-expanded={!sidebarCollapsed.sources}
+                  onClick={() => toggleSidebarSection("sources")}
+                  title={sidebarCollapsed.sources ? "Show sources" : "Hide sources"}
+                >
                   <span className="sidebar-kicker">Volumes</span>
-                  <h2>Sources</h2>
-                </div>
+                  <h2>
+                    Sources
+                    <FiChevronDown className="sidebar-collapse-chevron" aria-hidden="true" />
+                  </h2>
+                </button>
                 <button
                   onClick={addIndexSource}
                   data-tour="sources-add"
@@ -7134,7 +7164,7 @@ function App() {
                 </button>
               </div>
 
-              {sources.length === 0 ? (
+              {!sidebarCollapsed.sources && (sources.length === 0 ? (
                 <p className="sidebar-empty">
                   Add a folder, phone, or Google account to get started.
                 </p>
@@ -7218,13 +7248,11 @@ function App() {
                     </div>
                   ))}
                 </>
-              )}
-              <div data-tour="indexing-progress" data-help="Review indexing stages and progress. File indexing prepares local search; face indexing is a separate optional task in People.">
-                <IndexingPanel />
-              </div>
+              ))}
             </section>
 
-            {!googleSourcesHidden && <details
+            {/* Google sources do not work in this build; hidden until they are supported. */}
+            {GOOGLE_SOURCES_IN_SIDEBAR && !googleSourcesHidden && <details
               className="sidebar-section cloud-accounts"
               data-tour="google-sources"
               data-help="Optional online sources. Connecting a Google account uses Google's sign-in and consent flow; it does not affect local folders or offline features."
@@ -7374,10 +7402,19 @@ function App() {
               data-help="Create or change local collections of file references. Adding, removing, renaming, reordering or deleting a Digital Folder does not move, rename or delete the original files."
             >
               <div className="sidebar-heading">
-                <div>
+                <button
+                  type="button"
+                  className="sidebar-collapse-toggle"
+                  aria-expanded={!sidebarCollapsed.folders}
+                  onClick={() => toggleSidebarSection("folders")}
+                  title={sidebarCollapsed.folders ? "Show virtual folders" : "Hide virtual folders"}
+                >
                   <span className="sidebar-kicker">Virtual</span>
-                  <h2>Digital Folders</h2>
-                </div>
+                  <h2>
+                    Digital Folders
+                    <FiChevronDown className="sidebar-collapse-chevron" aria-hidden="true" />
+                  </h2>
+                </button>
                 <button
                   onClick={createDigitalFolder}
                   title="New Digital Folder"
@@ -7385,6 +7422,7 @@ function App() {
                   <FiPlus />
                 </button>
               </div>
+              {!sidebarCollapsed.folders && <>
               {folderOrderError && (
                 <p className="sidebar-empty" role="alert">
                   {folderOrderError}
@@ -7557,6 +7595,15 @@ function App() {
                   Remove selected reference
                 </button>
               )}
+              </>}
+            </section>
+
+            <section
+              className="sidebar-section library-indexing"
+              data-tour="indexing-progress"
+              data-help="Review indexing stages and progress. File indexing prepares local search; face indexing is a separate optional task in People."
+            >
+              <IndexingPanel />
             </section>
           </aside>
           <div
