@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FiFolder, FiHardDrive, FiMail, FiRefreshCw, FiTrash2 } from "react-icons/fi";
 import "../styles/GoogleReclaimDialog.css";
 
@@ -35,6 +35,7 @@ export default function GoogleReclaimDialog({ api, account, onReconnect, onClose
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [tab, setTab] = useState<GoogleReclaimKind>("drive");
+  const tabChosen = useRef(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [destination, setDestination] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -53,6 +54,10 @@ export default function GoogleReclaimDialog({ api, account, onReconnect, onClose
         return;
       }
       setOverview(response.overview);
+      if (!tabChosen.current) {
+        tabChosen.current = true;
+        if (response.overview.driveFiles.length === 0) setTab("gmail");
+      }
       setDestination(response.overview.destination);
       const available = new Set([...response.overview.driveFiles, ...response.overview.emails].map(itemKey));
       setSelected((current) => new Set([...current].filter((key) => available.has(key))));
@@ -132,7 +137,7 @@ export default function GoogleReclaimDialog({ api, account, onReconnect, onClose
   const driveActive = storage ? Math.max(0, storage.usageInDrive - storage.usageInDriveTrash) : 0;
   const scale = storage ? Math.max(storage.limit ?? storage.usage, storage.usage, 1) : 1;
   const percent = (value: number) => `${Math.min(100, (value / scale) * 100)}%`;
-  const gmailBlocked = tab === "gmail" && !account.gmailAccess;
+  const gmailBlocked = tab === "gmail" && !(overview?.gmailAccess ?? account.gmailAccess);
   const close = () => { if (!running) onClose(); };
 
   return (
@@ -190,7 +195,13 @@ export default function GoogleReclaimDialog({ api, account, onReconnect, onClose
           ) : (tab === "drive" ? overview?.driveError : overview?.gmailError) ? (
             <p className="google-reclaim-empty">{tab === "drive" ? overview?.driveError : overview?.gmailError}</p>
           ) : items.length === 0 ? (
-            <p className="google-reclaim-empty">{tab === "drive" ? "No large files you own were found." : "No emails over 5 MB were found."}</p>
+            <p className="google-reclaim-empty">
+              {tab === "gmail"
+                ? "No emails over 5 MB were found."
+                : storage && storage.usageInDrive < 1024 * 1024
+                  ? `This account's Drive isn't using any storage. Files shared with you count against their owner. The ${formatBytes(otherUsage)} used here is Gmail and Google Photos.`
+                  : "No files you own were found in Drive."}
+            </p>
           ) : (
             <>
               <label className="google-reclaim-row google-reclaim-all">

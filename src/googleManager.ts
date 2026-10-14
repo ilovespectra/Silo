@@ -489,8 +489,10 @@ export class GoogleManager {
     const payload = (await response.json()) as {
       access_token: string;
       expires_in: number;
+      scope?: string;
     };
     account.accessToken = payload.access_token;
+    if (payload.scope) account.scopes = payload.scope.split(/\s+/).filter(Boolean);
     account.expiresAt = Date.now() + payload.expires_in * 1000;
     account.needsReauth = false;
     await this.persist();
@@ -972,9 +974,28 @@ export class GoogleManager {
     return items.sort((a, b) => b.size - a.size);
   }
 
+  /** Accounts connected before scopes were saved: ask Google what this token can do. */
+  private async loadGrantedScopes(accountId: string): Promise<void> {
+    const account = this.accounts.get(accountId);
+    if (!account) return;
+    try {
+      const token = await this.accessToken(accountId);
+      if (account.scopes) return;
+      const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
+      if (!response.ok) return;
+      const { scope } = (await response.json()) as { scope?: string };
+      if (!scope) return;
+      account.scopes = scope.split(/\s+/).filter(Boolean);
+      await this.persist();
+    } catch {
+      // The overview reports connection problems itself.
+    }
+  }
+
   async getReclaimOverview(accountId: string): Promise<GoogleReclaimOverview> {
     const account = this.accounts.get(accountId);
     if (!account) throw new Error("That Google account is not connected.");
+    if (!account.scopes) await this.loadGrantedScopes(accountId);
     const gmailAccess = Boolean(account.scopes?.includes(GMAIL_MODIFY_SCOPE));
     const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
     const [storage, drive, gmail] = await Promise.allSettled([
