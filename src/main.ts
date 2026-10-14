@@ -8283,6 +8283,10 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
     const current = await memoryStateWithPreviews();
     return { ...current, message: "Enter a topic using plain text." };
   }
+  if (customTopic !== undefined && !fullAccessEnabled()) {
+    const current = await memoryStateWithPreviews();
+    return { ...current, message: "Creating a memory from your own prompt is available with Silo Lifetime." };
+  }
   if (customTopic === undefined) {
     try {
       return await runMemoryGenerator("on-demand", replace === true);

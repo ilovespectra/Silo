@@ -41,6 +41,15 @@
 .memories-icon-button { border: 0; background: transparent; color: var(--memories-muted); width: 34px; height: 34px; flex-shrink: 0; border-radius: 8px; display: inline-flex; justify-content: center; align-items: center; }
 .memories-icon-button:not(:disabled):hover { color: var(--memories-orange); background: color-mix(in srgb, var(--memories-text) 7%, transparent); }
 .memories-text-button { border: 0; background: transparent; color: var(--memories-orange); font-size: 12px; padding: 4px 0; display: inline-flex; gap: 6px; align-items: center; text-align: left; }
+.memories-create { display: flex; align-items: center; justify-content: space-between; gap: 16px 24px; flex-wrap: wrap; margin-bottom: 18px; padding: 16px 18px; border: 1px solid var(--memories-border); border-radius: 14px; background: color-mix(in srgb, var(--memories-text) 3%, transparent); }
+.memories-create-copy { display: grid; gap: 3px; min-width: 200px; }
+.memories-create-copy h2 { margin: 0; display: inline-flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; }
+.memories-create-copy span { font-size: 12px; opacity: .7; }
+.memories-create-field { display: flex; gap: 8px; flex: 1 1 320px; max-width: 560px; }
+.memories-create-field input { flex: 1; min-width: 0; border: 1px solid var(--memories-border); border-radius: 10px; background: transparent; color: var(--memories-text); padding: 10px 13px; font-size: 13px; }
+.memories-create-field input:focus { outline: 2px solid color-mix(in srgb, var(--memories-text) 30%, transparent); outline-offset: 1px; }
+.memories-create-field .memories-button { padding: 9px 16px; white-space: nowrap; }
+.memories-create.is-locked { opacity: .75; }
 .memories-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; padding: 17px 0; border-top: 1px solid var(--memories-border); border-bottom: 1px solid var(--memories-border); font-size: 12px; }
 .memories-settings label, .memories-launcher-footer label { display: flex; align-items: center; gap: 8px; }
 .memories-settings > span { color: var(--memories-muted); font-size: 11px; }

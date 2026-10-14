@@ -1,7 +1,7 @@
 import React, { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { IconBaseProps } from "react-icons";
-import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
+import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiEdit3 as Edit3, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiLock as Lock, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
 import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryGenerationStatus, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
 import {
   MEMORY_DEFAULT_SELECTION_COUNT,
@@ -13,10 +13,10 @@ import "../styles/Memories.css";
 
 // react-icons uses the newer ReactNode component signature; this project uses TS 4.9.
 export const MemoryIcons = {
-  FiArrowRight: ArrowRight, FiCheck: Check, FiChevronRight: ChevronRight, FiDownload: Download, FiFilm: Film, FiFolder: Folder,
+  FiArrowRight: ArrowRight, FiCheck: Check, FiChevronRight: ChevronRight, FiDownload: Download, FiEdit3: Edit3, FiFilm: Film, FiLock: Lock, FiFolder: Folder,
   FiImage: Image, FiMaximize: Maximize, FiMinimize: Minimize, FiMusic: Music, FiPause: Pause, FiPlay: Play, FiRefreshCw: RefreshCw, FiSearch: Search, FiTrash2: Trash2, FiX: X,
-} as unknown as Record<"FiArrowRight" | "FiCheck" | "FiChevronRight" | "FiDownload" | "FiFilm" | "FiFolder" | "FiImage" | "FiMaximize" | "FiMinimize" | "FiMusic" | "FiPause" | "FiPlay" | "FiRefreshCw" | "FiSearch" | "FiTrash2" | "FiX", React.FC<IconBaseProps>>;
-const { FiArrowRight, FiCheck, FiChevronRight, FiDownload, FiFilm, FiFolder, FiImage, FiMaximize, FiMinimize, FiMusic, FiPause, FiPlay, FiRefreshCw, FiSearch, FiTrash2, FiX } = MemoryIcons;
+} as unknown as Record<"FiArrowRight" | "FiCheck" | "FiChevronRight" | "FiDownload" | "FiEdit3" | "FiFilm" | "FiLock" | "FiFolder" | "FiImage" | "FiMaximize" | "FiMinimize" | "FiMusic" | "FiPause" | "FiPlay" | "FiRefreshCw" | "FiSearch" | "FiTrash2" | "FiX", React.FC<IconBaseProps>>;
+const { FiArrowRight, FiCheck, FiChevronRight, FiDownload, FiEdit3, FiFilm, FiLock, FiFolder, FiImage, FiMaximize, FiMinimize, FiMusic, FiPause, FiPlay, FiRefreshCw, FiSearch, FiTrash2, FiX } = MemoryIcons;
 
 export interface MemoriesPageProps {
   api: MemoriesAPI;
@@ -588,6 +588,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   const [exporting, setExporting] = useState<{ memory: MemorySuggestion; options: MemoryExportOptions } | null>(null);
   const [previews, setPreviews] = useState<Record<string, MemoryPreviewStatus>>({});
   const [toast, setToast] = useState("");
+  const [prompt, setPrompt] = useState("");
   const mounted = useRef(true);
   const pending = useRef(false);
   const revision = useRef(0);
@@ -675,6 +676,12 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   const pendingCards = !generating ? 0 : finding ? 5 : Math.max(1, Math.min(5, generation?.expected ?? 5));
   const visibleSuggestions = finding ? [] : state?.suggestions ?? [];
   const memoryGenerationDisabled = busy || demoMode || generating;
+  const trimmedPrompt = prompt.trim().replace(/\s+/g, " ");
+  const promptValid = trimmedPrompt.length >= 3 && trimmedPrompt.length <= 80;
+  const createMemory = () => {
+    if (memoryGenerationDisabled || !promptValid) return;
+    void run("Creating memory", () => api.generateMemories(false, trimmedPrompt)).then(() => { if (mounted.current) setPrompt(""); });
+  };
   const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new editable memories. Finished ones move to your Memory Book below.";
   return <section className="memories-page" aria-label="Memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
@@ -686,13 +693,25 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
         </span>
       </div>
     </header>
+    <form className={`memories-create${demoMode ? " is-locked" : ""}`} aria-label="Create a memory" data-help="Describe a moment and Silo makes one memory movie from your indexed photos and clips. Available with Silo Lifetime."
+      onSubmit={(event) => { event.preventDefault(); createMemory(); }}>
+      <div className="memories-create-copy"><h2><FiEdit3 />Create a memory</h2><span>{demoMode ? "Unlock Silo Lifetime to make a memory from your own words." : "Describe a moment. Silo makes one movie from your library."}</span></div>
+      <div className="memories-create-field">
+        <input type="text" value={prompt} maxLength={80} placeholder={demoMode ? "Available with Silo Lifetime" : "e.g. summer at the lake with the dog"} aria-label="Memory prompt"
+          disabled={demoMode || busy || generating} onChange={(event) => setPrompt(event.target.value)} />
+        <button type="submit" className="memories-button memories-primary" disabled={memoryGenerationDisabled || !promptValid}
+          title={demoMode ? "Available with Silo Lifetime." : !promptValid ? "Enter 3 to 80 characters." : "Create one memory from this prompt."}>
+          {demoMode ? <FiLock /> : <FiFilm />}{action === "Creating memory" ? "Creating…" : "Create"}
+        </button>
+      </div>
+    </form>
     <div className="memories-settings">
       <label><input type="checkbox" checked={state?.settings.showOnLaunch ?? false} disabled={busy || !state} data-help="Show the Memories page when Silo opens; it does not generate videos automatically." onChange={(event) => { const showOnLaunch = event.target.checked; void run("Saving settings", () => api.updateMemorySettings({ showOnLaunch })); }} />Show on launch</label>
       <span>Original files are always kept.</span>
     </div>
     {error && <p className="memories-error memories-page-notice" role="alert">{error}</p>}
     {!generating && (!ready || loading || action || state?.message) && <p className="memories-page-notice" role="status" aria-live="polite">
-      {!ready ? "Waiting for silo to finish starting. New memories are created automatically once indexing settles." : loading ? "Preparing full-resolution memories for instant viewing…" : action === "Finding memories" ? "Finding memories and preparing them for instant viewing…" : action || state?.message || "Memory search uses what is indexed now. Generate whenever you like."}
+      {!ready ? "Waiting for silo to finish starting. New memories are created automatically once indexing settles." : loading ? "Preparing full-resolution memories for instant viewing…" : action === "Finding memories" ? "Finding memories and preparing them for instant viewing…" : action === "Creating memory" ? "Creating your memory…" : action || state?.message || "Memory search uses what is indexed now. Generate whenever you like."}
     </p>}
     {generating && <div className="memories-generation-progress" role="status" aria-live="polite">
       <div className="memories-generation-progress-header"><span>{progress?.label ?? "Looking for memories…"}</span><strong>{Math.round((progress?.progress ?? 0) * 100)}%</strong></div>

@@ -585,6 +585,7 @@ export function PhoneManagementPanel({
     if (!backupRequest) return;
     const { device, mode } = backupRequest;
     if (mode === "renew" && backupTypes && backupTypes.length === 0) return;
+    if (busyDeviceId === device.id) return;
     setBackupRequest(null);
     if (mode === "connect") onConnect(device);
     else onRenewBackup(device, backupTypes ?? undefined);
@@ -705,11 +706,12 @@ export function PhoneManagementPanel({
                 className="primary"
                 autoFocus
                 disabled={
-                  backupRequest.mode === "renew" &&
-                  (!previewReady || (backupTypes !== null && backupTypes.length === 0))
+                  busyDeviceId === backupRequest.device.id ||
+                  (backupRequest.mode === "renew" &&
+                    (!previewReady || (backupTypes !== null && backupTypes.length === 0)))
                 }
               >
-                Back up now
+                {busyDeviceId === backupRequest.device.id ? "Backing up…" : "Back up now"}
               </button>
             </div>
           </form>
