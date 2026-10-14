@@ -41,6 +41,12 @@ export interface MemoryGenerationProgress {
   progress: number;
   etaSeconds?: number;
 }
+export interface MemoryGenerationStatus {
+  generating: boolean;
+  /** How many stories this run is trying to create. */
+  expected: number;
+  progress?: MemoryGenerationProgress;
+}
 export interface MemoryState {
   suggestions: MemorySuggestion[];
   settings: MemorySettings;
@@ -161,6 +167,8 @@ export interface MemoriesAPI {
   /** Optional so older bridges keep working; cards fall back to polling state. */
   onMemoryPreviewProgress?(callback: (previews: Record<string, MemoryPreviewStatus>) => void): () => void;
   onMemoriesChanged?(callback: (state: MemoryState) => void): () => void;
+  /** Live generation status, so the page can show placeholders while stories are found. */
+  onMemoryGenerationProgress?(callback: (status: MemoryGenerationStatus) => void): () => void;
   /** Movies in the memories folder that no longer have a card. */
   listSavedMemoryMovies?(): Promise<SavedMemoryMovie[]>;
   revealSavedMemoryMovie?(moviePath: string): Promise<{ ok: boolean; error?: string }>;

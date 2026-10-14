@@ -2,7 +2,7 @@ import React, { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { IconBaseProps } from "react-icons";
 import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
-import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
+import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryGenerationStatus, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
 import {
   MEMORY_DEFAULT_SELECTION_COUNT,
   MEMORY_DURATION_SECONDS,
@@ -576,6 +576,8 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
   useEffect(() => { if (state?.previews) setPreviews((current) => ({ ...current, ...state.previews })); }, [state]);
   useEffect(() => api.onMemoryPreviewProgress?.((next) => setPreviews((current) => ({ ...current, ...next }))), [api]);
   useEffect(() => api.onMemoriesChanged?.((next) => { if (mounted.current && !pending.current) setState(next); }), [api]);
+  const [generation, setGeneration] = useState<MemoryGenerationStatus | null>(null);
+  useEffect(() => api.onMemoryGenerationProgress?.((status) => { if (mounted.current) setGeneration(status.generating ? status : null); }), [api]);
   const waiting = Boolean(state?.suggestions.some((memory) => previews[memory.id] && previews[memory.id].status !== "ready" && previews[memory.id].status !== "failed"));
   useEffect(() => {
     // Bridges without progress events still update by polling the cached state.
@@ -643,7 +645,13 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     if (mounted.current) setState(next);
   };
   const busy = !ready || loading || Boolean(action) || Boolean(exporting);
-  const memoryGenerationDisabled = busy || demoMode || state?.generating;
+  const finding = action === "Finding memories";
+  const generating = finding || Boolean(generation?.generating || state?.generating);
+  const progress = generation?.progress ?? state?.generationProgress;
+  // Generate replaces the editable set, so its cards give way to placeholders; top-ups only fill open slots.
+  const pendingCards = !generating ? 0 : finding ? 5 : Math.max(1, Math.min(5, generation?.expected ?? 5));
+  const visibleSuggestions = finding ? [] : state?.suggestions ?? [];
+  const memoryGenerationDisabled = busy || demoMode || generating;
   const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new editable memories. Finished ones move to your Memory Book below.";
   return <section className="memories-page" aria-label="Memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
@@ -660,26 +668,25 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
       <span>Original files are always kept.</span>
     </div>
     {error && <p className="memories-error memories-page-notice" role="alert">{error}</p>}
-    {(!ready || loading || action || state?.generating || state?.message) && <p className="memories-page-notice" role="status" aria-live="polite">
+    {!generating && (!ready || loading || action || state?.message) && <p className="memories-page-notice" role="status" aria-live="polite">
       {!ready ? "Waiting for silo to finish starting. New memories are created automatically once indexing settles." : loading ? "Preparing full-resolution memories for instant viewing…" : action === "Finding memories" ? "Finding memories and preparing them for instant viewing…" : action || state?.message || "Memory search uses what is indexed now. Generate whenever you like."}
     </p>}
-    {state?.generating && state.generationProgress && <div className="memories-generation-progress" role="status" aria-live="polite">
-      <div className="memories-generation-progress-header"><span>{state.generationProgress.label}</span><strong>{Math.round((state.generationProgress.progress ?? 0) * 100)}%</strong></div>
-      <div className="memories-preparing-bar"><span style={{ width: `${Math.round((state.generationProgress.progress ?? 0) * 100)}%` }} /></div>
-      <small>{state.generationProgress.etaSeconds !== undefined ? `About ${formatEta(state.generationProgress.etaSeconds)} left` : "Estimating time…"}</small>
+    {generating && <div className="memories-generation-progress" role="status" aria-live="polite">
+      <div className="memories-generation-progress-header"><span>{progress?.label ?? "Looking for memories…"}</span><strong>{Math.round((progress?.progress ?? 0) * 100)}%</strong></div>
+      <div className="memories-preparing-bar"><span style={{ width: `${Math.round((progress?.progress ?? 0) * 100)}%` }} /></div>
+      <small>{progress?.etaSeconds !== undefined ? `About ${formatEta(progress.etaSeconds)} left` : "Estimating time…"}</small>
     </div>}
-    {state?.generating && <p className="memories-hint">This uses photos and clips already indexed. Anything indexed later will be available the next time you generate.</p>}
-    {Boolean(state?.suggestions.length) && <p className="memories-collection-label">{state?.suggestions.length} {state?.suggestions.length === 1 ? "memory" : "memories"} to edit <span>Generating again moves finished ones to your Memory Book below.</span></p>}
+    {Boolean(visibleSuggestions.length) && <p className="memories-collection-label">{visibleSuggestions.length} {visibleSuggestions.length === 1 ? "memory" : "memories"} to edit <span>Generating again moves finished ones to your Memory Book below.</span></p>}
     <div className="memories-grid" data-tour="memory-controls" data-help="Each story card lets you preview and save its movie, remove only the suggestion, tune photos, duration and soundtrack, and choose where the saved copy goes.">
-      {(action === "Finding memories" || state?.generating) && Array.from({ length: 5 }, (_, index) => <article key={`pending-${index}`} className="memories-card memories-card-pending" aria-busy="true" aria-label="Memory being created">
-        <div className="memories-cover-placeholder"><FiFilm /><span>{index === 0 ? state?.generationProgress?.label || "Finding a story…" : "Waiting for a story…"}</span></div>
-        <div className="memories-card-pending-body"><span /><span /></div>
-      </article>)}
-      {state?.suggestions.map((memory) => <MemoryCard key={memory.id} api={api} memory={memory} disabled={busy || state.generating}
+      {visibleSuggestions.map((memory) => <MemoryCard key={memory.id} api={api} memory={memory} disabled={busy || generating}
         preview={previews[memory.id]} onBlockedView={() => blockedView(memory)} onState={(next) => { if (mounted.current) setState(next); }}
         onDismiss={() => { void run("Removing suggestion", () => api.dismissMemory(memory.id)); }}
         onExport={(selected, options) => setExporting((current) => current || { memory: selected, options })}
         onToast={setToast} />)}
+      {Array.from({ length: pendingCards }, (_, index) => <article key={`pending-${index}`} className="memories-card memories-card-pending" aria-busy="true" aria-label="Memory being created">
+        <div className="memories-cover-placeholder"><span className="memories-spinner" aria-hidden="true" /><span>{index === 0 ? "Finding a story…" : "Waiting for a story…"}</span></div>
+        <div className="memories-card-pending-body"><span /><span /></div>
+      </article>)}
     </div>
     {savedMovies.length > 0 && <section className="memories-book" aria-label="Memory Book">
       <header className="memories-book-header"><h2>Memory Book</h2><span>{savedMovies.length} finished {savedMovies.length === 1 ? "memory" : "memories"} · saved in your memories folder</span></header>
@@ -688,7 +695,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
       </div>
     </section>}
     {toast && <p className="memories-toast" role="status" aria-live="assertive">{toast}</p>}
-    {ready && !loading && !state?.suggestions.length && !savedMovies.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>
+    {ready && !loading && !generating && !state?.suggestions.length && !savedMovies.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>
       <h2>A little nostalgia goes a long way.</h2><p>Find themed stories in your indexed photos and clips, then choose the mood, frame and length of your movie.</p>
       <p className="memories-hint">Nothing runs until you choose Generate memories. It uses what is indexed now, even while indexing continues. Each movie is then prepared in the background, one at a time, with progress shown on its card.</p>
     </div>}

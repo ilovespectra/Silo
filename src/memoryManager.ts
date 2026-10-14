@@ -6,6 +6,7 @@ import {
   MEMORY_DEFAULT_SELECTION_COUNT,
   MemoryAudioBrowseRequest, MemoryAudioBrowseResult, MemoryAudioBrowseFile,
   MemoryGenerationProgress,
+  MemoryGenerationStatus,
   MemoryMedia, MemoryMood, MemorySettings, MemorySoundtrack,
   MemoryState, MemorySuggestion,
 } from "./memoryTypes";
@@ -40,6 +41,8 @@ export interface MemoryManagerDependencies {
   onSearchError?(stage: string, error: unknown): void;
   /** Path-free counts explaining each generation step, for diagnostics. */
   onTrace?(event: string, details: Record<string, unknown>): void;
+  /** Live status while a generation pass runs. */
+  onGenerationProgress?(status: MemoryGenerationStatus): void;
 }
 
 export interface MemoryStoryCandidate {
@@ -225,6 +228,7 @@ export class MemoryManager {
   private dismissed = new Set<string>();
   private initialization?: Promise<void>;
   private generation?: Promise<MemoryState>;
+  private generationExpected = 0;
   private writes: Promise<void> = Promise.resolve();
 
   constructor(userDataPath: string, private readonly deps: MemoryManagerDependencies) {
@@ -264,6 +268,13 @@ export class MemoryManager {
       this.trace("memory-duplicate-check-failed", { message: error instanceof Error ? error.message : String(error) });
       return null;
     }
+  }
+
+  private emitGenerationProgress() {
+    try {
+      this.deps.onGenerationProgress?.({ generating: this.state.generating, expected: this.generationExpected,
+        ...(this.state.generationProgress ? { progress: this.state.generationProgress } : {}) });
+    } catch { /* Progress display never affects generation. */ }
   }
 
   private trace(event: string, details: Record<string, unknown>) {
@@ -397,6 +408,7 @@ export class MemoryManager {
       ? Math.max(0, Math.round((elapsedSeconds / progress) * (1 - progress)))
       : undefined;
     this.state.generationProgress = { phase, label, progress, ...(etaSeconds !== undefined ? { etaSeconds } : {}) };
+    this.emitGenerationProgress();
   }
 
   async getState(): Promise<MemoryState> {
@@ -518,6 +530,9 @@ export class MemoryManager {
         : replace
           ? NEW_PER_RUN + Math.max(0, RESERVE_CARDS - reserve.length)
           : Math.max(0, NEW_PER_RUN + RESERVE_CARDS - current.length - reserve.length);
+      // Placeholders the page shows: one for a topic, a full set for Generate, open slots for top-ups.
+      this.generationExpected = customTopic ? 1 : replace ? NEW_PER_RUN : Math.max(0, Math.min(want, NEW_PER_RUN - current.length));
+      this.emitGenerationProgress();
       this.trace("memory-generate-start", { replace, customTopic: Boolean(customTopic), want,
         current: current.length, reserve: reserve.length, savedCards: this.state.suggestions.length, savedReserve: this.reserve.length });
       const signatures = new Set([...current, ...reserve].map(card => signature(card.media)));
@@ -681,6 +696,8 @@ export class MemoryManager {
     } finally {
       this.state.generating = false;
       this.state.generationProgress = undefined;
+      this.generationExpected = 0;
+      this.emitGenerationProgress();
     }
     return this.getState();
   }

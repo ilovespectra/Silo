@@ -7563,6 +7563,7 @@ app.whenReady().then(async () => {
       stage, message: error instanceof Error ? error.message : String(error),
     }),
     onTrace: (event, details) => runtimeLog(event, details),
+    onGenerationProgress: (status) => sendToRenderer("memory-generation-progress", status),
     isAllowed: memoryAllowed,
     findLiveVideo: memoryLiveVideo,
   });

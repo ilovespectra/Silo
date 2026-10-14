@@ -47,6 +47,11 @@ contextBridge.exposeInMainWorld("electron", {
       ipcRenderer.on("memory-preview-progress", listener);
       return () => ipcRenderer.removeListener("memory-preview-progress", listener);
     },
+    onMemoryGenerationProgress: (callback) => {
+      const listener = (_event, status) => callback(status);
+      ipcRenderer.on("memory-generation-progress", listener);
+      return () => ipcRenderer.removeListener("memory-generation-progress", listener);
+    },
     onMemoriesChanged: (callback) => {
       const listener = (_event, state) => callback(state);
       ipcRenderer.on("memories-changed", listener);

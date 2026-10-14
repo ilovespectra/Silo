@@ -818,6 +818,7 @@ interface Window {
     onMemoryExportProgress: import("./memoryTypes").MemoriesAPI["onMemoryExportProgress"];
     onMemoryPreviewProgress?: import("./memoryTypes").MemoriesAPI["onMemoryPreviewProgress"];
     onMemoriesChanged?: import("./memoryTypes").MemoriesAPI["onMemoriesChanged"];
+    onMemoryGenerationProgress?: import("./memoryTypes").MemoriesAPI["onMemoryGenerationProgress"];
     listSavedMemoryMovies?: import("./memoryTypes").MemoriesAPI["listSavedMemoryMovies"];
     revealSavedMemoryMovie?: import("./memoryTypes").MemoriesAPI["revealSavedMemoryMovie"];
     readInventoryPage(
