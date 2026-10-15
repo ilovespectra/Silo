@@ -21,6 +21,8 @@ const { FiArrowRight, FiCheck, FiChevronRight, FiDownload, FiEdit3, FiFilm, FiLo
 export interface MemoriesPageProps {
   api: MemoriesAPI;
   ready?: boolean;
+  thumbnailSize?: number;
+  onThumbnailSizeChange?: (size: number) => void;
 }
 
 const errorMessage = (cause: unknown, fallback: string) => cause instanceof Error ? cause.message : typeof cause === "string" && cause.trim() ? cause : fallback;
@@ -43,8 +45,8 @@ function formatPlaybackTime(seconds: number) {
 }
 
 /** Playback time and scrubber are synchronized from the media element's actual playhead. */
-function MemoryVideoPlayer({ src, label, autoPlay = false }: {
-  src: string; label: string; autoPlay?: boolean;
+function MemoryVideoPlayer({ src, label, autoPlay = false, onEnded }: {
+  src: string; label: string; autoPlay?: boolean; onEnded?: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [duration, setDuration] = useState(0);
@@ -93,7 +95,7 @@ function MemoryVideoPlayer({ src, label, autoPlay = false }: {
       onSeeking={syncPlayhead}
       onPlay={() => setPlaying(true)}
       onPause={() => setPlaying(false)}
-      onEnded={() => setPlaying(false)}
+      onEnded={() => { setPlaying(false); onEnded?.(); }}
       onDoubleClick={toggleFullscreen}
     />
     <div className="memories-playback-controls">
@@ -206,7 +208,7 @@ export function MemoryViewDialog({ api, memory, onClose }: {
   return <MemoriesDialog title={`Memories · ${memory.title}`} onClose={onClose}>
     <div className="memories-modal-body">
       <p className="memories-hint">Full-resolution memory · ready to watch</p>
-      {moviePath && <MemoryVideoPlayer src={`app-media://stream/${encodeURIComponent(moviePath)}`} autoPlay label={`Memory movie: ${memory.title}`} />}
+      {moviePath && <MemoryVideoPlayer src={`app-media://stream/${encodeURIComponent(moviePath)}`} autoPlay label={`Memory movie: ${memory.title}`} onEnded={onClose} />}
       {busy && <p className="memories-hint" role="status">Opening memory…</p>}
       {error && <p className="memories-error" role="alert">{error}</p>}
       <div className="memories-modal-actions">
@@ -270,7 +272,7 @@ function ExportDialog({ api, memory, options, onClose, onDownloaded }: {
     <div className="memories-modal-body">
       <p className="memories-hint">{options.count} photos / clips · {options.duration} seconds ({(options.duration / options.count).toFixed(1)}s each) · Landscape 16:9</p>
       {!moviePath && <MemoryCover memory={memory} />}
-      {moviePath && <MemoryVideoPlayer src={`app-media://stream/${encodeURIComponent(moviePath)}`} label={`Exported movie: ${memory.title}`} />}
+      {moviePath && <MemoryVideoPlayer src={`app-media://stream/${encodeURIComponent(moviePath)}`} label={`Exported movie: ${memory.title}`} onEnded={onClose} />}
       {running && <div className="memories-export-progress" role="status" aria-live="polite">
         <span>{progress?.message || "Choose a save location, then your movie will be prepared…"}</span>
         <progress max={1} value={ratio} aria-label="Movie export progress" />
@@ -393,6 +395,34 @@ function PreparingOverlay({ preview }: { preview: MemoryPreviewStatus }) {
   </span>;
 }
 
+function EditableMemoryTitle({ title, disabled, onSave }: {
+  title: string; disabled?: boolean; onSave: (title: string) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(title);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { if (!editing) setDraft(title); }, [editing, title]);
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const normalized = draft.trim().replace(/\s+/g, " ");
+    if (!normalized || normalized.length > 80) { setError("Use a title from 1 to 80 characters."); return; }
+    setSaving(true); setError("");
+    try { await onSave(normalized); setEditing(false); }
+    catch (cause) { setError(errorMessage(cause, "The title could not be saved.")); }
+    finally { setSaving(false); }
+  };
+  return <div className="memories-title-editor">
+    {!editing ? <div className="memories-title-line"><h2>{title}</h2><button type="button" className="memories-icon-button memories-title-edit" disabled={disabled} aria-label={`Rename memory: ${title}`} title="Rename memory" onClick={() => { setDraft(title); setEditing(true); }}><FiEdit3 /></button></div> :
+      <form className="memories-title-form" onSubmit={(event) => { void save(event); }}>
+        <input autoFocus value={draft} maxLength={80} aria-label="Memory title" disabled={saving} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") setEditing(false); }} />
+        <button type="submit" className="memories-icon-button" aria-label="Save memory title" title="Save" disabled={saving}><FiCheck /></button>
+        <button type="button" className="memories-icon-button" aria-label="Cancel title edit" title="Cancel" disabled={saving} onClick={() => setEditing(false)}><FiX /></button>
+      </form>}
+    {error && <small className="memories-title-error" role="alert">{error}</small>}
+  </div>;
+}
+
 function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, onExport, onState, onToast }: {
   api: MemoriesAPI; memory: MemorySuggestion; disabled: boolean; preview?: MemoryPreviewStatus;
   onBlockedView: () => void; onDismiss: () => void;
@@ -493,13 +523,17 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
       <div className="memories-card-heading"><div className="memories-card-badges"><span className={`memories-mood-label memories-mood-${memory.mood}`}>{memory.mood}</span>{memory.downloadedAt && <span className="memories-saved-label" title={`Movie saved ${new Date(memory.downloadedAt).toLocaleString()}`}><FiCheck aria-hidden="true" />Saved</span>}</div>
         <button type="button" className="memories-icon-button" aria-label={`Remove suggestion: ${memory.title}`} title="Remove suggestion only; original files are kept" disabled={disabled} onClick={onDismiss}><FiTrash2 /></button>
       </div>
-      <h2>{memory.title}</h2><p className="memories-description">{memory.description}</p>
+      <EditableMemoryTitle title={memory.title} disabled={disabled} onSave={async (title) => {
+        const next = await api.renameMemory(memory.id, title);
+        onState?.(next);
+      }} />
+      <p className="memories-description">{memory.description}</p>
       <div className="memories-meta"><span><FiImage />{photos} photos</span><span><FiFilm />{clips} clips</span><span>Landscape · 16:9</span></div>
       <details className="memories-settings-dropdown">
         <summary>Edit movie settings <span>{selectedCount} files · 1 min</span></summary>
       <div className="memories-card-controls">
         <label htmlFor={`${fieldId}-count`}>Photos & clips <output>{selectedCount} / {memory.media.length} · {(MEMORY_DURATION_SECONDS / Math.max(1, selectedCount)).toFixed(1)}s each</output></label>
-        <input id={`${fieldId}-count`} type="range" min={minimum} max={maximum} step={1} value={selectedCount} disabled={disabled || maximum <= minimum} onChange={(event) => changeCount(Number(event.target.value))} />
+        <input id={`${fieldId}-count`} type="range" min={minimum} max={maximum} step={1} value={selectedCount} disabled={disabled || maximum <= 2 || maximum <= minimum} onChange={(event) => changeCount(Number(event.target.value))} />
         <small className="memories-hint">{maximum < MEMORY_DEFAULT_SELECTION_COUNT ? `Up to ${maximum} available items; shots never repeat.` : "More shots means quicker cuts."}</small>
         <div className="memories-fixed-length"><span>Movie length</span><output>1 minute · {MEMORY_DURATION_SECONDS} seconds</output></div>
         <label htmlFor={`${fieldId}-soundtrack`}><span><FiMusic aria-hidden="true" />Soundtrack · {memory.mood}</span></label>
@@ -517,6 +551,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
       </div>
       </details>
       <div className="memories-card-actions">
+        <button type="button" className="memories-button memories-primary" disabled={disabled || trackStatus === "loading" || maximum === 0} onClick={() => { void prepareExport(); }}>Save memory</button>
         <button type="button" className="memories-icon-button memories-reveal-button" disabled={disabled || trackStatus === "loading" || maximum === 0} onClick={() => { void revealSavedMovie(); }} aria-label={`Show saved movie for ${memory.title}`} title={memory.downloadedAt ? `Open saved movie in Finder` : "Movie is already saved in your chosen memory folder"}><FiFolder aria-hidden="true" /></button>
       </div>
     </div>
@@ -528,7 +563,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
 function SavedMovieDialog({ movie, onClose }: { movie: SavedMemoryMovie; onClose: () => void }) {
   return <MemoriesDialog title={`Memories · ${movie.title}`} onClose={onClose}>
     <div className="memories-modal-body">
-      <MemoryVideoPlayer src={`app-media://stream/${encodeURIComponent(movie.path)}`} autoPlay label={`Memory movie: ${movie.title}`} />
+      <MemoryVideoPlayer src={`app-media://stream/${encodeURIComponent(movie.path)}`} autoPlay label={`Memory movie: ${movie.title}`} onEnded={onClose} />
       <div className="memories-modal-actions">
         <button type="button" className="memories-button memories-primary" onClick={onClose}>Done</button>
       </div>
@@ -537,7 +572,10 @@ function SavedMovieDialog({ movie, onClose }: { movie: SavedMemoryMovie; onClose
 }
 
 /** A story moving into the Memory Book: its thumbnails stay visible while its movie is prepared. */
-function PendingBookCard({ memory, preview }: { memory: MemorySuggestion; preview?: MemoryPreviewStatus }) {
+function PendingBookCard({ api, memory, preview, onState, onRefresh }: {
+  api: MemoriesAPI; memory: MemorySuggestion; preview?: MemoryPreviewStatus;
+  onState: (state: MemoryState) => void; onRefresh: () => Promise<void>;
+}) {
   return <article className="memories-card memories-saved-movie memories-book-pending" aria-busy={preview?.status !== "failed"}>
     <div className="memories-cover-button" role="group" aria-label={`Preparing memory: ${memory.title}`}>
       <MemoryCover memory={memory} />
@@ -545,14 +583,19 @@ function PendingBookCard({ memory, preview }: { memory: MemorySuggestion; previe
     </div>
     <div className="memories-card-body">
       <div className="memories-card-heading"><div className="memories-card-badges"><span className="memories-saved-label"><FiFilm aria-hidden="true" />Moving to Memory Book</span></div></div>
-      <h2>{memory.title}</h2>
+      <EditableMemoryTitle title={memory.title} onSave={async (title) => {
+        onState(await api.renameMemory(memory.id, title));
+        await onRefresh();
+      }} />
       <div className="memories-meta"><span><FiImage />{memory.media.length} {memory.media.length === 1 ? "item" : "items"}</span></div>
     </div>
   </article>;
 }
 
 /** A finished movie from the memories folder whose story card is no longer kept. */
-function SavedMovieCard({ api, movie, onToast }: { api: MemoriesAPI; movie: SavedMemoryMovie; onToast: (message: string) => void }) {
+function SavedMovieCard({ api, movie, onToast, onRefresh }: {
+  api: MemoriesAPI; movie: SavedMemoryMovie; onToast: (message: string) => void; onRefresh: () => Promise<void>;
+}) {
   const [viewing, setViewing] = useState(false);
   const reveal = async () => {
     const result = await api.revealSavedMemoryMovie?.(movie.path).catch(() => null);
@@ -569,14 +612,19 @@ function SavedMovieCard({ api, movie, onToast }: { api: MemoriesAPI; movie: Save
       <div className="memories-card-heading"><div className="memories-card-badges"><span className="memories-saved-label"><FiCheck aria-hidden="true" />Saved movie</span></div>
         <button type="button" className="memories-icon-button" aria-label={`Show ${movie.title} in Finder`} title="Show in Finder" onClick={() => { void reveal(); }}><FiFolder /></button>
       </div>
-      <h2>{movie.title}</h2>
+      <EditableMemoryTitle title={movie.title} onSave={async (title) => {
+        if (!api.renameSavedMemoryMovie) throw new Error("Renaming saved movies is unavailable in this Silo version.");
+        const result = await api.renameSavedMemoryMovie(movie.path, title);
+        if (!result.ok) throw new Error(result.error || "The saved movie title could not be updated.");
+        await onRefresh();
+      }} />
       <div className="memories-meta"><span><FiFilm />{new Date(movie.modified).toLocaleDateString()}</span><span>{formatBytes(movie.size)}</span></div>
     </div>
     {viewing && <SavedMovieDialog movie={movie} onClose={() => setViewing(false)} />}
   </article>;
 }
 
-export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
+export default function MemoriesPage({ api, ready = true, thumbnailSize = 200, onThumbnailSizeChange }: MemoriesPageProps) {
   const [state, setState] = useState<MemoryState | null>(null);
   const [demoMode, setDemoMode] = useState(false);
   const [savedMovies, setSavedMovies] = useState<SavedMemoryMovie[]>([]);
@@ -668,6 +716,11 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     const next = await api.getMemories(true);
     if (mounted.current) setState(next);
   };
+  const refreshSavedMovies = async () => {
+    if (!api.listSavedMemoryMovies) return;
+    const movies = await api.listSavedMemoryMovies();
+    if (mounted.current && Array.isArray(movies)) setSavedMovies(movies);
+  };
   const busy = !ready || loading || Boolean(action) || Boolean(exporting);
   const finding = action === "Finding memories";
   const generating = finding || Boolean(generation?.generating || state?.generating);
@@ -683,7 +736,7 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
     void run("Creating memory", () => api.generateMemories(false, trimmedPrompt)).then(() => { if (mounted.current) setPrompt(""); });
   };
   const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new editable memories. Finished ones move to your Memory Book below.";
-  return <section className="memories-page" aria-label="Memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
+  return <section className="memories-page" aria-label="Memories" data-retained-scroll="memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
       <div><span className="memories-eyebrow">silo / little time capsules</span><h1>Your life, in motion<span>.</span></h1>
         <p>Small stories from your library. Made by you, kept by you.</p></div>
@@ -736,12 +789,14 @@ export default function MemoriesPage({ api, ready = true }: MemoriesPageProps) {
       const moving = retiring.filter((memory) => !listedPending.has(memory.id) && !editable.has(memory.id));
       const total = moving.length + savedMovies.length;
       return <section className="memories-book" aria-label="Memory Book">
-        <header className="memories-book-header"><h2>Memory Book</h2><span>{total} {total === 1 ? "memory" : "memories"} · saved in your memories folder</span></header>
-        <div className="memories-grid">
-          {moving.map((memory) => <PendingBookCard key={`moving:${memory.id}`} memory={memory} preview={previews[memory.id]} />)}
+        <header className="memories-book-header"><div><h2>Memory Book</h2><span>{total} {total === 1 ? "memory" : "memories"} · saved in your memories folder</span></div>
+          <label className="memories-book-size"><span>Thumbnail size</span><input type="range" min={120} max={200} step={10} value={thumbnailSize} disabled={!onThumbnailSizeChange} aria-label="Memory Book thumbnail size" onChange={(event) => onThumbnailSizeChange?.(Number(event.target.value))} /><output>{thumbnailSize}px</output></label>
+        </header>
+        <div className="memories-grid memories-book-grid" style={{ "--memory-book-thumbnail-size": `${thumbnailSize}px` } as React.CSSProperties}>
+          {moving.map((memory) => <PendingBookCard key={`moving:${memory.id}`} api={api} memory={memory} preview={previews[memory.id]} onState={setState} onRefresh={refreshSavedMovies} />)}
           {savedMovies.map((movie) => movie.pending
-            ? <PendingBookCard key={`pending:${movie.pending.id}`} memory={movie.pending} preview={previews[movie.pending.id]} />
-            : <SavedMovieCard key={movie.path} api={api} movie={movie} onToast={setToast} />)}
+            ? <PendingBookCard key={`pending:${movie.pending.id}`} api={api} memory={movie.pending} preview={previews[movie.pending.id]} onState={setState} onRefresh={refreshSavedMovies} />
+            : <SavedMovieCard key={movie.path} api={api} movie={movie} onToast={setToast} onRefresh={refreshSavedMovies} />)}
         </div>
       </section>;
     })()}

@@ -2558,7 +2558,7 @@ label.settings-row {
 
 .volume-item {
   display: grid;
-  grid-template-columns: max-content max-content minmax(0, 1fr) 22px;
+  grid-template-columns: max-content max-content minmax(0, 1fr) 22px max-content;
   align-items: center;
   gap: 7px;
   padding: 7px 8px;
@@ -2663,6 +2663,25 @@ label.settings-row {
 .volume-open:hover {
   border-color: var(--orange);
   color: var(--orange-bright);
+}
+
+.source-unplug-button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+.source-unplug-button:hover {
+  border-color: var(--error, #c46e5d);
+  color: var(--error, #c46e5d);
+  background: color-mix(in srgb, var(--error, #c46e5d) 8%, transparent);
 }
 
 .google-account.stale {

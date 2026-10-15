@@ -381,7 +381,7 @@ export default function DuplicatesPage({
   }, [busy, state.scanned, state.total]);
 
   return (
-    <main className="duplicates-page" data-help="Scan compares exact file contents. Keep the protected original, review selected copies in the recoverable removal area, and verify before permanent deletion.">
+    <main className="duplicates-page" data-retained-scroll="duplicates" data-help="Scan compares exact file contents. Keep the protected original, review selected copies in the recoverable removal area, and verify before permanent deletion.">
       <header className="duplicates-header" data-tour="duplicates-overview">
         <div>
           <span className="sidebar-kicker">Exact-byte comparison</span>

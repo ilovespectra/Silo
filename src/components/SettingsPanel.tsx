@@ -851,6 +851,7 @@ export default function SettingsPanel({
   const [directLifetimePurchase, setDirectLifetimePurchase] = useState(false);
   const [lifetimeLicense, setLifetimeLicense] =
     useState<LifetimeLicenseState>({ isLicensed: false });
+  const [lifetimeLicenseLoaded, setLifetimeLicenseLoaded] = useState(false);
   const [demoMode, setDemoMode] = useState({
     available: false,
     enabled: false,
@@ -949,7 +950,10 @@ export default function SettingsPanel({
     const load = () =>
       void electronAPI?.getLifetimeLicense()
         .then((license) => {
-          if (!disposed) setLifetimeLicense(license);
+          if (!disposed) {
+            setLifetimeLicense(license);
+            setLifetimeLicenseLoaded(true);
+          }
         })
         .catch(() => undefined);
     load();
@@ -1304,7 +1308,7 @@ export default function SettingsPanel({
                   )}
               </div>
             </section>
-            {!lifetimeLicense.isLicensed && (
+            {lifetimeLicenseLoaded && !lifetimeLicense.isLicensed && (
               <>
                 <h4 className="settings-group-label">License</h4>
                 <section
@@ -1338,6 +1342,28 @@ export default function SettingsPanel({
                       Lifetime options
                     </button>
                   </div>
+                </section>
+              </>
+            )}
+            {demoMode.available && (
+              <>
+                <h4 className="settings-group-label">Developer testing</h4>
+                <section className="settings-card" data-help="This control is available only in the local npm run dev build and restarts Silo with demo limits for tour testing. Your saved lifetime license is retained.">
+                  <label className="settings-row settings-toggle">
+                    <div className="settings-row-text">
+                      <strong>Activate demo mode</strong>
+                      <span>Apply demo limits after restarting Silo. Your lifetime license remains saved.</span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      className="settings-switch"
+                      role="switch"
+                      aria-label="Activate demo mode"
+                      checked={demoMode.enabled}
+                      disabled={demoModeBusy}
+                      onChange={() => void toggleDemoTestingMode()}
+                    />
+                  </label>
                 </section>
               </>
             )}
@@ -1765,7 +1791,7 @@ export default function SettingsPanel({
           >
             <a
               className="settings-row settings-link-row"
-              href="https://repo-six-inky-51.vercel.app/"
+              href="https://silohelp.kolektivkrog.si/"
               target="_blank"
               rel="noreferrer"
             >

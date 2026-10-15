@@ -147,7 +147,8 @@ async function main() {
   log("Launching Silo…");
   // Large libraries hold ~1M index records in the main process; V8's default heap is too tight.
   electron = start(path.join(root, "node_modules/.bin/electron"),
-    [".", "--enable-logging", "--js-flags=--max-old-space-size=8192 --expose-gc", ...process.argv.slice(2)]);
+    [".", "--enable-logging", "--js-flags=--max-old-space-size=8192 --expose-gc", ...process.argv.slice(2)],
+    { SILO_LOCAL_DEV: "1" });
   electron.on("exit", (code) => {
     log(`Silo exited${code ? ` with code ${code}` : ""}.`);
     void shutdown(code ?? 0);

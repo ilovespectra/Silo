@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld("electron", {
     getMemories: (prepareViews) => ipcRenderer.invoke("get-memories", Boolean(prepareViews)),
     generateMemories: (replace, customTopic) => ipcRenderer.invoke("generate-memories", Boolean(replace), customTopic),
     dismissMemory: (id) => ipcRenderer.invoke("dismiss-memory", id),
+    renameMemory: (id, title) => ipcRenderer.invoke("rename-memory", id, title),
     updateMemorySettings: (settings) => ipcRenderer.invoke("update-memory-settings", settings),
     selectMemoryDirectory: () => ipcRenderer.invoke("select-memory-directory"),
     getMemorySoundtracks: (id) => ipcRenderer.invoke("get-memory-soundtracks", id),
@@ -34,6 +35,7 @@ contextBridge.exposeInMainWorld("electron", {
     viewMemory: (id) => ipcRenderer.invoke("view-memory", id),
     revealMemory: (id) => ipcRenderer.invoke("reveal-memory", id),
     listSavedMemoryMovies: () => ipcRenderer.invoke("list-saved-memory-movies"),
+    renameSavedMemoryMovie: (moviePath, title) => ipcRenderer.invoke("rename-saved-memory-movie", moviePath, title),
     revealSavedMemoryMovie: (moviePath) => ipcRenderer.invoke("reveal-saved-memory-movie", moviePath),
     exportMemory: (options) => ipcRenderer.invoke("export-memory", options),
     cancelMemoryExport: () => ipcRenderer.invoke("cancel-memory-export"),
@@ -499,9 +501,10 @@ contextBridge.exposeInMainWorld("electron", {
   googleExportPhotos: (accountId) =>
     ipcRenderer.invoke("google-export-photos", accountId),
   listSources: () => ipcRenderer.invoke("list-sources"),
+  removeIndexSource: (sourcePath) => ipcRenderer.invoke("remove-index-source", sourcePath),
   getLibraryShareStatus: () => ipcRenderer.invoke("get-library-share-status"),
-  startLibraryShare: (sourceIds) =>
-    ipcRenderer.invoke("start-library-share", sourceIds),
+  startLibraryShare: (selections) =>
+    ipcRenderer.invoke("start-library-share", selections),
   stopLibraryShare: () => ipcRenderer.invoke("stop-library-share"),
   getAllSourcesPath: () => ipcRenderer.invoke("get-all-sources-path"),
   setSourceEnabled: (sourceId, enabled) =>

@@ -826,6 +826,18 @@ export class MemoryManager {
     return this.getState();
   }
 
+  async rename(id: string, title: string): Promise<MemoryState> {
+    await this.initialize();
+    const normalized = title.trim().replace(/\s+/g, " ");
+    if (!text(id, 200) || !normalized || normalized.length > 80 || normalized.includes("\0"))
+      throw new Error("Enter a memory title between 1 and 80 characters.");
+    const card = [...this.state.suggestions, ...this.reserve].find((item) => item.id === id);
+    if (!card) throw new Error("That memory is no longer available.");
+    card.title = normalized;
+    await this.persist();
+    return this.getState();
+  }
+
   private applySettings(settings: Partial<MemorySettings> | undefined): void {
     if (!settings || typeof settings !== "object") return;
     for (const key of ["showOnLaunch"] as const) {

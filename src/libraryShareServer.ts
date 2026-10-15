@@ -23,6 +23,10 @@ const MAX_REQUEST_BODY = 1_000_000;
 const MAX_SHARED_SOURCES = 20;
 const imageSvgExtension = ".svg";
 
+export type LibraryShareSelection =
+  | { type: "source"; id: string }
+  | { type: "folder"; id: string };
+
 export interface LibraryShareSource {
   id: string;
   label: string;
@@ -40,6 +44,16 @@ interface ShareSourceSnapshot extends LibraryShareSource {
   canonicalRoot: string;
   publicId: string;
   rootIdentity: IndexedShareRootIdentity;
+  selectionKey: string;
+  folderId?: string;
+  allowedPaths?: Set<string>;
+}
+
+interface ShareDigitalFolder {
+  id: string;
+  name: string;
+  filePaths: string[];
+  hidden?: boolean;
 }
 
 interface ShareContext {
@@ -53,6 +67,7 @@ interface ShareContext {
 
 export interface LibraryShareServerOptions {
   getSources(): Promise<LibraryShareSource[]>;
+  getDigitalFolders(): Promise<ShareDigitalFolder[]>;
   getIndexedFiles(sourceRoots: string[]): IndexedShareFile[];
   search(query: string, sourceRoots: string[]): Promise<IndexedShareFile[]>;
   getThumbnail(filePath: string): Promise<Buffer | null>;
@@ -121,16 +136,16 @@ function isOnShareSubnet(remoteAddress: string | undefined, network: ShareNetwor
   return remote !== null && host !== null && mask !== null && (remote & mask) === (host & mask);
 }
 
-function itemId(token: string, rootPath: string, relativePath: string): string {
+function itemId(token: string, selectionKey: string, rootPath: string, relativePath: string): string {
   return createHmac("sha256", token)
-    .update(`${rootPath}\0${relativePath}`)
+    .update(`${selectionKey}\0${rootPath}\0${relativePath}`)
     .digest("base64url")
     .slice(0, 24);
 }
 
-function sourceId(token: string, rootPath: string): string {
+function sourceId(token: string, selectionKey: string, rootPath: string): string {
   return createHmac("sha256", token)
-    .update(`source\0${rootPath}`)
+    .update(`source\0${selectionKey}\0${rootPath}`)
     .digest("base64url")
     .slice(0, 20);
 }
@@ -230,21 +245,40 @@ export class LibraryShareServer {
     };
   }
 
-  async start(selectedSourceIds: string[]): Promise<LibraryShareStatus> {
+  async start(selections: LibraryShareSelection[]): Promise<LibraryShareStatus> {
     if (this.context) await this.stop();
-    if (!Array.isArray(selectedSourceIds) || selectedSourceIds.length === 0)
-      throw new Error("Choose at least one local library to share.");
-    if (selectedSourceIds.length > MAX_SHARED_SOURCES)
-      throw new Error(`Choose no more than ${MAX_SHARED_SOURCES} libraries.`);
+    if (!Array.isArray(selections) || selections.length === 0)
+      throw new Error("Choose at least one local library or virtual folder to share.");
+    if (selections.length > MAX_SHARED_SOURCES)
+      throw new Error(`Choose no more than ${MAX_SHARED_SOURCES} libraries or folders.`);
 
-    const allSources = await this.options.getSources();
-    const uniqueIds = new Set(selectedSourceIds);
-    if (uniqueIds.size !== selectedSourceIds.length)
-      throw new Error("A library was selected more than once.");
+    const [allSources, allFolders] = await Promise.all([
+      this.options.getSources(),
+      this.options.getDigitalFolders(),
+    ]);
+    const validSelections = selections.filter((selection): selection is LibraryShareSelection =>
+      selection && typeof selection === "object" &&
+      (selection.type === "source" || selection.type === "folder") &&
+      typeof selection.id === "string" && selection.id.length > 0,
+    );
+    if (validSelections.length !== selections.length)
+      throw new Error("A selected library or virtual folder is invalid.");
+    const selectionKeys = validSelections.map(({ type, id }) => `${type}:${id}`);
+    if (new Set(selectionKeys).size !== selectionKeys.length)
+      throw new Error("A library or virtual folder was selected more than once.");
+
+    const localSources = allSources.filter((source) =>
+      source.kind === "local" && source.available,
+    );
     const sources: ShareSourceSnapshot[] = [];
-    for (const id of selectedSourceIds) {
-      const source = allSources.find((candidate) => candidate.id === id);
-      if (!source || source.kind !== "local" || !source.available)
+    const addSourceSnapshot = async (
+      source: LibraryShareSource,
+      selectionKey: string,
+      label: string,
+      folderId?: string,
+      allowedPaths?: Set<string>,
+    ) => {
+      if (source.kind !== "local" || !source.available)
         throw new Error("Only available local libraries can be shared.");
       const canonicalRoot = await fsPromises.realpath(source.rootPath);
       const rootStat = await fsPromises.stat(canonicalRoot);
@@ -252,11 +286,61 @@ export class LibraryShareServer {
         throw new Error("A selected library is no longer a folder.");
       sources.push({
         ...source,
+        label,
         canonicalRoot,
-        publicId: sourceId("pending", source.rootPath),
+        publicId: "",
         rootIdentity: { device: rootStat.dev, inode: rootStat.ino },
+        selectionKey,
+        ...(folderId ? { folderId } : {}),
+        ...(allowedPaths ? { allowedPaths } : {}),
       });
+    };
+
+    for (const selection of validSelections) {
+      const selectionKey = `${selection.type}:${selection.id}`;
+      if (selection.type === "source") {
+        const source = localSources.find((candidate) => candidate.id === selection.id);
+        if (!source) throw new Error("Only available local libraries can be shared.");
+        await addSourceSnapshot(source, selectionKey, source.label);
+        continue;
+      }
+
+      const folder = allFolders.find((candidate) => candidate.id === selection.id && !candidate.hidden);
+      if (!folder) throw new Error("That virtual folder is no longer available to share.");
+      const pathsBySource = new Map<string, Set<string>>();
+      for (const rawPath of folder.filePaths) {
+        if (typeof rawPath !== "string" || !path.isAbsolute(rawPath)) continue;
+        const memberPath = path.resolve(rawPath);
+        const source = localSources
+          .filter((candidate) => {
+            const relative = path.relative(path.resolve(candidate.rootPath), memberPath);
+            return relative !== "" && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`);
+          })
+          .sort((left, right) => path.resolve(right.rootPath).length - path.resolve(left.rootPath).length)[0];
+        if (!source) continue;
+        const paths = pathsBySource.get(source.id) ?? new Set<string>();
+        paths.add(memberPath);
+        pathsBySource.set(source.id, paths);
+      }
+      if (!pathsBySource.size)
+        throw new Error(`“${folder.name}” has no indexed files inside available local libraries.`);
+      for (const [sourceId, allowedPaths] of pathsBySource) {
+        const source = localSources.find((candidate) => candidate.id === sourceId)!;
+        await addSourceSnapshot(
+          source,
+          selectionKey,
+          `${folder.name} · ${source.label}`,
+          folder.id,
+          allowedPaths,
+        );
+      }
     }
+
+    if (!sources.length)
+      throw new Error("No available local libraries or virtual folders were found.");
+    if (sources.length > MAX_SHARED_SOURCES)
+      throw new Error(`The selection spans more than ${MAX_SHARED_SOURCES} local libraries.`);
+
     const sourceLabelCounts = new Map<string, number>();
     for (const source of sources) {
       const baseLabel = comparableName(source.label);
@@ -269,7 +353,8 @@ export class LibraryShareServer {
     if ((!isPrivateIPv4(network.address) && !this.options.networkInterface) || ipv4Number(network.netmask) === null)
       throw new Error("Silo can share only through a private local network.");
     const token = randomBytes(32).toString("base64url");
-    for (const source of sources) source.publicId = sourceId(token, source.rootPath);
+    for (const source of sources)
+      source.publicId = sourceId(token, source.selectionKey, source.rootPath);
 
     const server = createServer((request, response) => {
       setBaseHeaders(response);
@@ -314,15 +399,36 @@ export class LibraryShareServer {
   }
 
   private async currentSources(context: ShareContext): Promise<ShareSourceSnapshot[]> {
-    const registered = await this.options.getSources();
-    return context.sources.filter((shared) =>
-      registered.some((source) =>
+    const [registered, folders] = await Promise.all([
+      this.options.getSources(),
+      this.options.getDigitalFolders(),
+    ]);
+    return context.sources.flatMap((shared) => {
+      const sourceStillAvailable = registered.some((source) =>
         source.kind === "local" &&
         source.available &&
         source.id === shared.id &&
         path.resolve(source.rootPath) === path.resolve(shared.rootPath),
-      ),
-    );
+      );
+      if (!sourceStillAvailable) return [];
+      if (!shared.folderId) return [shared];
+
+      const folder = folders.find((candidate) =>
+        candidate.id === shared.folderId && !candidate.hidden,
+      );
+      if (!folder) return [];
+      const root = path.resolve(shared.rootPath);
+      const allowedPaths = new Set(folder.filePaths.flatMap((memberPath) => {
+        if (typeof memberPath !== "string" || !path.isAbsolute(memberPath)) return [];
+        const resolved = path.resolve(memberPath);
+        const relative = path.relative(root, resolved);
+        return relative !== "" && !path.isAbsolute(relative) &&
+          relative !== ".." && !relative.startsWith(`..${path.sep}`)
+          ? [resolved]
+          : [];
+      }));
+      return allowedPaths.size ? [{ ...shared, allowedPaths }] : [];
+    });
   }
 
   private async currentFiles(context: ShareContext, sources: ShareSourceSnapshot[]) {
@@ -334,13 +440,15 @@ export class LibraryShareServer {
     }> = [];
     for (const source of sources)
       for (const file of this.options.getIndexedFiles([source.rootPath])) {
+        if (source.allowedPaths && !source.allowedPaths.has(path.resolve(file.path)))
+          continue;
         const type = mediaType(file);
         if (!type || file.relativePath.includes("\0")) continue;
         results.push({
           file,
           source,
           type,
-          id: itemId(context.token, source.rootPath, file.relativePath),
+          id: itemId(context.token, source.publicId, source.rootPath, file.relativePath),
         });
       }
     return results;

@@ -164,6 +164,7 @@ export interface MemoriesAPI {
   getMemories(prepareViews?: boolean): Promise<MemoryState>;
   generateMemories(replace?: boolean, customTopic?: string): Promise<MemoryState>;
   dismissMemory(id: string): Promise<MemoryState>;
+  renameMemory(id: string, title: string): Promise<MemoryState>;
   updateMemorySettings(settings: Partial<MemorySettings>): Promise<MemoryState>;
   selectMemoryDirectory(): Promise<MemoryState>;
   getMemorySoundtracks(id: string): Promise<MemorySoundtrack[]>;
@@ -183,5 +184,6 @@ export interface MemoriesAPI {
   onMemoryGenerationProgress?(callback: (status: MemoryGenerationStatus) => void): () => void;
   /** Movies in the memories folder that no longer have a card. */
   listSavedMemoryMovies?(): Promise<SavedMemoryMovie[]>;
+  renameSavedMemoryMovie?(moviePath: string, title: string): Promise<{ ok: boolean; error?: string }>;
   revealSavedMemoryMovie?(moviePath: string): Promise<{ ok: boolean; error?: string }>;
 }

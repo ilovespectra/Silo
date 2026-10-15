@@ -752,7 +752,7 @@ export default function LocalHelpPanel({
                 </button>
                 <a
                   className="local-help-read-more"
-                  href={`https://repo-six-inky-51.vercel.app${activeArticle.guidePath}`}
+                  href={`https://silohelp.kolektivkrog.si${activeArticle.guidePath}`}
                   target="_blank"
                   rel="noreferrer"
                   aria-label={`Read more about ${activeArticle.title} in the Silo user guide`}
@@ -796,7 +796,7 @@ export default function LocalHelpPanel({
                   <span>{section.chapterTitle}</span>
                   <p>{section.excerpt}</p>
                   <a
-                    href={`https://repo-six-inky-51.vercel.app${section.guidePath}`}
+                    href={`https://silohelp.kolektivkrog.si${section.guidePath}`}
                     target="_blank"
                     rel="noreferrer"
                     aria-label={`Read ${section.title} in ${section.chapterTitle}`}

@@ -118,6 +118,8 @@ import {
   TopicSignal,
   discoverMemoryStories,
   isPersonalPhotoPath,
+  isPromptedVideoPhotoEligible,
+  currentPromptedVideoIndexingImage,
   nonPersonalFolderKeyword,
   personalPhotoRejection,
 } from "./memoryDiscovery";
@@ -189,7 +191,7 @@ import {
   type ConfigTransferProgress,
 } from "./configBundle";
 import { ContentPreferences, ContentSettingsStore } from "./contentSettings";
-import { LibraryShareServer } from "./libraryShareServer";
+import { LibraryShareServer, type LibraryShareSelection } from "./libraryShareServer";
 import {
   containsExplicitTerms,
   fileTextLooksExplicit,
@@ -2285,10 +2287,25 @@ function memoryFileMetadata(filePath: string): FileMetadata | undefined {
     : undefined;
 }
 
+/** Paths that identify screenshots, application bundles, or obvious UI artwork. */
+function memoryObviousNonPhotoPath(filePath: unknown): boolean {
+  if (typeof filePath !== "string" || !filePath) return true;
+  const segments = filePath.replace(/\\/g, "/").split("/").filter(Boolean);
+  const fileName = segments.at(-1) ?? "";
+  const assetFolder = /^(?:assets?|resources?|icons?|logos?|thumbnails?|thumbs|wallpapers?|backgrounds?|stock(?: photos?)?|clip art|templates?|avatars?|previews?|screenshots?|screen shots?|screen captures?)$/i;
+  const applicationBundle = /\.(?:app|bundle|framework|plugin|asar)$/i;
+  const screenshotName = /(?:screenshot|screen[\s._-]*shot|screencap|screen[\s._-]*capture|screen[\s._-]*record)/i;
+  const artworkName = /(?:^|[._\s-])(?:app[._\s-]?)?(?:icon|logo|favicon|sprite|toolbar|button|vector[._\s-]*graphic|clip[._\s-]*art|illustration)(?:[._\s-]|$)/i;
+  return segments.some((segment) => assetFolder.test(segment) || applicationBundle.test(segment))
+    || screenshotName.test(fileName)
+    || artworkName.test(fileName);
+}
+
 /** Strict and toggle-independent: ignores showNsfw/showBannedPeople and folder reveal views. */
 function memoryAllowed(filePath: unknown): boolean {
   if (typeof filePath !== "string" || !filePath || filePath.includes("\0"))
     return false;
+  if (memoryObviousNonPhotoPath(filePath)) return false;
   if (!stateStore || !faceIndexer) return false;
   const hidden = getHiddenFolderPaths();
   // Hidden-folder entries may be directories; their descendants are hidden too.
@@ -2308,6 +2325,16 @@ function memoryAllowed(filePath: unknown): boolean {
     { name: path.basename(filePath), path: filePath },
     memoryFileMetadata(filePath),
   );
+}
+
+/** Search results may be any indexed image format or size; safety/path filters and
+ * album-folder detection screen out junk without dropping compressed photographs. */
+function memorySearchImageEligible(
+  file: { path: string; type: string },
+  musicDirectories: ReadonlySet<string>,
+): boolean {
+  return file.type === "image" && memoryAllowed(file.path) &&
+    !musicDirectories.has(path.dirname(file.path));
 }
 
 async function memoryLiveVideo(file: MemoryMedia) {
@@ -2373,8 +2400,34 @@ function memoryDot(first: Float32Array, second: Float32Array) {
   return sum;
 }
 
+/**
+ * Scores an image against remembered real-photo and obvious-graphic prompts.
+ * Missing prompts or vectors fail open; ambiguous imagery stays eligible.
+ */
+function memoryImageContentFactor(
+  vector: Float32Array | undefined,
+  prompts: { good?: Float32Array[]; nonPhoto?: Float32Array[]; junk?: Float32Array[] } | undefined,
+): number {
+  const nonPhotoPrompts = prompts?.nonPhoto ?? prompts?.junk;
+  if (!vector?.length || !prompts?.good?.length || !nonPhotoPrompts?.length) return 1;
+  const good = Math.max(...prompts.good.map((prompt) => memoryDot(prompt, vector)));
+  const nonPhoto = Math.max(...nonPhotoPrompts.map((prompt) => memoryDot(prompt, vector)));
+  if (!Number.isFinite(good) || !Number.isFinite(nonPhoto)) return 1;
+  const advantage = good - nonPhoto;
+  if (advantage <= -0.05) return 0;
+  return Math.max(0, Math.min(1, 0.5 + advantage));
+}
+
+function memoryImageIsObviousNonPhoto(
+  vector: Float32Array | undefined,
+  prompts: { good?: Float32Array[]; nonPhoto?: Float32Array[]; junk?: Float32Array[] } | undefined,
+): boolean {
+  return memoryImageContentFactor(vector, prompts) === 0;
+}
+
 async function filterMemoryPhotos(paths: string[]): Promise<string[]> {
-  if (!aestheticScorer || paths.length === 0) return [];
+  if (paths.length === 0) return [];
+  if (!aestheticScorer) return paths;
   return aestheticScorer.filterSimilar(paths, MEMORY_DUPLICATE_SIMILARITY);
 }
 
@@ -2421,7 +2474,8 @@ async function namedMemoryMedia(query: string, roots: string[]): Promise<ScoredM
   for (let start = 0; start < sampled.length; start += 32) {
     const stats = await Promise.all(sampled.slice(start, start + 32).map(async (filePath) => {
       try {
-        const stat = await fsPromises.stat(filePath);
+        const localPath = await resolveLocalPath(filePath);
+        const stat = await fsPromises.stat(localPath);
         return stat.isFile() ? { filePath, stat } : null;
       } catch { return null; }
     }));
@@ -2462,7 +2516,7 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
         continue;
       }
       if (!memoryAllowed(file.path)) { dropped.notAllowed++; continue; }
-      if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) {
+      if (musicDirectories.has(path.dirname(file.path))) {
         dropped.notPersonal++;
         nonPersonalMatches.push(file);
         continue;
@@ -2473,18 +2527,34 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
     }
   };
   collectPhotos(matches);
-  // On x64, graphics can fill the entire top-500 image window. Filter before
-  // ranking in the sparse case rather than relaxing personal-photo or safety rules.
-  const filteredSearch = process.arch === "x64" && photoCandidates.length < MEMORY_MIN_SELECTION_COUNT;
+  // If the initial ranking is mostly unsafe or obvious artwork, refill from a
+  // safety-filtered search on every architecture while indexing continues.
+  const filteredSearch = photoCandidates.length < MEMORY_MIN_SELECTION_COUNT;
   let filteredMatches = 0;
   if (filteredSearch) {
     const eligibleMatches = await semanticIndexer.search(
       query, MEMORY_SEARCH_MIN_CONFIDENCE, roots, () => false, undefined,
-      (file) => file.type === "image" && memoryAllowed(file.path) &&
-        isPersonalPhotoPath(file.path, file.size, musicDirectories),
+      (file) => memorySearchImageEligible(file, musicDirectories),
     );
     filteredMatches = eligibleMatches.length;
     collectPhotos(eligibleMatches);
+  }
+  let obviousGraphics = 0;
+  if (photoCandidates.length) {
+    const [vectors, prompts] = await Promise.all([
+      semanticIndexer.getImageVectors(photoCandidates.map((file) => file.path)),
+      memoryPromptVectors(),
+    ]);
+    for (let index = photoCandidates.length - 1; index >= 0; index--) {
+      const candidate = photoCandidates[index];
+      const vector = vectors.get(candidate.path);
+      if (!vector) continue;
+      if (memoryImageIsObviousNonPhoto(vector, prompts)) {
+        photoCandidates.splice(index, 1);
+        candidatePaths.delete(candidate.path);
+        obviousGraphics++;
+      }
+    }
   }
   const magic: MagicRankResult = photoCandidates.length
     ? await aestheticScorer.rankDistinct(photoCandidates.map(({ path: filePath, name, size, modified }) =>
@@ -2497,19 +2567,12 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
     if (!candidate) return [];
     const magicScore = magic.scores[filePath];
     return [{ ...candidate, magicScore: Number.isFinite(magicScore) ? magicScore : -1,
-      score: (Number.isFinite(magicScore) ? magicScore : 0) + candidate.score / 1000
-        + (namedPaths.has(filePath) ? 1 : 0) }];
+      score: candidate.score + (namedPaths.has(filePath) ? 1 : 0) }];
   });
   const qualityPhotos = await applyMemoryPhotoQuality(rankedPhotos);
-  // Resolution rules must not leave a prompt short when lower-resolution matches exist.
-  if (qualityPhotos.length < MEMORY_MIN_SELECTION_COUNT) {
-    const kept = new Set(qualityPhotos.map((file) => file.path));
-    qualityPhotos.push(...rankedPhotos.filter((file) => !kept.has(file.path))
-      .slice(0, MEMORY_MIN_SELECTION_COUNT - qualityPhotos.length));
-  }
   const photos = selectMemoryPhotoCandidates(qualityPhotos).map(({ magicScore, ...photo }) => photo);
   runtimeLog("memory-search-trace", { stage: "photos", roots: roots.length, named: named.length, matches: matches.length, ...dropped,
-    candidates: photoCandidates.length, distinct: magic.order.length, analyzed: magic.analyzed,
+    obviousGraphics, candidates: photoCandidates.length, distinct: magic.order.length, analyzed: magic.analyzed,
     ranked: rankedPhotos.length, quality: qualityPhotos.length, selected: photos.length,
     minConfidence: MEMORY_SEARCH_MIN_CONFIDENCE, filteredSearch, filteredMatches, magicRunning: magic.running, magicTotal: magic.total,
     topMatchConfidence: matches.length ? Math.round(Math.max(...matches.map((m) => m.confidence ?? 0))) : 0,
@@ -2529,12 +2592,13 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
     ]);
     for (const filePath of candidates) {
       try {
-        const stat = await fsPromises.stat(filePath);
+        const localPath = await resolveLocalPath(filePath);
+        const stat = await fsPromises.stat(localPath);
         if (!stat.isFile()) continue;
         const key = `${filePath}:${stat.size}:${stat.mtimeMs}`;
         let vector = memoryFrameVectors.get(key);
         if (!vector) {
-          const framePath = memoryThumbnailFile(await getThumbnail(filePath, false, 480));
+          const framePath = memoryThumbnailFile(await getThumbnail(localPath, false, 480));
           if (!framePath) continue;
           vector = await semanticIndexer.embedPreviewImage(framePath);
           if (memoryFrameVectors.size >= 128) memoryFrameVectors.delete(memoryFrameVectors.keys().next().value!);
@@ -2554,6 +2618,135 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
     }
   }
   return [...photos, ...videos].sort((first, second) => second.score - first.score);
+}
+
+function promptedVideoPhotoCandidate(
+  file: { path: string; name: string; type: string; size: number; modified: number; confidence?: number },
+  musicDirectories: ReadonlySet<string>,
+): ScoredMemoryMedia | null {
+  if (file.type !== "image" || typeof file.confidence !== "number" || file.confidence < MEMORY_SEARCH_MIN_CONFIDENCE)
+    return null;
+  if (!memoryAllowed(file.path)) return null;
+  const phonePath = phoneManager?.isPhonePath?.(file.path) ?? file.path.startsWith("/__phone__/");
+  if (!isPromptedVideoPhotoEligible(file.path, file.size, musicDirectories, phonePath)) return null;
+  return { path: file.path, name: file.name, type: "image", modified: file.modified,
+    size: file.size, score: file.confidence };
+}
+
+/** Relevant adjacent clips for matched photos, including live phone directories. */
+async function memoryVideoMatchesForPhotos(
+  query: string,
+  photos: ScoredMemoryMedia[],
+): Promise<ScoredMemoryMedia[]> {
+  if (!photos.length) return [];
+  const candidates = new Map<string, { path: string; name: string; modified: number; size?: number }>();
+  const localDirectories = Array.from(new Set(photos.filter((photo) => !isRemotePath(photo.path))
+    .map((photo) => path.dirname(photo.path)))).slice(0, 4);
+  for (const filePath of await memoryVideoCandidates(localDirectories, 12))
+    candidates.set(filePath, { path: filePath, name: path.basename(filePath), modified: 0 });
+
+  const phoneDirectories = Array.from(new Set(photos.filter((photo) =>
+    phoneManager?.isPhonePath?.(photo.path) ?? photo.path.startsWith("/__phone__/"))
+    .map((photo) => path.dirname(photo.path)))).slice(0, 4);
+  for (const directory of phoneDirectories) {
+    try {
+      const files = await phoneManager.listPhoneFiles(directory, false);
+      for (const file of files) {
+        if (candidates.size >= 12) break;
+        if (file.isDirectory || !MEMORY_VIDEO_EXTENSIONS.has(path.extname(file.name).toLowerCase())
+          || memoryObviousNonPhotoPath(file.path) || !memoryAllowed(file.path)) continue;
+        candidates.set(file.path, { path: file.path, name: file.name, modified: file.modified, size: file.size });
+      }
+    } catch { /* An offline phone directory contributes no clips. */ }
+  }
+  if (!candidates.size) return [];
+
+  const [queryPrompt, unsafePrompt, safePrompt] = await semanticIndexer.embedPrompts([
+    `a photo of ${query}`, `a photo of ${NSFW_VISUAL_PROMPT}`, `a photo of ${SAFE_VISUAL_PROMPT}`,
+  ]);
+  const videos: ScoredMemoryMedia[] = [];
+  for (const candidate of candidates.values()) {
+    try {
+      const localPath = await resolveLocalPath(candidate.path);
+      const stat = await fsPromises.stat(localPath);
+      if (!stat.isFile()) continue;
+      const key = `${localPath}:${stat.size}:${stat.mtimeMs}`;
+      let vector = memoryFrameVectors.get(key);
+      if (!vector) {
+        const framePath = memoryThumbnailFile(await getThumbnail(localPath, false, 480));
+        if (!framePath) continue;
+        vector = await semanticIndexer.embedPreviewImage(framePath);
+        if (memoryFrameVectors.size >= 128) memoryFrameVectors.delete(memoryFrameVectors.keys().next().value!);
+        memoryFrameVectors.set(key, vector);
+      }
+      const unsafe = memoryDot(unsafePrompt, vector);
+      if (unsafe >= 0.2 && unsafe - memoryDot(safePrompt, vector) >= 0.008) {
+        memoryUnsafeVideoPaths.add(candidate.path);
+        continue;
+      }
+      const similarity = memoryDot(queryPrompt, vector);
+      if (similarity < 0.24 || !memoryAllowed(candidate.path)) continue;
+      videos.push({ path: candidate.path, name: candidate.name, type: "video",
+        modified: candidate.modified || stat.mtimeMs, size: candidate.size ?? stat.size,
+        score: Math.min(100, similarity * 100) });
+    } catch { /* Offline or damaged clips do not discard matching photos. */ }
+  }
+  return videos.sort((first, second) => second.score - first.score);
+}
+
+/** Search every available configured source without depending on source visibility toggles. */
+async function searchPromptedMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
+  const cleanQuery = typeof query === "string" ? query.trim() : "";
+  if (!cleanQuery || !semanticIndexer || !faceIndexer) return [];
+  const roots = await getAllIndexSources();
+  if (!roots.length) return [];
+  const musicDirectories = memoryMusicDirectories();
+  const matches = await semanticIndexer.search(
+    cleanQuery, MEMORY_SEARCH_MIN_CONFIDENCE, roots, () => false, undefined,
+    (file) => promptedVideoPhotoCandidate(file as SearchResult, musicDirectories) !== null,
+  );
+  const byPath = new Map<string, ScoredMemoryMedia>();
+  for (const file of matches) {
+    const candidate = promptedVideoPhotoCandidate(file, musicDirectories);
+    if (candidate && (!byPath.has(candidate.path) || byPath.get(candidate.path)!.score < candidate.score))
+      byPath.set(candidate.path, candidate);
+  }
+
+  const indexedImages = semanticIndexer.getIndexedImages(roots);
+  const progress = semanticIndexer.getProgress();
+  const activeImage = currentPromptedVideoIndexingImage(
+    indexedImages, progress.status, progress.currentFile, new Set(byPath.keys()),
+  );
+  if (activeImage) {
+    const active = promptedVideoPhotoCandidate({ ...activeImage, confidence: 100 }, musicDirectories);
+    if (active) {
+      try {
+        const prompts = await memoryPromptVectors();
+        const imagePath = await resolveLocalPath(active.path);
+        const vector = await semanticIndexer.getImageVectors([active.path]).then((vectors) => vectors.get(active.path));
+        let activeVector = vector;
+        if (!activeVector) {
+          const thumbnail = memoryThumbnailFile(await getThumbnail(imagePath, false, 480));
+          if (thumbnail) activeVector = await semanticIndexer.embedPreviewImage(thumbnail);
+        }
+        const [queryPrompt] = await semanticIndexer.embedPrompts([`a photo of ${cleanQuery}`]);
+        if (activeVector && !memoryImageIsObviousNonPhoto(activeVector, prompts)) {
+          const confidence = memoryDot(queryPrompt, activeVector) * 100;
+          if (confidence >= MEMORY_SEARCH_MIN_CONFIDENCE)
+            byPath.set(active.path, { ...active, score: confidence });
+        }
+      } catch { /* A thumbnail or model failure leaves ordinary indexed search usable. */ }
+    }
+  }
+
+  const prompts = await memoryPromptVectors();
+  const vectors = await semanticIndexer.getImageVectors(Array.from(byPath.keys()));
+  const photos = Array.from(byPath.values()).filter((photo) => {
+    const vector = vectors.get(photo.path);
+    return !vector || !memoryImageIsObviousNonPhoto(vector, prompts);
+  }).sort((first, second) => second.score - first.score).slice(0, 160);
+  const videos = await memoryVideoMatchesForPhotos(cleanQuery, photos);
+  return [...photos, ...videos];
 }
 
 let memoryTopicProfile: MemoryTopicProfile | null = null;
@@ -2600,19 +2793,19 @@ async function refreshMemoryTopicsAfterIndexing(): Promise<void> {
   // Previews render only once indexing is quiet; the next notification retries otherwise.
   if (!memoryProfileBusy()) await prepareAllMemoryPreviews(state.suggestions);
 }
-let memoryPhotoPromptVectors: Promise<{ junk: Float32Array[]; good: Float32Array[] }> | null = null;
+let memoryPhotoPromptVectors: Promise<{ nonPhoto: Float32Array[]; good: Float32Array[] }> | null = null;
 
-function memoryPromptVectors() {
+function memoryPromptVectors(): Promise<{ nonPhoto: Float32Array[]; good: Float32Array[] }> {
   if (!memoryPhotoPromptVectors) {
     memoryPhotoPromptVectors = semanticIndexer
       .embedPrompts([...MEMORY_JUNK_PROMPTS, ...MEMORY_PHOTO_PROMPTS])
       .then((vectors) => ({
-        junk: vectors.slice(0, MEMORY_JUNK_PROMPTS.length),
+        nonPhoto: vectors.slice(0, MEMORY_JUNK_PROMPTS.length),
         good: vectors.slice(MEMORY_JUNK_PROMPTS.length),
       }));
     memoryPhotoPromptVectors.catch(() => { memoryPhotoPromptVectors = null; });
   }
-  return memoryPhotoPromptVectors;
+  return memoryPhotoPromptVectors!;
 }
 
 /** Story photos ranked by how much they look like real moments; screenshots and documents are dropped. */
@@ -2625,11 +2818,11 @@ async function loadMemoryIdeaMedia(paths: string[], modified: Map<string, number
   for (const filePath of paths) {
     const vector = vectors.get(filePath);
     if (!vector) continue;
+    if (memoryImageIsObviousNonPhoto(vector, prompts)) continue;
+    const contentFactor = memoryImageContentFactor(vector, prompts);
     const good = Math.max(...prompts.good.map((prompt) => memoryDot(prompt, vector)));
-    const junk = Math.max(...prompts.junk.map((prompt) => memoryDot(prompt, vector)));
-    if (junk > good + 0.01) continue;
     media.push({ path: filePath, name: path.basename(filePath), type: "image",
-      modified: modified.get(filePath) ?? 0, score: good * 100 });
+      modified: modified.get(filePath) ?? 0, score: good * contentFactor * 100 });
   }
   if (media.length === 0) return [];
   const magic = await aestheticScorer.rankDistinct(media.map((item) => ({
@@ -2677,29 +2870,26 @@ async function readMemoryExif(filePath: string): Promise<MemoryExif | null> {
 }
 
 /**
- * Drops low-resolution and artwork-like images (no camera data and square, like album
- * covers) and favours real camera shots; remote files are kept as-is.
+ * Uses EXIF only to rank photos. Resolution and square crops are weak hints; they
+ * never make a safe indexed photo ineligible for a memory.
  */
 async function applyMemoryPhotoQuality(media: ScoredMemoryMedia[]): Promise<ScoredMemoryMedia[]> {
-  const kept: ScoredMemoryMedia[] = [];
+  const ranked: ScoredMemoryMedia[] = [];
   for (let start = 0; start < media.length; start += 16) {
     const batch = media.slice(start, start + 16);
     const exif = await Promise.all(batch.map((item) =>
       item.type === "image" && !isRemotePath(item.path) ? readMemoryExif(item.path) : Promise.resolve(null)));
     batch.forEach((item, index) => {
       const data = exif[index];
-      if (!data) return kept.push(item);
+      if (!data) return ranked.push(item);
       const long = Math.max(data.width, data.height);
-      const short = Math.min(data.width, data.height);
-      if (long && (long < 1280 || short < 720)) return;
       const square = long > 0 && Math.abs(data.width - data.height) / long < 0.02;
-      if (!data.camera && !data.takenAt && square) return;
-      const factor = data.camera ? 1.15 : data.takenAt ? 1 : 0.7;
-      kept.push({ ...item, score: item.score * factor,
+      const factor = data.camera ? 1.15 : data.takenAt ? 1 : square ? 0.7 : 0.9;
+      ranked.push({ ...item, score: item.score * factor,
         ...(data.takenAt ? { modified: data.takenAt } : {}) });
     });
   }
-  return kept;
+  return ranked;
 }
 
 let memoryMusicDirectoryCache: { key: string; directories: Set<string> } | null = null;
@@ -6220,7 +6410,7 @@ async function createWindow() {
     try {
       const parsedUrl = new URL(url);
       isOfficialGuideUrl =
-        parsedUrl.origin === "https://repo-six-inky-51.vercel.app" &&
+        parsedUrl.origin === "https://silohelp.kolektivkrog.si" &&
         parsedUrl.protocol === "https:" &&
         !parsedUrl.username &&
         !parsedUrl.password &&
@@ -6418,16 +6608,17 @@ async function getAllIndexSources(): Promise<string[]> {
 async function getIndexableRootsFromSources(
   sources: BrowseSource[],
 ): Promise<string[]> {
-  const candidates = sources.filter(
-    (source) =>
-      source.available &&
-      source.rootPath.trim() &&
-      (fullAccessEnabled() || (source.enabled && !source.demoLocked)) &&
-      (!source.offlineBackup || source.enabled),
+  const candidates = sources.filter((source) =>
+    source.rootPath.trim() &&
+    (fullAccessEnabled() || !source.demoLocked) &&
+    // Memories use every configured source, independent of result visibility.
+    // A local root stays useful to the existing index while its drive is offline;
+    // remote roots must be available before their virtual paths can be searched.
+    (source.available || !source.rootPath.startsWith("/__")),
   );
   const enabledBackupDevices = new Set<string>();
-  for (const source of sources) {
-    if (!source.offlineBackup || !source.enabled) continue;
+  for (const source of candidates) {
+    if (!source.offlineBackup) continue;
     const parsed = phoneManager?.parsePhonePath(source.rootPath);
     if (parsed)
       enabledBackupDevices.add(`${parsed.platform}:${parsed.deviceId}`);
@@ -7450,6 +7641,7 @@ app.whenReady().then(async () => {
         kind,
         available,
       })),
+    getDigitalFolders: async () => stateStore.getState().digitalFolders,
     getIndexedFiles: (sourceRoots) => semanticIndexer.getIndexedFiles(sourceRoots),
     search: (query, sourceRoots) =>
       trackInteractiveSearch(() => semanticIndexer.search(query, 0, sourceRoots)),
@@ -7861,6 +8053,7 @@ app.whenReady().then(async () => {
   scheduleThumbnailPregeneration();
   memoryManager = new MemoryManager(app.getPath("userData"), {
     search: searchMemoryMedia,
+    searchPrompted: searchPromptedMemoryMedia,
     hasMovie: async (card: MemorySuggestion) => Boolean(await findMemoryMovie(card)),
     filterImages: filterMemoryPhotos,
     thumb: async (filePath) => getThumbnail(await resolveLocalPath(filePath), false, 200),
@@ -8561,6 +8754,40 @@ ipcMain.handle("dismiss-memory", (_event, id: unknown) => {
   if (typeof id !== "string" || !id || id.length > 200) throw new Error("Invalid memory.");
   return memoryManager.dismiss(id);
 });
+ipcMain.handle("rename-memory", async (_event, id: unknown, title: unknown) => {
+  if (typeof id !== "string" || !id || id.length > 200 || typeof title !== "string")
+    throw new Error("Invalid memory title.");
+  const previous = await memoryManager.getSuggestion(id) ?? memoryBookPending.get(id);
+  if (!previous) throw new Error("That memory is no longer available.");
+  const normalizedTitle = title.trim().replace(/\s+/g, " ");
+  if (!normalizedTitle || normalizedTitle.length > 80 || normalizedTitle.includes("\0"))
+    throw new Error("Enter a memory title between 1 and 80 characters.");
+  const previousName = memoryPreviewFileName(previous);
+  const managedSuggestion = await memoryManager.getSuggestion(id);
+  const nextState = managedSuggestion
+    ? await memoryManager.rename(id, normalizedTitle)
+    : await memoryManager.getState();
+  const renamed = managedSuggestion
+    ? (await memoryManager.getSuggestion(id) ?? { ...previous, title: normalizedTitle })
+    : { ...previous, title: normalizedTitle };
+  if (memoryBookPending.has(id)) memoryBookPending.set(id, renamed);
+  const nextName = memoryPreviewFileName(renamed);
+  if (previousName !== nextName) {
+    for (const directory of await memoryMovieDirectories()) {
+      const previousPath = path.join(directory, previousName);
+      const nextPath = path.join(directory, nextName);
+      const nextExists = await fsPromises.stat(nextPath).then((stat) => stat.isFile(), () => false);
+      if (!nextExists)
+        await fsPromises.copyFile(previousPath, nextPath).catch(() => undefined);
+    }
+  }
+  await rememberMemoryMovieTitles([renamed]);
+  memoryPreviewStatus.delete(id);
+  void prepareMemoryPreviews([renamed]).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+  const result = await memoryStateWithPreviews(nextState);
+  sendToRenderer("memories-changed", result);
+  return result;
+});
 ipcMain.handle("update-memory-settings", (_event, settings: unknown) => {
   if (!settings || typeof settings !== "object" || Array.isArray(settings))
     throw new Error("Invalid memory settings.");
@@ -8671,6 +8898,22 @@ async function rememberMemoryMovieTitles(suggestions: MemorySuggestion[]): Promi
   await fsPromises.writeFile(MEMORY_MOVIE_TITLES_PATH(), JSON.stringify(titles)).catch(() => undefined);
 }
 
+async function saveMemoryMovieTitle(moviePath: string, title: string): Promise<void> {
+  const normalizedTitle = title.trim().replace(/\s+/g, " ");
+  if (!normalizedTitle || normalizedTitle.length > 80 || normalizedTitle.includes("\0"))
+    throw new Error("Enter a memory title between 1 and 80 characters.");
+  const resolved = path.resolve(moviePath);
+  const directories = await memoryMovieDirectories();
+  if (!directories.some((directory) => path.dirname(resolved) === path.resolve(directory)))
+    throw new Error("That movie is not in your memories folder.");
+  const stat = await fsPromises.stat(resolved).catch(() => null);
+  if (!stat?.isFile() || !/\.mp4$/i.test(resolved)) throw new Error("That saved movie is unavailable.");
+  const titles = await readMemoryMovieTitles();
+  titles[path.basename(resolved)] = normalizedTitle;
+  await fsPromises.mkdir(path.dirname(MEMORY_MOVIE_TITLES_PATH()), { recursive: true });
+  await fsPromises.writeFile(MEMORY_MOVIE_TITLES_PATH(), JSON.stringify(titles));
+}
+
 function titleFromMemoryMovieName(name: string): string {
   const stem = name.replace(/\.mp4$/i, "").replace(/-[a-z0-9]{1,6}-[a-f0-9]{4}$/i, "");
   const dated = /^(\d{4}-\d{2}-\d{2})-(.+)$/.exec(stem);
@@ -8721,6 +8964,13 @@ ipcMain.handle("list-saved-memory-movies", async () => {
     pending.push({ path: "", title: card.title, modified: Date.now(), size: 0, pending: card });
   }
   return [...pending, ...finished];
+});
+
+ipcMain.handle("rename-saved-memory-movie", async (_event, moviePath: unknown, title: unknown) => {
+  if (typeof moviePath !== "string" || typeof title !== "string")
+    throw new Error("Invalid saved memory title.");
+  await saveMemoryMovieTitle(moviePath, title);
+  return { ok: true };
 });
 
 ipcMain.handle("reveal-saved-memory-movie", async (_event, moviePath: unknown) => {
@@ -10487,6 +10737,12 @@ ipcMain.handle("retry-indexing-stage", async (_event, id: unknown) => {
   await indexRecovery.retry(id);
   return { ok: true };
 });
+ipcMain.handle("pause-indexing-stage", async (_event, id: unknown) => {
+  if (typeof id !== "string" || !indexRecovery)
+    throw new Error("Index recovery is not ready.");
+  await indexRecovery.pauseStage(id);
+  return { ok: true };
+});
 async function collectShelterSourceFiles(source: BrowseSource, operationId: string) {
   const files: Array<ShelterSourceFile & { size: number; modified: number }> = [];
   const fingerprint = new InventoryFingerprint();
@@ -12122,13 +12378,17 @@ ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
     };
   }
 });
+const isLocalNpmDev = () => !app.isPackaged && process.env.SILO_LOCAL_DEV === "1";
+
 ipcMain.handle("get-demo-testing-mode", () => ({
-  available: lifetimeLicensed,
-  enabled: lifetimeLicensed && demoTestingModeEnabled,
+  available: lifetimeLicensed && isLocalNpmDev(),
+  enabled: lifetimeLicensed && isLocalNpmDev() && demoTestingModeEnabled,
 }));
 ipcMain.handle("set-demo-testing-mode", async (_event, enabledValue: unknown) => {
   if (typeof enabledValue !== "boolean")
     throw new Error("Demo testing mode must be enabled or disabled explicitly.");
+  if (!isLocalNpmDev())
+    throw new Error("Demo testing mode is available only in the local npm run dev app.");
   if (!lifetimeLicensed)
     throw new Error("A saved lifetime license is required for demo testing mode.");
   if (enabledValue === demoTestingModeEnabled)
@@ -12880,12 +13140,12 @@ ipcMain.handle("get-library-share-status", () =>
   libraryShareServer?.getStatus() ?? { active: false, sources: [] },
 );
 
-ipcMain.handle("start-library-share", async (_event, sourceIds: unknown) => {
+ipcMain.handle("start-library-share", async (_event, selections: unknown) => {
   if (!libraryShareServer || !semanticIndexer?.isLoaded())
     throw new Error("Silo is still loading its search index.");
-  if (!Array.isArray(sourceIds) || sourceIds.some((id) => typeof id !== "string"))
-    throw new Error("Choose one or more local libraries to share.");
-  return libraryShareServer.start(sourceIds as string[]);
+  if (!Array.isArray(selections))
+    throw new Error("Choose one or more local libraries or virtual folders to share.");
+  return libraryShareServer.start(selections as LibraryShareSelection[]);
 });
 
 ipcMain.handle("stop-library-share", async () => {

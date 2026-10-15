@@ -351,7 +351,7 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
   );
 
   return (
-    <main className="stats-page">
+    <main className="stats-page" data-retained-scroll="stats">
       <header className="stats-page-heading">
         <div>
           <span className="stats-kicker">SILO · INVENTORY &amp; RESILIENCE</span>

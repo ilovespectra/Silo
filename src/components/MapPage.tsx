@@ -1658,6 +1658,7 @@ export default function MapPage({
   return (
     <main
       className={`map-page ${selectedCluster ? "region-open" : ""} ${selectionArmed ? "selection-armed" : ""}`}
+      data-retained-scroll="map"
       data-help="Map browsing and selection do not change source files. Relocate changes Silo's location override and organization metadata after review; it does not write GPS/EXIF into photos or move them."
     >
       <div className="map-globe" ref={containerRef} />

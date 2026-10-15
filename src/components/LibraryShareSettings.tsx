@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { FiCopy, FiShare2, FiStopCircle } from "react-icons/fi";
+import type { LibraryShareSelection } from "../libraryShareServer";
 import "../styles/LibraryShareSettings.css";
 
 type ShareStatus = {
@@ -12,7 +13,8 @@ type ShareStatus = {
 export default function LibraryShareSettings() {
   const electronAPI = window.electron;
   const [sources, setSources] = useState<BrowseSource[]>([]);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [folders, setFolders] = useState<DigitalFolder[]>([]);
+  const [selections, setSelections] = useState<LibraryShareSelection[]>([]);
   const [share, setShare] = useState<ShareStatus>({ active: false, sources: [] });
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
@@ -24,10 +26,11 @@ export default function LibraryShareSettings() {
       setBusy(false);
       return;
     }
-    void Promise.all([electronAPI.listSources(), electronAPI.getLibraryShareStatus()])
-      .then(([availableSources, currentShare]) => {
+    void Promise.all([electronAPI.listSources(), electronAPI.getAppState(), electronAPI.getLibraryShareStatus()])
+      .then(([availableSources, appState, currentShare]) => {
         if (disposed) return;
         setSources(availableSources);
+        setFolders(appState.digitalFolders ?? []);
         setShare(currentShare);
       })
       .catch((cause) => {
@@ -44,22 +47,26 @@ export default function LibraryShareSettings() {
   const availableSources = sources.filter(
     (source) => source.kind === "local" && source.available,
   );
+  const availableFolders = folders.filter((folder) => !folder.hidden && folder.filePaths.length > 0);
 
-  const toggleSource = (sourceId: string) => {
-    setSelectedIds((current) =>
-      current.includes(sourceId)
-        ? current.filter((id) => id !== sourceId)
-        : [...current, sourceId],
+  const isSelected = (selection: LibraryShareSelection) =>
+    selections.some((item) => item.type === selection.type && item.id === selection.id);
+
+  const toggleSelection = (selection: LibraryShareSelection) => {
+    setSelections((current) =>
+      current.some((item) => item.type === selection.type && item.id === selection.id)
+        ? current.filter((item) => item.type !== selection.type || item.id !== selection.id)
+        : [...current, selection],
     );
   };
 
   const startSharing = async () => {
-    if (!electronAPI || selectedIds.length === 0) return;
+    if (!electronAPI || selections.length === 0) return;
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      setShare(await electronAPI.startLibraryShare(selectedIds));
+      setShare(await electronAPI.startLibraryShare(selections));
       setNotice("Sharing is ready on your local network.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Silo could not start sharing.");
@@ -75,7 +82,7 @@ export default function LibraryShareSettings() {
     setNotice("");
     try {
       setShare(await electronAPI.stopLibraryShare());
-      setSelectedIds([]);
+      setSelections([]);
       setNotice("The share link has been revoked.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Silo could not stop sharing.");
@@ -142,26 +149,29 @@ export default function LibraryShareSettings() {
         </>
       ) : (
         <>
-          <p className="library-share-description">Choose local libraries to share. Only indexed photos and videos are included; maps, people, duplicates, and other Silo tools stay private.</p>
-          {busy ? <p className="library-share-muted">Loading local libraries…</p> : null}
-          {!busy && availableSources.length === 0 ? (
-            <p className="library-share-muted">Add an available local library in Silo before sharing.</p>
+          <p className="library-share-description">Choose a local library or a virtual folder. Folder shares include only that folder’s current members. Only indexed photos and videos are included.</p>
+          {busy ? <p className="library-share-muted">Loading libraries and virtual folders…</p> : null}
+          {!busy && availableSources.length === 0 && availableFolders.length === 0 ? (
+            <p className="library-share-muted">Add a local library or create a virtual folder with local photos or videos before sharing.</p>
           ) : (
             <div className="library-share-sources">
-              {availableSources.map((source) => (
-                <label className="library-share-source" key={source.id}>
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.includes(source.id)}
-                    disabled={busy}
-                    onChange={() => toggleSource(source.id)}
-                  />
+              {availableSources.map((source) => {
+                const selection = { type: "source", id: source.id } as const;
+                return <label className="library-share-source" key={`source:${source.id}`}>
+                  <input type="checkbox" checked={isSelected(selection)} disabled={busy} onChange={() => toggleSelection(selection)} />
                   <span><strong>{source.label}</strong><small>{source.detail}</small></span>
-                </label>
-              ))}
+                </label>;
+              })}
+              {availableFolders.map((folder) => {
+                const selection = { type: "folder", id: folder.id } as const;
+                return <label className="library-share-source" key={`folder:${folder.id}`}>
+                  <input type="checkbox" checked={isSelected(selection)} disabled={busy} onChange={() => toggleSelection(selection)} />
+                  <span><strong>{folder.name}</strong><small>Virtual folder · {folder.filePaths.length.toLocaleString()} members</small></span>
+                </label>;
+              })}
             </div>
           )}
-          <button type="button" className="settings-save library-share-start" disabled={busy || selectedIds.length === 0} onClick={() => void startSharing()}>
+          <button type="button" className="settings-save library-share-start" disabled={busy || selections.length === 0} onClick={() => void startSharing()}>
             <FiShare2 /> Start sharing
           </button>
           <p className="library-share-warning">Use trusted private Wi-Fi only: the local HTTP link is not encrypted. Anyone with the link on that network can browse and download until you stop sharing or quit Silo.</p>

@@ -694,6 +694,7 @@ function App() {
       Math.max(120, Number(localStorage.getItem("silo.thumbnailSize")) || 200),
     ),
   );
+  const retainedScrollPositionsRef = useRef<Record<string, number>>({});
   const [viewerOpen, setViewerOpen] = useState(false);
   const viewerOpenRef = useRef(viewerOpen);
   viewerOpenRef.current = viewerOpen;
@@ -1348,6 +1349,40 @@ function App() {
   useEffect(() => {
     localStorage.setItem("silo.thumbnailSize", String(thumbnailSize));
   }, [thumbnailSize]);
+
+  useEffect(() => {
+    const rememberScroll = (event: Event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const scroller = target.closest<HTMLElement>("[data-retained-scroll]");
+      const key = scroller?.dataset.retainedScroll;
+      if (scroller && key) retainedScrollPositionsRef.current[key] = scroller.scrollTop;
+    };
+    document.addEventListener("scroll", rememberScroll, true);
+    return () => document.removeEventListener("scroll", rememberScroll, true);
+  }, []);
+
+  useEffect(() => {
+    const key = appSection;
+    const scrollTop = retainedScrollPositionsRef.current[key];
+    if (scrollTop === undefined || scrollTop <= 0) return;
+    let frames = 0;
+    let frame = 0;
+    const restore = () => {
+      const scroller = document.querySelector<HTMLElement>(`[data-retained-scroll="${key}"]`);
+      if (scroller) {
+        const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        if (maxScrollTop >= scrollTop || frames >= 180) {
+          scroller.scrollTop = Math.min(scrollTop, maxScrollTop);
+          return;
+        }
+      }
+      frames += 1;
+      if (frames < 181) frame = requestAnimationFrame(restore);
+    };
+    frame = requestAnimationFrame(restore);
+    return () => cancelAnimationFrame(frame);
+  }, [appSection]);
 
   useEffect(() => {
     if (!typeFilterOpen) return;
@@ -2881,6 +2916,26 @@ function App() {
       loadDirectory,
     ],
   );
+
+  const unplugSource = useCallback(async (source: BrowseSource) => {
+    if (!electronAPI || (source.kind !== "local" && source.kind !== "machine")) return;
+    try {
+      await electronAPI.removeIndexSource(source.rootPath);
+      const updated = await electronAPI.listSources();
+      sourcesRef.current = updated;
+      setSources(updated);
+      allSourcesLoadedRef.current.delete(source.id);
+      if (currentPath && pathIsWithinSourceRoot(currentPath, source.rootPath)) {
+        setActiveDigitalFolderId(null);
+        setCurrentPath(allSourcesPath);
+        await loadDirectory(allSourcesPath, explodedRef.current, true, true);
+      } else if (currentPath === allSourcesPath || (currentPath === null && activeDigitalFolderId === null)) {
+        await loadDirectory(allSourcesPath, explodedRef.current, true, true);
+      }
+    } catch (cause) {
+      setBrowseError(`Could not unplug “${source.label}”. ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }, [activeDigitalFolderId, allSourcesPath, currentPath, electronAPI, loadDirectory]);
 
   const setEverySource = useCallback(
     async (enabled: boolean) => {
@@ -6399,12 +6454,12 @@ function App() {
       </React.Suspense>
       {appSection === "memories" ? (
         <React.Suspense fallback={<main className="viewer-status">Loading Memories…</main>}>
-          <MemoriesPage api={electronAPI} ready={startupState.ready} />
+          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={thumbnailSize} onThumbnailSizeChange={setThumbnailSize} />
         </React.Suspense>
       ) : appSection === "stats" ? (
         electronAPI ? <StatsDashboard api={electronAPI} /> : <main className="viewer-status">Stats services are unavailable.</main>
       ) : appSection === "people" ? (
-        <main className="people-page" data-tour="people-page" data-help="Review photos and face groups. Naming people, correcting assignments, merging profiles and changing visibility save People records only; source photos are unchanged."
+        <main className="people-page" data-retained-scroll="people" data-tour="people-page" data-help="Review photos and face groups. Naming people, correcting assignments, merging profiles and changing visibility save People records only; source photos are unchanged."
         >
           <section className="face-index-status" data-tour="people-index" data-help="This independent offline index detects and groups faces. It does not move or rename source files.">
             <div>
@@ -7273,7 +7328,7 @@ function App() {
           tourView={tourDuplicateView}
         />
       ) : appSection === "mobile" ? (
-        <main className="mobile-page" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
+        <main className="mobile-page" data-retained-scroll="mobile" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
           <section className="mobile-messages-section" aria-label="Mobile manager">
             <MessageExportPanel
               devicePanel={
@@ -7448,6 +7503,18 @@ function App() {
                           aria-label={`Browse ${source.label}`}
                         >
                           <FiChevronRight />
+                        </button>
+                      )}
+                      {(source.kind === "local" || source.kind === "machine") && (
+                        <button
+                          className="source-unplug-button"
+                          type="button"
+                          onClick={(event) => { event.preventDefault(); event.stopPropagation(); void unplugSource(source); }}
+                          title="Unplug this source from Silo. Its files and folders will stay on disk."
+                          aria-label={`Unplug ${source.label} from Silo. Files stay on disk.`}
+                          data-help="Unplug only removes this folder from Silo's source list. It never deletes or moves files on disk."
+                        >
+                          <FiX aria-hidden="true" /><span>Unplug</span>
                         </button>
                       )}
                     </div>
@@ -7844,6 +7911,7 @@ function App() {
           />
           <div
             className={`file-browser ${audioOnlySelected ? "audio-only" : ""}`}
+            data-retained-scroll="files"
             ref={fileBrowserRef}
           >
             {browseError && (
@@ -8489,7 +8557,7 @@ function App() {
           <a href="https://trysilo.kolektivkrog.si/" target="_blank" rel="noreferrer">
             TrySilo <span aria-hidden="true">↗</span>
           </a>
-          <a href="https://repo-six-inky-51.vercel.app/" target="_blank" rel="noreferrer">
+          <a href="https://silohelp.kolektivkrog.si/" target="_blank" rel="noreferrer">
             Docs <span aria-hidden="true">↗</span>
           </a>
           <a href="https://github.com/ilovespectra/Silo" target="_blank" rel="noreferrer">

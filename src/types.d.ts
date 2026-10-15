@@ -322,6 +322,10 @@ interface DigitalFolder {
   hidden?: boolean;
 }
 
+type LibraryShareSelection =
+  | { type: "source"; id: string }
+  | { type: "folder"; id: string };
+
 interface FileMetadata {
   displayName?: string;
   year?: number;
@@ -875,6 +879,7 @@ interface Window {
     getMemories: import("./memoryTypes").MemoriesAPI["getMemories"];
     generateMemories: import("./memoryTypes").MemoriesAPI["generateMemories"];
     dismissMemory: import("./memoryTypes").MemoriesAPI["dismissMemory"];
+    renameMemory: import("./memoryTypes").MemoriesAPI["renameMemory"];
     updateMemorySettings: import("./memoryTypes").MemoriesAPI["updateMemorySettings"];
     selectMemoryDirectory: import("./memoryTypes").MemoriesAPI["selectMemoryDirectory"];
     getMemorySoundtracks: import("./memoryTypes").MemoriesAPI["getMemorySoundtracks"];
@@ -889,6 +894,7 @@ interface Window {
     onMemoriesChanged?: import("./memoryTypes").MemoriesAPI["onMemoriesChanged"];
     onMemoryGenerationProgress?: import("./memoryTypes").MemoriesAPI["onMemoryGenerationProgress"];
     listSavedMemoryMovies?: import("./memoryTypes").MemoriesAPI["listSavedMemoryMovies"];
+    renameSavedMemoryMovie?: import("./memoryTypes").MemoriesAPI["renameSavedMemoryMovie"];
     revealSavedMemoryMovie?: import("./memoryTypes").MemoriesAPI["revealSavedMemoryMovie"];
     readInventoryPage(
       token: string,
@@ -1451,12 +1457,13 @@ interface Window {
     googleClearPickedPhotos(accountId?: string): Promise<GoogleAccountsState>;
     googleExportPhotos(accountId?: string): Promise<FileOperationResult>;
     listSources(): Promise<BrowseSource[]>;
+    removeIndexSource(sourcePath: string): Promise<PersistedAppState>;
     getLibraryShareStatus(): Promise<{
       active: boolean;
       url?: string;
       sources: Array<{ id: string; label: string }>;
     }>;
-    startLibraryShare(sourceIds: string[]): Promise<{
+    startLibraryShare(selections: LibraryShareSelection[]): Promise<{
       active: boolean;
       url?: string;
       sources: Array<{ id: string; label: string }>;

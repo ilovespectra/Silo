@@ -112,9 +112,10 @@ const context = vm.createContext({
   faceIndexer: { getBannedPhotoPaths: () => context.banned, getProgress: () => ({ status: progress.face }),
     getPeople: () => context.__people, getPerson: (id) => context.__people.find((person) => person.id === id) },
   aestheticScorer: {
-    rankDistinct: async (items, preset, threshold) => {
+    rankDistinct: async function (items, preset, threshold) {
       magicRankCalls.push({ items, preset, threshold });
-      return { order: items.map((item) => item.path), scores: Object.fromEntries(items.map((item) => [item.path, magicScores.get(item.path) ?? 50])), analyzed: items.length, total: items.length, running: false };
+      const order = await this.filterSimilar(items.map((item) => item.path), threshold);
+      return { order, scores: Object.fromEntries(items.map((item) => [item.path, magicScores.get(item.path) ?? 50])), analyzed: items.length, total: items.length, running: false };
     },
     filterSimilar: async (paths, threshold) => { assert.equal(threshold, 0.85); magicFilterCalls.push(paths); return paths; },
   },
@@ -223,10 +224,10 @@ function evaluate(source) {
   }).outputText, context);
 }
 for (const name of [
-  "memoryFileMetadata", "memoryObviousNonPhotoPath", "memoryAllowed", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
-  "memoryTopCounts", "memoryErrorDetails",
+  "memoryFileMetadata", "memoryObviousNonPhotoPath", "memoryAllowed", "memorySearchImageEligible", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
+  "memoryTopCounts", "memoryPersonalRejectionSummary", "memoryErrorDetails",
   "memoryDot", "memoryImageContentFactor", "memoryImageIsObviousNonPhoto", "filterMemoryPhotos", "memoryNameMatches", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
-  "promptedVideoPhotoCandidate", "searchPromptedMemoryMedia", "memoryVideoMatchesForPhotos",
+  "promptedVideoPhotoCandidate", "searchPromptedMemoryMedia", "memoryVideoMatchesForPhotos", "memoryMusicDirectories",
   "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
   "memoryPreviewOptions", "memoryPreviewFileName", "memoryTitleStem", "memoryMovieDirectory", "findMemoryMovie", "runMemoryRender",
   "prepareMemoryPreviewsNow", "prepareMemoryPreviews", "prepareAllMemoryPreviews", "setMemoryPreviewStatus",
