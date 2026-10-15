@@ -26,6 +26,7 @@ import isDev from "electron-is-dev";
 import { autoUpdater } from "electron-updater";
 import {
   IndexableFile,
+  isPermanentImageFailure,
   SearchResult,
   SemanticIndexer,
   type IndexProgress,
@@ -1121,6 +1122,15 @@ function getRecentSafeRuntimeEvents() {
           if (
             !event.startsWith("semantic-worker-") &&
             !["render-process-gone", "renderer-unresponsive"].includes(event)
+          )
+            return [];
+          if (
+            event === "semantic-worker-request-failed" &&
+            entry.requestType === "image" &&
+            !entry.infrastructure &&
+            isPermanentImageFailure(
+              typeof entry.message === "string" ? entry.message : undefined,
+            )
           )
             return [];
           const safeDetails = allowedFields.flatMap((key) => {

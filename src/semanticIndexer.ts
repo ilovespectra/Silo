@@ -29,6 +29,14 @@ class UnreadableImageError extends Error {
   }
 }
 
+// Decoder verdicts about the file itself; retrying an unchanged file repeats them.
+const PERMANENT_IMAGE_FAILURE =
+  /unsupported image format|could not be read as an image|corrupt|premature end|bad seek|invalid (?:marker|image|dimensions)|exceeds the 100 million pixel|not a (?:valid )?(?:jpeg|png|tiff|gif|webp)|vipsjpeg|vipspng|heif: |unable to decode/i;
+
+export function isPermanentImageFailure(message: string | undefined): boolean {
+  return Boolean(message && PERMANENT_IMAGE_FAILURE.test(message));
+}
+
 class EmbeddingProcessError extends Error {
   constructor(
     message: string,
@@ -3185,13 +3193,20 @@ export class SemanticIndexer {
         );
         const phase = sanitizeWorkerDiagnosticText(message.phase, 120);
         const stack = sanitizeWorkerDiagnosticStack(message.stack, 1800);
-        this.onDiagnostic("semantic-worker-request-failed", {
-          requestType: request.type,
-          infrastructure: Boolean(message.infrastructure),
-          ...(diagnosticMessage ? { message: diagnosticMessage } : {}),
-          ...(phase ? { phase } : {}),
-          ...(stack ? { stack } : {}),
-        });
+        // A bad file is recorded on its index row; logging each one would bury
+        // real worker and renderer events in crash diagnostics.
+        if (
+          message.infrastructure ||
+          request.type !== "image" ||
+          !isPermanentImageFailure(diagnosticMessage)
+        )
+          this.onDiagnostic("semantic-worker-request-failed", {
+            requestType: request.type,
+            infrastructure: Boolean(message.infrastructure),
+            ...(diagnosticMessage ? { message: diagnosticMessage } : {}),
+            ...(phase ? { phase } : {}),
+            ...(stack ? { stack } : {}),
+          });
         const error =
           message.infrastructure || request.type === "preload"
             ? new EmbeddingProcessError(
@@ -3419,6 +3434,14 @@ export class SemanticIndexer {
       record.error &&
       failure?.signature === record.signature &&
       failure.attempts >= 3
+    )
+      return false;
+    // Unchanged files the decoder rejected stay parked; a new signature
+    // (the file was repaired or replaced) re-queues them through discovery.
+    if (
+      record.vectorOffset < 0 &&
+      record.type === "image" &&
+      isPermanentImageFailure(record.error)
     )
       return false;
     // A persisted record without a vector is either a saved failure or an
