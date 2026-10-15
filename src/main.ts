@@ -8410,6 +8410,9 @@ let autoMemoryTimer: NodeJS.Timeout | null = null;
 /** Stories retired by Generate before their movie finished; listed in the Memory Book until it does. */
 const memoryBookPending = new Map<string, MemorySuggestion>();
 
+/** Prompted memories are saved to the Memory Book as soon as they are created. */
+const isCustomMemory = (card: MemorySuggestion) => card.storyKey?.startsWith("custom:") === true;
+
 async function retireMemoriesToBook(before: MemorySuggestion[], after: MemorySuggestion[]) {
   const kept = new Set(after.map((card) => card.id));
   const retired = before.filter((card) => !kept.has(card.id));
@@ -8477,6 +8480,10 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
     }
   }
   let state;
+  const knownIds = new Set([
+    ...(await memoryManager.getState()).suggestions,
+    ...await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]),
+  ].map((card) => card.id));
   try {
     state = await memoryManager.generate(replace === true, customTopic);
   } catch (error) {
@@ -8484,6 +8491,9 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
     const current = await memoryStateWithPreviews();
     return { ...current, message: "Memory generation hit a problem; your saved memories are unchanged." };
   }
+  const created = state.suggestions.filter((card) => isCustomMemory(card) && !knownIds.has(card.id));
+  await rememberMemoryMovieTitles(created).catch(() => undefined);
+  for (const card of created) if (!await findMemoryMovie(card).catch(() => null)) memoryBookPending.set(card.id, card);
   if (state.suggestions.length)
     void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
   return { ...(await memoryStateWithPreviews()), message: state.message };
@@ -8664,8 +8674,9 @@ ipcMain.handle("list-saved-memory-movies", async () => {
   const state = await memoryManager.getState();
   const cards = [...state.suggestions, ...await memoryManager.getReserve()];
   await rememberMemoryMovieTitles(cards).catch(() => undefined);
-  // Editable stories are shown as cards above; any render of them stays out of the book.
-  const editableKeys = new Set(state.suggestions.map((card) => memoryMovieStoryKey(memoryPreviewFileName(card))).filter(Boolean));
+  // Editable stories are shown as cards above; any render of them stays out of the book,
+  // except prompted memories, which the user asked for and are saved straight away.
+  const editableKeys = new Set(state.suggestions.filter((card) => !isCustomMemory(card)).map((card) => memoryMovieStoryKey(memoryPreviewFileName(card))).filter(Boolean));
   const titles = await readMemoryMovieTitles();
   const movies = new Map<string, { path: string; title: string; modified: number; size: number }>();
   for (const directory of await memoryMovieDirectories()) {
@@ -8685,7 +8696,7 @@ ipcMain.handle("list-saved-memory-movies", async () => {
     }
   }
   const finished = Array.from(movies.values()).sort((a, b) => b.modified - a.modified);
-  const editableIds = new Set(state.suggestions.map((card) => card.id));
+  const editableIds = new Set(state.suggestions.filter((card) => !isCustomMemory(card)).map((card) => card.id));
   const pending: Array<{ path: string; title: string; modified: number; size: number; pending: MemorySuggestion }> = [];
   for (const [id, card] of memoryBookPending) {
     if (editableIds.has(id) || await findMemoryMovie(card).catch(() => null)) { memoryBookPending.delete(id); continue; }
