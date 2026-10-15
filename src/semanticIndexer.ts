@@ -286,6 +286,7 @@ export class SemanticIndexer {
   private readonly vectorsPath: string;
   private readonly progressPath: string;
   private readonly modelCachePath: string;
+  private readonly resolveFilePath: (filePath: string) => Promise<string>;
   private readonly scanSource: ScanSource;
   private readonly onProgress: ProgressListener;
   private readonly onDiagnostic: DiagnosticListener;
@@ -500,6 +501,7 @@ export class SemanticIndexer {
     onProgress: ProgressListener,
     onDiagnostic: DiagnosticListener = () => undefined,
     indexStoragePath: string = userDataPath,
+    resolveFilePath: (filePath: string) => Promise<string> = async (filePath) => filePath,
   ) {
     this.userDataPath = path.resolve(userDataPath);
     this.canonicalUserDataPath = this.userDataPath;
@@ -509,6 +511,7 @@ export class SemanticIndexer {
     this.vectorsPath = path.join(this.indexDirectory, "vectors.bin");
     this.progressPath = path.join(this.indexDirectory, "progress.json");
     this.modelCachePath = modelCachePath;
+    this.resolveFilePath = resolveFilePath;
     this.scanSource = scanSource;
     this.onProgress = onProgress;
     this.onDiagnostic = onDiagnostic;
@@ -519,6 +522,37 @@ export class SemanticIndexer {
     listener: ((changedFiles: Map<string, string>) => void) | null,
   ) {
     this.backgroundIndexWorkListener = listener;
+  }
+
+  addIndexedImageListener(
+    listener: (image: {
+      path: string;
+      sourcePath: string;
+      name: string;
+      relativePath: string;
+      size: number;
+      modified: number;
+      type: string;
+      extension: string;
+      isDirectory: false;
+    }) => void,
+  ) {
+    const wrapped = (record: IndexRecord) => {
+      if (record.type !== "image" || record.vectorOffset < 0) return;
+      listener({
+        path: record.path,
+        sourcePath: record.sourcePath,
+        name: record.name,
+        relativePath: record.relativePath,
+        size: record.size,
+        modified: record.modified,
+        type: record.type,
+        extension: record.extension,
+        isDirectory: false,
+      });
+    };
+    this.indexedRecordListeners.add(wrapped);
+    return () => this.indexedRecordListeners.delete(wrapped);
   }
 
   setPerformanceSettings(settings: SearchPerformanceSettings) {
@@ -1145,6 +1179,7 @@ export class SemanticIndexer {
       .filter(
         (record) =>
           record.type === "image" &&
+          record.vectorOffset >= 0 &&
           activeSources.has(record.sourcePath) &&
           this.isIndexable(record, record.sourcePath) &&
           (!demoPaths || demoPaths.has(record.path)),
@@ -2077,7 +2112,11 @@ export class SemanticIndexer {
 
     const indexedRecordCount = this.latestRecordsByVectorKey.size;
     let hits: Array<{ key: number; confidence: number }>;
-    if (this.vectorIndexFailed || include) {
+    // Startup can expose an already-loaded vector file before the persistent
+    // ANN worker finishes building. Search those complete indexed records now
+    // instead of blocking Memory and Search until background preparation ends.
+    const usePartialExactSearch = !this.vectorIndexReadyState && indexedRecordCount > 0;
+    if (this.vectorIndexFailed || include || usePartialExactSearch) {
       hits = await this.exactVectorSearch(
         sourcePaths,
         searchEmbeddings.image,
@@ -2269,7 +2308,7 @@ export class SemanticIndexer {
           originalEntries.map(async ([filePath, sourcePath]) => {
             let modified = this.latestRecords.get(filePath)?.modified ?? 0;
             try {
-              const stats = await fsPromises.stat(filePath);
+              const stats = await fsPromises.stat(await this.resolveFilePath(filePath));
               if (stats.isFile()) modified = stats.mtime.getTime();
             } catch {
               // The normal incremental pass removes stale records for vanished files.
@@ -2392,7 +2431,7 @@ export class SemanticIndexer {
           if (this.pauseRequested) break;
 
           try {
-            const stats = await fsPromises.stat(filePath);
+            const stats = await fsPromises.stat(await this.resolveFilePath(filePath));
             if (stats.isDirectory()) {
               this.filesToIndex?.delete(filePath);
               continue;
@@ -3090,12 +3129,13 @@ export class SemanticIndexer {
 
   private async embedImage(filePath: string, runtime: ClipRuntime) {
     return this.runInference(async () => {
+      const localPath = await this.resolveFilePath(filePath);
       // Intel builds of libheif lack HEVC, so macOS converts HEIC with sips first.
       const heifFirst =
-        process.platform === "darwin" && /\.(heic|heif)$/i.test(filePath);
+        process.platform === "darwin" && /\.(heic|heif)$/i.test(localPath);
       try {
         if (heifFirst) throw new Error("HEIC is decoded by macOS.");
-        return await this.embedImageFile(filePath, runtime);
+        return await this.embedImageFile(localPath, runtime);
       } catch (originalError) {
         if (originalError instanceof EmbeddingProcessError) throw originalError;
         if (process.platform !== "darwin") throw originalError;
@@ -3109,7 +3149,7 @@ export class SemanticIndexer {
             "-s",
             "format",
             "jpeg",
-            filePath,
+            localPath,
             "--out",
             convertedPath,
           ]).catch(() => undefined);
@@ -3118,7 +3158,7 @@ export class SemanticIndexer {
             .then((stat) => stat.size > 0)
             .catch(() => false);
           if (!converted) {
-            if (heifFirst) return await this.embedImageFile(filePath, runtime);
+            if (heifFirst) return await this.embedImageFile(localPath, runtime);
             throw new UnreadableImageError();
           }
           return await this.embedImageFile(convertedPath, runtime);
@@ -3388,12 +3428,13 @@ export class SemanticIndexer {
   }
 
   private async extractText(file: IndexableFile) {
+    const localPath = await this.resolveFilePath(file.path);
     if (file.extension === ".pdf") {
       if (file.size > 50 * 1024 * 1024)
         throw new Error("PDF is larger than 50 MB.");
       const { PDFParse } = require("pdf-parse") as any;
       const parser = new PDFParse({
-        data: await fsPromises.readFile(file.path),
+        data: await fsPromises.readFile(localPath),
       });
       try {
         const result = await parser.getText();
@@ -3404,7 +3445,7 @@ export class SemanticIndexer {
     }
     if (!plainTextExtensions.has(file.extension))
       throw new Error("Document format is not text-readable.");
-    const handle = await fsPromises.open(file.path, "r");
+    const handle = await fsPromises.open(localPath, "r");
     try {
       const buffer = Buffer.alloc(Math.min(file.size, 256 * 1024));
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);

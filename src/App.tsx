@@ -610,6 +610,33 @@ function asFastFileSearchResult(
   };
 }
 
+function pathIsWithinSourceRoot(filePath: string, root: string) {
+  if (root === "/" || root === "\\") return filePath.startsWith(root);
+  const normalizedRoot = root.replace(/[\\/]+$/, "");
+  return (
+    filePath === normalizedRoot ||
+    filePath.startsWith(`${normalizedRoot}/`) ||
+    filePath.startsWith(`${normalizedRoot}\\`)
+  );
+}
+
+function pathIsWithinAnySource(filePath: string, roots: ReadonlySet<string>) {
+  for (const root of roots)
+    if (pathIsWithinSourceRoot(filePath, root)) return true;
+  return false;
+}
+
+function pathIsVisibleForSelectedSources(
+  filePath: string,
+  enabledRoots: ReadonlySet<string>,
+  allRoots: ReadonlySet<string>,
+) {
+  return (
+    pathIsWithinAnySource(filePath, enabledRoots) ||
+    !pathIsWithinAnySource(filePath, allRoots)
+  );
+}
+
 // Fallout Shelter Silo-only aliases share a physical path with their canonical file.
 const fileListKey = (file: { path: string; relativePath?: string; siloAlias?: boolean }) =>
   file.siloAlias ? `${file.path}\u0000${file.relativePath ?? ""}` : file.path;
@@ -980,6 +1007,49 @@ function App() {
     currentFile: null,
     message: "Waiting for indexed photos.",
   });
+  const [faceActionPending, setFaceActionPending] = useState<"pause" | "resume" | null>(null);
+  const [faceActionNotice, setFaceActionNotice] = useState<{
+    kind: "pause" | "resume";
+    message: string;
+  } | null>(null);
+  const [faceActionError, setFaceActionError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!faceActionNotice) return;
+    const active = ["loading-model", "indexing"].includes(faceProgress.status);
+    if (
+      (faceActionNotice.kind === "resume" && active) ||
+      (faceActionNotice.kind === "pause" && faceProgress.status === "paused")
+    )
+      setFaceActionNotice(null);
+  }, [faceActionNotice, faceProgress.status]);
+  const toggleFaceIndexing = async () => {
+    if (!electronAPI || faceActionPending) return;
+    const pausing = ["loading-model", "indexing"].includes(faceProgress.status);
+    const kind = pausing ? "pause" : "resume";
+    setFaceActionPending(kind);
+    setFaceActionError(null);
+    setFaceActionNotice({
+      kind,
+      message: pausing
+        ? "Pause requested · finishing the current photo and saving progress…"
+        : "Resume requested · queued behind available processing work…",
+    });
+    try {
+      const progress = pausing
+        ? await electronAPI.pauseFaceIndexing()
+        : await electronAPI.startFaceIndexing();
+      setFaceProgress(progress);
+      if (pausing && progress.status === "paused")
+        setFaceActionNotice(null);
+      if (!pausing && ["loading-model", "indexing"].includes(progress.status))
+        setFaceActionNotice(null);
+    } catch (cause) {
+      setFaceActionNotice(null);
+      setFaceActionError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setFaceActionPending(null);
+    }
+  };
   const [people, setPeople] = useState<PersonSummary[]>([]);
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [personDetail, setPersonDetail] = useState<PersonDetail | null>(null);
@@ -1125,6 +1195,26 @@ function App() {
     }
   };
   const [sources, setSources] = useState<BrowseSource[]>([]);
+  const enabledSourcePaths = useMemo(
+    () => new Set(sources
+      .filter((source) => source.enabled && source.available && source.rootPath.trim())
+      .map((source) => source.rootPath)),
+    [sources],
+  );
+  const allSourcePaths = useMemo(
+    () => new Set(sources
+      .filter((source) => source.rootPath.trim())
+      .map((source) => source.rootPath)),
+    [sources],
+  );
+  const enabledSourcePathsKey = useMemo(
+    () => Array.from(enabledSourcePaths).sort().join("\u0000"),
+    [enabledSourcePaths],
+  );
+  const enabledSourcePathsRef = useRef(enabledSourcePaths);
+  enabledSourcePathsRef.current = enabledSourcePaths;
+  const allSourcePathsRef = useRef(allSourcePaths);
+  allSourcePathsRef.current = allSourcePaths;
   const [sourceSort, setSourceSort] = useState<"name" | "kind" | "backup">(
     "name",
   );
@@ -2207,6 +2297,7 @@ function App() {
     void refreshPeople();
     const removeListener = electronAPI.onFaceIndexProgress((progress) => {
       setFaceProgress(progress);
+      if (progress.status === "error") setFaceActionNotice(null);
       if (progress.processed % 25 === 0 || progress.status === "complete")
         void refreshPeople();
     });
@@ -2243,10 +2334,15 @@ function App() {
         viewMode,
         showFilters,
         confidence,
+      }, {
+        section: appSection,
+        searchActive: searching,
+        viewerOpen,
       });
     }, 250);
     return () => window.clearTimeout(timer);
   }, [
+    appSection,
     confidence,
     currentPath,
     electronAPI,
@@ -2254,7 +2350,9 @@ function App() {
     filters.includedType,
     hydrated,
     showFilters,
+    searching,
     sort,
+    viewerOpen,
     viewMode,
   ]);
 
@@ -2822,6 +2920,52 @@ function App() {
       loadDirectory,
     ],
   );
+
+  useEffect(() => {
+    if (
+      appSection !== "files" ||
+      !currentPath ||
+      currentPath === allSourcesPath ||
+      activeDigitalFolderId
+    ) return;
+    const belongsToRegisteredSource = sources.some(
+      (source) => source.rootPath && pathIsWithinSourceRoot(currentPath, source.rootPath),
+    );
+    const belongsToEnabledSource = sources.some(
+      (source) => source.enabled && source.available && source.rootPath &&
+        pathIsWithinSourceRoot(currentPath, source.rootPath),
+    );
+    if (!belongsToRegisteredSource || belongsToEnabledSource) return;
+
+    setConnectedPhone(null);
+    setCurrentPath(allSourcesPath);
+    setNavigationHistory([{ type: "path", value: allSourcesPath }]);
+    setHistoryIndex(0);
+    setActiveDigitalFolderId(null);
+    setExploded(false);
+    void loadDirectory(allSourcesPath, false);
+  }, [
+    activeDigitalFolderId,
+    allSourcesPath,
+    appSection,
+    currentPath,
+    loadDirectory,
+    sources,
+  ]);
+
+  useEffect(() => {
+    if (
+      !selectedFile ||
+      pathIsVisibleForSelectedSources(
+        selectedFile.path,
+        enabledSourcePaths,
+        allSourcePaths,
+      )
+    ) return;
+    setSelectedFile(null);
+    setFilePreview(null);
+    setViewerOpen(false);
+  }, [allSourcePaths, enabledSourcePaths, selectedFile]);
 
   const browseAllSources = useCallback(async () => {
     setConnectedPhone(null);
@@ -4302,13 +4446,17 @@ function App() {
           requestId,
         );
         if (requestId === searchRequestRef.current) {
-          rememberSearchResultOrder(results, searchQuery);
           const hidden = bannedHiddenPathsRef.current;
-          setSearchResults(
-            hidden.size > 0
-              ? results.filter((result) => !hidden.has(result.path))
-              : results,
+          const visible = results.filter((result) =>
+            !hidden.has(result.path) &&
+            pathIsVisibleForSelectedSources(
+              result.path,
+              enabledSourcePathsRef.current,
+              allSourcePathsRef.current,
+            ),
           );
+          rememberSearchResultOrder(visible, searchQuery);
+          setSearchResults(visible);
         }
       } catch (cause) {
         if (requestId === searchRequestRef.current) {
@@ -4334,6 +4482,7 @@ function App() {
     [
       appSection,
       electronAPI,
+      enabledSourcePathsKey,
       rememberSearchResultOrder,
       searchIndexReadiness.status,
       searchQuery,
@@ -4344,7 +4493,16 @@ function App() {
     if (!electronAPI) return;
     return electronAPI.onSemanticSearchProgress((progress) => {
       if (progress.requestId !== searchRequestRef.current) return;
-      rememberSearchResultOrder(progress.results, searchQueryRef.current);
+      const hidden = bannedHiddenPathsRef.current;
+      const visible = progress.results.filter((result) =>
+        !hidden.has(result.path) &&
+        pathIsVisibleForSelectedSources(
+          result.path,
+          enabledSourcePathsRef.current,
+          allSourcePathsRef.current,
+        ),
+      );
+      rememberSearchResultOrder(visible, searchQueryRef.current);
       const receivedAt = performance.now();
       const done = progress.status === "done";
       setSearchTiming((current) =>
@@ -4353,18 +4511,13 @@ function App() {
               ...current,
               firstResultAt:
                 current.firstResultAt ??
-                (progress.results.length > 0 ? receivedAt : null),
+                (visible.length > 0 ? receivedAt : null),
               completedAt:
                 done ? (current.completedAt ?? receivedAt) : current.completedAt,
             }
           : current,
       );
-      const hidden = bannedHiddenPathsRef.current;
-      setSearchResults(
-        hidden.size > 0
-          ? progress.results.filter((result) => !hidden.has(result.path))
-          : progress.results,
-      );
+      setSearchResults(visible);
       if (progress.textCapped) setFastFileSearchCapped(true);
       setSearchProgress({
         scanned: progress.scanned,
@@ -4417,6 +4570,7 @@ function App() {
   }, [
     appSection,
     bannedHiddenPaths,
+    enabledSourcePathsKey,
     searchIndexReadiness.status,
     searchQuery,
   ]);
@@ -4490,13 +4644,34 @@ function App() {
   }, [appSection, contentSafetyRevision, runSemanticSearch]);
 
   const rawContentFiles: FileInfo[] = useMemo(() => {
-    if (!searchQuery.trim()) return files;
+    if (!searchQuery.trim())
+      return files.filter((file) =>
+        pathIsVisibleForSelectedSources(
+          file.path,
+          enabledSourcePaths,
+          allSourcePaths,
+        ),
+      );
     const resultsByPath = new Map<string, SemanticSearchResult>();
     for (const result of fastFileSearchResults)
-      if (!bannedHiddenPaths.has(result.path))
+      if (
+        !bannedHiddenPaths.has(result.path) &&
+        pathIsVisibleForSelectedSources(
+          result.path,
+          enabledSourcePaths,
+          allSourcePaths,
+        )
+      )
         resultsByPath.set(result.path, result);
     for (const result of searchResults) {
-      if (bannedHiddenPaths.has(result.path)) continue;
+      if (
+        bannedHiddenPaths.has(result.path) ||
+        !pathIsVisibleForSelectedSources(
+          result.path,
+          enabledSourcePaths,
+          allSourcePaths,
+        )
+      ) continue;
       if (
         result._priority === 3 &&
         (result.confidence ?? -Infinity) < confidence
@@ -4530,6 +4705,8 @@ function App() {
     fastFileSearchResults,
     files,
     confidence,
+    enabledSourcePaths,
+    allSourcePaths,
     searchQuery,
     searchResults,
   ]);
@@ -4692,6 +4869,7 @@ function App() {
     !searchQuery.trim();
   const filteredAndSortedFiles = useMemo(() => {
     const filtered = contentFiles.filter((file) => {
+      if (!pathIsVisibleForSelectedSources(file.path, enabledSourcePaths, allSourcePaths)) return false;
       if (file.isDirectory)
         return !exploded && peopleFilter === "all" && locationFilter === "all";
       if (
@@ -4764,6 +4942,8 @@ function App() {
     contentFiles,
     currentPath,
     deferBrowseSort,
+    enabledSourcePaths,
+    allSourcePaths,
     exploded,
     filters,
     magicState.ranks,
@@ -6230,7 +6410,8 @@ function App() {
             <div>
               <span className="sidebar-kicker">Secondary offline index</span>
               <h2>Face detection & clustering</h2>
-              <p>{faceProgress.message}</p>
+              <p>{faceActionNotice?.message ?? faceProgress.message}</p>
+              {faceActionError && <p className="indexing-stage-errors" role="alert">{faceActionError}</p>}
             </div>
             <div className="face-progress-numbers">
               <span>
@@ -6253,22 +6434,27 @@ function App() {
               className="index-action"
               data-tour="face-indexing"
               data-help="Start, pause, or resume the separate face-detection index. It changes People’s index, not source files."
-              onClick={
-                ["loading-model", "indexing"].includes(faceProgress.status)
-                  ? () => electronAPI?.pauseFaceIndexing().then(setFaceProgress)
-                  : () => electronAPI?.startFaceIndexing().then(setFaceProgress)
-              }
+              disabled={faceActionPending !== null}
+              onClick={() => void toggleFaceIndexing()}
             >
-              {["loading-model", "indexing"].includes(faceProgress.status) ? (
+              {faceActionPending === "pause" ? (
+                <FiPause />
+              ) : faceActionPending === "resume" ? (
+                <FiRefreshCw />
+              ) : ["loading-model", "indexing"].includes(faceProgress.status) ? (
                 <FiPause />
               ) : (
                 <FiPlay />
               )}
-              {faceProgress.status === "paused"
-                ? "Resume face indexing"
-                : faceProgress.status === "complete"
-                  ? "Check new photos"
-                  : "Start face indexing"}
+              {faceActionPending === "pause"
+                ? "Pausing…"
+                : faceActionPending === "resume"
+                  ? "Queueing…"
+                  : faceProgress.status === "paused"
+                    ? "Resume face indexing"
+                    : faceProgress.status === "complete"
+                      ? "Check new photos"
+                      : "Start face indexing"}
             </button>
           </section>
 

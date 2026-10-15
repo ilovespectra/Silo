@@ -59,7 +59,7 @@ export function isMacDataVolumePathExcluded(candidatePath: string, sourceRoot: s
 }
 
 // Software trees (dependencies, app bundles, VCS internals) hold thousands of files and no memories.
-const NON_LIBRARY_SEGMENT = /(^|[\\/])(node_modules|bower_components|\.git|\.svn|\.hg|__pycache__|\.Trashes|\.cache|\.silo-phone-restores|[^\\/]+\.(app|asar|framework|bundle|plugin|kext|xpc|appex|xcodeproj|xcassets))([\\/]|$)/i;
+const NON_LIBRARY_SEGMENT = /(^|[\\/])(node_modules|bower_components|\.git|\.svn|\.hg|__pycache__|\.Trashes|\.cache|\.silo-phone-restores|\.silo-phone-snapshots|[^\\/]+\.(app|asar|framework|bundle|plugin|kext|xpc|appex|xcodeproj|xcassets))([\\/]|$)/i;
 
 /** True for paths inside software trees that are never indexed or scanned for search. */
 export function isNonLibraryPath(candidatePath: string): boolean {

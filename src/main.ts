@@ -117,9 +117,7 @@ import {
   MEMORY_PHOTO_PROMPTS,
   TopicSignal,
   discoverMemoryStories,
-  isPersonalPhotoPath,
-  nonPersonalFolderKeyword,
-  personalPhotoRejection,
+  currentPromptedVideoIndexingImage,
 } from "./memoryDiscovery";
 import { MemoryTopicProfile, RefreshScheduler } from "./memoryTopicProfile";
 import * as exifr from "exifr";
@@ -179,7 +177,7 @@ import {
   isSiloCloneDirectory,
   MAC_DATA_VOLUME_ROOT,
 } from "./indexingPathPolicy";
-import { AestheticScorer, MagicItem, MagicPresetId, MagicRankResult } from "./aestheticScorer";
+import { AestheticScorer, MagicItem, MagicPresetId } from "./aestheticScorer";
 import {
   applyPendingImport,
   cancelStagedImport,
@@ -308,6 +306,10 @@ async function requireIndexStorageSelection(userDataPath: string): Promise<boole
   dialog.showErrorBox(
     "Silo storage destination required",
     "Silo needs a storage folder before it can open. Reopen Silo to choose one.",
+  );
+  runtimeLog(
+    "app-lifecycle-before-exit",
+    lifecycleDiagnosticSnapshot("storage-destination-not-selected"),
   );
   app.exit(1);
   return false;
@@ -1110,7 +1112,18 @@ function getRecentSafeRuntimeEvents() {
   const allowedFields = [
     "reason", "signal", "code", "exitCode", "status", "requestType",
     "requestTypes", "infrastructure", "pendingCount", "message", "failureReason",
-    "phase", "durationMs",
+    "phase", "durationMs", "stage", "appPhase", "uiSection", "uiPathSet",
+    "uiViewMode", "uiSortField", "uiAscending", "uiTypeFilterActive",
+    "uiFilterPanelOpen", "uiExploded", "searchActive", "viewerOpen",
+    "startupStep", "startupTotal", "startupReady", "rendererId", "rendererPid",
+    "indexStatus", "indexTotal", "indexIndexed", "indexRemaining", "indexErrors",
+    "faceStatus", "faceProcessed", "faceRemaining", "faceErrors",
+    "geoStatus", "geoScanned", "geoTotal", "duplicateStatus", "duplicateScanned",
+    "duplicateTotal", "thumbnailStatus", "thumbnailProcessed", "thumbnailGenerated",
+    "thumbnailFailed", "thumbnailTotal", "magicRunning", "magicAnalyzed", "magicTotal",
+    "audioRunning", "audioScanned", "audioSources", "derivedIndexRunning",
+    "recoveryTimerScheduled", "rendererReady", "shuttingDown", "quitPass",
+    "interpretation", "lifecycleTrigger",
   ];
   try {
     const content = fs.readFileSync(diagnosticsPath, "utf8").slice(-512 * 1024);
@@ -1123,7 +1136,19 @@ function getRecentSafeRuntimeEvents() {
           const event = typeof entry.event === "string" ? entry.event : "";
           if (
             !event.startsWith("semantic-worker-") &&
-            !["render-process-gone", "renderer-unresponsive"].includes(event)
+            ![
+              "render-process-gone",
+              "renderer-unresponsive",
+              "renderer-lifecycle",
+              "app-lifecycle-before-reload",
+              "app-lifecycle-before-close",
+              "app-lifecycle-before-quit",
+              "app-lifecycle-before-relaunch",
+              "app-lifecycle-before-exit",
+              "app-lifecycle-will-quit",
+              "app-lifecycle-after-close",
+              "previous-session-marker-found",
+            ].includes(event)
           )
             return [];
           if (
@@ -1442,7 +1467,30 @@ interface StartupState {
   label: string;
 }
 
+type DiagnosticAppSection =
+  | "files"
+  | "people"
+  | "map"
+  | "duplicates"
+  | "pets"
+  | "mobile"
+  | "memories"
+  | "stats";
+
+interface DiagnosticUiUpdate {
+  section?: DiagnosticAppSection;
+  searchActive?: boolean;
+  viewerOpen?: boolean;
+}
+
+const DIAGNOSTIC_APP_SECTIONS = new Set<DiagnosticAppSection>([
+  "files", "people", "map", "duplicates", "pets", "mobile", "memories", "stats",
+]);
+const DIAGNOSTIC_SORT_FIELDS = new Set([
+  "name", "size", "modified", "type", "source", "magic", "people", "mapped",
+]);
 const startupStartedAt = Date.now();
+let lastKnownAppPhase = "module-init";
 let startupState: StartupState = {
   ready: false,
   step: 0,
@@ -2109,6 +2157,9 @@ function reportStartup(label: string, ready = false) {
     total: startupState.total,
     label,
   };
+  lastKnownAppPhase = ready
+    ? "ready"
+    : `startup:${safeRuntimeDiagnosticText(label).slice(0, 96) || "in-progress"}`;
   runtimeLog("startup-stage", {
     ...startupState,
     elapsedMs: Date.now() - startupStartedAt,
@@ -2123,6 +2174,7 @@ function reportStartup(label: string, ready = false) {
 function reportStartupDetail(label: string) {
   if (startupState.ready || startupState.label === label) return;
   startupState = { ...startupState, label };
+  lastKnownAppPhase = `startup:${safeRuntimeDiagnosticText(label).slice(0, 96) || "in-progress"}`;
   sendToRenderer("startup-progress", startupState);
 }
 
@@ -2225,6 +2277,19 @@ let appUpdateInstall: Promise<AppUpdateState> | null = null;
 const rendererRecovery = new RendererRecovery();
 let rendererRecoveryTimer: NodeJS.Timeout | null = null;
 let stateStore: StateStore;
+let lastUiDiagnosticStateUpdatedAt = 0;
+let lastKnownUiDiagnosticState = {
+  section: "files" as DiagnosticAppSection,
+  pathSet: false,
+  viewMode: "grid" as "list" | "grid",
+  sortField: "name",
+  ascending: true,
+  typeFilterActive: false,
+  filterPanelOpen: false,
+  exploded: false,
+  searchActive: false,
+  viewerOpen: false,
+};
 let hiddenFolderPathCache = new Set<string>();
 let semanticIndexer: SemanticIndexer;
 let libraryShareServer: LibraryShareServer | null = null;
@@ -2283,10 +2348,22 @@ function memoryFileMetadata(filePath: string): FileMetadata | undefined {
     : undefined;
 }
 
+/** Obvious screenshot and application artwork paths are never Memory photos. */
+function memoryObviousNonPhotoPath(filePath: string): boolean {
+  const basename = path.basename(filePath);
+  const normalizedName = basename.toLocaleLowerCase().replace(/[\s_-]+/g, "");
+  if (normalizedName.includes("screenshot") || normalizedName.includes("screencap")) return true;
+  if (/(?:^|[\/])node_modules(?:[\/]|$)/i.test(filePath)) return true;
+  if (/(?:^|[\/])[^\/]+\.(?:app|bundle|framework|plugin|asar)(?:[\/]|$)/i.test(filePath)) return true;
+  const stem = normalizedName.replace(/\.[^.]*$/, "");
+  return /^(?:app)?(?:icon|logo|favicon|splash|launchimage|launchscreen|loading|mascot)(?:[0-9]+|set)?$/i.test(stem);
+}
+
 /** Strict and toggle-independent: ignores showNsfw/showBannedPeople and folder reveal views. */
 function memoryAllowed(filePath: unknown): boolean {
   if (typeof filePath !== "string" || !filePath || filePath.includes("\0"))
     return false;
+  if (memoryObviousNonPhotoPath(filePath)) return false;
   if (!stateStore || !faceIndexer) return false;
   const hidden = getHiddenFolderPaths();
   // Hidden-folder entries may be directories; their descendants are hidden too.
@@ -2343,10 +2420,24 @@ async function memoryVideoCandidates(
   directories: string[],
   limit = 12,
   entriesPerDirectory = 2000,
+  includePhoneDirectories = false,
 ): Promise<string[]> {
   const found: string[] = [];
   for (const directory of directories.slice(0, 4)) {
     if (found.length >= limit) break;
+    if (includePhoneDirectories && phoneManager?.isPhonePath(directory)) {
+      try {
+        const entries = await phoneManager.listPhoneFiles(directory, false);
+        for (const entry of entries) {
+          if (found.length >= limit) break;
+          if (entry.isDirectory || !MEMORY_VIDEO_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
+          if (memoryAllowed(entry.path)) found.push(entry.path);
+        }
+      } catch {
+        // A disconnected phone contributes no clips.
+      }
+      continue;
+    }
     try {
       const dir = await fsPromises.opendir(directory);
       let seen = 0;
@@ -2369,6 +2460,27 @@ function memoryDot(first: Float32Array, second: Float32Array) {
   const length = Math.min(first.length, second.length);
   for (let index = 0; index < length; index++) sum += first[index] * second[index];
   return sum;
+}
+
+/** Down-rank generic graphics while keeping every safe indexed image eligible. */
+function memoryImageContentFactor(
+  vector: Float32Array,
+  prompts: { good: Float32Array[]; junk: Float32Array[] },
+) {
+  const good = prompts.good.length ? Math.max(...prompts.good.map((prompt) => memoryDot(prompt, vector))) : 0;
+  const junk = prompts.junk.length ? Math.max(...prompts.junk.map((prompt) => memoryDot(prompt, vector))) : 0;
+  return junk > good + 0.01 ? 0.55 : 1;
+}
+
+/** Keep ambiguous images; reject only strong CLIP matches to non-photo content. */
+function memoryImageIsObviousNonPhoto(
+  vector: Float32Array,
+  prompts: { good: Float32Array[]; nonPhoto: Float32Array[] },
+): boolean {
+  if (!prompts.nonPhoto.length || !prompts.good.length) return false;
+  const bestPhoto = Math.max(...prompts.good.map((prompt) => memoryDot(prompt, vector)));
+  const bestNonPhoto = Math.max(...prompts.nonPhoto.map((prompt) => memoryDot(prompt, vector)));
+  return bestNonPhoto >= 0.24 && bestNonPhoto - bestPhoto >= 0.035;
 }
 
 async function filterMemoryPhotos(paths: string[]): Promise<string[]> {
@@ -2419,8 +2531,11 @@ async function namedMemoryMedia(query: string, roots: string[]): Promise<ScoredM
   for (let start = 0; start < sampled.length; start += 32) {
     const stats = await Promise.all(sampled.slice(start, start + 32).map(async (filePath) => {
       try {
-        const stat = await fsPromises.stat(filePath);
-        return stat.isFile() ? { filePath, stat } : null;
+        const localPath = await resolveLocalPath(filePath);
+        const stat = await fsPromises.stat(localPath);
+        return stat.isFile() && memoryAllowed(filePath)
+          ? { filePath, stat }
+          : null;
       } catch { return null; }
     }));
     for (const entry of stats)
@@ -2446,9 +2561,7 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   // User-named photos lead; visual matches fill the rest of a wide pool.
   const photoCandidates: ScoredMemoryMedia[] = named.slice(0, 120);
   const candidatePaths = new Set(photoCandidates.map((file) => file.path));
-  const musicDirectories = memoryMusicDirectories();
-  const dropped = { notImage: 0, notAllowed: 0, notPersonal: 0 };
-  const nonPersonalMatches: { path: string; size?: number }[] = [];
+  const dropped = { notImage: 0, notAllowed: 0 };
   const nonImageTypes = new Map<string, number>();
   const collectPhotos = (results: typeof matches) => {
     for (const file of results) {
@@ -2460,64 +2573,68 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
         continue;
       }
       if (!memoryAllowed(file.path)) { dropped.notAllowed++; continue; }
-      if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) {
-        dropped.notPersonal++;
-        nonPersonalMatches.push(file);
-        continue;
-      }
       candidatePaths.add(file.path);
       photoCandidates.push({ path: file.path, name: file.name, type: "image",
         modified: file.modified, size: file.size, score: file.confidence });
     }
   };
   collectPhotos(matches);
-  // On x64, graphics can fill the entire top-500 image window. Filter before
-  // ranking in the sparse case rather than relaxing personal-photo or safety rules.
-  const filteredSearch = process.arch === "x64" && photoCandidates.length < MEMORY_MIN_SELECTION_COUNT;
+  // When documents crowd the broad results, scan the indexed image vectors
+  // directly so every safe image remains eligible, regardless of source type.
+  const filteredSearch = photoCandidates.length < MEMORY_MIN_SELECTION_COUNT;
   let filteredMatches = 0;
   if (filteredSearch) {
     const eligibleMatches = await semanticIndexer.search(
       query, MEMORY_SEARCH_MIN_CONFIDENCE, roots, () => false, undefined,
-      (file) => file.type === "image" && memoryAllowed(file.path) &&
-        isPersonalPhotoPath(file.path, file.size, musicDirectories),
+      (file) => file.type === "image" && memoryAllowed(file.path),
     );
     filteredMatches = eligibleMatches.length;
     collectPhotos(eligibleMatches);
   }
-  const magic: MagicRankResult = photoCandidates.length
-    ? await aestheticScorer.rankDistinct(photoCandidates.map(({ path: filePath, name, size, modified }) =>
-      ({ path: filePath, name, size: size ?? 0, modified })), "variety", MEMORY_DUPLICATE_SIMILARITY)
-    : { order: [], scores: {}, analyzed: 0, total: 0, running: false };
-  const candidatesByPath = new Map(photoCandidates.map((file) => [file.path, file]));
-  const namedPaths = new Set(named.map((file) => file.path));
-  const rankedPhotos: ScoredMemoryMedia[] = magic.order.slice(0, 48).flatMap((filePath) => {
+  const prompts = await memoryPromptVectors();
+  const vectors = await semanticIndexer.getImageVectors(photoCandidates.map((file) => file.path));
+  const rankedPhotos = photoCandidates.flatMap((file) => {
+    const vector = vectors.get(file.path);
+    if (vector && memoryImageIsObviousNonPhoto(vector, prompts)) return [];
+    return [vector
+      ? { ...file, score: file.score * memoryImageContentFactor(vector, prompts) }
+      : file];
+  }).sort((first, second) => second.score - first.score || first.path.localeCompare(second.path));
+  // Relevance decides which frame leads; Magic only removes near-identical shots.
+  const distinctPaths = await filterMemoryPhotos(rankedPhotos.map((file) => file.path));
+  const candidatesByPath = new Map(rankedPhotos.map((file) => [file.path, file]));
+  const distinctPhotos = distinctPaths.flatMap((filePath) => {
     const candidate = candidatesByPath.get(filePath);
-    if (!candidate) return [];
-    const magicScore = magic.scores[filePath];
-    return [{ ...candidate, magicScore: Number.isFinite(magicScore) ? magicScore : -1,
-      score: (Number.isFinite(magicScore) ? magicScore : 0) + candidate.score / 1000
-        + (namedPaths.has(filePath) ? 1 : 0) }];
+    return candidate ? [candidate] : [];
   });
-  const qualityPhotos = await applyMemoryPhotoQuality(rankedPhotos);
+  const qualityPhotos = await applyMemoryPhotoQuality(distinctPhotos);
   // Resolution rules must not leave a prompt short when lower-resolution matches exist.
   if (qualityPhotos.length < MEMORY_MIN_SELECTION_COUNT) {
     const kept = new Set(qualityPhotos.map((file) => file.path));
     qualityPhotos.push(...rankedPhotos.filter((file) => !kept.has(file.path))
       .slice(0, MEMORY_MIN_SELECTION_COUNT - qualityPhotos.length));
   }
-  const photos = selectMemoryPhotoCandidates(qualityPhotos).map(({ magicScore, ...photo }) => photo);
+  const photos = selectMemoryPhotoCandidates(qualityPhotos);
   runtimeLog("memory-search-trace", { stage: "photos", roots: roots.length, named: named.length, matches: matches.length, ...dropped,
-    candidates: photoCandidates.length, distinct: magic.order.length, analyzed: magic.analyzed,
+    candidates: photoCandidates.length, distinct: distinctPhotos.length,
     ranked: rankedPhotos.length, quality: qualityPhotos.length, selected: photos.length,
-    minConfidence: MEMORY_SEARCH_MIN_CONFIDENCE, filteredSearch, filteredMatches, magicRunning: magic.running, magicTotal: magic.total,
+    minConfidence: MEMORY_SEARCH_MIN_CONFIDENCE, filteredSearch, filteredMatches,
     topMatchConfidence: matches.length ? Math.round(Math.max(...matches.map((m) => m.confidence ?? 0))) : 0,
-    nonImageTypes: memoryTopCounts(nonImageTypes),
-    ...(dropped.notPersonal ? memoryPersonalRejectionSummary(nonPersonalMatches, musicDirectories) : {}) });
-  // Clips beside matched photos; first frames are classified on demand, never a library rescan.
-  const directories = Array.from(new Set(photos
-    .filter((file) => !isRemotePath(file.path))
-    .map((file) => path.dirname(file.path)))).slice(0, 4);
-  const candidates = photos.length ? await memoryVideoCandidates(directories) : [];
+    nonImageTypes: memoryTopCounts(nonImageTypes) });
+  const videos = await memoryVideoMatchesForPhotos(photos, query, true);
+  return [...photos, ...videos].sort((first, second) => second.score - first.score);
+}
+
+/** Matches adjacent MOV/MP4 clips by their first frame, including remote phone folders for prompted videos. */
+async function memoryVideoMatchesForPhotos(
+  photos: ScoredMemoryMedia[],
+  query: string,
+  includePhoneDirectories = false,
+): Promise<ScoredMemoryMedia[]> {
+  const directories = Array.from(new Set(photos.map((file) => path.dirname(file.path)))).slice(0, 4);
+  const candidates = photos.length
+    ? await memoryVideoCandidates(directories, 12, 2000, includePhoneDirectories)
+    : [];
   const videos: ScoredMemoryMedia[] = [];
   if (candidates.length) {
     const [prompt, unsafePrompt, safePrompt] = await semanticIndexer.embedPrompts([
@@ -2527,12 +2644,13 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
     ]);
     for (const filePath of candidates) {
       try {
-        const stat = await fsPromises.stat(filePath);
+        const localPath = await resolveLocalPath(filePath);
+        const stat = await fsPromises.stat(localPath);
         if (!stat.isFile()) continue;
         const key = `${filePath}:${stat.size}:${stat.mtimeMs}`;
         let vector = memoryFrameVectors.get(key);
         if (!vector) {
-          const framePath = memoryThumbnailFile(await getThumbnail(filePath, false, 480));
+          const framePath = memoryThumbnailFile(await getThumbnail(localPath, false, 480));
           if (!framePath) continue;
           vector = await semanticIndexer.embedPreviewImage(framePath);
           if (memoryFrameVectors.size >= 128) memoryFrameVectors.delete(memoryFrameVectors.keys().next().value!);
@@ -2551,16 +2669,89 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
       } catch { /* A damaged clip must not discard the photo story. */ }
     }
   }
+  return videos;
+}
+
+function promptedVideoPhotoCandidate(file: { path: string; size: number; type: string }): boolean {
+  return file.type === "image" && memoryAllowed(file.path);
+}
+
+/**
+ * Prompted-video selection is relevance-first: filter the full targeted result
+ * set, confidence and screenshot checks before the bounded candidate pool.
+ * This path deliberately does not use Magic's order; Magic remains a memory
+ * curation signal in the automatic discovery path.
+ */
+async function searchPromptedMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
+  if (typeof query !== "string" || !query.trim()) return [];
+  if (!semanticIndexer || !faceIndexer)
+    throw new Error("Memory search is not ready yet. Try again shortly.");
+  const roots = await getAllIndexSources();
+  if (!roots.length) return [];
+  const [named, matches, photoPrompts, queryPrompts] = await Promise.all([
+    namedMemoryMedia(query, roots),
+    semanticIndexer.search(query, MEMORY_SEARCH_MIN_CONFIDENCE, roots, () => false, undefined, promptedVideoPhotoCandidate),
+    memoryPromptVectors(),
+    semanticIndexer.embedPrompts([`a photo of ${query}`]),
+  ]);
+  const candidateByPath = new Map<string, ScoredMemoryMedia>();
+  // Explicit people/folder labels are already exact matches; semantic hits still
+  // have to clear the configured confidence floor before any candidate cap.
+  const confident = matches.filter((file) => file.confidence >= MEMORY_SEARCH_MIN_CONFIDENCE
+    && promptedVideoPhotoCandidate(file))
+    .sort((first, second) => second.confidence - first.confidence);
+  const vectors = await semanticIndexer.getImageVectors(Array.from(new Set([
+    ...named.map((file) => file.path), ...confident.map((file) => file.path),
+  ])));
+  for (const file of named) {
+    const vector = vectors.get(file.path);
+    if (vector && memoryImageIsObviousNonPhoto(vector, photoPrompts)) continue;
+    if (promptedVideoPhotoCandidate({ path: file.path, size: file.size ?? 0, type: file.type }))
+      candidateByPath.set(file.path, { ...file, score: 100 });
+  }
+  for (const file of confident) {
+    const vector = vectors.get(file.path);
+    if (!vector || memoryImageIsObviousNonPhoto(vector, photoPrompts)) continue;
+    candidateByPath.set(file.path, { path: file.path, name: file.name, type: "image",
+      modified: file.modified, size: file.size,
+      score: file.confidence * memoryImageContentFactor(vector, photoPrompts) });
+  }
+
+  // IndexProgress only publishes the active basename. Include that image only
+  // when it maps to one unambiguous not-yet-ranked record, then score it with
+  // the same query and junk vectors. This bounded exception is prompted-video-only.
+  const selectedPaths = new Set(candidateByPath.keys());
+  const indexedImages = semanticIndexer.getIndexedImages(roots);
+  const active = currentPromptedVideoIndexingImage(
+    indexedImages, semanticIndexer.getProgress().status, semanticIndexer.getProgress().currentFile, selectedPaths,
+  );
+  if (active && promptedVideoPhotoCandidate(active)) {
+    try {
+      const existing = await semanticIndexer.getImageVectors([active.path]);
+      const vector = existing.get(active.path)
+        ?? await semanticIndexer.embedPreviewImage(await resolveLocalPath(active.path));
+      const confidence = memoryDot(queryPrompts[0], vector) * 100;
+      if (confidence >= MEMORY_SEARCH_MIN_CONFIDENCE && !memoryImageIsObviousNonPhoto(vector, photoPrompts))
+        candidateByPath.set(active.path, { path: active.path, name: active.name, type: "image",
+          modified: active.modified, size: active.size,
+          score: confidence * memoryImageContentFactor(vector, photoPrompts) });
+    } catch { /* A file still being written waits for the next prompt attempt. */ }
+  }
+
+  const ranked = [...candidateByPath.values()].sort((first, second) => second.score - first.score);
+  const quality = await applyMemoryPhotoQuality(ranked);
+  const distinctPaths = await filterMemoryPhotos(quality.map((file) => file.path));
+  const byPath = new Map(quality.map((file) => [file.path, file]));
+  const photos = distinctPaths.flatMap((filePath) => {
+    const item = byPath.get(filePath);
+    return item ? [item] : [];
+  }).slice(0, 160);
+  const videos = await memoryVideoMatchesForPhotos(photos, query, true);
   return [...photos, ...videos].sort((first, second) => second.score - first.score);
 }
 
 let memoryTopicProfile: MemoryTopicProfile | null = null;
 let memoryProfileScheduler: RefreshScheduler | null = null;
-
-function personalMemoryPhotoFilter() {
-  const musicDirectories = memoryMusicDirectories();
-  return (file: { path: string; size: number }) => isPersonalPhotoPath(file.path, file.size, musicDirectories);
-}
 
 /** Incremental, persisted profile of what the archive is about; only changed records are reread. */
 function getMemoryTopicProfile(): MemoryTopicProfile {
@@ -2572,8 +2763,11 @@ function getMemoryTopicProfile(): MemoryTopicProfile {
       revision: () => semanticIndexer.getRevision(),
       records: async () => {
         await semanticIndexer.whenLoaded();
-        const personal = personalMemoryPhotoFilter();
-        return semanticIndexer.getIndexedImageRecords(await getAllIndexSources()).filter(personal);
+        // Source checkboxes only control Search visibility. Memories learn from
+        // every indexed source, with the same strict content-safety gate used at
+        // generation and display time.
+        return semanticIndexer.getIndexedImageRecords(await getAllIndexSources())
+          .filter((record) => memoryAllowed(record.path));
       },
       vectors: (paths) => semanticIndexer.getImageVectors(paths),
       embedPrompts: (prompts) => semanticIndexer.embedPrompts(prompts),
@@ -2583,22 +2777,27 @@ function getMemoryTopicProfile(): MemoryTopicProfile {
   return memoryTopicProfile;
 }
 
-/** Indexing or startup reconciliation is still changing records; profile work waits. */
+/** Wait only for the saved records and local CLIP model needed to read vectors. */
 function memoryProfileBusy(): boolean {
+  // Topic profiling reads existing vectors, so it can keep up with CLIP indexing
+  // instead of waiting for a multi-day library scan to finish.
   return !semanticIndexer?.isLoaded() ||
-    PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) ||
-    semanticIndexer.getReconciliationProgress().running;
+    semanticRuntimeProgress.status !== "complete";
 }
 
 async function refreshMemoryTopicsAfterIndexing(): Promise<void> {
   const result = await getMemoryTopicProfile().refresh();
   runtimeLog("memory-topic-profile", { ...result, sampled: memoryTopicProfile?.getSnapshot()?.sampledPhotos ?? 0 });
-  if (!result.changed || !memoryManager) return;
+  if ((!result.changed && result.classified === 0 && result.removed === 0) || !memoryManager) return;
   const state = await memoryManager.refreshForProfileChange();
+  sendToRenderer("memories-changed", {
+    ...(await memoryStateWithPreviews(state)),
+    message: state.message,
+  });
   // Previews render only once indexing is quiet; the next notification retries otherwise.
   if (!memoryProfileBusy()) await prepareAllMemoryPreviews(state.suggestions);
 }
-let memoryPhotoPromptVectors: Promise<{ junk: Float32Array[]; good: Float32Array[] }> | null = null;
+let memoryPhotoPromptVectors: Promise<{ junk: Float32Array[]; good: Float32Array[]; nonPhoto: Float32Array[] }> | null = null;
 
 function memoryPromptVectors() {
   if (!memoryPhotoPromptVectors) {
@@ -2607,42 +2806,55 @@ function memoryPromptVectors() {
       .then((vectors) => ({
         junk: vectors.slice(0, MEMORY_JUNK_PROMPTS.length),
         good: vectors.slice(MEMORY_JUNK_PROMPTS.length),
+        nonPhoto: vectors.filter((_, index) => index < MEMORY_JUNK_PROMPTS.length &&
+          MEMORY_JUNK_PROMPTS[index] !== "a blurry dark accidental photo" &&
+          MEMORY_JUNK_PROMPTS[index] !== "a product photo on a plain white background"),
       }));
     memoryPhotoPromptVectors.catch(() => { memoryPhotoPromptVectors = null; });
   }
   return memoryPhotoPromptVectors;
 }
 
-/** Story photos ranked by how much they look like real moments; screenshots and documents are dropped. */
-async function loadMemoryIdeaMedia(paths: string[], modified: Map<string, number>) {
-  const [vectors, prompts] = await Promise.all([
+/** Story photos ranked by relevance; every safe indexed image remains eligible. */
+async function loadMemoryIdeaMedia(
+  paths: string[],
+  modified: Map<string, number>,
+  query: string,
+  storyKey: string,
+) {
+  paths = paths.filter(memoryAllowed);
+  if (!paths.length) return [];
+  const [vectors, prompts, conceptPrompts] = await Promise.all([
     semanticIndexer.getImageVectors(paths),
     memoryPromptVectors(),
+    /^concept(?:[-:]|$)/i.test(storyKey)
+      ? semanticIndexer.embedPrompts([`a photo of ${query}`])
+      : Promise.resolve([] as Float32Array[]),
   ]);
+  const conceptPrompt = conceptPrompts[0];
   const media: ScoredMemoryMedia[] = [];
   for (const filePath of paths) {
     const vector = vectors.get(filePath);
-    if (!vector) continue;
+    if (!vector || memoryImageIsObviousNonPhoto(vector, prompts)) continue;
     const good = Math.max(...prompts.good.map((prompt) => memoryDot(prompt, vector)));
-    const junk = Math.max(...prompts.junk.map((prompt) => memoryDot(prompt, vector)));
-    if (junk > good + 0.01) continue;
+    const relevance = conceptPrompt ? memoryDot(conceptPrompt, vector) : good;
     media.push({ path: filePath, name: path.basename(filePath), type: "image",
-      modified: modified.get(filePath) ?? 0, score: good * 100 });
+      modified: modified.get(filePath) ?? 0,
+      score: relevance * 100 * memoryImageContentFactor(vector, prompts) });
   }
   if (media.length === 0) return [];
-  const magic = await aestheticScorer.rankDistinct(media.map((item) => ({
-    path: item.path, name: item.name, size: item.size ?? 0, modified: item.modified,
-  })), "variety", MEMORY_DUPLICATE_SIMILARITY);
+
+  media.sort((first, second) => second.score - first.score
+    || first.modified - second.modified
+    || first.path.localeCompare(second.path));
+  const distinctPaths = await filterMemoryPhotos(media.map((item) => item.path));
   const candidatesByPath = new Map(media.map((item) => [item.path, item]));
-  const rankedPhotos: ScoredMemoryMedia[] = magic.order.slice(0, 38).flatMap((filePath) => {
+  const distinctMedia = distinctPaths.flatMap((filePath) => {
     const candidate = candidatesByPath.get(filePath);
-    if (!candidate) return [];
-    const magicScore = magic.scores[filePath];
-    return [{ ...candidate, magicScore: Number.isFinite(magicScore) ? magicScore : -1,
-      score: (Number.isFinite(magicScore) ? magicScore : 0) + candidate.score / 1000 }];
+    return candidate ? [candidate] : [];
   });
-  const qualityPhotos = await applyMemoryPhotoQuality(rankedPhotos);
-  return selectMemoryPhotoCandidates(qualityPhotos).map(({ magicScore, ...photo }) => photo);
+  const qualityPhotos = await applyMemoryPhotoQuality(distinctMedia);
+  return selectMemoryPhotoCandidates(qualityPhotos);
 }
 
 type MemoryExif = { camera: boolean; width: number; height: number; takenAt: number };
@@ -2675,8 +2887,8 @@ async function readMemoryExif(filePath: string): Promise<MemoryExif | null> {
 }
 
 /**
- * Drops low-resolution and artwork-like images (no camera data and square, like album
- * covers) and favours real camera shots; remote files are kept as-is.
+ * Uses camera data, resolution and capture time to rank likely photographs higher.
+ * These are ranking hints only: every safe indexed image remains eligible.
  */
 async function applyMemoryPhotoQuality(media: ScoredMemoryMedia[]): Promise<ScoredMemoryMedia[]> {
   const kept: ScoredMemoryMedia[] = [];
@@ -2689,10 +2901,11 @@ async function applyMemoryPhotoQuality(media: ScoredMemoryMedia[]): Promise<Scor
       if (!data) return kept.push(item);
       const long = Math.max(data.width, data.height);
       const short = Math.min(data.width, data.height);
-      if (long && (long < 1280 || short < 720)) return;
       const square = long > 0 && Math.abs(data.width - data.height) / long < 0.02;
-      if (!data.camera && !data.takenAt && square) return;
-      const factor = data.camera ? 1.15 : data.takenAt ? 1 : 0.7;
+      const factor = data.camera ? 1.15
+        : data.takenAt ? 1
+          : long && (long < 1280 || short < 720) ? 0.55
+            : square ? 0.55 : 0.7;
       kept.push({ ...item, score: item.score * factor,
         ...(data.takenAt ? { modified: data.takenAt } : {}) });
     });
@@ -2700,46 +2913,10 @@ async function applyMemoryPhotoQuality(media: ScoredMemoryMedia[]): Promise<Scor
   return kept;
 }
 
-let memoryMusicDirectoryCache: { key: string; directories: Set<string> } | null = null;
-
 /** Top-N "key:count" list for compact, path-free diagnostics. */
 function memoryTopCounts(counts: Map<string, number>, limit = 8): string {
   return Array.from(counts).sort((a, b) => b[1] - a[1]).slice(0, limit)
     .map(([key, count]) => `${key}:${count}`).join(",");
-}
-
-/**
- * Why indexed images were not treated as personal photos: reason counts, the
- * extensions and generic folder keywords responsible. No names or paths.
- */
-function memoryPersonalRejectionSummary(
-  files: { path: string; size?: number }[],
-  musicDirectories: ReadonlySet<string>,
-): Record<string, number | string> {
-  const reasons = { extension: 0, small: 0, folder: 0, name: 0, music: 0 };
-  const extensions = new Map<string, number>();
-  const folders = new Map<string, number>();
-  const remote = { personal: 0, rejected: 0 };
-  for (const file of files) {
-    const reason = personalPhotoRejection(file.path, file.size, musicDirectories);
-    if (isRemotePath(file.path)) remote[reason ? "rejected" : "personal"] += 1;
-    if (!reason) continue;
-    reasons[reason] += 1;
-    if (reason === "extension" || reason === "small") {
-      const extension = path.extname(file.path).toLowerCase().slice(1, 8) || "none";
-      const key = reason === "small" ? `${extension}<150k` : extension;
-      extensions.set(key, (extensions.get(key) ?? 0) + 1);
-    } else if (reason === "folder") {
-      const keyword = nonPersonalFolderKeyword(file.path) ?? "other";
-      folders.set(keyword, (folders.get(keyword) ?? 0) + 1);
-    }
-  }
-  return {
-    rejectedExtension: reasons.extension, rejectedSmall: reasons.small, rejectedFolder: reasons.folder,
-    rejectedName: reasons.name, rejectedMusicFolder: reasons.music,
-    rejectedFormats: memoryTopCounts(extensions), rejectedFolders: memoryTopCounts(folders),
-    remotePersonal: remote.personal, remoteRejected: remote.rejected,
-  };
 }
 
 /** Message and the first in-app stack frames, with home-directory paths reduced to "~". */
@@ -2773,21 +2950,6 @@ function memoryEnvironmentSnapshot(): Record<string, unknown> {
 }
 
 /** Folders holding several audio files are album folders; their images are cover art. */
-function memoryMusicDirectories(): Set<string> {
-  const snapshot = audioLibraryCache?.getSnapshot();
-  if (!snapshot) return new Set();
-  const key = `${snapshot.scannedAt}:${snapshot.files.length}`;
-  if (memoryMusicDirectoryCache?.key === key) return memoryMusicDirectoryCache.directories;
-  const counts = new Map<string, number>();
-  for (const file of snapshot.files) {
-    const directory = path.dirname(file.path);
-    counts.set(directory, (counts.get(directory) ?? 0) + 1);
-  }
-  const directories = new Set(Array.from(counts).filter(([, count]) => count >= 3).map(([directory]) => directory));
-  memoryMusicDirectoryCache = { key, directories };
-  return directories;
-}
-
 /**
  * Mines story ideas from every available indexed source: prevalent subjects (CLIP),
  * time (this week N years ago, seasons, years, trips), places, people, pets and
@@ -2797,21 +2959,17 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   if (!semanticIndexer) throw new Error("Memory search is not ready yet.");
   const roots = await getAllIndexSources();
   if (!roots.length) return [];
-  const personal = personalMemoryPhotoFilter();
   const profile = getMemoryTopicProfile();
   await profile.refresh();
   const indexedImages = semanticIndexer.getIndexedImages(roots);
   runtimeLog("memory-environment", { ...memoryEnvironmentSnapshot(), roots: roots.length,
     remoteRoots: roots.filter((root) => isRemotePath(root)).length });
   const images = indexedImages
-    .filter(personal)
+    .filter(({ path: filePath }) => memoryAllowed(filePath))
     .map(({ path: filePath, modified }) => ({ path: filePath, modified, captured: profile.captureTimeOf(filePath) }));
-  const rejection = images.length < Math.max(40, indexedImages.length * 0.2)
-    ? memoryPersonalRejectionSummary(indexedImages, memoryMusicDirectories())
-    : {};
   if (images.length < 4) {
-    runtimeLog("memory-discover-trace", { roots: roots.length, indexedImages: indexedImages.length,
-      personalImages: images.length, ideas: 0, reason: "fewer-than-4-personal-photos", ...rejection });
+    runtimeLog("memory-discover-trace", { architecture: process.arch, roots: roots.length, indexedImages: indexedImages.length,
+      safeIndexedImages: images.length, ideas: 0, reason: "fewer-than-4-safe-indexed-images" });
     return [];
   }
   const modified = new Map(images.map((image) => [image.path, image.captured ?? image.modified]));
@@ -2837,19 +2995,18 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
     ? petIndexer.getClusters().map((cluster) => ({ name: cluster.name, paths: petIndexer.getClusterPhotos(cluster.id) }))
     : [];
   const ideas = discoverMemoryStories({ images, places, people, pets, concepts, topics: signals });
-  runtimeLog("memory-discover-trace", { roots: roots.length, indexedImages: indexedImages.length,
-    personalImages: images.length, topics: topics.length, concepts: concepts.length, places: places.length,
+  runtimeLog("memory-discover-trace", { architecture: process.arch, roots: roots.length, indexedImages: indexedImages.length,
+    safeIndexedImages: images.length, topics: topics.length, concepts: concepts.length, places: places.length,
     people: people.length, pets: pets.length, ideas: ideas.length,
     ideaKinds: memoryTopCounts(ideas.reduce((counts, idea) => {
       const kind = idea.key.split(":")[0];
       return counts.set(kind, (counts.get(kind) ?? 0) + 1);
     }, new Map<string, number>())),
-    peopleNamed: people.length, petPhotos: pets.reduce((sum, pet) => sum + pet.paths.length, 0),
-    ...rejection });
+    peopleNamed: people.length, petPhotos: pets.reduce((sum, pet) => sum + pet.paths.length, 0) });
   return ideas
     .map((idea) => ({
       key: idea.key, title: idea.title, description: idea.description, query: idea.query, mood: idea.mood,
-      load: () => loadMemoryIdeaMedia(idea.paths, modified),
+      load: () => loadMemoryIdeaMedia(idea.paths, modified, idea.query, idea.key),
     }));
 }
 
@@ -3163,6 +3320,12 @@ const ALL_INDEX_RECOVERY_STAGES = [
   "audio",
   "quality",
 ];
+const pendingFaceIndexImages = new Map<string, IndexableFile>();
+const pendingLocationIndexImages = new Map<string, IndexableFile>();
+let progressiveIndexFlushTimer: NodeJS.Timeout | null = null;
+let lastMemoryIndexRefreshRequest = 0;
+let faceInitialCoverageNeeded = true;
+let locationInitialCoverageNeeded = true;
 let geocoder: Geocoder;
 let duplicateManager: DuplicateManager;
 let contentSettingsStore: ContentSettingsStore;
@@ -3270,6 +3433,36 @@ function queueSemanticIndexWork(
       );
   } else {
     requestIndexRecoveryStages(["search", ...relatedStages]);
+  }
+}
+
+function takeProgressiveImages(queue: Map<string, IndexableFile>) {
+  const images = Array.from(queue.values());
+  queue.clear();
+  return images;
+}
+
+function flushProgressiveIndexWork() {
+  progressiveIndexFlushTimer = null;
+  if (pendingFaceIndexImages.size || pendingLocationIndexImages.size) {
+    requestIndexRecoveryStages(["faces", "locations"]);
+  }
+  const now = Date.now();
+  if (now - lastMemoryIndexRefreshRequest >= 60_000) {
+    lastMemoryIndexRefreshRequest = now;
+    memoryProfileScheduler?.notify();
+  }
+}
+
+function queueProgressiveIndexedImage(image: IndexableFile) {
+  pendingFaceIndexImages.set(image.path, image);
+  pendingLocationIndexImages.set(image.path, image);
+  if (pendingFaceIndexImages.size >= 128 || pendingLocationIndexImages.size >= 128) {
+    if (progressiveIndexFlushTimer) clearTimeout(progressiveIndexFlushTimer);
+    flushProgressiveIndexWork();
+  } else if (!progressiveIndexFlushTimer) {
+    progressiveIndexFlushTimer = setTimeout(flushProgressiveIndexWork, 1000);
+    progressiveIndexFlushTimer.unref?.();
   }
 }
 
@@ -6196,6 +6389,118 @@ function getPreloadPath(): string {
   return path.join(app.getAppPath(), "public", "preload.js");
 }
 
+function lifecycleDiagnosticSnapshot(reason: string, window?: BrowserWindow | null) {
+  const snapshot: Record<string, unknown> = {
+    lifecycleTrigger: reason,
+    appPhase: lastKnownAppPhase,
+    startupStep: startupState.step,
+    startupTotal: startupState.total,
+    startupReady: startupState.ready,
+    uiSection: lastKnownUiDiagnosticState.section,
+    uiPathSet: lastKnownUiDiagnosticState.pathSet,
+    uiViewMode: lastKnownUiDiagnosticState.viewMode,
+    uiSortField: lastKnownUiDiagnosticState.sortField,
+    uiAscending: lastKnownUiDiagnosticState.ascending,
+    uiTypeFilterActive: lastKnownUiDiagnosticState.typeFilterActive,
+    uiFilterPanelOpen: lastKnownUiDiagnosticState.filterPanelOpen,
+    uiExploded: lastKnownUiDiagnosticState.exploded,
+    searchActive: lastKnownUiDiagnosticState.searchActive,
+    viewerOpen: lastKnownUiDiagnosticState.viewerOpen,
+    shuttingDown,
+  };
+  const read = (get: () => Record<string, unknown>, key: string) => {
+    try {
+      Object.assign(snapshot, get());
+    } catch {
+      snapshot[`${key}Status`] = "unavailable";
+    }
+  };
+
+  if (typeof semanticIndexer !== "undefined" && semanticIndexer)
+    read(() => {
+      const progress = semanticIndexer.getProgress();
+      return {
+        indexStatus: progress.status,
+        indexTotal: progress.total,
+        indexIndexed: progress.indexed,
+        indexRemaining: progress.remaining,
+        indexErrors: progress.errors,
+      };
+    }, "index");
+  if (typeof faceIndexer !== "undefined" && faceIndexer)
+    read(() => {
+      const progress = faceIndexer.getProgress();
+      return {
+        faceStatus: progress.status,
+        faceProcessed: progress.processed,
+        faceRemaining: progress.remaining,
+        faceErrors: progress.errors,
+      };
+    }, "face");
+  if (typeof geoIndexer !== "undefined" && geoIndexer)
+    read(() => {
+      const progress = geoIndexer.getStatus();
+      return {
+        geoStatus: progress.status,
+        geoScanned: progress.scanned,
+        geoTotal: progress.total,
+      };
+    }, "geo");
+  if (typeof duplicateManager !== "undefined" && duplicateManager)
+    read(() => {
+      const progress = duplicateManager.getState();
+      return {
+        duplicateStatus: progress.status,
+        duplicateScanned: progress.scanned,
+        duplicateTotal: progress.total,
+      };
+    }, "duplicate");
+  if (thumbnailPregenerator)
+    read(() => {
+      const progress = thumbnailPregenerator!.getProgress();
+      return {
+        thumbnailStatus: progress.status,
+        thumbnailProcessed: progress.processed,
+        thumbnailGenerated: progress.generated,
+        thumbnailFailed: progress.failed,
+        thumbnailTotal: progress.total,
+      };
+    }, "thumbnail");
+  snapshot.magicRunning = magicLibraryProgress.running;
+  snapshot.magicAnalyzed = magicLibraryProgress.analyzed;
+  snapshot.magicTotal = magicLibraryProgress.total;
+  snapshot.audioRunning = audioInventoryRunning;
+  snapshot.audioScanned = audioInventoryProgress?.scanned ?? 0;
+  snapshot.audioSources = audioInventoryProgress?.sourceCount ?? 0;
+  snapshot.derivedIndexRunning = Boolean(derivedIndexPromise);
+
+  if (window && !window.isDestroyed()) {
+    try {
+      snapshot.rendererId = window.webContents.id;
+      snapshot.rendererPid = window.webContents.getOSProcessId();
+    } catch {
+      snapshot.rendererId = "unavailable";
+    }
+  }
+  return snapshot;
+}
+
+function reloadRendererWithDiagnostics(window: BrowserWindow, reason: string) {
+  runtimeLog(
+    "app-lifecycle-before-reload",
+    lifecycleDiagnosticSnapshot(reason, window),
+  );
+  window.webContents.reload();
+}
+
+function relaunchAppWithDiagnostics(reason: string) {
+  runtimeLog(
+    "app-lifecycle-before-relaunch",
+    lifecycleDiagnosticSnapshot(reason, mainWindow),
+  );
+  app.relaunch();
+}
+
 async function createWindow() {
   const preloadPath = getPreloadPath();
 
@@ -6213,6 +6518,20 @@ async function createWindow() {
     },
   });
   const inventoryOwner = mainWindow.webContents.id;
+  mainWindow.on("close", () => {
+    runtimeLog(
+      "app-lifecycle-before-close",
+      lifecycleDiagnosticSnapshot("window-close", mainWindow),
+    );
+  });
+  mainWindow.webContents.on("will-navigate", (_event, url) => {
+    const currentUrl = mainWindow?.webContents.getURL();
+    if (currentUrl && url === currentUrl)
+      runtimeLog(
+        "app-lifecycle-before-reload",
+        lifecycleDiagnosticSnapshot("renderer-requested-reload", mainWindow),
+      );
+  });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     let isOfficialGuideUrl = false;
     try {
@@ -6308,43 +6627,63 @@ async function createWindow() {
     runtimeLog("renderer-responsive"),
   );
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
-    runtimeLog("render-process-gone", { ...details });
-    if (!shuttingDown)
-      createAppCrashDiagnosticReport("The Silo interface process stopped.", {
-        reason: details.reason,
-        exitCode: details.exitCode,
-      });
     const window = mainWindow;
-    if (!window || window.isDestroyed()) return;
-    rendererReady = false;
-    inventoryTransfers.releaseOwner(window.webContents.id);
-    const plan = rendererRecovery.plan(details.reason, shuttingDown);
-    if (plan.restart) {
-      if (rendererRecoveryTimer) clearTimeout(rendererRecoveryTimer);
-      runtimeLog("renderer-recovery-scheduled", {
-        reason: details.reason,
-        delayMs: plan.delay,
-      });
-      rendererRecoveryTimer = setTimeout(() => {
-        rendererRecoveryTimer = null;
-        if (!shuttingDown && !window.isDestroyed()) window.webContents.reload();
-      }, plan.delay);
-    } else if (plan.manual && !shuttingDown) {
-      void dialog
-        .showMessageBox(window, {
-          type: "warning",
-          title: "Silo interface stopped",
-          message: "The interface crashed repeatedly or ran out of memory.",
-          detail:
-            "Index data and original files have not been reset. Automatic reloads stopped to prevent a crash loop.",
-          buttons: ["Reload interface", "Keep closed"],
-          defaultId: 1,
-          cancelId: 1,
-        })
-        .then(({ response }) => {
-          if (response === 0 && !shuttingDown && !window.isDestroyed())
-            window.webContents.reload();
+    const rendererDetails = {
+      reason: details.reason,
+      exitCode: details.exitCode,
+    };
+    runtimeLog("renderer-lifecycle", {
+      stage: "before-render-process-gone-handler",
+      ...rendererDetails,
+      ...lifecycleDiagnosticSnapshot("renderer-process-gone", window),
+    });
+    try {
+      runtimeLog("render-process-gone", rendererDetails);
+      if (!shuttingDown)
+        createAppCrashDiagnosticReport("The Silo interface process stopped.", {
+          reason: details.reason,
+          exitCode: details.exitCode,
         });
+      if (!window || window.isDestroyed()) return;
+      rendererReady = false;
+      inventoryTransfers.releaseOwner(window.webContents.id);
+      const plan = rendererRecovery.plan(details.reason, shuttingDown);
+      if (plan.restart) {
+        if (rendererRecoveryTimer) clearTimeout(rendererRecoveryTimer);
+        runtimeLog("renderer-recovery-scheduled", {
+          reason: details.reason,
+          delayMs: plan.delay,
+        });
+        rendererRecoveryTimer = setTimeout(() => {
+          rendererRecoveryTimer = null;
+          if (!shuttingDown && !window.isDestroyed())
+            reloadRendererWithDiagnostics(window, "renderer-recovery");
+        }, plan.delay);
+      } else if (plan.manual && !shuttingDown) {
+        void dialog
+          .showMessageBox(window, {
+            type: "warning",
+            title: "Silo interface stopped",
+            message: "The interface crashed repeatedly or ran out of memory.",
+            detail:
+              "Index data and original files have not been reset. Automatic reloads stopped to prevent a crash loop.",
+            buttons: ["Reload interface", "Keep closed"],
+            defaultId: 1,
+            cancelId: 1,
+          })
+          .then(({ response }) => {
+            if (response === 0 && !shuttingDown && !window.isDestroyed())
+              reloadRendererWithDiagnostics(window, "manual-renderer-recovery");
+          });
+      }
+    } finally {
+      runtimeLog("renderer-lifecycle", {
+        stage: "after-render-process-gone-handler",
+        ...rendererDetails,
+        rendererReady,
+        recoveryTimerScheduled: Boolean(rendererRecoveryTimer),
+        ...lifecycleDiagnosticSnapshot("renderer-process-gone", window),
+      });
     }
   });
 
@@ -6353,6 +6692,10 @@ async function createWindow() {
   }
 
   mainWindow.on("closed", () => {
+    runtimeLog("app-lifecycle-after-close", {
+      appPhase: lastKnownAppPhase,
+      rendererReady,
+    });
     mainWindow = null;
   });
 }
@@ -6418,37 +6761,22 @@ async function getIndexableRootsFromSources(
 ): Promise<string[]> {
   const candidates = sources.filter(
     (source) =>
-      source.available &&
       source.rootPath.trim() &&
-      (fullAccessEnabled() || (source.enabled && !source.demoLocked)) &&
-      (!source.offlineBackup || source.enabled),
+      // Keep configured local roots in memory searches while an external drive
+      // is offline; their indexed records stay useful and reconnects resume them.
+      (!isRemotePath(source.rootPath) || source.available) &&
+      // Source checkboxes control visibility, not index coverage. Preserve the
+      // demo source cap while indexing every source allowed by the current tier.
+      (fullAccessEnabled() || !source.demoLocked),
   );
-  const enabledBackupDevices = new Set<string>();
-  for (const source of sources) {
-    if (!source.offlineBackup || !source.enabled) continue;
-    const parsed = phoneManager?.parsePhonePath(source.rootPath);
-    if (parsed)
-      enabledBackupDevices.add(`${parsed.platform}:${parsed.deviceId}`);
-  }
   const safeRoots: string[] = [];
   for (const source of candidates) {
     if (!(await isSiloInternalRoot(source.rootPath)))
       safeRoots.push(source.rootPath);
   }
-  // Keep live phone roots out when their local copy is already under an indexed
-  // folder. Saved copies retain separate virtual roots for source-level filtering.
-  const localRoots = safeRoots.filter((root) => !root.startsWith("/__"));
-  const covered = (root: string) => {
-    const phonePath = phoneManager?.parsePhonePath(root);
-    if (!phonePath || phonePath.offlineBackup) return false;
-    const { platform, deviceId } = phonePath;
-    if (enabledBackupDevices.has(`${platform}:${deviceId}`)) return true;
-    const backupRoot = phoneManager?.getBackupRoot?.(platform, deviceId);
-    return Boolean(backupRoot && localRoots.some((local) => isPathWithin(backupRoot, local)));
-  };
-  return Array.from(
-    new Set(safeRoots.filter((root) => !covered(root))),
-  );
+  // Keep virtual source roots even when their backing files are also inside a
+  // local folder. Their virtual paths preserve per-source Search visibility.
+  return Array.from(new Set(safeRoots));
 }
 
 async function getEnabledIndexSources(): Promise<string[]> {
@@ -6481,10 +6809,13 @@ function fileIsInEnabledSource(
   sourcePaths: ReadonlySet<string> = enabledSourcePathCache,
 ) {
   for (const sourcePath of sourcePaths) {
-    const prefix = sourcePath.endsWith(path.sep)
-      ? sourcePath
-      : `${sourcePath}${path.sep}`;
-    if (filePath === sourcePath || filePath.startsWith(prefix)) return true;
+    const root = sourcePath.replace(/[\\/]+$/, "");
+    if (
+      filePath === sourcePath ||
+      filePath === root ||
+      filePath.startsWith(`${root}/`) ||
+      filePath.startsWith(`${root}\\`)
+    ) return true;
   }
   return false;
 }
@@ -7003,7 +7334,7 @@ function scheduleIndexStorageRelaunch() {
   if (indexStorageRelaunchPending) return;
   indexStorageRelaunchPending = true;
   setTimeout(() => {
-    app.relaunch();
+    relaunchAppWithDiagnostics("index-storage-migration");
     app.quit();
   }, 3500);
 }
@@ -7232,8 +7563,16 @@ app.whenReady().then(async () => {
   if (startupBetaUrl) queueBetaActivationUrl(startupBetaUrl);
   loadPendingDiagnosticReport();
   const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
-  if (previousSessionWasUnclosed)
-    createAppCrashDiagnosticReport("The previous Silo session did not close normally.");
+  if (previousSessionWasUnclosed) {
+    const markerContext = lifecycleDiagnosticSnapshot("previous-session-marker-found");
+    runtimeLog("previous-session-marker-found", {
+      interpretation: "symptom-only",
+      ...markerContext,
+    });
+    createAppCrashDiagnosticReport(
+      "A previous-session marker remained at startup. It records an interrupted or unclean shutdown symptom but does not identify its cause.",
+    );
+  }
   try {
     fs.writeFileSync(
       activeSessionMarkerPath,
@@ -7432,6 +7771,7 @@ app.whenReady().then(async () => {
     },
     logIndexingDiagnostic,
     indexStorageRoot,
+    resolveLocalPath,
   );
   semanticIndexer.setPerformanceSettings(
     contentSettingsStore.getSearchPerformanceSnapshot().settings,
@@ -7439,6 +7779,9 @@ app.whenReady().then(async () => {
   semanticIndexer.setBackgroundIndexWorkListener((changedFiles) =>
     queueSemanticIndexWork({ changedFiles }),
   );
+  // Every completed CLIP embedding feeds the independent downstream indexes.
+  // The maps also coalesce bursts while the recovery scheduler is starting up.
+  semanticIndexer.addIndexedImageListener(queueProgressiveIndexedImage);
   libraryShareServer = new LibraryShareServer({
     getSources: async () =>
       (await listSources()).map(({ id, label, rootPath, kind, available }) => ({
@@ -7557,6 +7900,7 @@ app.whenReady().then(async () => {
     contentSettingsStore.getSearchPerformanceSnapshot().settings
       .backgroundWorkPercent,
     () => activeInteractiveSearches > 0,
+    resolveLocalPath,
   );
   faceIndexer.setRecognitionListener(({ added, removed }) => {
     const showBanned = Boolean(
@@ -7679,6 +8023,19 @@ app.whenReady().then(async () => {
       if (statusChanged && progress.status === "complete") {
         // A finished snapshot becomes a browseable source even after the phone is unplugged.
         invalidateSourceList();
+        void phoneManager.getOfflineBackups().then((backups) => {
+          const latest = backups
+            .filter((backup) =>
+              backup.platform === progress.platform &&
+              backup.id === progress.deviceId,
+            )
+            .sort((first, second) => second.snapshotAt - first.snapshotAt)[0];
+          if (!latest) return;
+          return indexNewSources([latest.rootPath], "phone-backup-complete");
+        }).catch((error) => runtimeLog("phone-backup-index-queue-error", {
+          platform: progress.platform,
+          message: error instanceof Error ? error.message : String(error),
+        }));
       }
       if (!mainWindow || mainWindow.isDestroyed()) return;
       mainWindow.webContents.send("phone-backup-progress", progress);
@@ -7738,7 +8095,7 @@ app.whenReady().then(async () => {
     // Progress events carry counts only; the renderer fetches photos when photosVersion changes.
     sendToRenderer("geo-index-progress", state);
     scheduleThumbnailPregeneration();
-  }, indexStorageRoot);
+  }, indexStorageRoot, resolveLocalPath);
   const geoLoad = indexStorageInitializationDeferred
     ? Promise.resolve()
     : geoIndexer.initialize();
@@ -7859,6 +8216,7 @@ app.whenReady().then(async () => {
   scheduleThumbnailPregeneration();
   memoryManager = new MemoryManager(app.getPath("userData"), {
     search: searchMemoryMedia,
+    searchPrompted: searchPromptedMemoryMedia,
     hasMovie: async (card: MemorySuggestion) => Boolean(await findMemoryMovie(card)),
     filterImages: filterMemoryPhotos,
     thumb: async (filePath) => getThumbnail(await resolveLocalPath(filePath), false, 200),
@@ -7990,6 +8348,13 @@ app.whenReady().then(async () => {
       return "Waiting for search indexing to resume and finish.";
     return "Waiting for processing resources.";
   };
+  const progressiveAnalysisBlocker = () => {
+    if (!semanticIndexer.isLoaded())
+      return "Opening saved indexed photos.";
+    if (semanticRuntimeProgress.status !== "complete")
+      return "Waiting for the offline search model.";
+    return "Waiting for the analysis lane.";
+  };
   const analysisIdle = () =>
     !PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) &&
     !PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status) &&
@@ -8071,7 +8436,7 @@ app.whenReady().then(async () => {
     },
     {
       id: "search",
-      lane: "background",
+      lane: "clip",
       blockedReason: () =>
         semanticRuntimeProgress.status !== "complete"
           ? "Waiting for offline search model recovery."
@@ -8080,7 +8445,7 @@ app.whenReady().then(async () => {
       ready: () =>
         indexStorageAvailable &&
         semanticRuntimeProgress.status === "complete" &&
-        analysisIdle() &&
+        !magicLibraryProgress.running &&
         (startupIndexReconciliationSettled || semanticIndexer.hasPendingIndexWork()),
       unresolvedWork: () => {
         const count = semanticIndexer.getRetryableErrorCount(recoverySearchSourcePaths);
@@ -8136,29 +8501,42 @@ app.whenReady().then(async () => {
     },
     {
       id: "faces",
-      lane: "background",
-      blockedReason: analysisBlocker,
+      lane: "analysis",
+      blockedReason: progressiveAnalysisBlocker,
       needsInitialCheck: true,
       progress: () => faceIndexer.getProgress(),
-      ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
+      ready: () =>
+        indexStorageAvailable &&
+        semanticRuntimeProgress.status === "complete" &&
+        semanticIndexer.isLoaded(),
       unresolvedWork: () => {
         const errors = faceIndexer.getProgress().errors;
         return errors
           ? `${errors.toLocaleString()} photos need another face-analysis attempt.`
           : null;
       },
-      start: () => faceIndexer.start(),
+      start: async () => {
+        const queuedImages = takeProgressiveImages(pendingFaceIndexImages);
+        if (faceInitialCoverageNeeded || queuedImages.length === 0) {
+          await faceIndexer.start();
+          if (faceIndexer.getProgress().status === "complete")
+            faceInitialCoverageNeeded = false;
+        } else {
+          await faceIndexer.start(queuedImages);
+        }
+      },
       pause: () => faceIndexer.pause(),
     },
     {
       id: "locations",
-      lane: "background",
-      blockedReason: analysisBlocker,
+      lane: "analysis",
+      blockedReason: progressiveAnalysisBlocker,
       progress: () => geoIndexer.getStatus(),
       needsInitialCheck: true,
       ready: () =>
         indexStorageAvailable &&
-        searchSettled() &&
+        semanticRuntimeProgress.status === "complete" &&
+        semanticIndexer.isLoaded() &&
         geoIndexer.getStatus().status !== "scanning",
       unresolvedWork: () => {
         const count = geoIndexer.getRetryableCount();
@@ -8166,7 +8544,17 @@ app.whenReady().then(async () => {
           ? `${count.toLocaleString()} location records need another check.`
           : null;
       },
-      start: () => runGeoCheck(),
+      start: async () => {
+        const queuedImages = takeProgressiveImages(pendingLocationIndexImages);
+        if (locationInitialCoverageNeeded || queuedImages.length === 0) {
+          await runGeoCheck();
+          if (geoIndexer.getStatus().status === "complete")
+            locationInitialCoverageNeeded = false;
+        } else {
+          const sources = await getAllIndexSources();
+          await geoIndexer.start(queuedImages, sources);
+        }
+      },
       pause: () => geoIndexer.pause(),
     },
     {
@@ -8357,6 +8745,7 @@ app.whenReady().then(async () => {
       derivedRunning: Boolean(derivedIndexPromise),
     });
   }, 10000);
+  lastKnownAppPhase = "ready";
   runtimeLog("app-ready");
 });
 
@@ -8368,6 +8757,10 @@ app.on("window-all-closed", () => {
 
 let quitFlushed = false;
 app.on("before-quit", (event) => {
+  runtimeLog("app-lifecycle-before-quit", {
+    quitPass: quitFlushed ? "flush-complete" : "initial",
+    ...lifecycleDiagnosticSnapshot("app-quit", mainWindow),
+  });
   memoryExporter?.cancel();
   void libraryShareServer?.stop();
   shuttingDown = true;
@@ -8407,7 +8800,13 @@ function clearActiveSessionMarker() {
     });
   }
 }
-app.on("will-quit", clearActiveSessionMarker);
+app.on("will-quit", () => {
+  runtimeLog(
+    "app-lifecycle-will-quit",
+    lifecycleDiagnosticSnapshot("will-quit", mainWindow),
+  );
+  clearActiveSessionMarker();
+});
 for (const signal of ["SIGTERM", "SIGINT"] as const)
   process.on(signal, () => app.quit());
 
@@ -8452,14 +8851,25 @@ async function runMemoryGenerator(reason: string, replace = false) {
   return next;
 }
 
-/** Generates once after startup indexing settles, then every 24 hours while running. */
+/** Generates from the growing CLIP index, then refreshes daily while running. */
 function scheduleAutomaticMemories() {
   if (autoMemoryTimer) return;
-  const tick = () => {
-    if (!memoryManager) return;
+  const tick = async () => {
+    if (!memoryManager || !semanticIndexer?.isLoaded() ||
+        semanticRuntimeProgress.status !== "complete") return;
     const due = lastAutoMemoryRunAt === 0 || Date.now() - lastAutoMemoryRunAt >= AUTO_MEMORY_INTERVAL_MS;
-    if (!due || getThumbnailIndexingWaitMessage() !== null) return;
-    const reason = lastAutoMemoryRunAt === 0 ? "startup" : "scheduled";
+    if (!due) return;
+    let roots: string[];
+    try {
+      roots = await getAllIndexSources();
+    } catch (error) {
+      runtimeLog("memory-auto-source-list-error", memoryErrorDetails(error));
+      return;
+    }
+    // Use counters here; materializing millions of image records just to decide
+    // whether Memories can start would create avoidable memory pressure.
+    if (semanticIndexer.getIndexSummary(roots).indexed < MEMORY_MIN_SELECTION_COUNT) return;
+    const reason = lastAutoMemoryRunAt === 0 ? "progressive-startup" : "scheduled";
     lastAutoMemoryRunAt = Date.now();
     void runMemoryGenerator(reason)
       .catch((error) => runtimeLog("memory-auto-generate-error", memoryErrorDetails(error)));
@@ -9827,7 +10237,11 @@ ipcMain.handle("import-config", async (event) => {
 
 ipcMain.handle("apply-config-import", async () => {
   await commitStagedImport(app.getPath("userData"));
-  app.relaunch();
+  relaunchAppWithDiagnostics("config-import");
+  runtimeLog(
+    "app-lifecycle-before-exit",
+    lifecycleDiagnosticSnapshot("config-import", mainWindow),
+  );
   app.exit(0);
 });
 
@@ -9895,8 +10309,40 @@ ipcMain.handle("clear-duplicate-trash", async (_event, ids?: string[]) => {
   return deletion;
 });
 
-ipcMain.handle("update-ui-state", async (_event, update) =>
-  stateStore.updateUi(update),
+ipcMain.handle(
+  "update-ui-state",
+  async (_event, update, diagnosticUi: DiagnosticUiUpdate = {}) => {
+    const state = await stateStore.updateUi(update);
+    const now = Date.now();
+    if (now - lastUiDiagnosticStateUpdatedAt >= 1000) {
+      const ui = state.ui;
+      const safeDiagnosticUi =
+        diagnosticUi && typeof diagnosticUi === "object" ? diagnosticUi : {};
+      const viewMode = ui.viewMode === "list" ? "list" : "grid";
+      const section = safeDiagnosticUi.section;
+      lastKnownUiDiagnosticState = {
+        section:
+          typeof section === "string" && DIAGNOSTIC_APP_SECTIONS.has(section as DiagnosticAppSection)
+            ? (section as DiagnosticAppSection)
+            : lastKnownUiDiagnosticState.section,
+        pathSet: typeof ui.currentPath === "string" && ui.currentPath.length > 0,
+        viewMode,
+        sortField: DIAGNOSTIC_SORT_FIELDS.has(ui.sortField) ? ui.sortField : "unknown",
+        ascending: ui.sortAscending === true,
+        typeFilterActive: typeof ui.includedType === "string" && ui.includedType !== "all" && ui.includedType.length > 0,
+        filterPanelOpen: ui.showFilters === true,
+        exploded: ui.exploded === true,
+        searchActive: typeof safeDiagnosticUi.searchActive === "boolean"
+          ? safeDiagnosticUi.searchActive
+          : lastKnownUiDiagnosticState.searchActive,
+        viewerOpen: typeof safeDiagnosticUi.viewerOpen === "boolean"
+          ? safeDiagnosticUi.viewerOpen
+          : lastKnownUiDiagnosticState.viewerOpen,
+      };
+      lastUiDiagnosticStateUpdatedAt = now;
+    }
+    return state;
+  },
 );
 
 ipcMain.handle("select-index-source", async () => {
@@ -9973,9 +10419,16 @@ ipcMain.handle("start-indexing", async () => {
 });
 
 ipcMain.handle("pause-indexing", async () => {
-  indexRecovery?.pause("search");
-  await semanticIndexer.pause();
+  if (indexRecovery) await indexRecovery.pauseStage("search");
+  else await semanticIndexer.pause();
   return semanticIndexer.getProgress();
+});
+
+ipcMain.handle("pause-indexing-stage", async (_event, id: unknown) => {
+  if (typeof id !== "string" || !indexRecovery)
+    throw new Error("Index recovery is not ready.");
+  await indexRecovery.pauseStage(id);
+  return { ok: true };
 });
 
 const semanticSearchGenerations = new WeakMap<object, number>();
@@ -11331,8 +11784,8 @@ ipcMain.handle("start-face-indexing", async () => {
   return faceIndexer.getProgress();
 });
 ipcMain.handle("pause-face-indexing", async () => {
-  indexRecovery?.pause("faces");
-  await faceIndexer.pause();
+  if (indexRecovery) await indexRecovery.pauseStage("faces");
+  else await faceIndexer.pause();
   return faceIndexer.getProgress();
 });
 ipcMain.handle("get-person", async (_event, personId: string) => {
@@ -12133,7 +12586,7 @@ ipcMain.handle("set-demo-testing-mode", async (_event, enabledValue: unknown) =>
 
   if (!enabling) queueIndexRecoveryStages(ALL_INDEX_RECOVERY_STAGES);
   await writeDemoTestingMode(enabling);
-  app.relaunch();
+  relaunchAppWithDiagnostics("demo-testing-mode");
   app.quit();
   return { available: true, enabled: enabling, restarting: true };
 });
@@ -13340,7 +13793,7 @@ ipcMain.handle("select-index-storage-root", async () => {
       return { canceled: true };
 
     await stageIndexStorageRoot(app.getPath("userData"), storageRoot);
-    app.relaunch();
+    relaunchAppWithDiagnostics("index-storage-root-change");
     app.quit();
     return { canceled: false, restarting: true, path: storageRoot };
   } catch (error) {

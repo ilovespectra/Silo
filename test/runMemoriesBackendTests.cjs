@@ -31,7 +31,11 @@ const {
 } = require("../src/memoryTypes.ts");
 const { MemoryManager } = require("../src/memoryManager.ts");
 const { AestheticScorer } = require("../src/aestheticScorer.ts");
-const { isPersonalPhotoPath, personalPhotoRejection, nonPersonalFolderKeyword } = require("../src/memoryDiscovery.ts");
+const { RefreshScheduler } = require("../src/memoryTopicProfile.ts");
+const {
+  isPersonalPhotoPath, personalPhotoRejection, nonPersonalFolderKeyword, PERSONAL_PHOTO_MIN_BYTES,
+  isPromptedVideoPhotoEligible, currentPromptedVideoIndexingImage,
+} = require("../src/memoryDiscovery.ts");
 const exifr = require("exifr");
 
 // VM-realm objects fail strict deepEqual on prototype identity.
@@ -59,18 +63,22 @@ const vectorByName = (name) => {
   if (name.startsWith("beach")) return [0.5, 0, 0, 0];
   if (name.startsWith("crowd")) return [0.5, 0.5, 0, 0];
   if (name.startsWith("dull")) return [0.1, 0, 0.5, 0];
+  if (name.startsWith("vector-graphic")) return [0, 1, 0, 0];
   return [0.3, 0, 0, 0];
 };
 const opened = [];
 const thumbnailCalls = [];
 const searchCalls = [];
 const magicRankCalls = [];
+const magicFilterCalls = [];
 const dialogCalls = [];
 const renderCalls = [];
 const previewEvents = [];
 const magicScores = new Map();
 let metadataReads = 0;
 let searchResults = [];
+let indexedImages = [];
+const missingVectorPaths = new Set();
 const progress = { semantic: "complete", face: "complete" };
 
 const context = vm.createContext({
@@ -80,7 +88,12 @@ const context = vm.createContext({
   createHash: crypto.createHash,
   fsPromises: {
     ...fsp,
-    opendir: async (directory, ...rest) => { opened.push(directory); return fsp.opendir(directory, ...rest); },
+    opendir: async (directory, ...rest) => {
+      opened.push(directory);
+      const logical = "/Photos";
+      const physical = path.join(library, path.relative(logical, directory));
+      return fsp.opendir(directory === logical || directory.startsWith(logical + path.sep) ? physical : directory, ...rest);
+    },
     readdir: async (directory, ...rest) => {
       if (directory === path.join(userData, "memories", "previews")) return fsp.readdir(directory, ...rest);
       throw new Error("Memories must stream library directories with opendir");
@@ -103,7 +116,7 @@ const context = vm.createContext({
       magicRankCalls.push({ items, preset, threshold });
       return { order: items.map((item) => item.path), scores: Object.fromEntries(items.map((item) => [item.path, magicScores.get(item.path) ?? 50])), analyzed: items.length, total: items.length, running: false };
     },
-    filterSimilar: async (paths, threshold) => { assert.equal(threshold, 0.85); return paths; },
+    filterSimilar: async (paths, threshold) => { assert.equal(threshold, 0.85); magicFilterCalls.push(paths); return paths; },
   },
   banned: new Set(),
   semanticUnsafePaths: new Set(),
@@ -111,18 +124,42 @@ const context = vm.createContext({
   MEMORY_DEFAULT_SELECTION_COUNT, MEMORY_MIN_SELECTION_COUNT, getMemorySelectionMinimum, MEMORY_MAGIC_SCORE_THRESHOLD, selectMemoryPhotoCandidates,
   getDefaultMemoryDuration, isMemoryDurationAllowed, MemoryExportCancelledError,
   isRemotePath: (value) => value.startsWith("/__phone__/"),
+  phoneManager: {
+    isPhonePath: (value) => value.startsWith("/__phone__/"),
+    parsePhonePath: () => null,
+    getBackupRoot: () => null,
+    listPhoneFiles: async () => [],
+    statPhoneFile: async () => null,
+  },
+  fullAccessEnabled: () => context.__fullAccess,
+  __fullAccess: true,
+  isSiloInternalRoot: async () => false,
+  isPathWithin: (candidate, parent) => candidate === parent || candidate.startsWith(parent + path.sep),
+  resolveLocalPath: async (value) => value === "/Photos" || value.startsWith("/Photos" + path.sep)
+    ? path.join(library, path.relative("/Photos", value)) : value,
   PIPELINE_BUSY_STATUSES: new Set(["scanning", "loading-model", "indexing"]),
   getAllIndexSources: async () => [library, "/__phone__/ios/ready"],
   semanticIndexer: {
-    getProgress: () => ({ status: progress.semantic }),
-    search: async (...args) => { searchCalls.push(args); return searchResults; },
+    getProgress: () => ({ status: progress.semantic, currentFile: progress.currentFile ?? null }),
+    getIndexedImages: () => indexedImages,
+    getImageVectors: async (paths) => new Map(paths.filter((filePath) => !missingVectorPaths.has(filePath))
+      .map((filePath) => [filePath, new Float32Array(vectorByName(path.basename(filePath)))])),
+    search: async (...args) => {
+      searchCalls.push(args);
+      const include = args[5];
+      return typeof include === "function" ? searchResults.filter(include) : searchResults;
+    },
     embedPrompts: async (prompts) => {
-      assert.deepEqual(plain(prompts.slice(1)), [`a photo of ${NSFW_VISUAL_PROMPT}`, `a photo of ${SAFE_VISUAL_PROMPT}`]);
-      return [new Float32Array([1, 0, 0, 0]), new Float32Array([0, 1, 0, 0]), new Float32Array([0, 0, 1, 0])];
+      if (prompts.length === 3 && prompts[1] === `a photo of ${NSFW_VISUAL_PROMPT}`) {
+        assert.deepEqual(plain(prompts), [prompts[0], `a photo of ${NSFW_VISUAL_PROMPT}`, `a photo of ${SAFE_VISUAL_PROMPT}`]);
+        return [new Float32Array([1, 0, 0, 0]), new Float32Array([0, 1, 0, 0]), new Float32Array([0, 0, 1, 0])];
+      }
+      return prompts.map(() => new Float32Array([1, 0, 0, 0]));
     },
     embedPreviewImage: async (file) => {
-      assert(file.startsWith(path.join(userData, "thumbnail-cache") + path.sep), "frame must come from thumbnail-cache");
-      return new Float32Array(JSON.parse(await fsp.readFile(file, "utf8")));
+      if (file.startsWith(path.join(userData, "thumbnail-cache") + path.sep))
+        return new Float32Array(JSON.parse(await fsp.readFile(file, "utf8")));
+      return new Float32Array(vectorByName(path.basename(file)));
     },
   },
   getThumbnail: async (filePath, force, size) => {
@@ -145,6 +182,11 @@ const context = vm.createContext({
   dialog: { showSaveDialog: async (...args) => { dialogCalls.push(args); return context.__dialog(); } },
   __dialog: async () => ({ canceled: false, filePath: path.join(root, "out.mp4") }),
   memoryManager: null,
+  memoryPromptVectors: async () => ({
+    junk: [new Float32Array([0, 1, 0, 0])],
+    good: [new Float32Array([1, 0, 0, 0])],
+    nonPhoto: [new Float32Array([0, 1, 0, 0])],
+  }),
   memoryExporter: null,
   memoryExportRunning: false,
   memoryExportCancelRequested: false,
@@ -158,11 +200,15 @@ const context = vm.createContext({
   isPersonalPhotoPath,
   personalPhotoRejection,
   nonPersonalFolderKeyword,
+  isPromptedVideoPhotoEligible,
+  currentPromptedVideoIndexingImage,
+  PERSONAL_PHOTO_MIN_BYTES,
   os: require("os"),
   exifr,
   audioLibraryCache: null,
   memoryMusicDirectoryCache: null,
   memoryExifCache: new Map(),
+  memoryPhotoPromptVectors: null,
   MEMORY_DEFAULT_MOVIE_DIRECTORY: () => path.join(userData, "memories", "previews"),
   consumeDemoMemoryPreview: async () => true,
   runtimeLog() {},
@@ -177,17 +223,20 @@ function evaluate(source) {
   }).outputText, context);
 }
 for (const name of [
-  "memoryFileMetadata", "memoryAllowed", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
-  "memoryTopCounts", "memoryPersonalRejectionSummary", "memoryErrorDetails",
-  "memoryDot", "filterMemoryPhotos", "memoryNameMatches", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
-  "memoryMusicDirectories", "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
-  "memoryPreviewOptions", "memoryPreviewFileName", "memoryMovieDirectory", "findMemoryMovie", "runMemoryRender",
+  "memoryFileMetadata", "memoryObviousNonPhotoPath", "memoryAllowed", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
+  "memoryTopCounts", "memoryErrorDetails",
+  "memoryDot", "memoryImageContentFactor", "memoryImageIsObviousNonPhoto", "filterMemoryPhotos", "memoryNameMatches", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
+  "promptedVideoPhotoCandidate", "searchPromptedMemoryMedia", "memoryVideoMatchesForPhotos",
+  "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
+  "memoryPreviewOptions", "memoryPreviewFileName", "memoryTitleStem", "memoryMovieDirectory", "findMemoryMovie", "runMemoryRender",
   "prepareMemoryPreviewsNow", "prepareMemoryPreviews", "prepareAllMemoryPreviews", "setMemoryPreviewStatus",
-  "memoryPreviewStatuses",
+  "memoryPreviewStatuses", "openMemoryMovie", "rememberMemoryMovieTitles",
 ]) {
   assert(functions.has(name), `missing ${name}`);
   evaluate(functions.get(name).getText(ast));
 }
+assert(functions.has("getIndexableRootsFromSources"), "missing getIndexableRootsFromSources");
+evaluate(functions.get("getIndexableRootsFromSources").getText(ast));
 const handler = (name) => {
   assert(handlers.has(name), `missing handler ${name}`);
   return evaluate(`(${handlers.get(name).arguments[1].getText(ast)})`);
@@ -200,42 +249,97 @@ async function test(name, body) {
 }
 
 async function run() {
-  await test("x64 memory search filters graphics before the result cap; arm64 keeps its existing search", async () => {
+  await test("memory profile refresh cannot be postponed by steady indexing notifications", async () => {
+    const timers = [];
+    let finishFirstRun;
+    let runs = 0;
+    const scheduler = new RefreshScheduler({
+      delayMs: 60_000,
+      isBusy: () => false,
+      run: () => {
+        runs += 1;
+        if (runs === 1) return new Promise((resolve) => { finishFirstRun = resolve; });
+        return Promise.resolve();
+      },
+      setTimer: (callback) => { timers.push(callback); return callback; },
+      clearTimer: () => {},
+    });
+
+    scheduler.notify();
+    scheduler.notify();
+    scheduler.notify();
+    assert.equal(timers.length, 1, "steady indexed-photo updates share a fixed refresh deadline");
+    timers.shift()();
+    assert.equal(runs, 1, "the profile refresh starts while indexing is still active");
+
+    scheduler.notify();
+    scheduler.notify();
+    finishFirstRun();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(timers.length, 1, "updates during a refresh collapse into one follow-up");
+    timers.shift()();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runs, 2);
+  });
+
+  await test("memory search keeps every safe indexed image eligible and blocks NSFW on both architectures", async () => {
     const originalSearch = context.semanticIndexer.search;
     const originalArch = context.process.arch;
-    const originalBanned = context.banned;
-    const graphics = Array.from({ length: 500 }, (_, i) => ({
-      path: path.join(library, `asset-${i}.png`), name: `asset-${i}.png`,
-      type: "image", size: 200000, modified: i, confidence: 95,
+    const originalUnsafe = context.semanticUnsafePaths;
+    const safeImages = Array.from({ length: 12 }, (_, i) => ({
+      path: path.join(library, i % 2 ? `Screenshots/shot-${i}.png` : `Covers/cover-${i}.jpg`),
+      name: i % 2 ? `shot-${i}.png` : `cover-${i}.jpg`,
+      type: "image", size: 900 + i, modified: i, confidence: 95,
     }));
-    const photos = Array.from({ length: 20 }, (_, i) => ({
-      path: path.join(library, `IMG_${i}.jpg`), name: `IMG_${i}.jpg`,
-      type: "image", size: 200000, modified: i, confidence: 30,
-    }));
-    let filteredCalls = 0;
-    let enoughPhotos = false;
-    const blocked = { ...photos[0], path: path.join(library, "IMG_blocked.jpg") };
-    context.banned = new Set([blocked.path]);
-    context.semanticIndexer.search = async (_query, confidence, roots, _cancel, _progress, include) => {
+    const graphic = { path: path.join(library, "vector-graphic.jpg"), name: "vector-graphic.jpg",
+      type: "image", size: 900_000, modified: 99, confidence: 98 };
+    const unsafe = { path: path.join(library, "unsafe.jpg"), name: "unsafe.jpg",
+      type: "image", size: 4_000_000, modified: 100, confidence: 99 };
+    context.semanticUnsafePaths = new Set([unsafe.path]);
+    context.semanticIndexer.search = async (_query, confidence, roots) => {
       assert.equal(confidence, 20);
-      if (!include) return enoughPhotos ? photos : graphics;
-      filteredCalls++;
-      return [...graphics, ...photos, blocked].filter(include);
+      assert.deepEqual(plain(roots), [library, "/__phone__/ios/ready"],
+        "Memories search every configured source regardless of its visibility checkbox");
+      return [...safeImages, graphic, unsafe];
     };
     try {
       for (const arch of ["arm64", "x64"]) {
         context.process.arch = arch;
         const hits = await context.searchMemoryMedia("holiday");
-        assert.equal(hits.filter((file) => file.type === "image").length, arch === "x64" ? 20 : 0);
-        assert(!hits.some((file) => file.path === blocked.path));
+        const selected = new Set(hits.filter((file) => file.type === "image").map((file) => file.path));
+        assert.equal(selected.size, safeImages.length);
+        assert(!selected.has(graphic.path), "clear graphic CLIP match is excluded");
+        for (const image of safeImages) assert(selected.has(image.path), `safe image excluded: ${image.name}`);
+        assert(!selected.has(unsafe.path), "NSFW indexed image is never exposed to Memories");
       }
-      enoughPhotos = true;
-      assert.equal((await context.searchMemoryMedia("holiday")).filter((file) => file.type === "image").length, 20);
-      assert.equal(filteredCalls, 1);
     } finally {
       context.semanticIndexer.search = originalSearch;
       context.process.arch = originalArch;
-      context.banned = originalBanned;
+      context.semanticUnsafePaths = originalUnsafe;
+    }
+  });
+
+  await test("memory source roots keep offline local indexes and ready added sources", async () => {
+    const originalFullAccess = context.__fullAccess;
+    try {
+      context.__fullAccess = true;
+      const roots = await context.getIndexableRootsFromSources([
+        { id: "/offline-drive/Photos", rootPath: "/offline-drive/Photos", available: false, enabled: false },
+        { id: "/added/Camera", rootPath: "/added/Camera", available: true, enabled: false },
+        { id: "phone", rootPath: "/__phone__/ios/ready", available: true, enabled: true },
+        { id: "disconnected-phone", rootPath: "/__phone__/ios/gone", available: false, enabled: true },
+      ]);
+      assert.deepEqual(plain(roots), ["/offline-drive/Photos", "/added/Camera", "/__phone__/ios/ready"]);
+      context.__fullAccess = false;
+      const selectedRoots = await context.getIndexableRootsFromSources([
+        { id: "/offline-drive/Photos", rootPath: "/offline-drive/Photos", available: false, enabled: false },
+        { id: "/added/Camera", rootPath: "/added/Camera", available: true, enabled: true },
+        { id: "/locked", rootPath: "/locked", available: true, enabled: true, demoLocked: true },
+      ]);
+      assert.deepEqual(plain(selectedRoots), ["/offline-drive/Photos", "/added/Camera"],
+        "Memories includes all configured roots regardless of source selection state");
+    } finally {
+      context.__fullAccess = originalFullAccess;
     }
   });
   await test("Magic threshold prioritizes 90+ photos and fills brisk cuts with the best lower scores", async () => {
@@ -307,6 +411,14 @@ async function run() {
     const ok = path.join(library, "ok.jpg");
     assert.equal(context.memoryAllowed(ok), true);
     for (const bad of [undefined, null, 4, "", "a\0b"]) assert.equal(context.memoryAllowed(bad), false);
+    assert.equal(context.memoryAllowed(path.join(library, "phone-screenshot-2026.png")), false,
+      "screenshot in the filename excludes it from Memories");
+    assert.equal(context.memoryAllowed(path.join(library, "Screenshots", "IMG_2026.jpg")), true,
+      "a real photo is still eligible when stored in a Screenshots folder");
+    assert.equal(context.memoryAllowed("/Applications/Example.app/Contents/Resources/icon.png"), false,
+      "application bundle artwork is excluded");
+    assert.equal(context.memoryAllowed(path.join(library, "app-icon.png")), false,
+      "obvious app icon assets are excluded by filename");
     context.hiddenPaths = new Set([path.join(library, "refused.jpg"), path.join(library, "secret")]);
     assert.equal(context.memoryAllowed(path.join(library, "refused.jpg")), false);
     assert.equal(context.memoryAllowed(path.join(library, "secret", "deep", "x.mov")), false, "hidden descendants");
@@ -354,28 +466,28 @@ async function run() {
     for (const name of ["beach.mov", "crowd.mov", "dull.mp4", "notes.txt"]) await fsp.writeFile(path.join(story, name), name);
     await fsp.mkdir(path.join(story, "folder.mov"));
     searchResults = [
-      ...Array.from({ length: 45 }, (_, i) => ({ path: path.join(story, `p${i}.jpg`), name: `p${i}.jpg`, type: "image",
+      ...Array.from({ length: 45 }, (_, i) => ({ path: path.join("/Photos/story", `p${i}.jpg`), name: `p${i}.jpg`, type: "image",
         modified: 1000 + i, confidence: 90 - i })),
       { path: path.join(story, "doc.pdf"), name: "doc.pdf", type: "document", modified: 1, confidence: 99 },
       { path: "/__phone__/ios/ready/remote.jpg", name: "remote.jpg", type: "image", modified: 1, confidence: 10 },
     ];
-    context.semanticUnsafePaths = new Set([path.join(story, "p0.jpg")]);
+    context.semanticUnsafePaths = new Set([path.join("/Photos/story", "p0.jpg")]);
     opened.length = 0;
     const hits = await context.searchMemoryMedia("beach");
     assert.deepEqual(plain(searchCalls.at(-1).slice(0, 3)), ["beach", 20, [library, "/__phone__/ios/ready"]]);
     assert(hits.length <= 50, "manager only reads the first 50 hits");
     const photos = hits.filter((hit) => hit.type === "image");
     assert.equal(photos.length, 20);
-    assert.equal(magicRankCalls.at(-1).preset, "variety");
-    assert.equal(magicRankCalls.at(-1).threshold, 0.85);
+    assert(magicFilterCalls.length > 0, "Magic still curates near-duplicate frames");
     assert(!hits.some((hit) => hit.path.endsWith("p0.jpg") || hit.path.endsWith("doc.pdf")));
-    assert.equal(photos.find((hit) => hit.path.endsWith("p1.jpg")).score, 50.089);
+    assert.equal(photos.find((hit) => hit.path.endsWith("p1.jpg")).score, 89,
+      "semantic relevance determines photo order instead of the Magic score");
     const videos = hits.filter((hit) => hit.type === "video");
     assert.deepEqual(plain(videos.map((hit) => path.basename(hit.path))), ["beach.mov"]);
     assert.equal(videos[0].score, 50);
-    assert(context.memoryUnsafeVideoPaths.has(path.join(story, "crowd.mov")));
-    assert.equal(context.memoryAllowed(path.join(story, "crowd.mov")), false, "unsafe clip blocked for saved suggestions");
-    assert.deepEqual(plain(opened), [story]);
+    assert(context.memoryUnsafeVideoPaths.has(path.join("/Photos/story", "crowd.mov")));
+    assert.equal(context.memoryAllowed(path.join("/Photos/story", "crowd.mov")), false, "unsafe clip blocked for saved suggestions");
+    assert.deepEqual(plain(opened), ["/Photos/story"]);
     for (let i = 1; i < hits.length; i++) assert(hits[i - 1].score >= hits[i].score);
     context.semanticUnsafePaths = new Set();
   });
@@ -384,7 +496,7 @@ async function run() {
     const dog = path.join(library, "dog");
     await fsp.mkdir(dog, { recursive: true });
     const files = Array.from({ length: 24 }, (_, i) => path.join(dog, `y${i}.jpg`));
-    for (const file of files) await fsp.writeFile(file, "x");
+    for (const file of files) await fsp.writeFile(file, Buffer.alloc(200_000));
     for (const file of files) context.memoryExifCache.set(file, null);
     context.__folders = [{ name: "Yoshimi", filePaths: files.slice(6, 18) }];
     context.__names = [{ name: "yoshimi", sourceType: "pet", filePaths: [{ path: files[18], confirmed: true }] }];
@@ -398,6 +510,93 @@ async function run() {
     for (const expected of ["y18.jpg", "y19.jpg", "y20.jpg"]) assert(names.has(expected), `missing ${expected}`);
     assert(!names.has("y21.jpg") && !names.has("y22.jpg"), "unnamed photos must not match");
     context.__folders = []; context.__names = []; context.__people = []; context.__metadata = {};
+  });
+
+  await test("named phone photos resolve through the phone cache", async () => {
+    const phonePath = "/__phone__/ios/ready/DCIM/IMG_2050.JPG";
+    const cachedPath = path.join(root, "cached-phone-photo.jpg");
+    await fsp.writeFile(cachedPath, Buffer.alloc(200_000));
+    const originalFolders = context.__folders;
+    const originalResolve = context.resolveLocalPath;
+    context.__folders = [{ name: "Family", filePaths: [phonePath] }];
+    context.resolveLocalPath = async (value) => value === phonePath ? cachedPath : originalResolve(value);
+    try {
+      const named = await context.namedMemoryMedia("family", ["/__phone__/ios/ready"]);
+      assert.equal(named.length, 1);
+      assert.equal(named[0].path, phonePath, "the memory keeps the virtual source path");
+    } finally {
+      context.__folders = originalFolders;
+      context.resolveLocalPath = originalResolve;
+    }
+  });
+
+  await test("prompted videos filter confidence and junk before capping, without Magic ordering", async () => {
+    const lowConfidence = Array.from({ length: 165 }, (_, index) => ({
+      path: path.join("/Photos", `weak-${index}.jpg`), name: `weak-${index}.jpg`, type: "image",
+      modified: index, size: 240_000, confidence: 19,
+    }));
+    const phonePhoto = { path: "/__phone__/ios/ready/DCIM/IMG_1.jpg", name: "IMG_1.jpg", type: "image",
+      modified: 200, size: 30_000, confidence: 75 };
+    const strongPhoto = { path: path.join("/Photos", "strong.jpg"), name: "strong.jpg", type: "image",
+      modified: 300, size: 300_000, confidence: 88 };
+    searchResults = [
+      { path: path.join(library, "notes.pdf"), name: "notes.pdf", type: "document", modified: 1, size: 900_000, confidence: 99 },
+      { path: path.join(library, "screenshot.png"), name: "screenshot.png", type: "image", modified: 2, size: 900_000, confidence: 98 },
+      { path: path.join(library, "vector-graphic.jpg"), name: "vector-graphic.jpg", type: "image", modified: 2, size: 900_000, confidence: 96 },
+      { path: "/Photos/Screenshots/IMG_2026.jpg", name: "IMG_2026.jpg", type: "image", modified: 3, size: 900_000, confidence: 97 },
+      ...lowConfidence,
+      phonePhoto,
+      strongPhoto,
+    ];
+    indexedImages = [];
+    progress.semantic = "complete";
+    progress.currentFile = null;
+    const magicCallsBefore = magicRankCalls.length;
+    const result = await context.searchPromptedMemoryMedia("summer beach");
+    const selected = new Set(result.map((item) => item.path));
+    assert(selected.has(strongPhoto.path), "a strong match after 165 weak hits survives filtering before the cap");
+    assert(selected.has(phonePhoto.path), "compressed phone JPEGs remain eligible for a prompted video");
+    assert(!selected.has(lowConfidence[0].path), "the query relevance floor still applies");
+    assert(!selected.has(path.join(library, "screenshot.png")), "named screenshots are excluded from Memories");
+    assert(!selected.has(path.join(library, "vector-graphic.jpg")), "clear visual graphics are excluded from Memories");
+    assert(selected.has("/Photos/Screenshots/IMG_2026.jpg"), "a photo in a Screenshots folder remains eligible");
+    assert(!selected.has(path.join(library, "notes.pdf")), "documents never reach the photo candidate pool");
+    assert.equal(searchCalls.at(-1)[1], 20, "prompted semantic search uses the confidence floor");
+    assert.equal(typeof searchCalls.at(-1)[5], "function", "NSFW and non-image safety filtering is applied inside the targeted search");
+    assert.equal(magicRankCalls.length, magicCallsBefore, "Magic order does not select prompted-video media");
+
+    const phoneClip = "/__phone__/ios/ready/DCIM/CLIP.MOV";
+    const localClip = path.join(root, "phone-clip.mov");
+    await fsp.writeFile(localClip, "phone video clip");
+    const originalListPhoneFiles = context.phoneManager.listPhoneFiles;
+    const originalResolveLocalPath = context.resolveLocalPath;
+    context.phoneManager.listPhoneFiles = async (directory) => directory === path.dirname(phonePhoto.path)
+      ? [{ path: phoneClip, name: "CLIP.MOV", isDirectory: false }] : [];
+    context.resolveLocalPath = async (value) => value === phoneClip ? localClip : originalResolveLocalPath(value);
+    try {
+      const withPhoneClip = await context.searchPromptedMemoryMedia("summer beach");
+      assert(withPhoneClip.some((item) => item.path === phoneClip && item.type === "video"),
+        "a relevant uppercase MOV beside a matched phone photo is included");
+    } finally {
+      context.phoneManager.listPhoneFiles = originalListPhoneFiles;
+      context.resolveLocalPath = originalResolveLocalPath;
+    }
+  });
+
+  await test("prompted videos can score the uniquely active indexing image", async () => {
+    const active = { path: path.join("/Photos", "in-flight.jpg"), name: "in-flight.jpg", type: "image",
+      modified: 400, size: 250_000 };
+    indexedImages = [active];
+    missingVectorPaths.add(active.path);
+    searchResults = [];
+    progress.semantic = "indexing";
+    progress.currentFile = active.name;
+    const result = await context.searchPromptedMemoryMedia("garden");
+    assert(result.some((item) => item.path === active.path), "the active image is embedded and query-scored");
+    indexedImages = [];
+    missingVectorPaths.delete(active.path);
+    progress.semantic = "complete";
+    progress.currentFile = null;
   });
 
   await test("video candidates: at most 4 directories and 12 clips", async () => {
@@ -424,7 +623,7 @@ async function run() {
     progress.semantic = "indexing";
     progress.face = "scanning";
     assert.deepEqual(plain(await context.searchMemoryMedia("already indexed")), []);
-    assert.equal(searchCalls.length, callsBefore + 1, "search must run against the available index");
+    assert.equal(searchCalls.length, callsBefore + 2, "search must run against the available index and refill eligible photos");
     assert.equal(searchCalls.at(-1)[0], "already indexed");
     progress.semantic = "complete";
     progress.face = "complete";
@@ -433,7 +632,7 @@ async function run() {
 
   await test("MemoryManager generates from indexed photos while indexing continues", async () => {
     const story = path.join(library, "story");
-    searchResults = Array.from({ length: 10 }, (_, i) => ({ path: path.join(story, `p${i}.jpg`), name: `p${i}.jpg`,
+    searchResults = Array.from({ length: 10 }, (_, i) => ({ path: path.join("/Photos/story", `p${i}.jpg`), name: `p${i}.jpg`,
       type: "image", modified: 1000 + i, confidence: 70 - i }));
     const manager = new MemoryManager(path.join(root, "manager"), {
       search: (query) => context.searchMemoryMedia(query), thumb: async () => null, listAudio: () => [],
@@ -448,6 +647,38 @@ async function run() {
     const media = state.suggestions.flatMap((card) => card.media.map((item) => path.basename(item.path)));
     assert(media.includes("beach.mov"));
     assert(!media.includes("crowd.mov") && !media.includes("dull.mp4"));
+  });
+
+  await test("similar prompted videos reject a mostly repeated photo set", async () => {
+    const shared = Array.from({ length: 8 }, (_, i) => ({
+      path: path.join(library, `overlap-${i}.jpg`), name: `overlap-${i}.jpg`, type: "image",
+      modified: 100 + i, score: 90 - i,
+    }));
+    const firstOnly = Array.from({ length: 4 }, (_, i) => ({
+      path: path.join(library, `first-${i}.jpg`), name: `first-${i}.jpg`, type: "image",
+      modified: 200 + i, score: 80 - i,
+    }));
+    const secondOnly = Array.from({ length: 4 }, (_, i) => ({
+      path: path.join(library, `second-${i}.jpg`), name: `second-${i}.jpg`, type: "image",
+      modified: 300 + i, score: 80 - i,
+    }));
+    let returnOverlappingSet = false;
+    const traces = [];
+    const manager = new MemoryManager(path.join(root, "manager-similar-prompts"), {
+      search: async () => [],
+      searchPrompted: async () => returnOverlappingSet ? [...shared, ...secondOnly] : [...shared, ...firstOnly],
+      thumb: async () => null, listAudio: () => [], isAllowed: async () => true,
+      onTrace: (event, details) => traces.push({ event, details }),
+    });
+    const first = await manager.generate(false, "summer beach trip");
+    assert.equal(first.suggestions.length, 1, first.message);
+    const firstId = first.suggestions[0].id;
+    returnOverlappingSet = true;
+    const second = await manager.generate(false, "beach summer holiday");
+    assert.equal(second.suggestions.length, 1, "the second prompt must not add a near-copy video");
+    assert.equal(second.suggestions[0].id, firstId, "the original prompted video remains available");
+    assert(traces.some(({ event, details }) => event === "memory-story-rejected"
+      && details.reason === "overlaps-existing-story"), "the overlap rejection should be traceable");
   });
 
   await test("export options validation", () => {
@@ -476,6 +707,7 @@ async function run() {
   const suggestion = { id: "s1", title: "Beach / Days!", orientation: "landscape", mood: "bright",
     media: [{ path: exportPhoto, name: "a.jpg", type: "image", modified: 1 }] };
   const library_track = { id: `library:${"a".repeat(64)}`, name: "song", path: path.join(library, "song.mp3"), source: "library", rights: "" };
+  await fsp.writeFile(library_track.path, "test soundtrack");
   let soundtrack = library_track;
   const movieSettings = { movieDirectory: null };
   const marked = [];
@@ -514,22 +746,54 @@ async function run() {
     context.__dialog = async () => ({ canceled: false, filePath: path.join(root, "out.mp4") });
   });
 
-  await test("memory photos: icons, covers, screenshots, low-res and album-folder art are excluded", async () => {
+  await test("Memories reject clear graphic vectors while preserving ambiguous photo vectors", () => {
+    const prompts = {
+      good: [new Float32Array([0, 1, 0, 0])],
+      nonPhoto: [new Float32Array([1, 0, 0, 0])],
+    };
+    assert.equal(context.memoryImageIsObviousNonPhoto(new Float32Array([0.9, 0.1, 0, 0]), prompts), true,
+      "a strong screenshot or graphic match is excluded");
+    assert.equal(context.memoryImageIsObviousNonPhoto(new Float32Array([0.1, 0.9, 0, 0]), prompts), false,
+      "a clear photo match remains eligible");
+    assert.equal(context.memoryImageIsObviousNonPhoto(new Float32Array([0.3, 0.28, 0, 0]), prompts), false,
+      "ambiguous content is kept to avoid false exclusions");
+    assert.equal(context.memoryImageIsObviousNonPhoto(new Float32Array([0.9, 0.1, 0, 0]), { good: [], nonPhoto: [] }), false,
+      "unavailable classifier prompts fail open");
+  });
+
+  await test("photo metadata only affects ranking; every safe indexed image stays eligible", async () => {
     for (const bad of ["/x/icon.jpg", "/x/Covers/a.jpg", "/x/Some.app/Contents/Resources/a.jpg", "/x/shot.png",
       "/x/node_modules/pkg/a.jpg", "/Music/Black Lips/Album/folder.jpg"])
       assert.equal(isPersonalPhotoPath(bad, 4_000_000), false, bad);
-    assert.equal(isPersonalPhotoPath("/Photos/2019/IMG_1.jpg", 50_000), false, "tiny files are thumbnails or icons");
+    assert.equal(isPersonalPhotoPath("/Photos/2019/IMG_1.jpg", 50_000), false, "very small files remain excluded");
+    assert.equal(isPersonalPhotoPath("/Photos/2019/IMG_2.jpg", 100_000), process.arch === "x64",
+      "x64 builds accept compressed phone photos below the legacy 150 KB floor");
     assert.equal(isPersonalPhotoPath("/Photos/2019/IMG_1.HEIC", 2_500_000), true);
     assert.equal(isPersonalPhotoPath("/Music/Black Lips/Arabia Mountain/art.jpg", 900_000,
       new Set(["/Music/Black Lips/Arabia Mountain"])), false, "images beside songs are album art");
-    context.memoryExifCache.set("/q/low.jpg", { camera: true, width: 640, height: 480, takenAt: 0 });
+    assert.equal(isPromptedVideoPhotoEligible("/__phone__/ios/id/DCIM/IMG_1.jpg", 30_000, undefined, true), true,
+      "prompted videos admit compressed phone photos above the hard floor");
+    assert.equal(isPromptedVideoPhotoEligible("/Photos/IMG_1.jpg", 30_000, undefined, false), false,
+      "local photo eligibility keeps its existing cutoff");
+    assert.equal(isPromptedVideoPhotoEligible("/__phone__/ios/id/Screenshots/IMG_2.jpg", 30_000, undefined, true), false,
+      "the phone allowance does not admit screenshot folders");
+    assert.equal(isPromptedVideoPhotoEligible("/__phone__/ios/id/DCIM/IMG_3.jpg", 23_999, undefined, true), false,
+      "tiny phone files remain excluded");
+    const activeImage = { name: "in-flight.jpg", path: "/Photos/in-flight.jpg" };
+    assert.deepEqual(currentPromptedVideoIndexingImage([activeImage], "indexing", activeImage.name, new Set()), activeImage);
+    assert.equal(currentPromptedVideoIndexingImage([activeImage], "paused", activeImage.name, new Set()), undefined);
+    assert.equal(currentPromptedVideoIndexingImage([activeImage, { ...activeImage, path: "/Other/in-flight.jpg" }],
+      "indexing", activeImage.name, new Set()), undefined, "ambiguous basenames are never guessed");
+    assert.equal(currentPromptedVideoIndexingImage([activeImage], "indexing", activeImage.name, new Set([activeImage.path])), undefined);
+    context.memoryExifCache.set("/q/low.jpg", { camera: false, width: 640, height: 480, takenAt: 0 });
     context.memoryExifCache.set("/q/cover.jpg", { camera: false, width: 1500, height: 1500, takenAt: 0 });
     context.memoryExifCache.set("/q/camera.jpg", { camera: true, width: 4032, height: 3024, takenAt: 1234 });
     const kept = await context.applyMemoryPhotoQuality(["low", "cover", "camera"].map((name) =>
       ({ path: `/q/${name}.jpg`, name, type: "image", modified: 1, score: 10 })));
-    assert.deepEqual(plain(kept.map((item) => item.name)), ["camera"]);
-    assert.equal(kept[0].modified, 1234, "capture date replaces file time");
-    assert(kept[0].score > 10, "camera photos rank higher");
+    assert.deepEqual(plain(kept.map((item) => item.name)), ["low", "cover", "camera"]);
+    assert.equal(kept[2].modified, 1234, "capture date replaces file time");
+    assert(kept[2].score > kept[0].score, "camera metadata is only a ranking hint");
+    assert(kept[1].score < 10, "generic square art is down-ranked, never excluded");
   });
 
   await test("successful export: sanitized options, scratch images, cleanup, ok despite bookkeeping error", async () => {

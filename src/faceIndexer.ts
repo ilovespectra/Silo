@@ -214,6 +214,7 @@ export class FaceIndexer {
     indexStoragePath: string = userDataPath,
     backgroundWorkPercent = 5,
     private readonly hasActiveInteractiveSearch: () => boolean = () => false,
+    private readonly resolveImagePath: (filePath: string) => Promise<string> = async (filePath) => filePath,
   ) {
     this.directory = path.join(indexStoragePath, "face-index");
     this.recordsPath = path.join(this.directory, "faces.jsonl");
@@ -482,10 +483,10 @@ export class FaceIndexer {
     return { ...this.progress };
   }
 
-  start() {
+  start(images?: IndexableFile[]) {
     if (this.runPromise) return this.runPromise;
     this.pauseRequested = false;
-    this.runPromise = this.run().finally(() => {
+    this.runPromise = this.run(images).finally(() => {
       this.runPromise = null;
     });
     return this.runPromise;
@@ -1241,13 +1242,12 @@ export class FaceIndexer {
     );
   }
 
-  private async run() {
+  private async run(indexedBatch?: IndexableFile[]) {
     try {
-      const imagesOrPromise = this.getIndexedImages();
-      const images =
-        imagesOrPromise instanceof Promise
-          ? await imagesOrPromise
-          : imagesOrPromise;
+      const imagesOrPromise = indexedBatch ?? this.getIndexedImages();
+      const images = imagesOrPromise instanceof Promise
+        ? await imagesOrPromise
+        : imagesOrPromise;
       const pending = images.filter(
         (image) =>
           this.processedSignatures.get(image.path) !== this.signature(image),
@@ -1366,8 +1366,9 @@ export class FaceIndexer {
   }
 
   private async processImage(image: IndexableFile, runtime: FaceRuntime) {
+    const localPath = await this.resolveImagePath(image.path);
     const decoded = await runtime
-      .sharp(image.path)
+      .sharp(localPath)
       .rotate()
       .resize({
         width: 1280,

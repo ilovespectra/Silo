@@ -10,7 +10,7 @@ export interface RecoveryStage {
   needsInitialCheck?: boolean;
   /** Recheck a transient startup stage once for each new process. */
   checkOnStartup?: boolean;
-  lane?: "analysis" | "disk" | "light" | "background";
+  lane?: "clip" | "analysis" | "disk" | "light" | "background";
   blockedReason?: () => string;
   pause?: () => Promise<unknown> | unknown;
   resume?: () => Promise<unknown> | unknown;
@@ -98,6 +98,8 @@ export class IndexingRecovery {
     } catch {
       this.records.clear();
       this.requested.clear();
+      this.persistenceError =
+        "Saved indexing recovery state could not be read; fresh recovery state is in use.";
     }
   }
 
@@ -146,6 +148,7 @@ export class IndexingRecovery {
       resumeQueued: this.requested.has(id),
       recoveryRunning: record?.running ?? false,
       userPaused: record?.userPaused ?? false,
+      canPause: Boolean(stage?.pause),
       blockedReason: blocker,
       persistenceError: this.persistenceError,
     };
@@ -262,6 +265,29 @@ export class IndexingRecovery {
     this.records.set(id, record);
     this.requested.delete(id);
     this.persist();
+  }
+
+  async pauseStage(id: string) {
+    const stage = this.stages.find((item) => item.id === id);
+    if (!stage?.pause)
+      throw new Error("This index cannot be paused safely.");
+    this.pause(id);
+    try {
+      await stage.pause();
+      this.persist();
+    } catch (error) {
+      const record = this.records.get(id);
+      if (record) {
+        record.userPaused = false;
+        record.checked = false;
+        record.error = `Pause failed: ${error instanceof Error ? error.message : String(error)}`;
+        record.retryAt = this.now();
+        this.requested.add(id);
+      }
+      this.persist();
+      void this.tick();
+      throw error;
+    }
   }
 
   clearUserPause(id: string) {

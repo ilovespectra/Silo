@@ -159,7 +159,9 @@ export const MEMORY_PHOTO_PROMPTS: readonly string[] = [
 
 // Formats cameras and phones write; PNG/GIF/WebP/etc. are almost always screenshots or graphics.
 const CAMERA_EXTENSIONS = /\.(jpe?g|heic|heif|dng|cr2|cr3|nef|arw|orf|rw2|raf|pef|srw|tiff?)$/i;
-const MIN_CAMERA_BYTES = 150 * 1024;
+// Lower the floor for x64 builds so compressed phone JPEGs remain eligible on
+// Intel Macs and Windows x64. The later resolution and photo-quality checks still apply.
+export const PERSONAL_PHOTO_MIN_BYTES = process.arch === "x64" ? 50 * 1024 : 150 * 1024;
 const NON_PERSONAL_SEGMENT = /(^|[\\/])(node_modules|[^\\/]+\.(app|bundle|framework|plugin|asar)|Library[\\/](Caches|Containers|Application Support|Group Containers)|iTunes|Album ?Art(work)?|Artwork|Covers?|Icons?|Logos?|Thumbnails?|thumbs|\.thumbnails|Fonts?|Wallpapers?|Backgrounds?|Stock|Clip ?art|Emojis?|Stickers|Assets|Resources|Templates|Screenshots?|Screen Shots?|Memes?|Avatars?|Previews?)([\\/]|$)/i;
 const NON_PERSONAL_NAME = /^(cover|folder|front|back|cd\d?|disc\d?|albumart[^.]*|artwork|thumb[^.]*|icon[^.]*|logo[^.]*|avatar[^.]*|screenshot[^.]*|screen shot[^.]*|poster[^.]*|banner[^.]*)\.[a-z0-9]+$/i;
 
@@ -172,7 +174,7 @@ export function personalPhotoRejection(
   musicDirectories?: ReadonlySet<string>,
 ): PersonalPhotoRejection | null {
   if (!CAMERA_EXTENSIONS.test(filePath)) return "extension";
-  if (Number.isFinite(size) && (size as number) < MIN_CAMERA_BYTES) return "small";
+  if (Number.isFinite(size) && (size as number) < PERSONAL_PHOTO_MIN_BYTES) return "small";
   if (NON_PERSONAL_SEGMENT.test(path.dirname(filePath))) return "folder";
   if (NON_PERSONAL_NAME.test(path.basename(filePath))) return "name";
   if (musicDirectories?.has(path.dirname(filePath))) return "music";
@@ -196,6 +198,42 @@ export function isPersonalPhotoPath(
   musicDirectories?: ReadonlySet<string>,
 ): boolean {
   return personalPhotoRejection(filePath, size, musicDirectories) === null;
+}
+
+const PROMPTED_PHONE_PHOTO_MIN_BYTES = 24 * 1024;
+
+/**
+ * Prompted-video-only allowance for compressed photos on a connected phone.
+ * Keep camera formats and all path/name/music exclusions; only the local size
+ * cutoff is relaxed, with a hard 24 KB floor. General search and memory curation
+ * continue using isPersonalPhotoPath unchanged.
+ */
+export function isPromptedVideoPhotoEligible(
+  filePath: string,
+  size: number | undefined,
+  musicDirectories: ReadonlySet<string> | undefined,
+  isPhonePath: boolean,
+): boolean {
+  const structuralRejection = personalPhotoRejection(filePath, undefined, musicDirectories);
+  if (structuralRejection) return false;
+  if (personalPhotoRejection(filePath, size, musicDirectories) === null) return true;
+  return isPhonePath && Number.isFinite(size) && (size as number) >= PROMPTED_PHONE_PHOTO_MIN_BYTES;
+}
+
+/**
+ * A prompted video may include the one image currently being indexed when its
+ * vector has not landed yet. IndexProgress exposes only a basename, so require
+ * a unique path match; never pull in an arbitrary portion of a partial index.
+ */
+export function currentPromptedVideoIndexingImage<T extends { name: string; path: string }>(
+  images: readonly T[],
+  status: string,
+  currentFile: string | null,
+  alreadySelected: ReadonlySet<string>,
+): T | undefined {
+  if (status !== "indexing" || !currentFile) return undefined;
+  const matches = images.filter((image) => image.name === currentFile && !alreadySelected.has(image.path));
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 const DEMONYMS: Record<string, string> = {

@@ -33,6 +33,17 @@ export interface GeoIndexState {
 
 export type GeoIndexStatus = Omit<GeoIndexState, "photos">;
 
+function pathIsUnderSource(filePath: string, sourcePath: string) {
+  if (sourcePath.startsWith("/__"))
+    return filePath === sourcePath || filePath.startsWith(`${sourcePath}/`);
+  const relative = path.relative(path.resolve(sourcePath), path.resolve(filePath));
+  return relative === "" || (
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
 interface GeoCacheEntry {
   path: string;
   signature: string;
@@ -67,6 +78,7 @@ export class GeoIndexer {
     userDataPath: string,
     onProgress: ProgressListener,
     indexStoragePath: string = userDataPath,
+    private readonly resolveImagePath: (filePath: string) => Promise<string> = async (filePath) => filePath,
   ) {
     this.cachePath = path.join(indexStoragePath, "geo-index.jsonl");
     this.onProgress = onProgress;
@@ -236,10 +248,7 @@ export class GeoIndexer {
 
   start(images: IndexableFile[], sourcePaths: string[]) {
     this.pauseRequested = false;
-    const nextSources = sourcePaths.filter(
-      (sourcePath) => !sourcePath.startsWith("/__"),
-    );
-    const connectedSources = new Set(nextSources.map((sourcePath) => path.resolve(sourcePath)));
+    const nextSources = [...new Set(sourcePaths)];
     if (
       nextSources.some((sourcePath) => !this.activeSources.has(sourcePath)) ||
       nextSources.length !== this.activeSources.size
@@ -248,10 +257,7 @@ export class GeoIndexer {
     this.activeSources = new Set(nextSources);
     this.pauseRequested = false;
     this.latestImages = images
-      .filter((image) => !image.path.startsWith("/__") && Array.from(connectedSources).some((root) => {
-        const relative = path.relative(root, path.resolve(image.path));
-        return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
-      }))
+      .filter((image) => nextSources.some((root) => pathIsUnderSource(image.path, root)))
       .sort((first, second) => {
         const retryDifference =
           Number(this.invalidRetryPaths.has(second.path)) -
@@ -356,6 +362,7 @@ export class GeoIndexer {
     image: IndexableFile,
     sourcePath: string,
   ): Promise<GeoPhoto | null> {
+    const localPath = await this.resolveImagePath(image.path);
     let latitude: number | null = null;
     let longitude: number | null = null;
     let city: string | null = null;
@@ -363,7 +370,7 @@ export class GeoIndexer {
     let country: string | null = null;
 
     try {
-      const gps = await exifr.gps(image.path);
+      const gps = await exifr.gps(localPath);
       if (
         gps &&
         Number.isFinite(gps.latitude) &&
@@ -372,7 +379,7 @@ export class GeoIndexer {
         latitude = gps.latitude;
         longitude = gps.longitude;
       }
-      const metadata = (await exifr.parse(image.path, {
+      const metadata = (await exifr.parse(localPath, {
         pick: [
           "GPSLatitude",
           "GPSLatitudeRef",
@@ -421,7 +428,7 @@ export class GeoIndexer {
           "kMDItemStateOrProvince",
           "-name",
           "kMDItemCountry",
-          image.path,
+          localPath,
         ]);
         latitude = this.numberField(stdout, "kMDItemLatitude");
         longitude = this.numberField(stdout, "kMDItemLongitude");
@@ -459,11 +466,7 @@ export class GeoIndexer {
   private findSource(filePath: string): string {
     return (
       Array.from(this.activeSources)
-        .filter(
-          (sourcePath) =>
-            filePath === sourcePath ||
-            filePath.startsWith(`${sourcePath}${path.sep}`),
-        )
+        .filter((sourcePath) => pathIsUnderSource(filePath, sourcePath))
         .sort((first, second) => second.length - first.length)[0] ??
       path.dirname(filePath)
     );

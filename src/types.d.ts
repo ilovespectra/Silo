@@ -283,6 +283,12 @@ interface FileOperationResult {
   failed?: number;
 }
 
+interface DiagnosticUiUpdate {
+  section?: "files" | "people" | "map" | "duplicates" | "pets" | "mobile" | "memories" | "stats";
+  searchActive?: boolean;
+  viewerOpen?: boolean;
+}
+
 interface PersistedUiState {
   currentPath: string | null;
   exploded: boolean;
@@ -438,6 +444,8 @@ interface IndexingStageProgress {
   retryable?: number;
   detail?: string;
   canRetry?: boolean;
+  canPause?: boolean;
+  userPaused?: boolean;
   attempts?: number;
   recoveryError?: string;
   retryAt?: number;
@@ -1015,6 +1023,7 @@ interface Window {
       truncated?: boolean;
     }>;
     retryIndexingStage(id: string): Promise<{ ok: boolean }>;
+    pauseIndexingStage(id: string): Promise<{ ok: boolean }>;
     onThumbnailPregenProgress(
       callback: (progress: ThumbnailPregenProgress) => void,
     ): () => void;
@@ -1058,6 +1067,7 @@ interface Window {
     ): () => void;
     updateUiState(
       update: Partial<PersistedUiState>,
+      diagnosticUi?: DiagnosticUiUpdate,
     ): Promise<PersistedAppState>;
     selectIndexSource(): Promise<PersistedAppState | null>;
     addMachineSource(): Promise<PersistedAppState | null>;

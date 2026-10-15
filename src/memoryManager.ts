@@ -28,6 +28,8 @@ export interface MemoryAudioFile {
  */
 export interface MemoryManagerDependencies {
   search(query: string): Promise<MemoryMedia[]>;
+  /** Prompted videos use confidence-first personal-photo matching and never Magic order. */
+  searchPrompted?(query: string): Promise<MemoryMedia[]>;
   /** True when a story's movie is finished, so it can leave the editable set for the Memory Book. */
   hasMovie?(card: MemorySuggestion): Promise<boolean>;
   /** Magic's ordered image filter removes shots above the duplicate-similarity threshold. */
@@ -195,6 +197,26 @@ function mediaValue(value: unknown): MemoryMedia | undefined {
 
 function signature(media: MemoryMedia[]): string {
   return createHash("sha256").update(JSON.stringify(media.map(item => item.path).sort())).digest("hex");
+}
+
+const STORY_OVERLAP_THRESHOLD = 0.6;
+
+function storyImagePaths(media: MemoryMedia[]): Set<string> {
+  return new Set(media.filter(item => item.type === "image").map(item => item.path));
+}
+
+/** Reject a new story when most of its photos already make up a saved story. */
+function materiallyOverlapsStory(media: MemoryMedia[], existing: MemoryMedia[][]): boolean {
+  const incoming = storyImagePaths(media);
+  if (!incoming.size) return false;
+  for (const story of existing) {
+    const prior = storyImagePaths(story);
+    if (!prior.size) continue;
+    let shared = 0;
+    for (const filePath of incoming) if (prior.has(filePath)) shared++;
+    if (shared / Math.min(incoming.size, prior.size) >= STORY_OVERLAP_THRESHOLD) return true;
+  }
+  return false;
 }
 
 function audioId(filePath: string): string {
@@ -466,6 +488,7 @@ export class MemoryManager {
     hits: unknown,
     signatures: Set<string>,
     usedPaths: Set<string>,
+    existingStories: MemoryMedia[][],
   ): Promise<MemorySuggestion | null> {
     const reject = (reason: string, counts: Record<string, number> = {}) => {
       this.runRejections.set(reason, (this.runRejections.get(reason) ?? 0) + 1);
@@ -489,10 +512,14 @@ export class MemoryManager {
       const score = (hits[i] as MemoryMedia & { score?: number }).score;
       candidates.push({ media, score: typeof score === "number" && Number.isFinite(score) ? score : 1 - i / limit });
     }
-    const fresh = candidates.filter(item => !usedPaths.has(item.media.path));
-    const pool = fresh.filter(item => item.media.type === "image").length >= 4 ? fresh : candidates;
+    if (materiallyOverlapsStory(candidates.filter(item => item.media.type === "image").map(item => item.media), existingStories))
+      return reject("overlaps-existing-story", { hits: hits.length, allowed: candidates.length,
+        fresh: candidates.filter(item => !usedPaths.has(item.media.path)).length,
+        images: candidates.filter(item => item.media.type === "image").length });
+    // Do not refill a sparse prompt with photos already used by another story.
+    const pool = candidates.filter(item => !usedPaths.has(item.media.path));
     const ranked = pool.filter(item => item.media.type === "image").sort((a, b) => b.score - a.score);
-    const counts = { hits: hits.length, allowed: candidates.length, fresh: fresh.length, images: ranked.length,
+    const counts = { hits: hits.length, allowed: candidates.length, fresh: pool.length, images: ranked.length,
       invalid, duplicate, blocked, videos: pool.length - ranked.length };
     if (ranked.length < 4) return reject(hits.length ? "too-few-allowed-photos" : "no-search-hits", counts);
     // Best shot of each near-identical cluster survives; unverifiable sets are skipped, not wiped.
@@ -504,6 +531,8 @@ export class MemoryManager {
     const media = [...diverse(photos, MAX_MEDIA - videos.length), ...videos]
       .sort((a, b) => a.modified - b.modified || a.path.localeCompare(b.path));
     if (signatures.has(signature(media))) return reject("same-photos-as-existing-story", counts);
+    if (materiallyOverlapsStory(media, existingStories))
+      return reject("overlaps-existing-story", { ...counts, selected: media.filter(item => item.type === "image").length });
     for (let i = 0; i < media.length; i++) {
       const item = media[i];
       if (item.liveVideoPath && !await this.allowed(item.liveVideoPath)) delete item.liveVideoPath;
@@ -525,7 +554,8 @@ export class MemoryManager {
     const safeImages = safe.filter(item => item.type === "image").length;
     if (safeImages < 4) return reject("too-few-safe-photos", { ...counts, distinct: photos.length, safe: safeImages });
     if (signatures.has(signature(safe))) return reject("same-photos-as-existing-story", counts);
-    signatures.add(signature(safe));
+    if (materiallyOverlapsStory(safe, existingStories))
+      return reject("overlaps-existing-story", { ...counts, selected: safeImages });
     return {
       id: randomUUID(), title: idea.title, query: idea.query, mood: idea.mood,
       defaultDuration: getDefaultMemoryDuration(Math.min(MEMORY_DEFAULT_SELECTION_COUNT, safe.length)),
@@ -557,6 +587,7 @@ export class MemoryManager {
       this.trace("memory-generate-start", { replace, customTopic: Boolean(customTopic), want,
         current: current.length, reserve: reserve.length, savedCards: this.state.suggestions.length, savedReserve: this.reserve.length });
       const signatures = new Set([...current, ...reserve].map(card => signature(card.media)));
+      const existingStories = [...current, ...reserve].map(card => card.media);
       const usedKeys = new Set([...this.recentKeys,
         ...[...current, ...reserve].map(card => card.storyKey).filter((key): key is string => Boolean(key))]);
       const usedPaths = new Set(current.flatMap(card => card.media.map(item => item.path)));
@@ -572,6 +603,13 @@ export class MemoryManager {
           this.trace("memory-story-thin", { story: card.storyKey?.split(":")[0] ?? "theme", items: card.media.length });
           return;
         }
+        const cardSignature = signature(card.media);
+        if (signatures.has(cardSignature) || materiallyOverlapsStory(card.media, existingStories)) {
+          this.trace("memory-story-rejected", { story: card.storyKey?.split(":")[0] ?? "theme", reason: "overlaps-existing-story" });
+          return;
+        }
+        signatures.add(cardSignature);
+        existingStories.push(card.media);
         produced.push(card);
         card.media.forEach(item => usedPaths.add(item.path));
         if (card.storyKey) {
@@ -601,14 +639,14 @@ export class MemoryManager {
           ...tokenQueries.map((word) => `${word} photos`),
         ].filter((query) => query.length >= 3 && query.length <= 160))).slice(0, 12);
         let searchErrors = 0;
-        const mergedHits: MemoryMedia[] = [];
+        const mergedHits: (MemoryMedia & { score?: number })[] = [];
         const mergeSeen = new Set<string>();
         for (let index = 0; index < broadQueries.length; index++) {
           const query = broadQueries[index];
           try {
             const topicTitle = customTopicTitle(customTopic);
             advance("scanning", `Searching “${topicTitle}” (${index + 1}/${broadQueries.length})`, 1);
-            const hits = await this.deps.search(query);
+            const hits = await (this.deps.searchPrompted?.(query) ?? this.deps.search(query));
             if (!Array.isArray(hits)) {
               this.trace("memory-custom-query", { index, of: broadQueries.length, words: query.split(/\s+/).length, hits: -1 });
               continue;
@@ -618,7 +656,8 @@ export class MemoryManager {
               const media = mediaValue(candidate);
               if (!media || mergeSeen.has(media.path)) continue;
               mergeSeen.add(media.path);
-              mergedHits.push(media);
+              const score = (candidate as MemoryMedia & { score?: number }).score;
+              mergedHits.push(typeof score === "number" && Number.isFinite(score) ? { ...media, score } : media);
             }
             this.trace("memory-custom-query", { index, of: broadQueries.length, words: query.split(/\s+/).length,
               hits: hits.length, added: mergedHits.length - mergedBefore, merged: mergedHits.length });
@@ -628,14 +667,14 @@ export class MemoryManager {
               description: `A story shaped by “${customTopic}” from your library.`,
               query: customTopic,
               mood: customTopicMood(customTopic),
-            }, mergedHits, signatures, new Set());
+            }, mergedHits, signatures, usedPaths, existingStories);
             if (card && card.media.length >= MEMORY_MIN_SELECTION_COUNT) {
               take(card);
               advance("matching", `Found a memory for “${topicTitle}”`, 1);
               break;
             }
             // Keep merging queries; the latest merged card is the fullest fallback.
-            if (card) { thin.length = 0; thin.push(card); signatures.delete(signature(card.media)); }
+            if (card) { thin.length = 0; thin.push(card); }
           } catch (error) {
             searchErrors += 1;
             this.deps.onSearchError?.("custom-topic", error);
@@ -663,7 +702,7 @@ export class MemoryManager {
             this.deps.onSearchError?.("idea", error);
             continue;
           }
-          const card = await this.buildCard(idea, hits, signatures, usedPaths);
+          const card = await this.buildCard(idea, hits, signatures, usedPaths, existingStories);
           take(card);
         }
       }
@@ -675,13 +714,12 @@ export class MemoryManager {
         let hits: MemoryMedia[];
         try { hits = await this.deps.search(theme.query); } catch (error) { searchFailed = true; this.deps.onSearchError?.("theme", error); continue; }
         take(await this.buildCard({ ...theme, key: `theme:${theme.title}`,
-          description: `A ${theme.mood} story inspired by ${theme.title.toLowerCase()}.` }, hits, signatures, usedPaths));
+          description: `A ${theme.mood} story inspired by ${theme.title.toLowerCase()}.` }, hits, signatures, usedPaths, existingStories));
       }
 
       if (produced.length < want && thin.length) {
         const fallback = thin.sort((a, b) => b.media.length - a.media.length).slice(0, want - produced.length);
         this.trace("memory-thin-fallback", { used: fallback.length, items: fallback.map(card => card.media.length) });
-        if (customTopic && fallback[0]) signatures.add(signature(fallback[0].media));
         fallback.forEach(card => take(card, true));
       }
 

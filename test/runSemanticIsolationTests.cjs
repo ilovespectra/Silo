@@ -597,7 +597,8 @@ test("three native image crashes persist across restarts, quarantine only unchan
   });
   await restarted.initialize();
   await restarted.start([]);
-  assert.equal(restarted.getIndexedImages([sourcePath]).length, 2);
+  assert.equal(restarted.getIndexedImages([sourcePath]).length, 1,
+    "the unchanged repeat-crashing image remains quarantined while the healthy image is available");
   const changes = await restarted.reconcileIndex([sourcePath]);
   assert.equal(changes.has(trap), false, "unchanged HEIC must not be retried");
   assert.ok(
@@ -700,6 +701,72 @@ test("failed recovery writes retain work and late queued starts cannot restart a
   );
   assert.equal(saved.entries.length, 2);
   assert.ok(saved.sources.includes(queuedRoot));
+});
+
+test("index pause and retry requests survive process restarts at saved checkpoints", async (t) => {
+  const { IndexingRecovery } = loadSource("indexingRecovery.ts");
+  const stateDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "indexing-recovery-test-"),
+  );
+  t.after(() => fs.rmSync(stateDirectory, { recursive: true, force: true }));
+  const statePath = path.join(stateDirectory, "recovery.json");
+  let ready = false;
+  let progress = { status: "indexing", message: "Processing batch" };
+  let starts = 0;
+  const stage = {
+    id: "faces",
+    progress: () => progress,
+    ready: () => ready,
+    pause: async () => { progress = { status: "paused", message: "Paused at checkpoint" }; },
+    start: async () => {
+      starts += 1;
+      progress = { status: "complete", message: "Up to date" };
+    },
+  };
+
+  const firstProcess = new IndexingRecovery([stage], Date.now, statePath);
+  await firstProcess.pauseStage("faces");
+  assert.equal(firstProcess.details("faces").userPaused, true);
+
+  const afterPauseRestart = new IndexingRecovery([stage], Date.now, statePath);
+  assert.equal(afterPauseRestart.details("faces").userPaused, true);
+  await afterPauseRestart.retry("faces");
+  assert.equal(afterPauseRestart.details("faces").resumeQueued, true);
+  assert.equal(afterPauseRestart.details("faces").userPaused, false);
+
+  const afterQueuedRestart = new IndexingRecovery([stage], Date.now, statePath);
+  assert.equal(afterQueuedRestart.details("faces").resumeQueued, true);
+  ready = true;
+  await afterQueuedRestart.tick();
+  for (let attempt = 0; attempt < 20 && starts === 0; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(starts, 1, "the persisted retry starts after its dependency becomes ready");
+  for (let attempt = 0; attempt < 20 && afterQueuedRestart.details("faces").recoveryRunning; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(progress.status, "complete");
+  assert.equal(afterQueuedRestart.details("faces").recoveryRunning, false);
+  assert.equal(afterQueuedRestart.details("faces").resumeQueued, false);
+});
+
+test("a failed pause clears the false paused state and reports the failure", async (t) => {
+  const { IndexingRecovery } = loadSource("indexingRecovery.ts");
+  const stateDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "indexing-pause-failure-test-"),
+  );
+  t.after(() => fs.rmSync(stateDirectory, { recursive: true, force: true }));
+  const statePath = path.join(stateDirectory, "recovery.json");
+  const stage = {
+    id: "locations",
+    progress: () => ({ status: "indexing", message: "Reading GPS" }),
+    ready: () => false,
+    pause: async () => { throw new Error("checkpoint write failed"); },
+    start: async () => {},
+  };
+  const recovery = new IndexingRecovery([stage], Date.now, statePath);
+  await assert.rejects(recovery.pauseStage("locations"), /checkpoint write failed/);
+  assert.equal(recovery.details("locations").userPaused, false);
+  assert.equal(recovery.details("locations").resumeQueued, true);
+  assert.match(recovery.details("locations").recoveryError, /Pause failed/);
 });
 
 test("worker labels constructor failures as infrastructure rather than file errors", async () => {
@@ -1313,6 +1380,49 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
     Array.from(relaxedResults, (result) => result.path),
     ["/photos/high.jpg", "/photos/weak.jpg"],
   );
+});
+
+test("semantic search uses loaded vectors while the ANN index is still preparing", async (t) => {
+  const { indexer } = makeIndexer(t);
+  const vectorBytes = 512 * Float32Array.BYTES_PER_ELEMENT;
+  const buffer = Buffer.alloc(vectorBytes * 2);
+  buffer.writeFloatLE(0.84, 0);
+  buffer.writeFloatLE(0.42, vectorBytes);
+  fs.mkdirSync(path.dirname(indexer.vectorsPath), { recursive: true });
+  fs.writeFileSync(indexer.vectorsPath, buffer);
+  for (const [key, name] of [[0, "phone.jpg"], [1, "drive.jpg"]]) {
+    const record = {
+      path: `/photos/${name}`, sourcePath: "/photos", name, relativePath: name,
+      size: 300_000, modified: 1, type: "image", extension: ".jpg", signature: "fixture",
+      vectorOffset: key * vectorBytes,
+    };
+    indexer.latestRecords.set(record.path, record);
+    indexer.latestRecordsByVectorKey.set(key, record);
+  }
+  indexer.demoFilePaths = () => null;
+  indexer.loadClipRuntime = async () => ({});
+  indexer.embedText = async () => {
+    const vector = new Float32Array(512);
+    vector[0] = 1;
+    return vector;
+  };
+  indexer.vectorIndexReadyState = false;
+  indexer.persistedVectorIndex = {
+    search: async () => assert.fail("partial search must not wait for the ANN worker"),
+    shutdown: async () => {},
+  };
+
+  let timeout;
+  try {
+    const results = await Promise.race([
+      indexer.search("phone photos", 20, ["/photos"]),
+      new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("search waited for ANN readiness")), 1000); }),
+    ]);
+    assert.deepEqual(Array.from(results, (result) => result.path), ["/photos/phone.jpg", "/photos/drive.jpg"]);
+    assert.equal(Math.round(results[0].confidence), 84);
+  } finally {
+    clearTimeout(timeout);
+  }
 });
 
 test("filtered memory search ranks eligible photos before the 500-result cap", async (t) => {

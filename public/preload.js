@@ -141,6 +141,7 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("get-runtime-diagnostics", cursor),
   exportRuntimeDiagnostics: () => ipcRenderer.invoke("export-runtime-diagnostics"),
   retryIndexingStage: (id) => ipcRenderer.invoke("retry-indexing-stage", id),
+  pauseIndexingStage: (id) => ipcRenderer.invoke("pause-indexing-stage", id),
   onThumbnailPregenProgress: (callback) => {
     const listener = (_event, progress) => callback(progress);
     ipcRenderer.on("thumbnail-pregen-progress", listener);
@@ -206,7 +207,7 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.on("content-safety-changed", listener);
     return () => ipcRenderer.removeListener("content-safety-changed", listener);
   },
-  updateUiState: (update) => ipcRenderer.invoke("update-ui-state", update),
+  updateUiState: (update, diagnosticUi) => ipcRenderer.invoke("update-ui-state", update, diagnosticUi),
   selectIndexSource: () => ipcRenderer.invoke("select-index-source"),
   addMachineSource: () => ipcRenderer.invoke("add-machine-source"),
   removeIndexSource: (sourcePath) =>

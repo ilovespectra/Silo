@@ -354,8 +354,9 @@ export class MemoryTopicProfile {
 }
 
 /**
- * Debounced, single-flight trigger: waits for a quiet period, defers while indexing is
- * busy, never overlaps runs, and collapses notifications during a run into one rerun.
+ * Coalesced, single-flight trigger: a steady indexing stream cannot keep moving the
+ * refresh deadline, busy periods defer the work, and notifications during a run
+ * collapse into one later refresh.
  */
 export class RefreshScheduler {
   private timer: unknown = null;
@@ -375,7 +376,10 @@ export class RefreshScheduler {
       this.dirty = true;
       return;
     }
-    if (this.timer !== null) (this.options.clearTimer ?? ((handle) => clearTimeout(handle as NodeJS.Timeout)))(this.timer);
+    if (this.timer !== null) {
+      this.dirty = true;
+      return;
+    }
     const schedule = this.options.setTimer ?? ((callback, delay) => {
       const handle = setTimeout(callback, delay);
       handle.unref?.();

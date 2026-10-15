@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { FiAlertCircle, FiChevronDown, FiRefreshCw } from "react-icons/fi";
+import { FiAlertCircle, FiChevronDown, FiPause, FiPlay, FiRefreshCw } from "react-icons/fi";
 import { describeIndexingConnectionError } from "../utils/indexingConnection";
 
 const activeStatuses = new Set([
@@ -46,7 +46,13 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const retryNow = useRef<() => void>(() => undefined);
   const [retryingStage, setRetryingStage] = useState<string | null>(null);
-  const [stageRetryError, setStageRetryError] = useState<{
+  const [actingStage, setActingStage] = useState<string | null>(null);
+  const [stageActionNotice, setStageActionNotice] = useState<{
+    id: string;
+    kind: "pause" | "retry";
+    message: string;
+  } | null>(null);
+  const [stageActionError, setStageActionError] = useState<{
     id: string;
     message: string;
   } | null>(null);
@@ -63,21 +69,60 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
   useEffect(() => {
     onStagesChange?.(stages);
   }, [onStagesChange, stages]);
+  useEffect(() => {
+    if (!stageActionNotice) return;
+    const stage = stages.find((item) => item.id === stageActionNotice.id);
+    if (!stage) return;
+    const actionAccepted = stageActionNotice.kind === "pause"
+      ? stage.userPaused && stage.status === "paused"
+      : stage.recoveryRunning || stage.resumeQueued;
+    if (actionAccepted) setStageActionNotice(null);
+  }, [stageActionNotice, stages]);
   const retryStage = async (id: string) => {
     setRetryingStage(id);
-    setStageRetryError(null);
+    setStageActionError(null);
+    setStageActionNotice({ id, kind: "retry", message: "Queueing retry…" });
     try {
       if (!window.electron?.retryIndexingStage)
         throw new Error("Restart Silo to enable manual index retries.");
       await window.electron.retryIndexingStage(id);
+      setStageActionNotice({
+        id,
+        kind: "retry",
+        message: "Retry accepted · waiting for its processing slot…",
+      });
       retryNow.current();
     } catch (cause) {
-      setStageRetryError({
+      setStageActionNotice(null);
+      setStageActionError({
         id,
         message: cause instanceof Error ? cause.message : String(cause),
       });
     } finally {
       setRetryingStage(null);
+    }
+  };
+  const pauseStage = async (id: string) => {
+    setActingStage(id);
+    setStageActionError(null);
+    setStageActionNotice({
+      id,
+      kind: "pause",
+      message: "Pause requested · finishing the current checkpoint and saving progress…",
+    });
+    try {
+      if (!window.electron?.pauseIndexingStage)
+        throw new Error("Restart Silo to enable stage controls.");
+      await window.electron.pauseIndexingStage(id);
+      retryNow.current();
+    } catch (cause) {
+      setStageActionNotice(null);
+      setStageActionError({
+        id,
+        message: cause instanceof Error ? cause.message : String(cause),
+      });
+    } finally {
+      setActingStage(null);
     }
   };
   useEffect(() => {
@@ -194,6 +239,12 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
           Waiting: {sharedWaitReason}
         </p>
       )}
+      {stages.find((stage) => stage.persistenceError)?.persistenceError && (
+        <p className="indexing-panel-error" role="alert">
+          Indexing recovery state is unavailable: {stages.find((stage) => stage.persistenceError)?.persistenceError}
+          {" "}Your latest pause or retry choice may not survive an app restart.
+        </p>
+      )}
       {stages.map((stage) => {
         const processed = Math.max(0, Number(stage.processed) || 0);
         const total = Math.max(0, Number(stage.total) || 0);
@@ -210,7 +261,8 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
             ? stage.message
             : stageDescriptions[stage.id] ?? "Indexing files";
         const showStageReason =
-          (stage.status === "error" || stage.status === "paused") &&
+          (stage.status === "error" ||
+            (stage.status === "paused" && !stage.userPaused)) &&
           Boolean(stage.message?.trim());
         const resuming = !complete && (stage.recoveryRunning || stage.resumeQueued);
         // A paused note is redundant once a resume is already lined up.
@@ -226,8 +278,12 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
         let statusAlert = stage.status === "error" && Boolean(stageReason);
         if (complete) {
           statusText = "";
+        } else if (stageActionNotice?.id === stage.id) {
+          statusText = stageActionNotice.message;
+        } else if (stage.userPaused) {
+          statusText = "Paused · progress saved at the latest checkpoint";
         } else if (stage.recoveryRunning) {
-          statusText = "Resuming…";
+          statusText = "Retrying or resuming…";
         } else if (stage.resumeQueued) {
           statusText = ownBlockedReason ? `Queued · ${ownBlockedReason}` : "Queued";
         } else if (stage.recoveryError && stage.recoveryError !== stage.message) {
@@ -269,7 +325,11 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
             </small>
             {statusLine && (
               <small
-                role={statusLine.alert ? "alert" : undefined}
+                role={statusLine.alert
+                  ? "alert"
+                  : stageActionNotice?.id === stage.id || stage.userPaused
+                    ? "status"
+                    : undefined}
                 className="indexing-stage-errors"
                 style={stageErrorStyle}
                 title={statusLine.text}
@@ -277,15 +337,29 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
                 {statusLine.text}
               </small>
             )}
-            {stageRetryError?.id === stage.id && (
+            {stageActionError?.id === stage.id && (
               <small
                 role="alert"
                 className="indexing-stage-errors"
                 style={stageErrorStyle}
               >
-                {stageRetryError.message}
+                {stageActionError.message}
               </small>
             )}
+            {stage.canPause &&
+              !complete &&
+              !stage.userPaused &&
+              (running || stage.resumeQueued || stage.recoveryRunning) && (
+                <button
+                  className="indexing-retry-button"
+                  disabled={actingStage !== null || retryingStage !== null}
+                  title="Pause after the current checkpoint and save progress"
+                  aria-label={`Pause ${stage.label} after the current checkpoint`}
+                  onClick={() => void pauseStage(stage.id)}
+                >
+                  <FiPause aria-hidden="true" />
+                </button>
+              )}
             {stage.canRetry &&
               !stage.resumeQueued &&
               !stage.recoveryRunning &&
@@ -294,11 +368,13 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
                 stage.status === "error" ||
                 stage.status === "waiting" ||
                 stage.status === "idle" ||
+                stage.userPaused ||
                 stage.retryExhausted) && (
                 <button
                   className="indexing-retry-button"
                   disabled={
                     retryingStage !== null ||
+                    actingStage !== null ||
                     stage.resumeQueued ||
                     stage.recoveryRunning
                   }
@@ -311,8 +387,8 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
                       ? "Resume queued"
                       : stage.recoveryRunning
                         ? "Resuming…"
-                        : stage.status === "paused"
-                          ? "Resume indexing"
+                        : stage.userPaused || stage.status === "paused"
+                          ? "Resume indexing from saved progress"
                           : "Retry indexing"
                   }
                   aria-label={
