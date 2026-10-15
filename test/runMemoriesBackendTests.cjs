@@ -31,7 +31,7 @@ const {
 } = require("../src/memoryTypes.ts");
 const { MemoryManager } = require("../src/memoryManager.ts");
 const { AestheticScorer } = require("../src/aestheticScorer.ts");
-const { isPersonalPhotoPath } = require("../src/memoryDiscovery.ts");
+const { isPersonalPhotoPath, personalPhotoRejection, nonPersonalFolderKeyword } = require("../src/memoryDiscovery.ts");
 const exifr = require("exifr");
 
 // VM-realm objects fail strict deepEqual on prototype identity.
@@ -155,6 +155,9 @@ const context = vm.createContext({
   memoryMetadataSnapshot: null,
   MEMORY_PREVIEW_RENDER_VERSION: 7,
   isPersonalPhotoPath,
+  personalPhotoRejection,
+  nonPersonalFolderKeyword,
+  os: require("os"),
   exifr,
   audioLibraryCache: null,
   memoryMusicDirectoryCache: null,
@@ -174,6 +177,7 @@ function evaluate(source) {
 }
 for (const name of [
   "memoryFileMetadata", "memoryAllowed", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
+  "memoryTopCounts", "memoryPersonalRejectionSummary", "memoryErrorDetails",
   "memoryDot", "filterMemoryPhotos", "memoryNameMatches", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
   "memoryMusicDirectories", "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
   "memoryPreviewOptions", "memoryPreviewFileName", "memoryMovieDirectory", "findMemoryMovie", "runMemoryRender",

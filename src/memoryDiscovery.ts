@@ -163,6 +163,29 @@ const MIN_CAMERA_BYTES = 150 * 1024;
 const NON_PERSONAL_SEGMENT = /(^|[\\/])(node_modules|[^\\/]+\.(app|bundle|framework|plugin|asar)|Library[\\/](Caches|Containers|Application Support|Group Containers)|iTunes|Album ?Art(work)?|Artwork|Covers?|Icons?|Logos?|Thumbnails?|thumbs|\.thumbnails|Fonts?|Wallpapers?|Backgrounds?|Stock|Clip ?art|Emojis?|Stickers|Assets|Resources|Templates|Screenshots?|Screen Shots?|Memes?|Avatars?|Previews?)([\\/]|$)/i;
 const NON_PERSONAL_NAME = /^(cover|folder|front|back|cd\d?|disc\d?|albumart[^.]*|artwork|thumb[^.]*|icon[^.]*|logo[^.]*|avatar[^.]*|screenshot[^.]*|screen shot[^.]*|poster[^.]*|banner[^.]*)\.[a-z0-9]+$/i;
 
+export type PersonalPhotoRejection = "extension" | "small" | "folder" | "name" | "music";
+
+/** Why a path is not "a photo from the user's life", or null when it is. */
+export function personalPhotoRejection(
+  filePath: string,
+  size: number | undefined,
+  musicDirectories?: ReadonlySet<string>,
+): PersonalPhotoRejection | null {
+  if (!CAMERA_EXTENSIONS.test(filePath)) return "extension";
+  if (Number.isFinite(size) && (size as number) < MIN_CAMERA_BYTES) return "small";
+  if (NON_PERSONAL_SEGMENT.test(path.dirname(filePath))) return "folder";
+  if (NON_PERSONAL_NAME.test(path.basename(filePath))) return "name";
+  if (musicDirectories?.has(path.dirname(filePath))) return "music";
+  return null;
+}
+
+/** The generic folder keyword (e.g. "Thumbnails") that excluded a path; never user folder names. */
+export function nonPersonalFolderKeyword(filePath: string): string | null {
+  const match = NON_PERSONAL_SEGMENT.exec(path.dirname(filePath));
+  if (!match) return null;
+  return /\.(app|bundle|framework|plugin|asar)$/i.test(match[2]) ? "app-bundle" : match[2].toLowerCase().replace(/[\\/]/g, "/");
+}
+
 /**
  * Cheap path/size test for "a photo from the user's life": camera formats, real file
  * sizes, outside app bundles, artwork/icon folders, and folders that hold music (album art).
@@ -172,12 +195,7 @@ export function isPersonalPhotoPath(
   size: number | undefined,
   musicDirectories?: ReadonlySet<string>,
 ): boolean {
-  if (!CAMERA_EXTENSIONS.test(filePath)) return false;
-  if (Number.isFinite(size) && (size as number) < MIN_CAMERA_BYTES) return false;
-  if (NON_PERSONAL_SEGMENT.test(path.dirname(filePath)) || NON_PERSONAL_NAME.test(path.basename(filePath)))
-    return false;
-  if (musicDirectories?.has(path.dirname(filePath))) return false;
-  return true;
+  return personalPhotoRejection(filePath, size, musicDirectories) === null;
 }
 
 const DEMONYMS: Record<string, string> = {

@@ -279,6 +279,9 @@ export class MemoryManager {
     } catch { /* Progress display never affects generation. */ }
   }
 
+  /** Rejection reasons for the current generation run, summarised in memory-generate-result. */
+  private runRejections = new Map<string, number>();
+
   private trace(event: string, details: Record<string, unknown>) {
     try { this.deps.onTrace?.(event, details); } catch { /* Diagnostics never affect generation. */ }
   }
@@ -465,6 +468,7 @@ export class MemoryManager {
     usedPaths: Set<string>,
   ): Promise<MemorySuggestion | null> {
     const reject = (reason: string, counts: Record<string, number> = {}) => {
+      this.runRejections.set(reason, (this.runRejections.get(reason) ?? 0) + 1);
       this.trace("memory-story-rejected", { story: idea.key?.split(":")[0] ?? "theme", reason, ...counts });
       return null;
     };
@@ -472,9 +476,14 @@ export class MemoryManager {
     const candidates: { media: MemoryMedia; score: number }[] = [];
     const seen = new Set<string>();
     const limit = Math.min(hits.length, 200);
+    let invalid = 0;
+    let duplicate = 0;
+    let blocked = 0;
     for (let i = 0; i < limit; i++) {
       const media = mediaValue(hits[i]);
-      if (!media || seen.has(media.path) || !await this.allowed(media.path)) continue;
+      if (!media) { invalid++; continue; }
+      if (seen.has(media.path)) { duplicate++; continue; }
+      if (!await this.allowed(media.path)) { blocked++; continue; }
       seen.add(media.path);
       // Main can optionally supply a relevance score without changing the shared contract.
       const score = (hits[i] as MemoryMedia & { score?: number }).score;
@@ -483,7 +492,8 @@ export class MemoryManager {
     const fresh = candidates.filter(item => !usedPaths.has(item.media.path));
     const pool = fresh.filter(item => item.media.type === "image").length >= 4 ? fresh : candidates;
     const ranked = pool.filter(item => item.media.type === "image").sort((a, b) => b.score - a.score);
-    const counts = { hits: hits.length, allowed: candidates.length, fresh: fresh.length, images: ranked.length };
+    const counts = { hits: hits.length, allowed: candidates.length, fresh: fresh.length, images: ranked.length,
+      invalid, duplicate, blocked, videos: pool.length - ranked.length };
     if (ranked.length < 4) return reject(hits.length ? "too-few-allowed-photos" : "no-search-hits", counts);
     // Best shot of each near-identical cluster survives; unverifiable sets are skipped, not wiped.
     const distinct = await this.distinctImages(ranked.map(item => item.media.path));
@@ -528,6 +538,7 @@ export class MemoryManager {
   private async generateOnce(replace: boolean, customTopic?: string): Promise<MemoryState> {
     await this.initialize();
     const startedAt = Date.now();
+    this.runRejections = new Map();
     this.state.generating = true;
     this.state.generationProgress = { phase: "scanning", label: customTopic ? `Searching for “${customTopic}”...` : "Looking for memories...", progress: 0 };
     this.state.message = customTopic ? `Looking for “${customTopic}” in your library…` : "Looking for memories…";
@@ -598,13 +609,19 @@ export class MemoryManager {
             const topicTitle = customTopicTitle(customTopic);
             advance("scanning", `Searching “${topicTitle}” (${index + 1}/${broadQueries.length})`, 1);
             const hits = await this.deps.search(query);
-            if (!Array.isArray(hits)) continue;
+            if (!Array.isArray(hits)) {
+              this.trace("memory-custom-query", { index, of: broadQueries.length, words: query.split(/\s+/).length, hits: -1 });
+              continue;
+            }
+            const mergedBefore = mergedHits.length;
             for (const candidate of hits) {
               const media = mediaValue(candidate);
               if (!media || mergeSeen.has(media.path)) continue;
               mergeSeen.add(media.path);
               mergedHits.push(media);
             }
+            this.trace("memory-custom-query", { index, of: broadQueries.length, words: query.split(/\s+/).length,
+              hits: hits.length, added: mergedHits.length - mergedBefore, merged: mergedHits.length });
             const card = await this.buildCard({
               key: `custom:${createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16)}`,
               title: topicTitle,
@@ -641,7 +658,11 @@ export class MemoryManager {
           const idea = ordered[attempt];
           advance("matching", `Reviewing story ideas (${attempt + 1}/${ideaSteps})`, 1);
           let hits: unknown;
-          try { hits = await idea.load(); } catch (error) { this.deps.onSearchError?.("idea", error); continue; }
+          try { hits = await idea.load(); } catch (error) {
+            this.runRejections.set("idea-load-failed", (this.runRejections.get("idea-load-failed") ?? 0) + 1);
+            this.deps.onSearchError?.("idea", error);
+            continue;
+          }
           const card = await this.buildCard(idea, hits, signatures, usedPaths);
           take(card);
         }
@@ -705,7 +726,8 @@ export class MemoryManager {
       await this.persist();
       const count = this.state.suggestions.length;
       this.trace("memory-generate-result", { produced: produced.length, visible: count, reserve: this.reserve.length,
-        promoted, searchFailed, elapsedMs: Date.now() - startedAt });
+        promoted, searchFailed, thin: thin.length, elapsedMs: Date.now() - startedAt,
+        rejections: Array.from(this.runRejections).map(([reason, n]) => `${reason}:${n}`).join(",") });
       this.state.message = customTopic
         ? produced.length
           ? `Created a memory for “${customTopicTitle(customTopic)}”.`

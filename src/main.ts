@@ -118,6 +118,8 @@ import {
   TopicSignal,
   discoverMemoryStories,
   isPersonalPhotoPath,
+  nonPersonalFolderKeyword,
+  personalPhotoRejection,
 } from "./memoryDiscovery";
 import { MemoryTopicProfile, RefreshScheduler } from "./memoryTopicProfile";
 import * as exifr from "exifr";
@@ -2446,12 +2448,22 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   const candidatePaths = new Set(photoCandidates.map((file) => file.path));
   const musicDirectories = memoryMusicDirectories();
   const dropped = { notImage: 0, notAllowed: 0, notPersonal: 0 };
+  const nonPersonalMatches: { path: string; size?: number }[] = [];
+  const nonImageTypes = new Map<string, number>();
   for (const file of matches) {
     if (photoCandidates.length >= 160) break;
     if (candidatePaths.has(file.path)) continue;
-    if (file.type !== "image") { dropped.notImage++; continue; }
+    if (file.type !== "image") {
+      dropped.notImage++;
+      nonImageTypes.set(file.type || "unknown", (nonImageTypes.get(file.type || "unknown") ?? 0) + 1);
+      continue;
+    }
     if (!memoryAllowed(file.path)) { dropped.notAllowed++; continue; }
-    if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) { dropped.notPersonal++; continue; }
+    if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) {
+      dropped.notPersonal++;
+      nonPersonalMatches.push(file);
+      continue;
+    }
     candidatePaths.add(file.path);
     photoCandidates.push({ path: file.path, name: file.name, type: "image",
       modified: file.modified, size: file.size, score: file.confidence });
@@ -2480,7 +2492,11 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   const photos = selectMemoryPhotoCandidates(qualityPhotos).map(({ magicScore, ...photo }) => photo);
   runtimeLog("memory-search-trace", { stage: "photos", roots: roots.length, named: named.length, matches: matches.length, ...dropped,
     candidates: photoCandidates.length, distinct: magic.order.length, analyzed: magic.analyzed,
-    ranked: rankedPhotos.length, quality: qualityPhotos.length, selected: photos.length });
+    ranked: rankedPhotos.length, quality: qualityPhotos.length, selected: photos.length,
+    minConfidence: MEMORY_SEARCH_MIN_CONFIDENCE, magicRunning: magic.running, magicTotal: magic.total,
+    topMatchConfidence: matches.length ? Math.round(Math.max(...matches.map((m) => m.confidence ?? 0))) : 0,
+    nonImageTypes: memoryTopCounts(nonImageTypes),
+    ...(dropped.notPersonal ? memoryPersonalRejectionSummary(nonPersonalMatches, musicDirectories) : {}) });
   // Clips beside matched photos; first frames are classified on demand, never a library rescan.
   const directories = Array.from(new Set(photos
     .filter((file) => !isRemotePath(file.path))
@@ -2670,6 +2686,76 @@ async function applyMemoryPhotoQuality(media: ScoredMemoryMedia[]): Promise<Scor
 
 let memoryMusicDirectoryCache: { key: string; directories: Set<string> } | null = null;
 
+/** Top-N "key:count" list for compact, path-free diagnostics. */
+function memoryTopCounts(counts: Map<string, number>, limit = 8): string {
+  return Array.from(counts).sort((a, b) => b[1] - a[1]).slice(0, limit)
+    .map(([key, count]) => `${key}:${count}`).join(",");
+}
+
+/**
+ * Why indexed images were not treated as personal photos: reason counts, the
+ * extensions and generic folder keywords responsible. No names or paths.
+ */
+function memoryPersonalRejectionSummary(
+  files: { path: string; size?: number }[],
+  musicDirectories: ReadonlySet<string>,
+): Record<string, number | string> {
+  const reasons = { extension: 0, small: 0, folder: 0, name: 0, music: 0 };
+  const extensions = new Map<string, number>();
+  const folders = new Map<string, number>();
+  const remote = { personal: 0, rejected: 0 };
+  for (const file of files) {
+    const reason = personalPhotoRejection(file.path, file.size, musicDirectories);
+    if (isRemotePath(file.path)) remote[reason ? "rejected" : "personal"] += 1;
+    if (!reason) continue;
+    reasons[reason] += 1;
+    if (reason === "extension" || reason === "small") {
+      const extension = path.extname(file.path).toLowerCase().slice(1, 8) || "none";
+      const key = reason === "small" ? `${extension}<150k` : extension;
+      extensions.set(key, (extensions.get(key) ?? 0) + 1);
+    } else if (reason === "folder") {
+      const keyword = nonPersonalFolderKeyword(file.path) ?? "other";
+      folders.set(keyword, (folders.get(keyword) ?? 0) + 1);
+    }
+  }
+  return {
+    rejectedExtension: reasons.extension, rejectedSmall: reasons.small, rejectedFolder: reasons.folder,
+    rejectedName: reasons.name, rejectedMusicFolder: reasons.music,
+    rejectedFormats: memoryTopCounts(extensions), rejectedFolders: memoryTopCounts(folders),
+    remotePersonal: remote.personal, remoteRejected: remote.rejected,
+  };
+}
+
+/** Message and the first in-app stack frames, with home-directory paths reduced to "~". */
+function memoryErrorDetails(error: unknown): Record<string, string> {
+  const home = os.homedir();
+  const scrub = (value: string) => (home ? value.split(home).join("~") : value);
+  if (!(error instanceof Error)) return { message: scrub(String(error)).slice(0, 400) };
+  return {
+    name: error.name, message: scrub(error.message).slice(0, 400),
+    ...(error.stack ? { stack: scrub(error.stack.split("\n").slice(1, 5).map((line) => line.trim()).join(" | ")).slice(0, 600) } : {}),
+  };
+}
+
+/** Platform, model and indexer state at the moment memories are generated. */
+function memoryEnvironmentSnapshot(): Record<string, unknown> {
+  const progress = semanticIndexer?.getProgress();
+  const face = faceIndexer?.getProgress();
+  const pet = petIndexer?.getProgress();
+  const geo = geoIndexer?.getStatus();
+  const profile = memoryTopicProfile?.getSnapshot();
+  return {
+    platform: process.platform, arch: process.arch, appVersion: app.getVersion(),
+    indexLoaded: Boolean(semanticIndexer?.isLoaded()),
+    indexStatus: progress?.status ?? "missing", indexIndexed: progress?.indexed ?? 0,
+    indexRemaining: progress?.remaining ?? 0, indexErrors: progress?.errors ?? 0,
+    faceStatus: face?.status ?? "missing", petStatus: pet?.status ?? "missing",
+    geoStatus: geo?.status ?? "missing", geoTagged: geo?.geotagged ?? 0,
+    profileTopics: profile?.topics?.length ?? 0, profileSampled: profile?.sampledPhotos ?? 0,
+    profileBusy: memoryProfileBusy(),
+  };
+}
+
 /** Folders holding several audio files are album folders; their images are cover art. */
 function memoryMusicDirectories(): Set<string> {
   const snapshot = audioLibraryCache?.getSnapshot();
@@ -2699,12 +2785,17 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   const profile = getMemoryTopicProfile();
   await profile.refresh();
   const indexedImages = semanticIndexer.getIndexedImages(roots);
+  runtimeLog("memory-environment", { ...memoryEnvironmentSnapshot(), roots: roots.length,
+    remoteRoots: roots.filter((root) => isRemotePath(root)).length });
   const images = indexedImages
     .filter(personal)
     .map(({ path: filePath, modified }) => ({ path: filePath, modified, captured: profile.captureTimeOf(filePath) }));
+  const rejection = images.length < Math.max(40, indexedImages.length * 0.2)
+    ? memoryPersonalRejectionSummary(indexedImages, memoryMusicDirectories())
+    : {};
   if (images.length < 4) {
     runtimeLog("memory-discover-trace", { roots: roots.length, indexedImages: indexedImages.length,
-      personalImages: images.length, ideas: 0, reason: "fewer-than-4-personal-photos" });
+      personalImages: images.length, ideas: 0, reason: "fewer-than-4-personal-photos", ...rejection });
     return [];
   }
   const modified = new Map(images.map((image) => [image.path, image.captured ?? image.modified]));
@@ -2732,7 +2823,13 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   const ideas = discoverMemoryStories({ images, places, people, pets, concepts, topics: signals });
   runtimeLog("memory-discover-trace", { roots: roots.length, indexedImages: indexedImages.length,
     personalImages: images.length, topics: topics.length, concepts: concepts.length, places: places.length,
-    people: people.length, pets: pets.length, ideas: ideas.length });
+    people: people.length, pets: pets.length, ideas: ideas.length,
+    ideaKinds: memoryTopCounts(ideas.reduce((counts, idea) => {
+      const kind = idea.key.split(":")[0];
+      return counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    }, new Map<string, number>())),
+    peopleNamed: people.length, petPhotos: pets.reduce((sum, pet) => sum + pet.paths.length, 0),
+    ...rejection });
   return ideas
     .map((idea) => ({
       key: idea.key, title: idea.title, description: idea.description, query: idea.query, mood: idea.mood,
@@ -2895,8 +2992,8 @@ function prepareMemoryPreviews(suggestions: MemorySuggestion[]): Promise<void> {
 /** Visible cards first, then the reserve stockpile, all on the single render queue. */
 async function prepareAllMemoryPreviews(visible: MemorySuggestion[]): Promise<void> {
   const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
-  void prepareMemoryPreviews(visible).catch(() => runtimeLog("memory-preview-error"));
-  if (reserve.length) void prepareMemoryPreviews(reserve).catch(() => runtimeLog("memory-reserve-preview-error"));
+  void prepareMemoryPreviews(visible).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+  if (reserve.length) void prepareMemoryPreviews(reserve).catch((error) => runtimeLog("memory-reserve-preview-error", memoryErrorDetails(error)));
 }
 
 let memoryPreviewEmitTimer: NodeJS.Timeout | null = null;
@@ -2985,7 +3082,7 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
           } catch (error) {
             // A song that vanished mid-render (e.g. drive unplugged) falls back to the story's own audio.
             if (options.soundtrackId === originalAudioId) throw error;
-            runtimeLog("memory-preview-soundtrack-fallback", { message: error instanceof Error ? error.message : String(error) });
+            runtimeLog("memory-preview-soundtrack-fallback", memoryErrorDetails(error));
             const fallbackOptions = { ...options, soundtrackId: originalAudioId };
             const fallback = await verifyMemoryExport(fallbackOptions);
             await renderPreview(fallbackOptions, fallback.soundtrack);
@@ -2997,7 +3094,7 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
         await rememberMemoryMovieTitles([suggestion]).catch(() => undefined);
       } catch (error) {
         setMemoryPreviewStatus(suggestion.id, { status: "failed" });
-        runtimeLog("memory-preview-skipped", { message: error instanceof Error ? error.message : String(error) });
+        runtimeLog("memory-preview-skipped", memoryErrorDetails(error));
       }
     }
     // Keep movies of every visible and reserve story; delete only Silo-named leftovers.
@@ -7752,7 +7849,7 @@ app.whenReady().then(async () => {
     listAudio: () => audioLibraryCache?.getSnapshot().files ?? [],
     discover: discoverMemoryIdeas,
     onSearchError: (stage, error) => runtimeLog("memory-search-error", {
-      stage, message: error instanceof Error ? error.message : String(error),
+      stage, ...memoryErrorDetails(error), ...memoryEnvironmentSnapshot(),
     }),
     onTrace: (event, details) => runtimeLog(event, details),
     onGenerationProgress: (status) => sendToRenderer("memory-generation-progress", status),
@@ -7769,7 +7866,7 @@ app.whenReady().then(async () => {
   // reads join the preview queue instead of racing or failing with a busy error.
   void memoryManager.getState()
     .then((state) => prepareAllMemoryPreviews(state.suggestions))
-    .catch(() => runtimeLog("memory-preview-warmup-error"));
+    .catch((error) => runtimeLog("memory-preview-warmup-error", memoryErrorDetails(error)));
   scheduleAutomaticMemories();
   // even when the audio screen is closed, and retry failures once due.
   audioInventoryRetryTimer = setInterval(
@@ -8321,7 +8418,7 @@ async function retireMemoriesToBook(before: MemorySuggestion[], after: MemorySug
   const unfinished: MemorySuggestion[] = [];
   for (const card of retired) if (!await findMemoryMovie(card).catch(() => null)) unfinished.push(card);
   for (const card of unfinished) memoryBookPending.set(card.id, card);
-  if (unfinished.length) void prepareMemoryPreviews(unfinished).catch(() => runtimeLog("memory-book-preview-error"));
+  if (unfinished.length) void prepareMemoryPreviews(unfinished).catch((error) => runtimeLog("memory-book-preview-error", memoryErrorDetails(error)));
 }
 
 async function runMemoryGenerator(reason: string, replace = false) {
@@ -8330,7 +8427,7 @@ async function runMemoryGenerator(reason: string, replace = false) {
   if (replace) await retireMemoriesToBook(before, state.suggestions).catch(() => undefined);
   runtimeLog("memory-generate", { reason, count: state.suggestions.length });
   if (state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
+    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
   const next = { ...(await memoryStateWithPreviews()), message: state.message };
   sendToRenderer("memories-changed", next);
   return next;
@@ -8346,7 +8443,7 @@ function scheduleAutomaticMemories() {
     const reason = lastAutoMemoryRunAt === 0 ? "startup" : "scheduled";
     lastAutoMemoryRunAt = Date.now();
     void runMemoryGenerator(reason)
-      .catch((error) => runtimeLog("memory-auto-generate-error", { message: error instanceof Error ? error.message : String(error) }));
+      .catch((error) => runtimeLog("memory-auto-generate-error", memoryErrorDetails(error)));
   };
   autoMemoryTimer = setInterval(tick, AUTO_MEMORY_POLL_MS);
   setTimeout(tick, 15000);
@@ -8357,7 +8454,7 @@ ipcMain.handle("get-memories", async (_event, prepareViews: unknown) => {
   // Returns immediately; movies render in the background and report progress per card.
   const state = await memoryManager.getState();
   if (prepareViews === true && state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
+    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
   return memoryStateWithPreviews(state);
 });
 ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic: unknown) => {
@@ -8374,7 +8471,7 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
     try {
       return await runMemoryGenerator("on-demand", replace === true);
     } catch (error) {
-      runtimeLog("memory-generate-error", { message: error instanceof Error ? error.message : String(error) });
+      runtimeLog("memory-generate-error", memoryErrorDetails(error));
       const current = await memoryStateWithPreviews();
       return { ...current, message: "Memory generation hit a problem; your saved memories are unchanged." };
     }
@@ -8383,12 +8480,12 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
   try {
     state = await memoryManager.generate(replace === true, customTopic);
   } catch (error) {
-    runtimeLog("memory-generate-error", { message: error instanceof Error ? error.message : String(error) });
+    runtimeLog("memory-generate-error", memoryErrorDetails(error));
     const current = await memoryStateWithPreviews();
     return { ...current, message: "Memory generation hit a problem; your saved memories are unchanged." };
   }
   if (state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
+    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
   return { ...(await memoryStateWithPreviews()), message: state.message };
 });
 /**
@@ -8429,7 +8526,7 @@ ipcMain.handle("select-memory-directory", async () => {
   });
   const state = await memoryManager.updateSettings({ movieDirectory: directory });
   // Copy already-rendered movies over so saved stories stay viewable offline.
-  void prepareAllMemoryPreviews(state.suggestions).catch(() => runtimeLog("memory-preview-error"));
+  void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
   return state;
 });
 ipcMain.handle("dismiss-memory", (_event, id: unknown) => {
@@ -8479,7 +8576,7 @@ ipcMain.handle("set-memory-soundtrack", async (_event, id: unknown, soundtrackId
   if (!card) throw new Error("That song is no longer available. Choose another one.");
   // The watchable movie re-renders with the new song on the single background queue.
   memoryPreviewStatus.delete(id);
-  void prepareMemoryPreviews([card]).catch(() => runtimeLog("memory-preview-error"));
+  void prepareMemoryPreviews([card]).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
   return memoryStateWithPreviews();
 });
 async function openMemoryMovie(id: string, revealInFolder: boolean): Promise<{ ok: boolean; path?: string; error?: string; preparing?: boolean; upgradeRequired?: boolean }> {
@@ -10689,6 +10786,32 @@ async function readRuntimeDiagnostics(cursorValue: unknown) {
   return { entries, cursor: contentStart + consumedBytes, truncated };
 }
 
+/** Memory-generator events from a wider tail, so heartbeats cannot push them out of an export. */
+async function readMemoryDiagnostics(maxEntries = 400): Promise<Record<string, unknown>[]> {
+  const maxBytes = 4 * 1024 * 1024;
+  try {
+    const stats = await fsPromises.stat(diagnosticsPath);
+    const start = Math.max(0, stats.size - maxBytes);
+    const handle = await fsPromises.open(diagnosticsPath, "r");
+    let content = "";
+    try {
+      const buffer = Buffer.alloc(stats.size - start);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+      content = buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+    const lines = content.split("\n");
+    if (start > 0) lines.shift();
+    return lines.flatMap((line) => {
+      if (!line.includes('"event":"memory-')) return [];
+      try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
+    }).slice(-maxEntries);
+  } catch {
+    return [];
+  }
+}
+
 ipcMain.handle("get-runtime-diagnostics", (_event, cursor: unknown) => readRuntimeDiagnostics(cursor));
 ipcMain.handle("export-runtime-diagnostics", async (event) => {
   if (!mainWindow || event.sender !== mainWindow.webContents)
@@ -10709,6 +10832,7 @@ ipcMain.handle("export-runtime-diagnostics", async (event) => {
     architecture: process.arch,
     truncated: diagnostics.truncated,
     entries: diagnostics.entries,
+    memoryEntries: await readMemoryDiagnostics(),
   };
   const timestamp = report.exportedAt.replace(/[:.]/g, "-");
   let textPath = "";
@@ -10738,6 +10862,9 @@ ipcMain.handle("export-runtime-diagnostics", async (event) => {
     "",
     "Runtime events (filesystem paths may appear):",
     ...report.entries.map((entry) => JSON.stringify(entry)),
+    "",
+    `Memory generator events (${report.memoryEntries.length}):`,
+    ...report.memoryEntries.map((entry) => JSON.stringify(entry)),
     "",
   ].join("\n");
   try {
