@@ -35,6 +35,7 @@ type SettingsPageId =
   | "backup"
   | "privacy"
   | "performance"
+  | "statistics"
   | "cache"
   | "memories"
   | "password"
@@ -52,17 +53,18 @@ interface SettingsPageDefinition {
 }
 
 const SETTINGS_PAGES: SettingsPageDefinition[] = [
-  { id: "update", label: "Software update", description: "Keep Silo current and manage your license.", icon: FiDownload, tint: "#3b82f6", keywords: "version upgrade install download release license lifetime demo purchase", section: 0 },
-  { id: "bug", label: "Report a bug", description: "Tell us about a problem or a confusing feature.", icon: FaBug, tint: "#ef4444", keywords: "problem feedback issue crash screenshot diagnostics", section: 0 },
-  { id: "appearance", label: "Appearance & behavior", description: "Theme and Map behavior.", icon: FiSliders, tint: "#8b5cf6", keywords: "theme dark light system map globe rotation textures", section: 1 },
-  { id: "share", label: "Share a library", description: "Let family browse and save originals on your local network.", icon: FiShare2, tint: "#10b981", keywords: "wifi network family link qr phone browse download", section: 1 },
-  { id: "backup", label: "Backup & restore", description: "Save Silo's whole setup to one file and restore it later.", icon: FiArchive, tint: "#0ea5e9", keywords: "export import config configuration reinstall restore", section: 1 },
-  { id: "privacy", label: "Privacy & safety", description: "Explicit content is hidden and blocked from search by default.", icon: FiShield, tint: "#64748b", keywords: "nsfw safe search explicit banned people parental content protection", section: 1 },
-  { id: "performance", label: "Performance", description: "How much CPU time search and indexing can use.", icon: FiCpu, tint: "#f59e0b", keywords: "cpu threads indexing speed pace statistics dashboard", section: 1 },
+  { id: "update", label: "Software update", description: "Keep Silo current and manage your license.", icon: FiDownload, tint: "#986b47", keywords: "version upgrade install download release license lifetime demo purchase", section: 0 },
+  { id: "bug", label: "Report a bug", description: "Tell us about a problem or a confusing feature.", icon: FaBug, tint: "#806b5b", keywords: "problem feedback issue crash screenshot diagnostics", section: 0 },
+  { id: "appearance", label: "Appearance & behavior", description: "Theme and Map behavior.", icon: FiSliders, tint: "#82756a", keywords: "theme dark light system map globe rotation textures", section: 1 },
+  { id: "share", label: "Share a library", description: "Let family browse and save originals on your local network.", icon: FiShare2, tint: "#8d6549", keywords: "wifi network family link qr phone browse download", section: 1 },
+  { id: "backup", label: "Backup & restore", description: "Save Silo's whole setup to one file and restore it later.", icon: FiArchive, tint: "#746c65", keywords: "export import config configuration reinstall restore", section: 1 },
+  { id: "privacy", label: "Privacy & safety", description: "Explicit content is hidden and blocked from search by default.", icon: FiShield, tint: "#696560", keywords: "nsfw safe search explicit banned people parental content protection", section: 1 },
+  { id: "performance", label: "Performance", description: "How much CPU time search and indexing can use.", icon: FiCpu, tint: "#986b47", keywords: "cpu threads indexing speed pace", section: 1 },
+  { id: "statistics", label: "Library statistics", description: "Inventory, source coverage, indexing and backup health.", icon: FiBarChart2, tint: "#78716c", keywords: "statistics dashboard totals inventory sources coverage indexing backup shelter", section: 1 },
   { id: "cache", label: "Silo cache destination", description: "Where indexes, faces, places, thumbnails and previews are stored.", icon: FiHardDrive, tint: "#78716c", keywords: "cache index thumbnails previews external drive storage fallback", section: 2 },
-  { id: "memories", label: "Memory destination", description: "Where Memory movies are saved so they play without the source drive.", icon: FiFilm, tint: "#ec4899", keywords: "memories movies videos folder storage", section: 2 },
-  { id: "password", label: "Password", description: "The parental password that protects content settings.", icon: FiLock, tint: "#6366f1", keywords: "parental password change create", section: 2 },
-  { id: "help", label: "Help & documentation", description: "Guides, walkthroughs and troubleshooting.", icon: FiBookOpen, tint: "#14b8a6", keywords: "docs documentation guide github source walkthrough", section: 3 },
+  { id: "memories", label: "Memory destination", description: "Where Memory movies are saved so they play without the source drive.", icon: FiFilm, tint: "#8d6549", keywords: "memories movies videos folder storage", section: 2 },
+  { id: "password", label: "Password", description: "The parental password that protects content settings.", icon: FiLock, tint: "#696560", keywords: "parental password change create", section: 2 },
+  { id: "help", label: "Help & documentation", description: "Guides, walkthroughs and troubleshooting.", icon: FiBookOpen, tint: "#82756a", keywords: "docs documentation guide github source walkthrough", section: 3 },
 ];
 
 /** Guided-tour targets and the Settings page that contains them. */
@@ -73,7 +75,7 @@ const SETTINGS_TOUR_PAGES: Record<string, SettingsPageId> = {
   '[data-tour="settings-backup"]': "backup",
   '[data-tour="content-protection"]': "privacy",
   '[data-tour="settings-performance"]': "performance",
-  '[data-tour="library-statistics"]': "performance",
+  '[data-tour="library-statistics"]': "statistics",
   '[data-tour="settings-cache-destination"]': "cache",
   '[data-tour="settings-memories"]': "memories",
   '[data-tour="settings-password"]': "password",
@@ -1587,10 +1589,10 @@ export default function SettingsPanel({
           </>
         );
       case "performance":
+        return <PerformanceSettingsSection />;
+      case "statistics":
         return (
           <>
-            <PerformanceSettingsSection />
-            <h4 className="settings-group-label">Library</h4>
             <section
               className="settings-card settings-statistics-section"
               data-tour="library-statistics"

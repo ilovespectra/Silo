@@ -467,7 +467,7 @@ body {
   gap: 10px;
   padding: 18px 10px 12px;
   border-right: 1px solid var(--line);
-  background: var(--surface-inset);
+  background: linear-gradient(180deg, var(--surface-sidebar), var(--surface-inset));
 }
 .settings-sidebar > h2 {
   margin: 0 8px;
@@ -522,7 +522,7 @@ body {
   width: 100%;
   height: 32px;
   padding: 0 8px;
-  border: 0;
+  border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
   color: var(--text);
@@ -537,11 +537,12 @@ body {
   white-space: nowrap;
 }
 .settings-nav button:hover {
-  background: rgba(127, 127, 127, 0.12);
+  background: rgba(166, 164, 158, 0.12);
 }
 .settings-nav button.active {
-  background: var(--orange);
-  color: #17110c;
+  background: linear-gradient(180deg, rgba(199, 122, 61, 0.3), rgba(199, 122, 61, 0.18));
+  color: var(--text);
+  border: 1px solid rgba(199, 122, 61, 0.42);
   font-weight: 600;
 }
 .settings-nav-divider {
@@ -571,7 +572,7 @@ body {
   background: var(--orange);
 }
 .settings-nav button.active .settings-nav-dot {
-  background: #17110c;
+  background: var(--orange-bright);
 }
 .settings-nav-empty {
   margin: 8px;

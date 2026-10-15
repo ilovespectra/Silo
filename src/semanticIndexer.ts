@@ -1749,6 +1749,7 @@ export class SemanticIndexer {
     sourcePaths: string[],
     isCancelled: () => boolean = () => false,
     onSearchProgress?: SearchProgressListener,
+    include?: (file: { path: string; size: number; type: string }) => boolean,
   ): Promise<SearchResult[]> {
     const confidenceThreshold = Number.isFinite(minimumConfidence)
       ? Math.max(0, Math.min(100, minimumConfidence))
@@ -1765,6 +1766,7 @@ export class SemanticIndexer {
         sourcePaths,
         isCancelled,
         onSearchProgress,
+        include,
       );
     } finally {
       this.activeSearchCount = Math.max(0, this.activeSearchCount - 1);
@@ -2047,6 +2049,7 @@ export class SemanticIndexer {
     sourcePaths: string[],
     isCancelled: () => boolean,
     onSearchProgress?: SearchProgressListener,
+    include?: (file: { path: string; size: number; type: string }) => boolean,
   ): Promise<SearchResult[]> {
     const cleanQuery = query.trim();
     if (isCancelled() || !cleanQuery || sourcePaths.length === 0) return [];
@@ -2074,12 +2077,13 @@ export class SemanticIndexer {
 
     const indexedRecordCount = this.latestRecordsByVectorKey.size;
     let hits: Array<{ key: number; confidence: number }>;
-    if (this.vectorIndexFailed) {
+    if (this.vectorIndexFailed || include) {
       hits = await this.exactVectorSearch(
         sourcePaths,
         searchEmbeddings.image,
         searchEmbeddings.document,
         isCancelled,
+        include,
       );
     } else {
       if (!(await this.waitForVectorIndexReady(isCancelled))) return [];
@@ -2131,14 +2135,20 @@ export class SemanticIndexer {
     imageQuery: Float32Array,
     documentQuery: Float32Array,
     isCancelled: () => boolean,
+    include?: (file: { path: string; size: number; type: string }) => boolean,
   ): Promise<Array<{ key: number; confidence: number }>> {
     const sources = new Set(sourcePaths);
+    const demoPaths = include ? this.demoFilePaths(sourcePaths) : null;
     const wanted = new Map<number, boolean>();
     for (const [key, record] of this.latestRecordsByVectorKey)
-      if (sources.has(record.sourcePath) && record.vectorOffset >= 0)
+      if (sources.has(record.sourcePath) && record.vectorOffset >= 0 &&
+        (!include || ((!demoPaths || demoPaths.has(record.path)) && include(record))))
         wanted.set(key, record.type === "image");
     if (!wanted.size) return [];
-    const handle = await fsPromises.open(this.vectorsPath, "r").catch(() => null);
+    const handle = await fsPromises.open(this.vectorsPath, "r").catch((error: unknown) => {
+      if (include) throw error;
+      return null;
+    });
     if (!handle) return [];
     const imageHits: Array<{ key: number; confidence: number }> = [];
     const documentHits: Array<{ key: number; confidence: number }> = [];
@@ -2170,6 +2180,12 @@ export class SemanticIndexer {
           });
         }
         await new Promise<void>((resolve) => setImmediate(resolve));
+        for (const hits of include ? [imageHits, documentHits] : []) {
+          if (hits.length > SEARCH_RESULT_PRUNE_THRESHOLD) {
+            hits.sort((first, second) => second.confidence - first.confidence);
+            hits.length = SEARCH_RESULTS_PER_TYPE;
+          }
+        }
       }
     } finally {
       await handle.close();

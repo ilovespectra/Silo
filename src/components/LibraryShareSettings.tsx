@@ -117,6 +117,8 @@ export default function LibraryShareSettings() {
                 size={148}
                 level="M"
                 includeMargin
+                bgColor="transparent"
+                fgColor="var(--text, #f4f1ed)"
                 title="QR code for the Silo share link"
               />
             </div>

@@ -81,10 +81,10 @@
   min-width: 0;
   flex: 1 1 auto;
   padding: 9px 10px;
-  border: 1px solid var(--border-color, #deded8);
+  border: 1px solid var(--line, #2c2c30);
   border-radius: 9px;
-  background: var(--surface-color, #fff);
-  color: inherit;
+  background: var(--surface-control, #1b1b1e);
+  color: var(--text, #f4f1ed);
   font-size: 12px;
 }
 
@@ -103,18 +103,19 @@
   gap: 14px;
   margin: 14px 0;
   padding: 12px;
-  border: 1px solid var(--border-color, #deded8);
+  border: 1px solid var(--line, #2c2c30);
   border-radius: 12px;
-  background: var(--surface-color, #fff);
+  background: var(--surface-control, #1b1b1e);
 }
 
 .library-share-qr {
   display: grid;
   flex: 0 0 auto;
   place-items: center;
-  padding: 5px;
-  border-radius: 7px;
-  background: #fff;
+  padding: 8px;
+  border: 1px solid var(--line, #2c2c30);
+  border-radius: 9px;
+  background: var(--surface-inset, #09090a);
 }
 
 .library-share-pairing-copy {

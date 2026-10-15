@@ -5428,7 +5428,7 @@ function App() {
                 data-tour="help-button"
                 data-help="Search the built-in local help and replay the guided tour; no live AI or network call is used."
               >
-                <FiHelpCircle /> Help
+                <FiHelpCircle aria-hidden="true" />
               </button>
             </nav>
           </div>

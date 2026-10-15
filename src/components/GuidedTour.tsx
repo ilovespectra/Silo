@@ -304,7 +304,7 @@ const ALL_GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "statistics",
     title: "Check library statistics",
-    body: "Open Settings and choose Open statistics dashboard to explore the full Library Statistics page. It summarizes inventory, source coverage, indexing, and backup health so you can confirm what Silo can currently see and which work is still in progress.",
+    body: "Open Settings and choose Library statistics in the sidebar to access the full dashboard. It summarizes inventory, source coverage, indexing, and backup health so you can confirm what Silo can currently see and which work is still in progress.",
     target: '[data-tour="library-statistics"]',
     section: "settings",
   },

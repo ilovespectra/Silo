@@ -1315,6 +1315,46 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
   );
 });
 
+test("filtered memory search ranks eligible photos before the 500-result cap", async (t) => {
+  const { indexer } = makeIndexer(t);
+  await indexer.loaded;
+  const count = 540;
+  const bytes = 512 * Float32Array.BYTES_PER_ELEMENT;
+  const buffer = Buffer.alloc(count * bytes);
+  for (let key = 0; key < count; key++) {
+    buffer.writeFloatLE(key < 520 ? 0.95 : 0.3, key * bytes);
+    const name = key < 520 ? `asset-${key}.png` : `IMG_${key}.jpg`;
+    const record = { path: `/photos/${name}`, sourcePath: "/photos", name, relativePath: name,
+      vectorOffset: key * bytes, type: "image", size: 200000, modified: 1, extension: path.extname(name), signature: "fixture" };
+    indexer.latestRecordsByVectorKey.set(key, record);
+  }
+  fs.mkdirSync(path.dirname(indexer.vectorsPath), { recursive: true });
+  fs.writeFileSync(indexer.vectorsPath, buffer);
+  indexer.loadClipRuntime = async () => ({});
+  indexer.embedText = async () => {
+    const vector = new Float32Array(512);
+    vector[0] = 1;
+    return vector;
+  };
+  indexer.persistedVectorIndex = { search: async () => assert.fail("filtered search must not cap unfiltered ANN hits"), shutdown: async () => {} };
+  const hits = await indexer.search("holiday", 20, ["/photos"], () => false, undefined,
+    (file) => file.type === "image" && file.path.endsWith(".jpg"));
+  assert.equal(hits.length, 20);
+  assert(hits.every((file) => file.path.endsWith(".jpg") && Math.abs(file.confidence - 30) < 0.001));
+  assert.equal((await indexer.search("holiday", 40, ["/photos"], () => false, undefined,
+    (file) => file.path.endsWith(".jpg"))).length, 0);
+  assert.equal((await indexer.search("holiday", 20, ["/offline"], () => false, undefined,
+    (file) => file.path.endsWith(".jpg"))).length, 0);
+  assert.equal((await indexer.search("holiday", 20, ["/photos"], () => true, undefined,
+    (file) => file.path.endsWith(".jpg"))).length, 0);
+  indexer.demoFilePaths = () => new Set(["/photos/IMG_520.jpg"]);
+  assert.equal((await indexer.search("holiday", 20, ["/photos"], () => false, undefined,
+    (file) => file.path.endsWith(".jpg"))).length, 1);
+  fs.unlinkSync(indexer.vectorsPath);
+  await assert.rejects(indexer.search("holiday", 20, ["/photos"], () => false, undefined,
+    (file) => file.path.endsWith(".jpg")), { code: "ENOENT" });
+});
+
 test("semantic search discards results when cancelled during embedding", async (t) => {
   let cancelled = false;
   const { indexer } = makeIndexer(t);

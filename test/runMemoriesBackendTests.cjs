@@ -76,6 +76,7 @@ const progress = { semantic: "complete", face: "complete" };
 const context = vm.createContext({
   console, path, os, URL, Buffer, Date, Math, Number, String, Array, Set, Map, Object, Error, Promise,
   Float32Array, JSON,
+  process: { arch: "arm64" },
   createHash: crypto.createHash,
   fsPromises: {
     ...fsp,
@@ -199,6 +200,44 @@ async function test(name, body) {
 }
 
 async function run() {
+  await test("x64 memory search filters graphics before the result cap; arm64 keeps its existing search", async () => {
+    const originalSearch = context.semanticIndexer.search;
+    const originalArch = context.process.arch;
+    const originalBanned = context.banned;
+    const graphics = Array.from({ length: 500 }, (_, i) => ({
+      path: path.join(library, `asset-${i}.png`), name: `asset-${i}.png`,
+      type: "image", size: 200000, modified: i, confidence: 95,
+    }));
+    const photos = Array.from({ length: 20 }, (_, i) => ({
+      path: path.join(library, `IMG_${i}.jpg`), name: `IMG_${i}.jpg`,
+      type: "image", size: 200000, modified: i, confidence: 30,
+    }));
+    let filteredCalls = 0;
+    let enoughPhotos = false;
+    const blocked = { ...photos[0], path: path.join(library, "IMG_blocked.jpg") };
+    context.banned = new Set([blocked.path]);
+    context.semanticIndexer.search = async (_query, confidence, roots, _cancel, _progress, include) => {
+      assert.equal(confidence, 20);
+      if (!include) return enoughPhotos ? photos : graphics;
+      filteredCalls++;
+      return [...graphics, ...photos, blocked].filter(include);
+    };
+    try {
+      for (const arch of ["arm64", "x64"]) {
+        context.process.arch = arch;
+        const hits = await context.searchMemoryMedia("holiday");
+        assert.equal(hits.filter((file) => file.type === "image").length, arch === "x64" ? 20 : 0);
+        assert(!hits.some((file) => file.path === blocked.path));
+      }
+      enoughPhotos = true;
+      assert.equal((await context.searchMemoryMedia("holiday")).filter((file) => file.type === "image").length, 20);
+      assert.equal(filteredCalls, 1);
+    } finally {
+      context.semanticIndexer.search = originalSearch;
+      context.process.arch = originalArch;
+      context.banned = originalBanned;
+    }
+  });
   await test("Magic threshold prioritizes 90+ photos and fills brisk cuts with the best lower scores", async () => {
     const candidates = Array.from({ length: 26 }, (_, index) => ({
       path: `/photo-${index}.jpg`, score: 100 - index, magicScore: index < 8 ? 98 - index : 89 - index,

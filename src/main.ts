@@ -2450,23 +2450,39 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   const dropped = { notImage: 0, notAllowed: 0, notPersonal: 0 };
   const nonPersonalMatches: { path: string; size?: number }[] = [];
   const nonImageTypes = new Map<string, number>();
-  for (const file of matches) {
-    if (photoCandidates.length >= 160) break;
-    if (candidatePaths.has(file.path)) continue;
-    if (file.type !== "image") {
-      dropped.notImage++;
-      nonImageTypes.set(file.type || "unknown", (nonImageTypes.get(file.type || "unknown") ?? 0) + 1);
-      continue;
+  const collectPhotos = (results: typeof matches) => {
+    for (const file of results) {
+      if (photoCandidates.length >= 160) break;
+      if (candidatePaths.has(file.path)) continue;
+      if (file.type !== "image") {
+        dropped.notImage++;
+        nonImageTypes.set(file.type || "unknown", (nonImageTypes.get(file.type || "unknown") ?? 0) + 1);
+        continue;
+      }
+      if (!memoryAllowed(file.path)) { dropped.notAllowed++; continue; }
+      if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) {
+        dropped.notPersonal++;
+        nonPersonalMatches.push(file);
+        continue;
+      }
+      candidatePaths.add(file.path);
+      photoCandidates.push({ path: file.path, name: file.name, type: "image",
+        modified: file.modified, size: file.size, score: file.confidence });
     }
-    if (!memoryAllowed(file.path)) { dropped.notAllowed++; continue; }
-    if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) {
-      dropped.notPersonal++;
-      nonPersonalMatches.push(file);
-      continue;
-    }
-    candidatePaths.add(file.path);
-    photoCandidates.push({ path: file.path, name: file.name, type: "image",
-      modified: file.modified, size: file.size, score: file.confidence });
+  };
+  collectPhotos(matches);
+  // On x64, graphics can fill the entire top-500 image window. Filter before
+  // ranking in the sparse case rather than relaxing personal-photo or safety rules.
+  const filteredSearch = process.arch === "x64" && photoCandidates.length < MEMORY_MIN_SELECTION_COUNT;
+  let filteredMatches = 0;
+  if (filteredSearch) {
+    const eligibleMatches = await semanticIndexer.search(
+      query, MEMORY_SEARCH_MIN_CONFIDENCE, roots, () => false, undefined,
+      (file) => file.type === "image" && memoryAllowed(file.path) &&
+        isPersonalPhotoPath(file.path, file.size, musicDirectories),
+    );
+    filteredMatches = eligibleMatches.length;
+    collectPhotos(eligibleMatches);
   }
   const magic: MagicRankResult = photoCandidates.length
     ? await aestheticScorer.rankDistinct(photoCandidates.map(({ path: filePath, name, size, modified }) =>
@@ -2493,7 +2509,7 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   runtimeLog("memory-search-trace", { stage: "photos", roots: roots.length, named: named.length, matches: matches.length, ...dropped,
     candidates: photoCandidates.length, distinct: magic.order.length, analyzed: magic.analyzed,
     ranked: rankedPhotos.length, quality: qualityPhotos.length, selected: photos.length,
-    minConfidence: MEMORY_SEARCH_MIN_CONFIDENCE, magicRunning: magic.running, magicTotal: magic.total,
+    minConfidence: MEMORY_SEARCH_MIN_CONFIDENCE, filteredSearch, filteredMatches, magicRunning: magic.running, magicTotal: magic.total,
     topMatchConfidence: matches.length ? Math.round(Math.max(...matches.map((m) => m.confidence ?? 0))) : 0,
     nonImageTypes: memoryTopCounts(nonImageTypes),
     ...(dropped.notPersonal ? memoryPersonalRejectionSummary(nonPersonalMatches, musicDirectories) : {}) });
