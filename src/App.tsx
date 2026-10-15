@@ -773,6 +773,7 @@ function App() {
     defaultContentSettings,
   );
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsTourTarget, setSettingsTourTarget] = useState<string | null>(null);
   const [showBugReport, setShowBugReport] = useState(false);
   const [indexingDiagnosticReport, setIndexingDiagnosticReport] =
     useState<DiagnosticReport | null>(null);
@@ -1303,6 +1304,7 @@ function App() {
   useEffect(() => {
     if (!electronAPI?.onDemoLimitReached) return;
     return electronAPI.onDemoLimitReached(() => {
+      setSettingsTourTarget('[data-tour="settings-license"]');
       setShowSettings(true);
       setLifetimePromptRequest((request) => request + 1);
     });
@@ -1559,9 +1561,11 @@ function App() {
       ? step.target === '[data-tour="duplicate-trash-actions"]' ? "trash" : "duplicates"
       : null);
     if (section === "settings") {
+      setSettingsTourTarget(step.target);
       setShowSettings(true);
       return;
     }
+    setSettingsTourTarget(null);
     setShowSettings(false);
     setAppSection(section);
   }, []);
@@ -8449,7 +8453,11 @@ function App() {
         <SettingsPanel
           settings={contentSettings}
           onChange={setContentSettings}
-          onClose={() => setShowSettings(false)}
+          focusTarget={settingsTourTarget}
+          onClose={() => {
+            setShowSettings(false);
+            setSettingsTourTarget(null);
+          }}
           onOpenBugReport={() => setShowBugReport(true)}
           onOpenStatistics={() => {
             setAppSection("stats");

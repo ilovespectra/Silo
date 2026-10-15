@@ -100,15 +100,7 @@ export default function LibraryShareSettings() {
   };
 
   return (
-    <section className="library-share-section" data-tour="library-share">
-      <div className="settings-section-title">
-        <FiShare2 />
-        <div>
-          <h3>Share a library</h3>
-          <p>Let family browse and save originals on your local network.</p>
-        </div>
-      </div>
-
+    <section className="library-share-section settings-card settings-card-padded" data-tour="library-share">
       {share.active && share.url ? (
         <>
           <label className="library-share-link-label" htmlFor="library-share-url">Private share link</label>
