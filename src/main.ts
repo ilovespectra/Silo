@@ -2440,6 +2440,19 @@ function memoryFileMetadata(filePath: string): FileMetadata | undefined {
     : undefined;
 }
 
+/** Obvious screenshot and application artwork paths are never Memory photos. */
+function memoryObviousNonPhotoPath(filePath: string): boolean {
+  const basename = path.basename(filePath);
+  const normalizedName = basename.toLocaleLowerCase().replace(/[\s_-]+/g, "");
+  const normalizedPath = filePath.toLocaleLowerCase().replace(/[\s_-]+/g, "");
+  if (normalizedPath.includes("screenshot") || normalizedPath.includes("screencap")) return true;
+  if (/(?:^|[\/])node_modules(?:[\/]|$)/i.test(filePath)) return true;
+  if (/(?:^|[\/])[^\/]+\.(?:app|bundle|framework|plugin|asar)(?:[\/]|$)/i.test(filePath)) return true;
+  if (/(?:^|[\/])(?:assets?|resources?|icons?|logos?|thumbnails?|thumbs)(?:[\/]|$)/i.test(filePath)) return true;
+  const stem = normalizedName.replace(/\.[^.]*$/, "");
+  return /^(?:app)?(?:icon|logo|favicon|splash|launchimage|launchscreen|loading|mascot)(?:[0-9]+|set)?$/i.test(stem);
+}
+
 /** Strict and toggle-independent: ignores showNsfw/showBannedPeople and folder reveal views. */
 function memoryAllowed(filePath: unknown): boolean {
   if (typeof filePath !== "string" || !filePath || filePath.includes("\0"))

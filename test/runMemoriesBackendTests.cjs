@@ -287,8 +287,8 @@ async function run() {
     const originalArch = context.process.arch;
     const originalUnsafe = context.semanticUnsafePaths;
     const safeImages = Array.from({ length: 12 }, (_, i) => ({
-      path: path.join(library, i % 2 ? `Screenshots/shot-${i}.png` : `Covers/cover-${i}.jpg`),
-      name: i % 2 ? `shot-${i}.png` : `cover-${i}.jpg`,
+      path: path.join(library, i % 2 ? `Photos/photo-${i}.png` : `Covers/cover-${i}.jpg`),
+      name: i % 2 ? `photo-${i}.png` : `cover-${i}.jpg`,
       type: "image", size: 900 + i, modified: i, confidence: 95,
     }));
     const graphic = { path: path.join(library, "vector-graphic.jpg"), name: "vector-graphic.jpg",
@@ -413,8 +413,12 @@ async function run() {
     for (const bad of [undefined, null, 4, "", "a\0b"]) assert.equal(context.memoryAllowed(bad), false);
     assert.equal(context.memoryAllowed(path.join(library, "phone-screenshot-2026.png")), false,
       "screenshot in the filename excludes it from Memories");
-    assert.equal(context.memoryAllowed(path.join(library, "Screenshots", "IMG_2026.jpg")), true,
-      "a real photo is still eligible when stored in a Screenshots folder");
+    assert.equal(context.memoryAllowed(path.join(library, "Screenshots", "IMG_2026.jpg")), false,
+      "files inside screenshot-named folders are excluded from Memories");
+    assert.equal(context.memoryAllowed(path.join(library, "Screen Shots", "IMG_2026.jpg")), false,
+      "spaced screenshot folder names are also excluded");
+    assert.equal(context.memoryAllowed(path.join(library, "Assets", "hero.jpg")), false,
+      "application asset folders are excluded from Memories");
     assert.equal(context.memoryAllowed("/Applications/Example.app/Contents/Resources/icon.png"), false,
       "application bundle artwork is excluded");
     assert.equal(context.memoryAllowed(path.join(library, "app-icon.png")), false,
@@ -559,7 +563,7 @@ async function run() {
     assert(!selected.has(lowConfidence[0].path), "the query relevance floor still applies");
     assert(!selected.has(path.join(library, "screenshot.png")), "named screenshots are excluded from Memories");
     assert(!selected.has(path.join(library, "vector-graphic.jpg")), "clear visual graphics are excluded from Memories");
-    assert(selected.has("/Photos/Screenshots/IMG_2026.jpg"), "a photo in a Screenshots folder remains eligible");
+    assert(!selected.has("/Photos/Screenshots/IMG_2026.jpg"), "photos in screenshot-named folders are excluded from Memories");
     assert(!selected.has(path.join(library, "notes.pdf")), "documents never reach the photo candidate pool");
     assert.equal(searchCalls.at(-1)[1], 20, "prompted semantic search uses the confidence floor");
     assert.equal(typeof searchCalls.at(-1)[5], "function", "NSFW and non-image safety filtering is applied inside the targeted search");
