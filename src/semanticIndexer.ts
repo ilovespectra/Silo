@@ -1,4 +1,5 @@
 import * as path from "path";
+import { isPersonalPhotoPath } from "./memoryDiscovery";
 import * as fsPromises from "fs/promises";
 import * as fs from "fs";
 import * as os from "os";
@@ -2652,7 +2653,13 @@ export class SemanticIndexer {
         this.searchDiscovery.changed = pending.length;
       }
 
+      // Camera photos first so memories, people and places have material
+      // long before app assets, logs and documents finish on slow machines.
+      const tier = (file: IndexableFile) =>
+        file.type !== "image" ? 2 : isPersonalPhotoPath(file.path, file.size) ? 0 : 1;
+      const tiers = new Map(pending.map(({ file }) => [file.path, tier(file)]));
       pending.sort((first, second) =>
+        tiers.get(first.file.path)! - tiers.get(second.file.path)! ||
         first.file.modified - second.file.modified ||
         (first.file.path < second.file.path
           ? -1
@@ -2744,7 +2751,7 @@ export class SemanticIndexer {
           await this.updateProgress(
             {
               status: "scanning",
-              message: `${this.filesToIndex.size.toLocaleString()} saved files remain in the chronological queue.`,
+              message: `${this.filesToIndex.size.toLocaleString()} saved files remain in the queue.`,
             },
             true,
           );
@@ -2803,7 +2810,7 @@ export class SemanticIndexer {
             {
               status: "paused",
               currentFile: null,
-              message: "Indexing paused with the remaining chronological queue saved.",
+              message: "Indexing paused with the remaining queue saved.",
             },
             true,
           );
