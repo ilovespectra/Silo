@@ -1928,14 +1928,15 @@ export default function MapPage({
         <div
           className="map-region-backdrop"
           role="presentation"
-          onMouseDown={() => setSelectedCluster(null)}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setSelectedCluster(null);
+          }}
         >
           <aside
             className="map-region-panel"
             role="dialog"
             aria-modal="true"
             aria-label={`${selectedCluster.label}, ${selectedCluster.photos.length} photos`}
-            onMouseDown={(event) => event.stopPropagation()}
           >
             <header>
               <div>
