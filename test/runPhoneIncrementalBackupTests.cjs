@@ -77,7 +77,31 @@ async function run() {
       assert((await fs.stat(path.join(latestRoot, "DCIM", name))).isFile(), `${name} is browseable`);
     assert((await fs.stat(manager.localCachePath(file("DCIM/b.jpg", 20).path))).isFile(), "old backed-up files are never removed");
 
-    console.log("Phone incremental backup tests passed: unchanged phones copy nothing, unknown details never force recopies, new files are added, deleted phone files are kept.");
+    // Silo reinstalled or its state was reset: copies already on the drive are reused, not recopied.
+    await fs.rm(path.join(userData, "phone-cache", "backup-state.json"), { force: true });
+    const fresh = new PhoneManager(userData);
+    fresh.log = () => {};
+    fresh.logError = () => {};
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await fresh.setBackupDestination(destination);
+    fresh.backupManifests.clear();
+    files = [file("DCIM/a.jpg", 10), file("DCIM/c.jpg", 30), file("DCIM/d.jpg", 40), file("DCIM/unknown.jpg", 0, 0)];
+    fresh.listPhoneFilesRecursively = manager.listPhoneFilesRecursively;
+    copied.length = 0;
+    fresh.materialize = async (candidate) => {
+      const entry = files.find((item) => item.path === candidate);
+      const localPath = fresh.localCachePath(candidate);
+      await fs.writeFile(localPath, Buffer.alloc(entry.size || 7, 1));
+      copied.push(path.posix.basename(candidate));
+      return localPath;
+    };
+    const resumed = await fresh.backupDevice(device);
+    assert.equal(resumed.status, "complete");
+    assert.deepEqual(copied.sort(), ["d.jpg", "unknown.jpg"],
+      "after a state reset only new files (and ones with unknown size) are copied");
+    assert((await fs.stat(fresh.localCachePath(file("DCIM/b.jpg", 20).path))).isFile(), "a reset never removes old copies");
+
+    console.log("Phone incremental backup tests passed: unchanged phones copy nothing, unknown details never force recopies, new files are added, deleted phone files are kept, a state reset reuses existing copies.");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

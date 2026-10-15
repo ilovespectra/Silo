@@ -1394,14 +1394,18 @@ export class PhoneManager {
     }
   }
 
-  /** A saved copy counts when it exists and matches the phone's size; unknown sizes never force a recopy. */
+  /**
+   * A saved copy counts when it exists and matches the phone's size. Copies already on
+   * the destination are reused even if Silo's state was reset, so a backup never starts over.
+   */
   private async isAlreadyBackedUp(
     manifest: PhoneBackupManifest,
     file: PhoneFileInfo,
   ): Promise<boolean> {
-    if (!manifest.files[file.path]) return false;
     const stats = await fsPromises.stat(this.localCachePath(file.path)).catch(() => null);
-    return Boolean(stats?.isFile()) && (file.size === 0 || stats!.size === file.size);
+    if (!stats?.isFile()) return false;
+    if (manifest.files[file.path]) return file.size === 0 || stats.size === file.size;
+    return file.size > 0 && stats.size === file.size;
   }
 
   private async createBrowseableSnapshot(
