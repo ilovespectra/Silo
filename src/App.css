@@ -17,11 +17,11 @@ input[type="checkbox"] {
   --line: #2c2c30;
   --text: #f4f1ed;
   --muted: #9a9690;
-  --orange: #ff7a1a;
-  --orange-bright: #ff9a4a;
+  --orange: #c77a3d;
+  --orange-bright: #d89b63;
   --surface-header: #101011;
-  --surface-inset: #09090a;
-  --surface-sidebar: #0f0f11;
+  --surface-inset: #0d0d0f;
+  --surface-sidebar: #121315;
   --surface-card: #151517;
   --surface-control: #1b1b1e;
   --surface-hover: #252529;

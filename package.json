@@ -15,6 +15,7 @@
     "test:search-eval": "node test/search-eval-core.test.cjs",
     "test:face-clustering": "node test/runFaceClusteringTests.cjs",
     "test:message-coverage": "node test/runMessageCoverageTests.cjs",
+    "test:ios-message-backup": "node test/runIosMessageBackupTests.cjs",
     "test:beta-license": "node test/runBetaLicenseTests.cjs && node test/runBetaReleaseCheckTests.cjs && node --check scripts/beta-license.cjs && node --check scripts/check-beta-release.cjs",
     "test:lifetime-payment": "node test/runLifetimePaymentTests.cjs && node test/runPaidLicenseTests.cjs && node test/runLegacyLicenseRejectionTests.cjs",
     "test:owner-license": "node test/runOwnerLicenseTests.cjs",

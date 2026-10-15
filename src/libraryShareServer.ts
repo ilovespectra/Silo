@@ -405,9 +405,13 @@ export class LibraryShareServer {
     const folder = safeFolder(url.searchParams.get("folder") ?? "");
     if (folder === null) return json(response, 400, { error: "Invalid folder path." });
     const query = (url.searchParams.get("q") ?? "").trim().slice(0, 160);
+    const explode = url.searchParams.get("explode") === "1";
+    const filterType = url.searchParams.get("type") ?? "all";
+    const sort = url.searchParams.get("sort") ?? "modified-desc";
     const offset = Math.max(0, Math.min(1_000_000, Number(url.searchParams.get("offset")) || 0));
     const limit = Math.max(1, Math.min(MAX_PAGE_SIZE, Number(url.searchParams.get("limit")) || MAX_PAGE_SIZE));
-    const entries = (await this.currentFiles(context, [source])).filter((entry) => {
+    const allEntries = await this.currentFiles(context, [source]);
+    const entries = allEntries.filter((entry) => {
       const relative = entry.file.relativePath.split(path.sep).join("/");
       if (!query) return true;
       return Boolean(relative) && relative.length > 0;
@@ -442,15 +446,19 @@ export class LibraryShareServer {
       }
       items = ranked.map((entry) => this.publicItem(context, entry));
     } else {
+      const prefix = folder ? `${folder}/` : "";
       const directFiles = entries.filter((entry) => {
         const relative = entry.file.relativePath.split(path.sep).join("/");
+        if (explode) {
+          return folder ? relative.startsWith(prefix) && relative !== folder : true;
+        }
         const parent = relative.includes("/") ? relative.slice(0, relative.lastIndexOf("/")) : "";
         return parent === folder;
       });
       const folders = new Map<string, string>();
       for (const entry of entries) {
         const relative = entry.file.relativePath.split(path.sep).join("/");
-        const prefix = folder ? `${folder}/` : "";
+        if (explode) continue;
         if (!relative.startsWith(prefix)) continue;
         const remainder = relative.slice(prefix.length);
         const slash = remainder.indexOf("/");
@@ -469,11 +477,36 @@ export class LibraryShareServer {
         mediaType: "folder",
       }));
       const fileItems = directFiles.map((entry) => this.publicItem(context, entry));
-      items = [...folderItems, ...fileItems].sort((left, right) => {
-        if (left.kind !== right.kind) return left.kind === "folder" ? -1 : 1;
-        return String(left.name).localeCompare(String(right.name), undefined, { numeric: true, sensitivity: "base" });
-      });
+      items = [...folderItems, ...fileItems];
     }
+
+    if (filterType === "image") {
+      items = items.filter((item) => item.kind !== "folder" && item.mediaType === "image");
+    } else if (filterType === "video") {
+      items = items.filter((item) => item.kind !== "folder" && item.mediaType === "video");
+    }
+
+    const sortField = sort || "modified-desc";
+    items = items.sort((left, right) => {
+      const leftKind = Number(left.kind === "folder");
+      const rightKind = Number(right.kind === "folder");
+      if (left.kind !== right.kind) {
+        if (sortField.startsWith("name") || sortField.startsWith("modified") || sortField.startsWith("size"))
+          return left.kind === "folder" ? -1 : 1;
+        return leftKind - rightKind;
+      }
+      const leftValue = left.kind === "folder" ? String(left.name) : String(left.name);
+      const rightValue = right.kind === "folder" ? String(right.name) : String(right.name);
+      switch (sortField) {
+        case "name-asc": return leftValue.localeCompare(rightValue, undefined, { numeric: true, sensitivity: "base" });
+        case "name-desc": return rightValue.localeCompare(leftValue, undefined, { numeric: true, sensitivity: "base" });
+        case "size-asc": return Number(left.size ?? 0) - Number(right.size ?? 0);
+        case "size-desc": return Number(right.size ?? 0) - Number(left.size ?? 0);
+        case "modified-asc": return Number(left.modified ?? 0) - Number(right.modified ?? 0);
+        case "modified-desc":
+        default: return Number(right.modified ?? 0) - Number(left.modified ?? 0);
+      }
+    });
 
     const page = items.slice(offset, offset + limit);
     json(response, 200, {

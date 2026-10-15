@@ -1,7 +1,7 @@
 import { resolvePhoneTool } from "./phoneTools";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import { createHash } from "crypto";
 
@@ -695,13 +695,7 @@ export class MessageManager {
         continue;
       }
     }
-    const backupRoots = [
-      path.join(this.userDataPath, "ios-message-backups"),
-      ...(this.backupDestinationPath
-        ? [path.join(this.backupDestinationPath, "ios", "ios-message-backups")]
-        : []),
-    ];
-    for (const backupRoot of backupRoots) {
+    for (const backupRoot of this.iosBackupRoots()) {
       const backups = await fsPromises
         .readdir(backupRoot, { withFileTypes: true })
         .catch(() => []);
@@ -780,84 +774,168 @@ export class MessageManager {
     await fsPromises.rename(temporary, destination);
   }
 
-  private async getIOSMessageThreads(
-    deviceId: string,
-    refresh: boolean,
-  ): Promise<MessageThread[]> {
-    if (process.platform !== "darwin")
-      throw new Error(
-        "Reading iPhone Messages from device backups is currently supported on macOS only.",
-      );
-    if (!this.userDataPath)
-      throw new Error("Message backup directory is unavailable.");
-    const backupRoot = path.join(
-      this.backupDestinationPath || this.userDataPath,
-      this.backupDestinationPath
-        ? "ios/ios-message-backups"
-        : "ios-message-backups",
-    );
-    const deviceBackup = path.join(backupRoot, deviceId);
-    const manifestPath = path.join(deviceBackup, "Manifest.db");
+  /** Where new iPhone Messages backups are written (the current destination). */
+  private iosBackupWriteRoot(): string {
+    return this.backupDestinationPath
+      ? path.join(this.backupDestinationPath, "ios", "ios-message-backups")
+      : path.join(this.userDataPath, "ios-message-backups");
+  }
 
-    // Check if backup exists
-    let backupExists = false;
-    try {
-      await fsPromises.access(manifestPath);
-      backupExists = true;
-    } catch {
-      backupExists = false;
-    }
+  /** Every location a Silo iPhone Messages backup may persist, newest destination first. */
+  private iosBackupRoots(): string[] {
+    return [
+      ...new Set([
+        this.iosBackupWriteRoot(),
+        path.join(this.userDataPath, "ios-message-backups"),
+        ...(this.backupDestinationPath
+          ? [path.join(this.backupDestinationPath, "ios", "ios-message-backups")]
+          : []),
+      ]),
+    ];
+  }
 
-    // Only do full backup if:
-    // 1. Backup doesn't exist (first time), OR
-    // 2. User explicitly refreshed AND backup doesn't exist
-    if (!backupExists || refresh) {
-      if (!refresh) {
-        throw new Error(
-          "No Silo iPhone message backup exists yet. Choose Refresh iPhone Messages to create one.",
-        );
-      }
-      this.log(
-        `Creating iPhone message backup at: ${backupRoot} (destination: ${this.backupDestinationPath || "default"})`,
-      );
-      await fsPromises.mkdir(backupRoot, { recursive: true });
+  /** Returns a backup folder whose Manifest.db lists Messages, preferring the write root. */
+  private async findIOSMessageBackup(deviceId: string): Promise<string | null> {
+    for (const root of this.iosBackupRoots()) {
+      const deviceBackup = path.join(root, deviceId);
+      const manifestPath = path.join(deviceBackup, "Manifest.db");
       try {
-        const idevicebackup2 = await resolvePhoneTool("idevicebackup2");
-        if (!idevicebackup2) {
-          throw new Error("idevicebackup2 is not available in this Silo build.");
-        }
-        await execFileAsync(
+        await fsPromises.access(manifestPath);
+        const fileId = (
+          await this.sqliteValue(
+            manifestPath,
+            "SELECT fileID FROM Files WHERE domain='HomeDomain' AND relativePath='Library/SMS/sms.db' LIMIT 1;",
+          )
+        ).trim();
+        if (!fileId) continue;
+        await fsPromises.access(path.join(deviceBackup, fileId.slice(0, 2), fileId));
+        return deviceBackup;
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  private readonly iosBackupJobs = new Map<string, Promise<void>>();
+
+  isIOSMessageBackupRunning(deviceId: string): boolean {
+    return this.iosBackupJobs.has(deviceId);
+  }
+
+  /** Coalesces concurrent requests; a second idevicebackup2 session for one phone always fails. */
+  private backUpIOSMessages(deviceId: string): Promise<void> {
+    const running = this.iosBackupJobs.get(deviceId);
+    if (running) return running;
+    const job = this.createIOSMessageBackup(deviceId).finally(() =>
+      this.iosBackupJobs.delete(deviceId),
+    );
+    this.iosBackupJobs.set(deviceId, job);
+    return job;
+  }
+
+  // Overridable in tests.
+  protected resolveIOSBackupTool(): Promise<string | null> {
+    return resolvePhoneTool("idevicebackup2");
+  }
+
+  protected runIOSBackupTool(
+    binary: string,
+    args: string[],
+    idleTimeoutMs: number,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(binary, args, {
+        env: { ...process.env, NO_COLOR: "1", TERM: "dumb" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      let idleTimer: NodeJS.Timeout | null = null;
+      let timedOut = false;
+      const armIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGTERM");
+        }, idleTimeoutMs);
+      };
+      const append = (chunk: Buffer) => {
+        output = `${output}${chunk.toString()}`.slice(-16000);
+        armIdle();
+      };
+      armIdle();
+      child.stdout.on("data", append);
+      child.stderr.on("data", append);
+      child.once("error", (error) => {
+        if (idleTimer) clearTimeout(idleTimer);
+        reject(error);
+      });
+      child.once("close", (code) => {
+        if (idleTimer) clearTimeout(idleTimer);
+        if (code === 0 && !timedOut) resolve();
+        else
+          reject(
+            Object.assign(
+              new Error(
+                timedOut
+                  ? `idevicebackup2 stopped responding for ${Math.round(idleTimeoutMs / 60000)} minutes.`
+                  : `idevicebackup2 exited with code ${code}.`,
+              ),
+              { stdout: output, timedOut },
+            ),
+          );
+      });
+    });
+  }
+
+  private async createIOSMessageBackup(deviceId: string): Promise<void> {
+    const backupRoot = this.iosBackupWriteRoot();
+    this.log(
+      `Creating iPhone message backup at: ${backupRoot} (destination: ${this.backupDestinationPath || "default"})`,
+    );
+    await fsPromises.mkdir(backupRoot, { recursive: true });
+    const idevicebackup2 = await this.resolveIOSBackupTool();
+    if (!idevicebackup2)
+      throw new Error("idevicebackup2 is not available in this Silo build.");
+    for (let attempt = 1; ; attempt++) {
+      try {
+        // idevicebackup2 is incremental: an interrupted run resumes in the same folder.
+        // No overall limit — a first backup of a large iPhone can take hours.
+        await this.runIOSBackupTool(
           idevicebackup2,
           ["-u", deviceId, "backup", backupRoot],
-          {
-            timeout: 20 * 60 * 1000,
-            maxBuffer: 20 * 1024 * 1024,
-          },
+          15 * 60 * 1000,
         );
+        return;
       } catch (error) {
-        const processError = error as Error & {
-          stdout?: string;
-          stderr?: string;
-        };
-        const message = [
-          processError.message,
-          processError.stdout,
-          processError.stderr,
-        ]
+        const processError = error as Error & { stdout?: string };
+        const message = [processError.message, processError.stdout]
           .filter(Boolean)
           .join("\n");
-
-        // Handle specific errors
-        if (/protocol version exchange|error code -1/i.test(message)) {
-          throw new Error(
-            "iPhone trust issue detected. " +
-              "Please: 1) Disconnect iPhone, 2) Wait 5 seconds, 3) Reconnect iPhone, " +
-              '4) Tap "Trust" on the iPhone screen, 5) Try again.',
+        const busy =
+          /protocol version exchange|Could not start service|error code -1\b|Object busy|ErrorCode 1\b/i.test(
+            message,
           );
+        if (busy && attempt < 3) {
+          this.log(`iPhone backup service busy; retrying (attempt ${attempt + 1})`);
+          await new Promise((resolve) => setTimeout(resolve, this.iosBusyRetryDelayMs));
+          continue;
         }
         const location = this.backupDestinationPath
           ? `external drive (${this.backupDestinationPath})`
           : "Mac storage";
+        if (/not paired|pairing|InvalidHostID|lockdownd.*(pair|trust)/i.test(message))
+          throw new Error(
+            "This iPhone no longer trusts this Mac. Reconnect it, tap Trust, then choose Refresh iPhone Messages.",
+          );
+        if (/Waiting for passcode|passcode/i.test(message))
+          throw new Error(
+            "Enter the iPhone passcode on the phone when asked to allow the backup, then choose Refresh iPhone Messages.",
+          );
+        if (busy)
+          throw new Error(
+            "The iPhone backup service is busy (another Silo, Finder, or iTunes backup may be running). Wait for it to finish, then choose Refresh iPhone Messages. The iPhone does not need to be trusted again.",
+          );
         if (/ErrorCode 105|Insufficient free disk space/i.test(message))
           throw new Error(
             `The iPhone backup needs more free space on your ${location} before Messages can be loaded. Free disk space, then choose Refresh iPhone Messages again.`,
@@ -866,16 +944,55 @@ export class MessageManager {
           throw new Error(
             "This iPhone uses encrypted backups. Create an unencrypted local backup or provide the backup password directly in Terminal.",
           );
+        if ((processError as { timedOut?: boolean }).timedOut)
+          throw new Error(
+            "The iPhone stopped responding during the Messages backup. Keep it unlocked and connected, then choose Refresh iPhone Messages; Silo resumes where it stopped.",
+          );
+        throw new Error(`Could not create the trusted iPhone backup: ${message}`);
+      }
+    }
+  }
+
+  protected iosBusyRetryDelayMs = 15000;
+  protected allowIOSBackupsOnAnyPlatform = false;
+
+  private async getIOSMessageThreads(
+    deviceId: string,
+    refresh: boolean,
+  ): Promise<MessageThread[]> {
+    if (process.platform !== "darwin" && !this.allowIOSBackupsOnAnyPlatform)
+      throw new Error(
+        "Reading iPhone Messages from device backups is currently supported on macOS only.",
+      );
+    if (!this.userDataPath)
+      throw new Error("Message backup directory is unavailable.");
+
+    if (refresh || this.iosBackupJobs.has(deviceId)) {
+      if (!refresh)
         throw new Error(
-          `Could not create the trusted iPhone backup: ${message}`,
+          "Silo is backing up this iPhone’s Messages now. Conversations appear automatically when the backup finishes.",
+        );
+      try {
+        await this.backUpIOSMessages(deviceId);
+      } catch (error) {
+        // Keep showing the last complete backup rather than losing visible messages.
+        const previous = await this.findIOSMessageBackup(deviceId);
+        if (!previous) throw error;
+        this.logError(
+          "iPhone Messages refresh failed; using the last complete backup:",
+          error instanceof Error ? error.message : error,
         );
       }
-    } else {
-      // Backup exists - just load messages from it (fast operation)
-      this.log(
-        `Loading messages from existing iPhone backup at: ${deviceBackup}`,
-      );
     }
+    const deviceBackup = await this.findIOSMessageBackup(deviceId);
+    if (!deviceBackup)
+      throw new Error(
+        refresh
+          ? "The iPhone backup finished but does not contain Messages data."
+          : "No Silo iPhone message backup exists yet. Choose Refresh iPhone Messages to create one.",
+      );
+    this.log(`Loading messages from iPhone backup at: ${deviceBackup}`);
+    const manifestPath = path.join(deviceBackup, "Manifest.db");
     const fileId = (
       await this.sqliteValue(
         manifestPath,

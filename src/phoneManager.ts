@@ -49,6 +49,31 @@ export type PhoneStatus =
   | "connected"
   | "error";
 
+export type IosPairingState = "trusted" | "locked" | "unpaired" | "unavailable";
+
+/**
+ * Only a definite "not paired"/trust-dialog answer means the device needs a new
+ * pairing. Timeouts and a locked phone are transient; calling `idevicepair pair`
+ * for them replaces the pairing record and forces the user to trust again.
+ */
+export function classifyIosPairing(result: {
+  ok: boolean;
+  stdout?: string;
+  stderr?: string;
+}): IosPairingState {
+  if (result.ok) return "trusted";
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  if (/passcode is set|enter the passcode|PasswordProtected/i.test(output))
+    return "locked";
+  if (
+    /not paired with this host|accept the trust dialog|denied the trust dialog|UserDeniedPairing|InvalidHostID|Pairing with device .* failed/i.test(
+      output,
+    )
+  )
+    return "unpaired";
+  return "unavailable";
+}
+
 export interface PhoneDevice {
   id: string;
   platform: PhonePlatform;
@@ -261,6 +286,7 @@ export class PhoneManager {
   private readonly backupManifests = new Map<string, PhoneBackupManifest>();
   private connectedDeviceKeys = new Set<string>();
   private readonly backupJobs = new Map<string, Promise<PhoneBackupProgress>>();
+  private readonly lastTrustedIosDevices = new Map<string, PhoneDevice>();
   private backupWriteChain = Promise.resolve();
   private backupDestinationPath: string | null = null;
   private deviceNames: Record<string, string> = {};
@@ -1865,15 +1891,37 @@ export class PhoneManager {
     const devices: PhoneDevice[] = [];
     for (const udid of udids) {
       debugLog(`[PhoneManager] listIosDevices: Checking device ${udid}`);
-      const paired = await this.run(
-        "idevicepair",
-        ["-u", udid, "validate"],
-        8000,
+      let pairing = classifyIosPairing(
+        await this.run("idevicepair", ["-u", udid, "validate"], 8000),
       );
-      const trusted = paired.ok;
+      // A busy phone (for example during a Messages backup) can answer slowly.
+      if (pairing === "unavailable")
+        pairing = classifyIosPairing(
+          await this.run("idevicepair", ["-u", udid, "validate"], 20000),
+        );
       debugLog(
-        `[PhoneManager] listIosDevices: Device ${udid} trusted: ${trusted}`,
+        `[PhoneManager] listIosDevices: Device ${udid} pairing: ${pairing}`,
       );
+      const previous = this.lastTrustedIosDevices.get(udid);
+      if (pairing === "unavailable" && previous) {
+        // Keep the established trust instead of flipping to "untrusted",
+        // which would prompt a reconnect and restart backups.
+        devices.push({ ...previous });
+        continue;
+      }
+      if (pairing === "locked") {
+        devices.push({
+          id: udid,
+          platform: "ios",
+          name: previous?.name ?? "iPhone / iPad",
+          model: previous?.model ?? null,
+          status: "untrusted",
+          rootPath: null,
+          message: "Unlock the iPhone with its passcode. It is already trusted.",
+        });
+        continue;
+      }
+      const trusted = pairing === "trusted";
 
       const name = trusted
         ? (
@@ -1918,6 +1966,8 @@ export class PhoneManager {
         `[PhoneManager] listIosDevices: Created device entry:`,
         device,
       );
+      if (device.status === "ready") this.lastTrustedIosDevices.set(udid, device);
+      else if (pairing === "unpaired") this.lastTrustedIosDevices.delete(udid);
       devices.push(device);
     }
     return devices;
@@ -2060,16 +2110,31 @@ export class PhoneManager {
 
   private async connectIos(udid: string): Promise<PhoneDevice> {
     debugLog(`[PhoneManager] connectIos: Connecting to iOS device ${udid}`);
-    const validated = await this.run(
-      "idevicepair",
-      ["-u", udid, "validate"],
-      10000,
+    let pairing = classifyIosPairing(
+      await this.run("idevicepair", ["-u", udid, "validate"], 10000),
     );
-    debugLog(
-      `[PhoneManager] connectIos: Validation result: ${validated.ok}`,
-    );
+    if (pairing === "unavailable")
+      pairing = classifyIosPairing(
+        await this.run("idevicepair", ["-u", udid, "validate"], 20000),
+      );
+    debugLog(`[PhoneManager] connectIos: Pairing state: ${pairing}`);
 
-    if (!validated.ok) {
+    if (pairing === "locked" || pairing === "unavailable") {
+      return {
+        id: udid,
+        platform: "ios",
+        name: this.lastTrustedIosDevices.get(udid)?.name ?? "iPhone / iPad",
+        model: this.lastTrustedIosDevices.get(udid)?.model ?? null,
+        status: pairing === "locked" ? "untrusted" : "error",
+        rootPath: null,
+        message:
+          pairing === "locked"
+            ? "Unlock the iPhone with its passcode, then try again. It does not need to be trusted again."
+            : "The iPhone is busy or not responding. Wait for any running backup to finish, then try again.",
+      };
+    }
+
+    if (pairing === "unpaired") {
       // Triggers the on-device "Trust This Computer" prompt.
       debugLog(
         `[PhoneManager] connectIos: Device not trusted, attempting to pair...`,
@@ -2142,6 +2207,7 @@ export class PhoneManager {
       message: "Trusted and ready to browse.",
     };
     debugLog(`[PhoneManager] connectIos: Created device:`, device);
+    this.lastTrustedIosDevices.set(udid, device);
     return device;
   }
 

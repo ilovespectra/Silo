@@ -14,6 +14,17 @@ interface PhoneManagerPanelProps {
   onResetBackupDestination: () => void;
 }
 
+/** A device is busy for a manual action or while an automatic backup is scanning/copying. */
+export function isPhoneDeviceBackingUp(
+  device: Pick<PhoneDevice, "id" | "platform">,
+  busyDeviceId: string | null,
+  backups: Record<string, PhoneBackupProgress>,
+): boolean {
+  if (busyDeviceId === device.id) return true;
+  const status = backups[`${device.platform}:${device.id}`]?.status;
+  return status === "scanning" || status === "backing-up";
+}
+
 interface PhoneManagementPanelProps {
   devices: PhoneDevice[];
   tooling: PhoneTooling | null;
@@ -46,6 +57,7 @@ interface PhoneDeviceCardProps {
   device: PhoneDevice;
   active: boolean;
   busyDeviceId: string | null;
+  backingUp: boolean;
   restoreArchives: PhoneRestoreArchive[];
   tooling: PhoneTooling | null;
   onBrowse: (device: PhoneDevice) => void;
@@ -68,6 +80,7 @@ function PhoneDeviceCard({
   device,
   active,
   busyDeviceId,
+  backingUp,
   restoreArchives,
   tooling,
   onBrowse,
@@ -85,7 +98,7 @@ function PhoneDeviceCard({
   const [restoreBusy, setRestoreBusy] = useState(false);
   const [restoreNotice, setRestoreNotice] = useState("");
   const [showArchives, setShowArchives] = useState(false);
-  const busy = busyDeviceId === device.id;
+  const busy = busyDeviceId === device.id || backingUp;
   const createRestoreArchive = async () => {
     if (backupPassword.length < 8 || backupPassword !== confirmPassword) {
       setRestoreNotice("Enter a matching password with at least 8 characters.");
@@ -147,7 +160,7 @@ function PhoneDeviceCard({
             <button
               className="phone-icon-button"
               onClick={() => onBrowse(device)}
-              disabled={busy}
+              disabled={busyDeviceId === device.id}
               title="Browse files exposed by this device"
               aria-label={`Browse ${device.name}`}
             >
@@ -585,7 +598,7 @@ export function PhoneManagementPanel({
     if (!backupRequest) return;
     const { device, mode } = backupRequest;
     if (mode === "renew" && backupTypes && backupTypes.length === 0) return;
-    if (busyDeviceId === device.id) return;
+    if (isPhoneDeviceBackingUp(device, busyDeviceId, backups)) return;
     setBackupRequest(null);
     if (mode === "connect") onConnect(device);
     else onRenewBackup(device, backupTypes ?? undefined);
@@ -601,6 +614,7 @@ export function PhoneManagementPanel({
                 device={device}
                 active={activeDeviceKey === `${device.platform}:${device.id}`}
                 busyDeviceId={busyDeviceId}
+                backingUp={isPhoneDeviceBackingUp(device, busyDeviceId, backups)}
                 restoreArchives={restoreArchives}
                 tooling={tooling}
                 onBrowse={onBrowse}
@@ -706,12 +720,14 @@ export function PhoneManagementPanel({
                 className="primary"
                 autoFocus
                 disabled={
-                  busyDeviceId === backupRequest.device.id ||
+                  isPhoneDeviceBackingUp(backupRequest.device, busyDeviceId, backups) ||
                   (backupRequest.mode === "renew" &&
                     (!previewReady || (backupTypes !== null && backupTypes.length === 0)))
                 }
               >
-                {busyDeviceId === backupRequest.device.id ? "Backing up…" : "Back up now"}
+                {isPhoneDeviceBackingUp(backupRequest.device, busyDeviceId, backups)
+                  ? "Backing up…"
+                  : "Back up now"}
               </button>
             </div>
           </form>
