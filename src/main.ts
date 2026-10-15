@@ -117,7 +117,9 @@ import {
   MEMORY_PHOTO_PROMPTS,
   TopicSignal,
   discoverMemoryStories,
-  currentPromptedVideoIndexingImage,
+  isPersonalPhotoPath,
+  nonPersonalFolderKeyword,
+  personalPhotoRejection,
 } from "./memoryDiscovery";
 import { MemoryTopicProfile, RefreshScheduler } from "./memoryTopicProfile";
 import * as exifr from "exifr";
@@ -177,7 +179,12 @@ import {
   isSiloCloneDirectory,
   MAC_DATA_VOLUME_ROOT,
 } from "./indexingPathPolicy";
-import { AestheticScorer, MagicItem, MagicPresetId } from "./aestheticScorer";
+import {
+  AestheticScorer,
+  MagicItem,
+  MagicPresetId,
+  MagicRankResult,
+} from "./aestheticScorer";
 import {
   applyPendingImport,
   cancelStagedImport,
@@ -229,7 +236,11 @@ if (process.stderr) {
 app.setName("Silo");
 
 function appIconPath(): string {
-  return path.join(app.getAppPath(), app.isPackaged ? "build" : "public", "icon.png");
+  return path.join(
+    app.getAppPath(),
+    app.isPackaged ? "build" : "public",
+    "icon.png",
+  );
 }
 
 // setName would otherwise relocate userData and orphan existing state.
@@ -251,7 +262,10 @@ function recommendedIndexStorageRoot(): string {
 }
 
 /** Lets the user pick (or create) a storage folder and saves it. Returns false if they cancel. */
-async function chooseIndexStorageFolder(userDataPath: string, message: string): Promise<boolean> {
+async function chooseIndexStorageFolder(
+  userDataPath: string,
+  message: string,
+): Promise<boolean> {
   for (;;) {
     const chosen = await dialog.showOpenDialog({
       title: "Choose Silo storage destination",
@@ -265,16 +279,26 @@ async function chooseIndexStorageFolder(userDataPath: string, message: string): 
     const resolvedUserData = path.resolve(userDataPath);
     const isInside = (child: string, parent: string) => {
       const relative = path.relative(parent, child);
-      return !relative || (!relative.startsWith("..") && !path.isAbsolute(relative));
+      return (
+        !relative || (!relative.startsWith("..") && !path.isAbsolute(relative))
+      );
     };
     try {
-      if (isInside(storageRoot, resolvedUserData) || isInside(resolvedUserData, storageRoot))
+      if (
+        isInside(storageRoot, resolvedUserData) ||
+        isInside(resolvedUserData, storageRoot)
+      )
         throw new Error("Choose a folder outside Silo's app data folder.");
       await fsPromises.mkdir(storageRoot, { recursive: true });
-      await fsPromises.access(storageRoot, fs.constants.R_OK | fs.constants.W_OK);
+      await fsPromises.access(
+        storageRoot,
+        fs.constants.R_OK | fs.constants.W_OK,
+      );
       await writeIndexStorageRoot(userDataPath, storageRoot).catch(async () => {
         // An unreadable settings file must not block choosing a new folder.
-        await fsPromises.rm(path.join(userDataPath, "index-storage.json"), { force: true });
+        await fsPromises.rm(path.join(userDataPath, "index-storage.json"), {
+          force: true,
+        });
         await writeIndexStorageRoot(userDataPath, storageRoot);
       });
       return true;
@@ -289,7 +313,9 @@ async function chooseIndexStorageFolder(userDataPath: string, message: string): 
   }
 }
 
-async function requireIndexStorageSelection(userDataPath: string): Promise<boolean> {
+async function requireIndexStorageSelection(
+  userDataPath: string,
+): Promise<boolean> {
   const settings = await getIndexStorageSettings(userDataPath).catch(() => ({
     path: userDataPath,
     allowLocalFallback: true,
@@ -299,17 +325,16 @@ async function requireIndexStorageSelection(userDataPath: string): Promise<boole
   const isDefaultBrowserLocation = selectedRoot === path.resolve(userDataPath);
   if (!isDefaultBrowserLocation) return true;
 
-  if (await chooseIndexStorageFolder(
-    userDataPath,
-    "Choose or create a folder for Silo's indexes, caches, and settings. It can be on this computer or an external drive.",
-  )) return true;
+  if (
+    await chooseIndexStorageFolder(
+      userDataPath,
+      "Choose or create a folder for Silo's indexes, caches, and settings. It can be on this computer or an external drive.",
+    )
+  )
+    return true;
   dialog.showErrorBox(
     "Silo storage destination required",
     "Silo needs a storage folder before it can open. Reopen Silo to choose one.",
-  );
-  runtimeLog(
-    "app-lifecycle-before-exit",
-    lifecycleDiagnosticSnapshot("storage-destination-not-selected"),
   );
   app.exit(1);
   return false;
@@ -383,14 +408,16 @@ async function requestRelayJson(
   if (endpoint.protocol !== "https:" && !isLocalHttp)
     throw new Error("The relay must use HTTPS.");
 
-  const body = options.body === undefined ? undefined : JSON.stringify(options.body);
+  const body =
+    options.body === undefined ? undefined : JSON.stringify(options.body);
   const headers: Record<string, string> = { ...options.headers };
   if (body !== undefined) {
     headers["Content-Type"] ??= "application/json";
     headers["Content-Length"] = String(Buffer.byteLength(body));
   }
   const timeoutMs = options.timeoutMs ?? 15000;
-  const timeoutMessage = options.timeoutMessage ?? "The relay request timed out.";
+  const timeoutMessage =
+    options.timeoutMessage ?? "The relay request timed out.";
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -426,7 +453,9 @@ async function requestRelayJson(
       response.on("end", () => {
         let payload: Record<string, any> = {};
         try {
-          const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          const parsed: unknown = JSON.parse(
+            Buffer.concat(chunks).toString("utf8"),
+          );
           if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
             payload = parsed as Record<string, any>;
         } catch {}
@@ -440,9 +469,10 @@ async function requestRelayJson(
     };
 
     const requestOptions = { method: options.method, headers };
-    request = endpoint.protocol === "https:"
-      ? https.request(endpoint, requestOptions, onResponse)
-      : http.request(endpoint, requestOptions, onResponse);
+    request =
+      endpoint.protocol === "https:"
+        ? https.request(endpoint, requestOptions, onResponse)
+        : http.request(endpoint, requestOptions, onResponse);
     requestTimeout = setTimeout(
       () => request.destroy(new Error(timeoutMessage)),
       timeoutMs,
@@ -465,12 +495,15 @@ async function requestLifetimePurchase(
 }> {
   return requestRelayJson(endpoint, {
     method: "POST",
-    body: { installationId: deviceId, paymentMethod, ...(reference ? { reference } : {}) },
+    body: {
+      installationId: deviceId,
+      paymentMethod,
+      ...(reference ? { reference } : {}),
+    },
     timeoutMs: 15000,
     timeoutMessage: "The payment relay request timed out.",
   });
 }
-
 
 const demoUsagePath = path.join(app.getPath("userData"), "demo-usage.json");
 const demoTestingModePath = path.join(
@@ -617,22 +650,16 @@ async function consumeDemoMemoryPreview(memoryId: string): Promise<boolean> {
 
 function getDemoPeople() {
   const allPeople = faceIndexer?.getPeople() ?? [];
-  return selectDemoPeople(
-    allPeople,
-    fullAccessEnabled(),
-    DEMO_LIMITS.people,
-  );
+  return selectDemoPeople(allPeople, fullAccessEnabled(), DEMO_LIMITS.people);
 }
 
 function canAccessDemoPerson(personId: string): boolean {
   if (fullAccessEnabled()) return true;
   const allPeople = faceIndexer?.getPeople() ?? [];
   if (!allPeople.some((person) => person.id === personId)) return false;
-  const allowed = selectDemoPeople(
-    allPeople,
-    false,
-    DEMO_LIMITS.people,
-  ).some((person) => person.id === personId);
+  const allowed = selectDemoPeople(allPeople, false, DEMO_LIMITS.people).some(
+    (person) => person.id === personId,
+  );
   if (!allowed) notifyDemoLimitReached("people");
   return allowed;
 }
@@ -710,9 +737,8 @@ async function getDeviceBindingId(): Promise<string> {
         ["-rd1", "-c", "IOPlatformExpertDevice"],
         { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 },
       );
-      machineUuid = /\"IOPlatformUUID\"\s*=\s*\"([A-Fa-f0-9-]+)\"/.exec(
-        stdout,
-      )?.[1] ?? "";
+      machineUuid =
+        /\"IOPlatformUUID\"\s*=\s*\"([A-Fa-f0-9-]+)\"/.exec(stdout)?.[1] ?? "";
     } else if (process.platform === "win32") {
       const { stdout } = await execFileAsync(
         "powershell.exe",
@@ -793,7 +819,9 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
   } catch {}
 
   try {
-    const stored = JSON.parse(await fsPromises.readFile(betaLicensePath, "utf8"));
+    const stored = JSON.parse(
+      await fsPromises.readFile(betaLicensePath, "utf8"),
+    );
     if (typeof stored?.activationCode !== "string")
       return { isLicensed: false };
     const installationId = await getBetaInstallationId();
@@ -822,7 +850,9 @@ async function writeLifetimeLicense(
     PAID_LICENSE_PUBLIC_KEY,
   );
   if (!payload)
-    throw new Error("The signed lifetime license is invalid for this computer.");
+    throw new Error(
+      "The signed lifetime license is invalid for this computer.",
+    );
   const record: StoredLifetimeLicense = {
     version: 3,
     deviceId,
@@ -832,11 +862,10 @@ async function writeLifetimeLicense(
     recursive: true,
   });
   const temporaryPath = `${lifetimeLicensePath}.${process.pid}.tmp`;
-  await fsPromises.writeFile(
-    temporaryPath,
-    JSON.stringify(record, null, 2),
-    { encoding: "utf8", mode: 0o600 },
-  );
+  await fsPromises.writeFile(temporaryPath, JSON.stringify(record, null, 2), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   await fsPromises.rename(temporaryPath, lifetimeLicensePath);
 }
 
@@ -973,6 +1002,8 @@ const maxBugReportScreenshotBytes = 3 * 1024 * 1024;
 const maxBugReportMessageLength = 100_000;
 const defaultBugReportEndpoint =
   "https://silo-bug-report-relay.vercel.app/api/bug-report";
+const defaultDevConsoleBugReportEndpoint =
+  "http://localhost:3334/api/bug-reports";
 const defaultBetaRequestEndpoint =
   "https://silo-bug-report-relay.vercel.app/api/beta-request";
 fs.mkdirSync(diagnosticsDirectory, { recursive: true });
@@ -1019,7 +1050,10 @@ function safeRuntimeDiagnosticStack(value: unknown) {
     .slice(0, 1800);
 }
 
-function logIndexingDiagnostic(event: string, details: Record<string, unknown> = {}) {
+function logIndexingDiagnostic(
+  event: string,
+  details: Record<string, unknown> = {},
+) {
   runtimeLog(event, details);
   if (!event.startsWith("semantic-worker-")) return;
   if (
@@ -1049,7 +1083,8 @@ function logIndexingDiagnostic(event: string, details: Record<string, unknown> =
     "durationMs",
   ]) {
     const value = details[key];
-    if (typeof value === "string" || typeof value === "number") safe[key] = value;
+    if (typeof value === "string" || typeof value === "number")
+      safe[key] = value;
   }
   if (typeof details.infrastructure === "boolean")
     safe.infrastructure = details.infrastructure;
@@ -1110,20 +1145,19 @@ function loadPendingDiagnosticReport() {
 
 function getRecentSafeRuntimeEvents() {
   const allowedFields = [
-    "reason", "signal", "code", "exitCode", "status", "requestType",
-    "requestTypes", "infrastructure", "pendingCount", "message", "failureReason",
-    "phase", "durationMs", "stage", "appPhase", "uiSection", "uiPathSet",
-    "uiViewMode", "uiSortField", "uiAscending", "uiTypeFilterActive",
-    "uiFilterPanelOpen", "uiExploded", "searchActive", "viewerOpen",
-    "startupStep", "startupTotal", "startupReady", "rendererId", "rendererPid",
-    "indexStatus", "indexTotal", "indexIndexed", "indexRemaining", "indexErrors",
-    "faceStatus", "faceProcessed", "faceRemaining", "faceErrors",
-    "geoStatus", "geoScanned", "geoTotal", "duplicateStatus", "duplicateScanned",
-    "duplicateTotal", "thumbnailStatus", "thumbnailProcessed", "thumbnailGenerated",
-    "thumbnailFailed", "thumbnailTotal", "magicRunning", "magicAnalyzed", "magicTotal",
-    "audioRunning", "audioScanned", "audioSources", "derivedIndexRunning",
-    "recoveryTimerScheduled", "rendererReady", "shuttingDown", "quitPass",
-    "interpretation", "lifecycleTrigger",
+    "reason",
+    "signal",
+    "code",
+    "exitCode",
+    "status",
+    "requestType",
+    "requestTypes",
+    "infrastructure",
+    "pendingCount",
+    "message",
+    "failureReason",
+    "phase",
+    "durationMs",
   ];
   try {
     const content = fs.readFileSync(diagnosticsPath, "utf8").slice(-512 * 1024);
@@ -1136,19 +1170,7 @@ function getRecentSafeRuntimeEvents() {
           const event = typeof entry.event === "string" ? entry.event : "";
           if (
             !event.startsWith("semantic-worker-") &&
-            ![
-              "render-process-gone",
-              "renderer-unresponsive",
-              "renderer-lifecycle",
-              "app-lifecycle-before-reload",
-              "app-lifecycle-before-close",
-              "app-lifecycle-before-quit",
-              "app-lifecycle-before-relaunch",
-              "app-lifecycle-before-exit",
-              "app-lifecycle-will-quit",
-              "app-lifecycle-after-close",
-              "previous-session-marker-found",
-            ].includes(event)
+            !["render-process-gone", "renderer-unresponsive"].includes(event)
           )
             return [];
           if (
@@ -1170,9 +1192,11 @@ function getRecentSafeRuntimeEvents() {
               return [`${key}=${String(value).slice(0, 80)}`];
             return [];
           });
-          return [`- ${String(entry.time || "unknown time")}: ${event}${
-            safeDetails.length ? ` ${safeDetails.join(" ")}` : ""
-          }`];
+          return [
+            `- ${String(entry.time || "unknown time")}: ${event}${
+              safeDetails.length ? ` ${safeDetails.join(" ")}` : ""
+            }`,
+          ];
         } catch {
           return [];
         }
@@ -1206,15 +1230,17 @@ function createIndexingDiagnosticReport(
   progress: IndexProgress,
   stalledForMs = 0,
 ) {
-  const classifiedCount = progress.indexed + progress.remaining + progress.errors;
+  const classifiedCount =
+    progress.indexed + progress.remaining + progress.errors;
   const unaccountedCount = progress.total - classifiedCount;
-  const reasonText = reason === "indexing-error"
-    ? progress.status === "complete" && progress.errors > 0
-      ? `Indexing completed with ${progress.errors.toLocaleString()} file errors.`
-      : progress.status === "complete" && unaccountedCount !== 0
-        ? "Indexing completed, but its progress counters did not reconcile."
-        : "The indexer reported an error."
-    : `Indexing made no measurable progress for ${Math.floor(stalledForMs / 60000)} minutes.`;
+  const reasonText =
+    reason === "indexing-error"
+      ? progress.status === "complete" && progress.errors > 0
+        ? `Indexing completed with ${progress.errors.toLocaleString()} file errors.`
+        : progress.status === "complete" && unaccountedCount !== 0
+          ? "Indexing completed, but its progress counters did not reconcile."
+          : "The indexer reported an error."
+      : `Indexing made no measurable progress for ${Math.floor(stalledForMs / 60000)} minutes.`;
   const workerEvents = indexingDiagnosticEvents.slice(-8).map((entry) => {
     const details = Object.entries(entry)
       .filter(([key]) => key !== "at")
@@ -1247,7 +1273,10 @@ ${workerEvents.join("\n")}`
   });
 }
 
-function createSemanticPreloadDiagnosticReport(attempts: number, message: string) {
+function createSemanticPreloadDiagnosticReport(
+  attempts: number,
+  message: string,
+) {
   const workerEvents = indexingDiagnosticEvents.slice(-12).map((entry) => {
     const details = Object.entries(entry)
       .filter(([key]) => key !== "at")
@@ -1313,7 +1342,9 @@ function createAppCrashDiagnosticReport(
 }
 
 function monitorIndexing(progress: IndexProgress, now = Date.now()) {
-  const active = ["scanning", "loading-model", "indexing"].includes(progress.status);
+  const active = ["scanning", "loading-model", "indexing"].includes(
+    progress.status,
+  );
 
   const hasCounterMismatch =
     progress.total !== progress.indexed + progress.remaining + progress.errors;
@@ -1321,7 +1352,10 @@ function monitorIndexing(progress: IndexProgress, now = Date.now()) {
   const attempted = progress.indexed + progress.errors;
   const systemicFileErrors =
     progress.errors >= 20 && progress.errors >= attempted * 0.1;
-  if (progress.status === "complete" && (systemicFileErrors || hasCounterMismatch)) {
+  if (
+    progress.status === "complete" &&
+    (systemicFileErrors || hasCounterMismatch)
+  ) {
     if (
       indexingMonitor?.status === "complete" &&
       indexingMonitor.total === progress.total &&
@@ -1346,7 +1380,10 @@ function monitorIndexing(progress: IndexProgress, now = Date.now()) {
 
   if (progress.status === "error") {
     if (!indexingMonitor || indexingMonitor.status !== "error") {
-      const created = createIndexingDiagnosticReport("indexing-error", progress);
+      const created = createIndexingDiagnosticReport(
+        "indexing-error",
+        progress,
+      );
       indexingMonitor = {
         status: "error",
         total: progress.total,
@@ -1416,7 +1453,9 @@ process.on("uncaughtException", (error) => {
     message: error.message,
     stack: error.stack,
   });
-  createAppCrashDiagnosticReport("The main process encountered an uncaught exception.");
+  createAppCrashDiagnosticReport(
+    "The main process encountered an uncaught exception.",
+  );
   process.exitCode = 1;
   app.quit();
 });
@@ -1467,30 +1506,7 @@ interface StartupState {
   label: string;
 }
 
-type DiagnosticAppSection =
-  | "files"
-  | "people"
-  | "map"
-  | "duplicates"
-  | "pets"
-  | "mobile"
-  | "memories"
-  | "stats";
-
-interface DiagnosticUiUpdate {
-  section?: DiagnosticAppSection;
-  searchActive?: boolean;
-  viewerOpen?: boolean;
-}
-
-const DIAGNOSTIC_APP_SECTIONS = new Set<DiagnosticAppSection>([
-  "files", "people", "map", "duplicates", "pets", "mobile", "memories", "stats",
-]);
-const DIAGNOSTIC_SORT_FIELDS = new Set([
-  "name", "size", "modified", "type", "source", "magic", "people", "mapped",
-]);
 const startupStartedAt = Date.now();
-let lastKnownAppPhase = "module-init";
 let startupState: StartupState = {
   ready: false,
   step: 0,
@@ -1513,19 +1529,24 @@ let indexingOverviewTask: Promise<unknown> | null = null;
  * stages, and afterwards one shared computation runs while callers get the last
  * snapshot if it takes longer than a moment.
  */
-function respondIndexingOverview(compute: () => Promise<unknown> | unknown): Promise<unknown> | unknown {
+function respondIndexingOverview(
+  compute: () => Promise<unknown> | unknown,
+): Promise<unknown> | unknown {
   if (!servicesAreReady)
-    return [{
-      id: "startup",
-      label: "Starting Silo",
-      status: "loading-model",
-      processed: startupState.step,
-      total: startupState.total,
-      unit: "steps",
-      errors: 0,
-      message: startupState.label,
-      detail: "Loading saved indexes. Progress for each stage appears as soon as they are open.",
-    }];
+    return [
+      {
+        id: "startup",
+        label: "Starting Silo",
+        status: "loading-model",
+        processed: startupState.step,
+        total: startupState.total,
+        unit: "steps",
+        errors: 0,
+        message: startupState.label,
+        detail:
+          "Loading saved indexes. Progress for each stage appears as soon as they are open.",
+      },
+    ];
   if (!indexingOverviewTask)
     indexingOverviewTask = Promise.resolve()
       .then(compute)
@@ -1539,7 +1560,9 @@ function respondIndexingOverview(compute: () => Promise<unknown> | unknown): Pro
   if (indexingOverviewCache === null) return indexingOverviewTask;
   return Promise.race([
     indexingOverviewTask.catch(() => indexingOverviewCache),
-    new Promise((resolve) => setTimeout(() => resolve(indexingOverviewCache), 1500)),
+    new Promise((resolve) =>
+      setTimeout(() => resolve(indexingOverviewCache), 1500),
+    ),
   ]);
 }
 // These only touch stateStore/contentSettings, which exist before the window is created.
@@ -1625,7 +1648,10 @@ function sendToRenderer(channel: string, payload: unknown) {
 
 function compareAppVersions(candidate: string, current: string): number | null {
   const parse = (value: string) => {
-    const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value.trim());
+    const match =
+      /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(
+        value.trim(),
+      );
     if (!match) return null;
     return {
       core: [Number(match[1]), Number(match[2]), Number(match[3])],
@@ -1737,7 +1763,8 @@ async function getLatestPlatformRelease(): Promise<AppUpdateState> {
     return {
       status: "unsupported",
       currentVersion,
-      message: "Silo updates are available for installed Windows and macOS builds.",
+      message:
+        "Silo updates are available for installed Windows and macOS builds.",
     };
   }
   const expectedArchitecture = process.arch === "arm64" ? "arm64" : "x64";
@@ -1839,17 +1866,30 @@ async function checkForAppUpdates(): Promise<AppUpdateState> {
 // rejects, so the verified bundle is swapped in by a helper after Silo quits.
 // Returns false when the bundle location is not writable; the downloaded
 // installer is then opened for a manual drag-to-Applications install.
-async function installMacAppUpdate(downloadPath: string, version: string): Promise<boolean> {
+async function installMacAppUpdate(
+  downloadPath: string,
+  version: string,
+): Promise<boolean> {
   const stagingDirectory = await fsPromises.mkdtemp(
     path.join(os.tmpdir(), "silo-update-stage-"),
   );
   if (downloadPath.endsWith(".zip")) {
-    await execFileAsync("/usr/bin/ditto", ["-x", "-k", downloadPath, stagingDirectory]);
+    await execFileAsync("/usr/bin/ditto", [
+      "-x",
+      "-k",
+      downloadPath,
+      stagingDirectory,
+    ]);
   } else {
     const mountPoint = path.join(stagingDirectory, "mount");
     await fsPromises.mkdir(mountPoint);
     await execFileAsync("/usr/bin/hdiutil", [
-      "attach", "-nobrowse", "-readonly", "-mountpoint", mountPoint, downloadPath,
+      "attach",
+      "-nobrowse",
+      "-readonly",
+      "-mountpoint",
+      mountPoint,
+      downloadPath,
     ]);
     try {
       await execFileAsync("/usr/bin/ditto", [
@@ -1857,31 +1897,68 @@ async function installMacAppUpdate(downloadPath: string, version: string): Promi
         path.join(stagingDirectory, "Silo.app"),
       ]);
     } finally {
-      await execFileAsync("/usr/bin/hdiutil", ["detach", mountPoint, "-force"]).catch(() => {});
+      await execFileAsync("/usr/bin/hdiutil", [
+        "detach",
+        mountPoint,
+        "-force",
+      ]).catch(() => {});
     }
   }
 
   const stagedBundle = path.join(stagingDirectory, "Silo.app");
   const { stdout: stagedVersion } = await execFileAsync("/usr/bin/plutil", [
-    "-extract", "CFBundleShortVersionString", "raw",
+    "-extract",
+    "CFBundleShortVersionString",
+    "raw",
     path.join(stagedBundle, "Contents", "Info.plist"),
   ]);
   if (stagedVersion.trim() !== version)
-    throw new Error(`The downloaded app is version ${stagedVersion.trim()}, expected ${version}.`);
-  await execFileAsync("/usr/bin/xattr", ["-dr", "com.apple.quarantine", stagedBundle]).catch(() => {});
+    throw new Error(
+      `The downloaded app is version ${stagedVersion.trim()}, expected ${version}.`,
+    );
+  await execFileAsync("/usr/bin/xattr", [
+    "-dr",
+    "com.apple.quarantine",
+    stagedBundle,
+  ]).catch(() => {});
 
-  const currentBundle = path.resolve(path.dirname(process.execPath), "..", "..");
-  await execFileAsync("/usr/bin/codesign", ["--verify", "--deep", "--strict", stagedBundle]).catch(() => {
+  const currentBundle = path.resolve(
+    path.dirname(process.execPath),
+    "..",
+    "..",
+  );
+  await execFileAsync("/usr/bin/codesign", [
+    "--verify",
+    "--deep",
+    "--strict",
+    stagedBundle,
+  ]).catch(() => {
     throw new Error("The downloaded app's code signature is invalid.");
   });
   // macOS keeps privacy grants only while the designated requirement stays the
   // same. Once Silo is certificate-signed, refuse an update that would change it
   // (and silently reset permissions); ad hoc installs migrate on their next update.
-  const currentRequirement = await execFileAsync("/usr/bin/codesign", ["-d", "-r-", currentBundle])
-    .then(({ stdout, stderr }) => /designated => (.+)/.exec(`${stdout}\n${stderr}`)?.[1]?.trim() ?? "", () => "");
+  const currentRequirement = await execFileAsync("/usr/bin/codesign", [
+    "-d",
+    "-r-",
+    currentBundle,
+  ]).then(
+    ({ stdout, stderr }) =>
+      /designated => (.+)/.exec(`${stdout}\n${stderr}`)?.[1]?.trim() ?? "",
+    () => "",
+  );
   if (currentRequirement.includes("certificate")) {
-    await execFileAsync("/usr/bin/codesign", ["--verify", "--deep", "--strict", `-R=${currentRequirement}`, stagedBundle])
-      .catch(() => { throw new Error("The downloaded app is not signed by Silo's signing certificate."); });
+    await execFileAsync("/usr/bin/codesign", [
+      "--verify",
+      "--deep",
+      "--strict",
+      `-R=${currentRequirement}`,
+      stagedBundle,
+    ]).catch(() => {
+      throw new Error(
+        "The downloaded app is not signed by Silo's signing certificate.",
+      );
+    });
   }
   runtimeLog("app-update-mac-signature-verified", {
     version,
@@ -1892,8 +1969,14 @@ async function installMacAppUpdate(downloadPath: string, version: string): Promi
     currentBundle.endsWith(".app") &&
     !currentBundle.includes("/AppTranslocation/") &&
     !currentBundle.startsWith("/Volumes/") &&
-    (await fsPromises.access(bundleParent, fs.constants.W_OK).then(() => true, () => false)) &&
-    (await fsPromises.access(currentBundle, fs.constants.W_OK).then(() => true, () => false));
+    (await fsPromises.access(bundleParent, fs.constants.W_OK).then(
+      () => true,
+      () => false,
+    )) &&
+    (await fsPromises.access(currentBundle, fs.constants.W_OK).then(
+      () => true,
+      () => false,
+    ));
   if (!canReplace) {
     runtimeLog("app-update-mac-manual-install", { currentBundle });
     await shell.openPath(downloadPath);
@@ -1919,7 +2002,13 @@ async function installMacAppUpdate(downloadPath: string, version: string): Promi
   );
   const helper = spawn(
     "/bin/sh",
-    [scriptPath, String(process.pid), currentBundle, stagedBundle, stagingDirectory],
+    [
+      scriptPath,
+      String(process.pid),
+      currentBundle,
+      stagedBundle,
+      stagingDirectory,
+    ],
     { detached: true, stdio: "ignore" },
   );
   await new Promise<void>((resolve, reject) => {
@@ -1988,7 +2077,9 @@ async function downloadAndInstallAppUpdate(): Promise<AppUpdateState> {
         !isTrustedReleaseUrl(downloadUrl, releaseTag) ||
         !allowedAssetNames.includes(assetName)
       ) {
-        throw new Error("The update does not point to this release's matching installer.");
+        throw new Error(
+          "The update does not point to this release's matching installer.",
+        );
       }
 
       const downloadDirectory = await fsPromises.mkdtemp(
@@ -2014,16 +2105,20 @@ async function downloadAndInstallAppUpdate(): Promise<AppUpdateState> {
           const downloadPercent = expectedSize
             ? Math.min(100, Math.round((downloadedBytes / expectedSize) * 100))
             : undefined;
-          if (downloadPercent === undefined || downloadPercent !== lastPublishedPercent) {
+          if (
+            downloadPercent === undefined ||
+            downloadPercent !== lastPublishedPercent
+          ) {
             lastPublishedPercent = downloadPercent ?? lastPublishedPercent;
             publishAppUpdateState({
               ...announcedUpdate,
               status: "downloading",
               currentVersion,
               ...(downloadPercent === undefined ? {} : { downloadPercent }),
-              message: downloadPercent === undefined
-                ? `Downloading Silo ${version}…`
-                : `Downloading Silo ${version}… ${downloadPercent}%`,
+              message:
+                downloadPercent === undefined
+                  ? `Downloading Silo ${version}…`
+                  : `Downloading Silo ${version}… ${downloadPercent}%`,
             });
           }
           callback(null, bytes);
@@ -2040,10 +2135,17 @@ async function downloadAndInstallAppUpdate(): Promise<AppUpdateState> {
       if (!downloadStats.isFile() || downloadStats.size === 0)
         throw new Error("The update download is empty.");
       if (expectedSize && downloadStats.size !== expectedSize)
-        throw new Error("The update size does not match GitHub's release record.");
+        throw new Error(
+          "The update size does not match GitHub's release record.",
+        );
       const actualDigest = `sha256:${hasher.digest("hex")}`;
-      if (expectedDigest && actualDigest.toLowerCase() !== expectedDigest.toLowerCase())
-        throw new Error("The update SHA-256 does not match GitHub's release record.");
+      if (
+        expectedDigest &&
+        actualDigest.toLowerCase() !== expectedDigest.toLowerCase()
+      )
+        throw new Error(
+          "The update SHA-256 does not match GitHub's release record.",
+        );
 
       if (process.platform === "win32") {
         const installerProcess = spawn(downloadPath, ["--updated"], {
@@ -2157,9 +2259,6 @@ function reportStartup(label: string, ready = false) {
     total: startupState.total,
     label,
   };
-  lastKnownAppPhase = ready
-    ? "ready"
-    : `startup:${safeRuntimeDiagnosticText(label).slice(0, 96) || "in-progress"}`;
   runtimeLog("startup-stage", {
     ...startupState,
     elapsedMs: Date.now() - startupStartedAt,
@@ -2174,7 +2273,6 @@ function reportStartup(label: string, ready = false) {
 function reportStartupDetail(label: string) {
   if (startupState.ready || startupState.label === label) return;
   startupState = { ...startupState, label };
-  lastKnownAppPhase = `startup:${safeRuntimeDiagnosticText(label).slice(0, 96) || "in-progress"}`;
   sendToRenderer("startup-progress", startupState);
 }
 
@@ -2193,7 +2291,10 @@ let searchIndexReadiness: SearchIndexReadiness = {
   message: "Preparing the saved search index…",
 };
 type SemanticRuntimeStatus = "idle" | "loading-model" | "complete" | "error";
-let semanticRuntimeProgress: { status: SemanticRuntimeStatus; message: string } = {
+let semanticRuntimeProgress: {
+  status: SemanticRuntimeStatus;
+  message: string;
+} = {
   status: "idle",
   message: "Waiting for the offline search model.",
 };
@@ -2277,19 +2378,6 @@ let appUpdateInstall: Promise<AppUpdateState> | null = null;
 const rendererRecovery = new RendererRecovery();
 let rendererRecoveryTimer: NodeJS.Timeout | null = null;
 let stateStore: StateStore;
-let lastUiDiagnosticStateUpdatedAt = 0;
-let lastKnownUiDiagnosticState = {
-  section: "files" as DiagnosticAppSection,
-  pathSet: false,
-  viewMode: "grid" as "list" | "grid",
-  sortField: "name",
-  ascending: true,
-  typeFilterActive: false,
-  filterPanelOpen: false,
-  exploded: false,
-  searchActive: false,
-  viewerOpen: false,
-};
 let hiddenFolderPathCache = new Set<string>();
 let semanticIndexer: SemanticIndexer;
 let libraryShareServer: LibraryShareServer | null = null;
@@ -2329,7 +2417,11 @@ let memoryMetadataSnapshot: {
   at: number;
   metadata: Record<string, FileMetadata>;
 } | null = null;
-type ScoredMemoryMedia = MemoryMedia & { score: number; size?: number; magicScore?: number };
+type ScoredMemoryMedia = MemoryMedia & {
+  score: number;
+  size?: number;
+  magicScore?: number;
+};
 const MEMORY_VIDEO_EXTENSIONS = new Set([".mov", ".mp4", ".m4v", ".webm"]);
 const MEMORY_PREVIEW_RENDER_VERSION = 7;
 const MEMORY_DUPLICATE_SIMILARITY = 0.85;
@@ -2348,22 +2440,10 @@ function memoryFileMetadata(filePath: string): FileMetadata | undefined {
     : undefined;
 }
 
-/** Obvious screenshot and application artwork paths are never Memory photos. */
-function memoryObviousNonPhotoPath(filePath: string): boolean {
-  const basename = path.basename(filePath);
-  const normalizedName = basename.toLocaleLowerCase().replace(/[\s_-]+/g, "");
-  if (normalizedName.includes("screenshot") || normalizedName.includes("screencap")) return true;
-  if (/(?:^|[\/])node_modules(?:[\/]|$)/i.test(filePath)) return true;
-  if (/(?:^|[\/])[^\/]+\.(?:app|bundle|framework|plugin|asar)(?:[\/]|$)/i.test(filePath)) return true;
-  const stem = normalizedName.replace(/\.[^.]*$/, "");
-  return /^(?:app)?(?:icon|logo|favicon|splash|launchimage|launchscreen|loading|mascot)(?:[0-9]+|set)?$/i.test(stem);
-}
-
 /** Strict and toggle-independent: ignores showNsfw/showBannedPeople and folder reveal views. */
 function memoryAllowed(filePath: unknown): boolean {
   if (typeof filePath !== "string" || !filePath || filePath.includes("\0"))
     return false;
-  if (memoryObviousNonPhotoPath(filePath)) return false;
   if (!stateStore || !faceIndexer) return false;
   const hidden = getHiddenFolderPaths();
   // Hidden-folder entries may be directories; their descendants are hidden too.
@@ -2388,14 +2468,21 @@ function memoryAllowed(filePath: unknown): boolean {
 async function memoryLiveVideo(file: MemoryMedia) {
   if (file.type !== "image" || isRemotePath(file.path)) return undefined;
   const parsed = path.parse(file.path);
-  if (![".heic", ".heif", ".jpg", ".jpeg"].includes(parsed.ext.toLowerCase())) return undefined;
+  if (![".heic", ".heif", ".jpg", ".jpeg"].includes(parsed.ext.toLowerCase()))
+    return undefined;
   const variants = [".mov", ".MOV", ".mp4", ".MP4"].map((ext) =>
     path.join(parsed.dir, parsed.name + ext),
   );
   // Case-insensitive volumes resolve every casing to one file, so all spellings must be allowed.
-  if (!variants.every((candidate) => memoryAllowed(candidate))) return undefined;
+  if (!variants.every((candidate) => memoryAllowed(candidate)))
+    return undefined;
   for (const candidate of variants) {
-    if (await fsPromises.stat(candidate).then((s) => s.isFile(), () => false))
+    if (
+      await fsPromises.stat(candidate).then(
+        (s) => s.isFile(),
+        () => false,
+      )
+    )
       return candidate;
   }
   return undefined;
@@ -2420,30 +2507,19 @@ async function memoryVideoCandidates(
   directories: string[],
   limit = 12,
   entriesPerDirectory = 2000,
-  includePhoneDirectories = false,
 ): Promise<string[]> {
   const found: string[] = [];
   for (const directory of directories.slice(0, 4)) {
     if (found.length >= limit) break;
-    if (includePhoneDirectories && phoneManager?.isPhonePath(directory)) {
-      try {
-        const entries = await phoneManager.listPhoneFiles(directory, false);
-        for (const entry of entries) {
-          if (found.length >= limit) break;
-          if (entry.isDirectory || !MEMORY_VIDEO_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
-          if (memoryAllowed(entry.path)) found.push(entry.path);
-        }
-      } catch {
-        // A disconnected phone contributes no clips.
-      }
-      continue;
-    }
     try {
       const dir = await fsPromises.opendir(directory);
       let seen = 0;
       for await (const entry of dir) {
         if (found.length >= limit || ++seen > entriesPerDirectory) break;
-        if (!entry.isFile() || !MEMORY_VIDEO_EXTENSIONS.has(path.extname(entry.name).toLowerCase()))
+        if (
+          !entry.isFile() ||
+          !MEMORY_VIDEO_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+        )
           continue;
         const filePath = path.join(directory, entry.name);
         if (memoryAllowed(filePath)) found.push(filePath);
@@ -2458,29 +2534,9 @@ async function memoryVideoCandidates(
 function memoryDot(first: Float32Array, second: Float32Array) {
   let sum = 0;
   const length = Math.min(first.length, second.length);
-  for (let index = 0; index < length; index++) sum += first[index] * second[index];
+  for (let index = 0; index < length; index++)
+    sum += first[index] * second[index];
   return sum;
-}
-
-/** Down-rank generic graphics while keeping every safe indexed image eligible. */
-function memoryImageContentFactor(
-  vector: Float32Array,
-  prompts: { good: Float32Array[]; junk: Float32Array[] },
-) {
-  const good = prompts.good.length ? Math.max(...prompts.good.map((prompt) => memoryDot(prompt, vector))) : 0;
-  const junk = prompts.junk.length ? Math.max(...prompts.junk.map((prompt) => memoryDot(prompt, vector))) : 0;
-  return junk > good + 0.01 ? 0.55 : 1;
-}
-
-/** Keep ambiguous images; reject only strong CLIP matches to non-photo content. */
-function memoryImageIsObviousNonPhoto(
-  vector: Float32Array,
-  prompts: { good: Float32Array[]; nonPhoto: Float32Array[] },
-): boolean {
-  if (!prompts.nonPhoto.length || !prompts.good.length) return false;
-  const bestPhoto = Math.max(...prompts.good.map((prompt) => memoryDot(prompt, vector)));
-  const bestNonPhoto = Math.max(...prompts.nonPhoto.map((prompt) => memoryDot(prompt, vector)));
-  return bestNonPhoto >= 0.24 && bestNonPhoto - bestPhoto >= 0.035;
 }
 
 async function filterMemoryPhotos(paths: string[]): Promise<string[]> {
@@ -2491,7 +2547,17 @@ async function filterMemoryPhotos(paths: string[]): Promise<string[]> {
 // Custom memory prompts accept looser visual matches than interactive search.
 const MEMORY_SEARCH_MIN_CONFIDENCE = 20;
 const MEMORY_NAMED_IMAGE_EXTENSIONS = new Set([
-  ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".tif", ".tiff", ".bmp", ".avif",
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".heic",
+  ".heif",
+  ".webp",
+  ".gif",
+  ".tif",
+  ".tiff",
+  ".bmp",
+  ".avif",
 ]);
 
 function memoryNameMatches(name: string | undefined, query: string): boolean {
@@ -2501,46 +2567,76 @@ function memoryNameMatches(name: string | undefined, query: string): boolean {
 }
 
 /** Photos the user has named via digital folders, people, pets, keywords or virtual names. */
-async function namedMemoryMedia(query: string, roots: string[]): Promise<ScoredMemoryMedia[]> {
+async function namedMemoryMedia(
+  query: string,
+  roots: string[],
+): Promise<ScoredMemoryMedia[]> {
   const normalizedQuery = query.trim().toLocaleLowerCase();
   if (normalizedQuery.length < 3) return [];
   const state = stateStore.getState();
   const paths = new Set<string>();
   for (const folder of state.digitalFolders)
-    if (memoryNameMatches(folder.name, normalizedQuery)) folder.filePaths.forEach((filePath) => paths.add(filePath));
+    if (memoryNameMatches(folder.name, normalizedQuery))
+      folder.filePaths.forEach((filePath) => paths.add(filePath));
   for (const person of faceIndexer.getPeople())
     if (memoryNameMatches(person.name, normalizedQuery))
-      faceIndexer.getPerson(person.id)?.confirmedPhotoPaths.forEach((filePath) => paths.add(filePath));
+      faceIndexer
+        .getPerson(person.id)
+        ?.confirmedPhotoPaths.forEach((filePath) => paths.add(filePath));
   for (const entry of state.nameIndex)
-    if (entry.sourceType !== "person" && memoryNameMatches(entry.name, normalizedQuery))
+    if (
+      entry.sourceType !== "person" &&
+      memoryNameMatches(entry.name, normalizedQuery)
+    )
       entry.filePaths.forEach(({ path: filePath }) => paths.add(filePath));
   for (const filePath in state.fileMetadata) {
     const metadata = state.fileMetadata[filePath];
-    if (memoryNameMatches(metadata.displayName, normalizedQuery)
-      || metadata.keywords.some((keyword) => memoryNameMatches(keyword, normalizedQuery)))
+    if (
+      memoryNameMatches(metadata.displayName, normalizedQuery) ||
+      metadata.keywords.some((keyword) =>
+        memoryNameMatches(keyword, normalizedQuery),
+      )
+    )
       paths.add(filePath);
   }
-  const eligible = [...paths].filter((filePath) =>
-    MEMORY_NAMED_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase())
-    && memoryAllowed(filePath)
-    && roots.some((root) => filePath === root || filePath.startsWith(root.endsWith(path.sep) ? root : root + path.sep)));
+  const eligible = [...paths].filter(
+    (filePath) =>
+      MEMORY_NAMED_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase()) &&
+      memoryAllowed(filePath) &&
+      roots.some(
+        (root) =>
+          filePath === root ||
+          filePath.startsWith(root.endsWith(path.sep) ? root : root + path.sep),
+      ),
+  );
   // Spread a large named collection across the whole set instead of its first entries.
   const step = Math.max(1, eligible.length / 160);
-  const sampled = Array.from({ length: Math.min(eligible.length, 160) }, (_, index) => eligible[Math.floor(index * step)]);
+  const sampled = Array.from(
+    { length: Math.min(eligible.length, 160) },
+    (_, index) => eligible[Math.floor(index * step)],
+  );
   const media: ScoredMemoryMedia[] = [];
   for (let start = 0; start < sampled.length; start += 32) {
-    const stats = await Promise.all(sampled.slice(start, start + 32).map(async (filePath) => {
-      try {
-        const localPath = await resolveLocalPath(filePath);
-        const stat = await fsPromises.stat(localPath);
-        return stat.isFile() && memoryAllowed(filePath)
-          ? { filePath, stat }
-          : null;
-      } catch { return null; }
-    }));
+    const stats = await Promise.all(
+      sampled.slice(start, start + 32).map(async (filePath) => {
+        try {
+          const stat = await fsPromises.stat(filePath);
+          return stat.isFile() ? { filePath, stat } : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
     for (const entry of stats)
-      if (entry) media.push({ path: entry.filePath, name: path.basename(entry.filePath), type: "image",
-        modified: entry.stat.mtimeMs, size: entry.stat.size, score: 100 });
+      if (entry)
+        media.push({
+          path: entry.filePath,
+          name: path.basename(entry.filePath),
+          type: "image",
+          modified: entry.stat.mtimeMs,
+          size: entry.stat.size,
+          score: 100,
+        });
   }
   return media;
 }
@@ -2561,7 +2657,9 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
   // User-named photos lead; visual matches fill the rest of a wide pool.
   const photoCandidates: ScoredMemoryMedia[] = named.slice(0, 120);
   const candidatePaths = new Set(photoCandidates.map((file) => file.path));
-  const dropped = { notImage: 0, notAllowed: 0 };
+  const musicDirectories = memoryMusicDirectories();
+  const dropped = { notImage: 0, notAllowed: 0, notPersonal: 0 };
+  const nonPersonalMatches: { path: string; size?: number }[] = [];
   const nonImageTypes = new Map<string, number>();
   const collectPhotos = (results: typeof matches) => {
     for (const file of results) {
@@ -2569,91 +2667,158 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
       if (candidatePaths.has(file.path)) continue;
       if (file.type !== "image") {
         dropped.notImage++;
-        nonImageTypes.set(file.type || "unknown", (nonImageTypes.get(file.type || "unknown") ?? 0) + 1);
+        nonImageTypes.set(
+          file.type || "unknown",
+          (nonImageTypes.get(file.type || "unknown") ?? 0) + 1,
+        );
         continue;
       }
-      if (!memoryAllowed(file.path)) { dropped.notAllowed++; continue; }
+      if (!memoryAllowed(file.path)) {
+        dropped.notAllowed++;
+        continue;
+      }
+      if (!isPersonalPhotoPath(file.path, file.size, musicDirectories)) {
+        dropped.notPersonal++;
+        nonPersonalMatches.push(file);
+        continue;
+      }
       candidatePaths.add(file.path);
-      photoCandidates.push({ path: file.path, name: file.name, type: "image",
-        modified: file.modified, size: file.size, score: file.confidence });
+      photoCandidates.push({
+        path: file.path,
+        name: file.name,
+        type: "image",
+        modified: file.modified,
+        size: file.size,
+        score: file.confidence,
+      });
     }
   };
   collectPhotos(matches);
-  // When documents crowd the broad results, scan the indexed image vectors
-  // directly so every safe image remains eligible, regardless of source type.
-  const filteredSearch = photoCandidates.length < MEMORY_MIN_SELECTION_COUNT;
+  // On x64, graphics can fill the entire top-500 image window. Filter before
+  // ranking in the sparse case rather than relaxing personal-photo or safety rules.
+  const filteredSearch =
+    process.arch === "x64" &&
+    photoCandidates.length < MEMORY_MIN_SELECTION_COUNT;
   let filteredMatches = 0;
   if (filteredSearch) {
     const eligibleMatches = await semanticIndexer.search(
-      query, MEMORY_SEARCH_MIN_CONFIDENCE, roots, () => false, undefined,
-      (file) => file.type === "image" && memoryAllowed(file.path),
+      query,
+      MEMORY_SEARCH_MIN_CONFIDENCE,
+      roots,
+      () => false,
+      undefined,
+      (file) =>
+        file.type === "image" &&
+        memoryAllowed(file.path) &&
+        isPersonalPhotoPath(file.path, file.size, musicDirectories),
     );
     filteredMatches = eligibleMatches.length;
     collectPhotos(eligibleMatches);
   }
-  const prompts = await memoryPromptVectors();
-  const vectors = await semanticIndexer.getImageVectors(photoCandidates.map((file) => file.path));
-  const rankedPhotos = photoCandidates.flatMap((file) => {
-    const vector = vectors.get(file.path);
-    if (vector && memoryImageIsObviousNonPhoto(vector, prompts)) return [];
-    return [vector
-      ? { ...file, score: file.score * memoryImageContentFactor(vector, prompts) }
-      : file];
-  }).sort((first, second) => second.score - first.score || first.path.localeCompare(second.path));
-  // Relevance decides which frame leads; Magic only removes near-identical shots.
-  const distinctPaths = await filterMemoryPhotos(rankedPhotos.map((file) => file.path));
-  const candidatesByPath = new Map(rankedPhotos.map((file) => [file.path, file]));
-  const distinctPhotos = distinctPaths.flatMap((filePath) => {
-    const candidate = candidatesByPath.get(filePath);
-    return candidate ? [candidate] : [];
-  });
-  const qualityPhotos = await applyMemoryPhotoQuality(distinctPhotos);
+  const magic: MagicRankResult = photoCandidates.length
+    ? await aestheticScorer.rankDistinct(
+        photoCandidates.map(({ path: filePath, name, size, modified }) => ({
+          path: filePath,
+          name,
+          size: size ?? 0,
+          modified,
+        })),
+        "variety",
+        MEMORY_DUPLICATE_SIMILARITY,
+      )
+    : { order: [], scores: {}, analyzed: 0, total: 0, running: false };
+  const candidatesByPath = new Map(
+    photoCandidates.map((file) => [file.path, file]),
+  );
+  const namedPaths = new Set(named.map((file) => file.path));
+  const rankedPhotos: ScoredMemoryMedia[] = magic.order
+    .slice(0, 48)
+    .flatMap((filePath) => {
+      const candidate = candidatesByPath.get(filePath);
+      if (!candidate) return [];
+      const magicScore = magic.scores[filePath];
+      return [
+        {
+          ...candidate,
+          magicScore: Number.isFinite(magicScore) ? magicScore : -1,
+          score:
+            (Number.isFinite(magicScore) ? magicScore : 0) +
+            candidate.score / 1000 +
+            (namedPaths.has(filePath) ? 1 : 0),
+        },
+      ];
+    });
+  const qualityPhotos = await applyMemoryPhotoQuality(rankedPhotos);
   // Resolution rules must not leave a prompt short when lower-resolution matches exist.
   if (qualityPhotos.length < MEMORY_MIN_SELECTION_COUNT) {
     const kept = new Set(qualityPhotos.map((file) => file.path));
-    qualityPhotos.push(...rankedPhotos.filter((file) => !kept.has(file.path))
-      .slice(0, MEMORY_MIN_SELECTION_COUNT - qualityPhotos.length));
+    qualityPhotos.push(
+      ...rankedPhotos
+        .filter((file) => !kept.has(file.path))
+        .slice(0, MEMORY_MIN_SELECTION_COUNT - qualityPhotos.length),
+    );
   }
-  const photos = selectMemoryPhotoCandidates(qualityPhotos);
-  runtimeLog("memory-search-trace", { stage: "photos", roots: roots.length, named: named.length, matches: matches.length, ...dropped,
-    candidates: photoCandidates.length, distinct: distinctPhotos.length,
-    ranked: rankedPhotos.length, quality: qualityPhotos.length, selected: photos.length,
-    minConfidence: MEMORY_SEARCH_MIN_CONFIDENCE, filteredSearch, filteredMatches,
-    topMatchConfidence: matches.length ? Math.round(Math.max(...matches.map((m) => m.confidence ?? 0))) : 0,
-    nonImageTypes: memoryTopCounts(nonImageTypes) });
-  const videos = await memoryVideoMatchesForPhotos(photos, query, true);
-  return [...photos, ...videos].sort((first, second) => second.score - first.score);
-}
-
-/** Matches adjacent MOV/MP4 clips by their first frame, including remote phone folders for prompted videos. */
-async function memoryVideoMatchesForPhotos(
-  photos: ScoredMemoryMedia[],
-  query: string,
-  includePhoneDirectories = false,
-): Promise<ScoredMemoryMedia[]> {
-  const directories = Array.from(new Set(photos.map((file) => path.dirname(file.path)))).slice(0, 4);
+  const photos = selectMemoryPhotoCandidates(qualityPhotos).map(
+    ({ magicScore, ...photo }) => photo,
+  );
+  runtimeLog("memory-search-trace", {
+    stage: "photos",
+    roots: roots.length,
+    named: named.length,
+    matches: matches.length,
+    ...dropped,
+    candidates: photoCandidates.length,
+    distinct: magic.order.length,
+    analyzed: magic.analyzed,
+    ranked: rankedPhotos.length,
+    quality: qualityPhotos.length,
+    selected: photos.length,
+    minConfidence: MEMORY_SEARCH_MIN_CONFIDENCE,
+    filteredSearch,
+    filteredMatches,
+    magicRunning: magic.running,
+    magicTotal: magic.total,
+    topMatchConfidence: matches.length
+      ? Math.round(Math.max(...matches.map((m) => m.confidence ?? 0)))
+      : 0,
+    nonImageTypes: memoryTopCounts(nonImageTypes),
+    ...(dropped.notPersonal
+      ? memoryPersonalRejectionSummary(nonPersonalMatches, musicDirectories)
+      : {}),
+  });
+  // Clips beside matched photos; first frames are classified on demand, never a library rescan.
+  const directories = Array.from(
+    new Set(
+      photos
+        .filter((file) => !isRemotePath(file.path))
+        .map((file) => path.dirname(file.path)),
+    ),
+  ).slice(0, 4);
   const candidates = photos.length
-    ? await memoryVideoCandidates(directories, 12, 2000, includePhoneDirectories)
+    ? await memoryVideoCandidates(directories)
     : [];
   const videos: ScoredMemoryMedia[] = [];
   if (candidates.length) {
-    const [prompt, unsafePrompt, safePrompt] = await semanticIndexer.embedPrompts([
-      `a photo of ${query}`,
-      `a photo of ${NSFW_VISUAL_PROMPT}`,
-      `a photo of ${SAFE_VISUAL_PROMPT}`,
-    ]);
+    const [prompt, unsafePrompt, safePrompt] =
+      await semanticIndexer.embedPrompts([
+        `a photo of ${query}`,
+        `a photo of ${NSFW_VISUAL_PROMPT}`,
+        `a photo of ${SAFE_VISUAL_PROMPT}`,
+      ]);
     for (const filePath of candidates) {
       try {
-        const localPath = await resolveLocalPath(filePath);
-        const stat = await fsPromises.stat(localPath);
+        const stat = await fsPromises.stat(filePath);
         if (!stat.isFile()) continue;
         const key = `${filePath}:${stat.size}:${stat.mtimeMs}`;
         let vector = memoryFrameVectors.get(key);
         if (!vector) {
-          const framePath = memoryThumbnailFile(await getThumbnail(localPath, false, 480));
+          const framePath = memoryThumbnailFile(
+            await getThumbnail(filePath, false, 480),
+          );
           if (!framePath) continue;
           vector = await semanticIndexer.embedPreviewImage(framePath);
-          if (memoryFrameVectors.size >= 128) memoryFrameVectors.delete(memoryFrameVectors.keys().next().value!);
+          if (memoryFrameVectors.size >= 128)
+            memoryFrameVectors.delete(memoryFrameVectors.keys().next().value!);
           memoryFrameVectors.set(key, vector);
         }
         // Same thresholds as SemanticIndexer.classifyUnsafeImages.
@@ -2664,140 +2829,88 @@ async function memoryVideoMatchesForPhotos(
         }
         const similarity = memoryDot(prompt, vector);
         if (similarity >= 0.24 && memoryAllowed(filePath))
-          videos.push({ path: filePath, name: path.basename(filePath), type: "video",
-            modified: stat.mtimeMs, score: Math.min(100, similarity * 100) });
-      } catch { /* A damaged clip must not discard the photo story. */ }
+          videos.push({
+            path: filePath,
+            name: path.basename(filePath),
+            type: "video",
+            modified: stat.mtimeMs,
+            score: Math.min(100, similarity * 100),
+          });
+      } catch {
+        /* A damaged clip must not discard the photo story. */
+      }
     }
   }
-  return videos;
-}
-
-function promptedVideoPhotoCandidate(file: { path: string; size: number; type: string }): boolean {
-  return file.type === "image" && memoryAllowed(file.path);
-}
-
-/**
- * Prompted-video selection is relevance-first: filter the full targeted result
- * set, confidence and screenshot checks before the bounded candidate pool.
- * This path deliberately does not use Magic's order; Magic remains a memory
- * curation signal in the automatic discovery path.
- */
-async function searchPromptedMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
-  if (typeof query !== "string" || !query.trim()) return [];
-  if (!semanticIndexer || !faceIndexer)
-    throw new Error("Memory search is not ready yet. Try again shortly.");
-  const roots = await getAllIndexSources();
-  if (!roots.length) return [];
-  const [named, matches, photoPrompts, queryPrompts] = await Promise.all([
-    namedMemoryMedia(query, roots),
-    semanticIndexer.search(query, MEMORY_SEARCH_MIN_CONFIDENCE, roots, () => false, undefined, promptedVideoPhotoCandidate),
-    memoryPromptVectors(),
-    semanticIndexer.embedPrompts([`a photo of ${query}`]),
-  ]);
-  const candidateByPath = new Map<string, ScoredMemoryMedia>();
-  // Explicit people/folder labels are already exact matches; semantic hits still
-  // have to clear the configured confidence floor before any candidate cap.
-  const confident = matches.filter((file) => file.confidence >= MEMORY_SEARCH_MIN_CONFIDENCE
-    && promptedVideoPhotoCandidate(file))
-    .sort((first, second) => second.confidence - first.confidence);
-  const vectors = await semanticIndexer.getImageVectors(Array.from(new Set([
-    ...named.map((file) => file.path), ...confident.map((file) => file.path),
-  ])));
-  for (const file of named) {
-    const vector = vectors.get(file.path);
-    if (vector && memoryImageIsObviousNonPhoto(vector, photoPrompts)) continue;
-    if (promptedVideoPhotoCandidate({ path: file.path, size: file.size ?? 0, type: file.type }))
-      candidateByPath.set(file.path, { ...file, score: 100 });
-  }
-  for (const file of confident) {
-    const vector = vectors.get(file.path);
-    if (!vector || memoryImageIsObviousNonPhoto(vector, photoPrompts)) continue;
-    candidateByPath.set(file.path, { path: file.path, name: file.name, type: "image",
-      modified: file.modified, size: file.size,
-      score: file.confidence * memoryImageContentFactor(vector, photoPrompts) });
-  }
-
-  // IndexProgress only publishes the active basename. Include that image only
-  // when it maps to one unambiguous not-yet-ranked record, then score it with
-  // the same query and junk vectors. This bounded exception is prompted-video-only.
-  const selectedPaths = new Set(candidateByPath.keys());
-  const indexedImages = semanticIndexer.getIndexedImages(roots);
-  const active = currentPromptedVideoIndexingImage(
-    indexedImages, semanticIndexer.getProgress().status, semanticIndexer.getProgress().currentFile, selectedPaths,
+  return [...photos, ...videos].sort(
+    (first, second) => second.score - first.score,
   );
-  if (active && promptedVideoPhotoCandidate(active)) {
-    try {
-      const existing = await semanticIndexer.getImageVectors([active.path]);
-      const vector = existing.get(active.path)
-        ?? await semanticIndexer.embedPreviewImage(await resolveLocalPath(active.path));
-      const confidence = memoryDot(queryPrompts[0], vector) * 100;
-      if (confidence >= MEMORY_SEARCH_MIN_CONFIDENCE && !memoryImageIsObviousNonPhoto(vector, photoPrompts))
-        candidateByPath.set(active.path, { path: active.path, name: active.name, type: "image",
-          modified: active.modified, size: active.size,
-          score: confidence * memoryImageContentFactor(vector, photoPrompts) });
-    } catch { /* A file still being written waits for the next prompt attempt. */ }
-  }
-
-  const ranked = [...candidateByPath.values()].sort((first, second) => second.score - first.score);
-  const quality = await applyMemoryPhotoQuality(ranked);
-  const distinctPaths = await filterMemoryPhotos(quality.map((file) => file.path));
-  const byPath = new Map(quality.map((file) => [file.path, file]));
-  const photos = distinctPaths.flatMap((filePath) => {
-    const item = byPath.get(filePath);
-    return item ? [item] : [];
-  }).slice(0, 160);
-  const videos = await memoryVideoMatchesForPhotos(photos, query, true);
-  return [...photos, ...videos].sort((first, second) => second.score - first.score);
 }
 
 let memoryTopicProfile: MemoryTopicProfile | null = null;
 let memoryProfileScheduler: RefreshScheduler | null = null;
 
+function personalMemoryPhotoFilter() {
+  const musicDirectories = memoryMusicDirectories();
+  return (file: { path: string; size: number }) =>
+    isPersonalPhotoPath(file.path, file.size, musicDirectories);
+}
+
 /** Incremental, persisted profile of what the archive is about; only changed records are reread. */
 function getMemoryTopicProfile(): MemoryTopicProfile {
   if (!memoryTopicProfile)
     memoryTopicProfile = new MemoryTopicProfile({
-      statePath: path.join(app.getPath("userData"), "memories", "topic-profile.json"),
-      topics: MEMORY_CONCEPTS.map((concept) => ({ id: concept.id, prompt: `a photo of ${concept.prompt}` })),
+      statePath: path.join(
+        app.getPath("userData"),
+        "memories",
+        "topic-profile.json",
+      ),
+      topics: MEMORY_CONCEPTS.map((concept) => ({
+        id: concept.id,
+        prompt: `a photo of ${concept.prompt}`,
+      })),
       distractorPrompts: [...MEMORY_JUNK_PROMPTS, ...MEMORY_PHOTO_PROMPTS],
       revision: () => semanticIndexer.getRevision(),
       records: async () => {
         await semanticIndexer.whenLoaded();
-        // Source checkboxes only control Search visibility. Memories learn from
-        // every indexed source, with the same strict content-safety gate used at
-        // generation and display time.
-        return semanticIndexer.getIndexedImageRecords(await getAllIndexSources())
-          .filter((record) => memoryAllowed(record.path));
+        const personal = personalMemoryPhotoFilter();
+        return semanticIndexer
+          .getIndexedImageRecords(await getAllIndexSources())
+          .filter(personal);
       },
       vectors: (paths) => semanticIndexer.getImageVectors(paths),
       embedPrompts: (prompts) => semanticIndexer.embedPrompts(prompts),
       captureTime: async (filePath) =>
-        isRemotePath(filePath) ? null : (await readMemoryExif(filePath))?.takenAt || null,
+        isRemotePath(filePath)
+          ? null
+          : (await readMemoryExif(filePath))?.takenAt || null,
     });
   return memoryTopicProfile;
 }
 
-/** Wait only for the saved records and local CLIP model needed to read vectors. */
+/** Indexing or startup reconciliation is still changing records; profile work waits. */
 function memoryProfileBusy(): boolean {
-  // Topic profiling reads existing vectors, so it can keep up with CLIP indexing
-  // instead of waiting for a multi-day library scan to finish.
-  return !semanticIndexer?.isLoaded() ||
-    semanticRuntimeProgress.status !== "complete";
+  return (
+    !semanticIndexer?.isLoaded() ||
+    PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) ||
+    semanticIndexer.getReconciliationProgress().running
+  );
 }
 
 async function refreshMemoryTopicsAfterIndexing(): Promise<void> {
   const result = await getMemoryTopicProfile().refresh();
-  runtimeLog("memory-topic-profile", { ...result, sampled: memoryTopicProfile?.getSnapshot()?.sampledPhotos ?? 0 });
-  if ((!result.changed && result.classified === 0 && result.removed === 0) || !memoryManager) return;
-  const state = await memoryManager.refreshForProfileChange();
-  sendToRenderer("memories-changed", {
-    ...(await memoryStateWithPreviews(state)),
-    message: state.message,
+  runtimeLog("memory-topic-profile", {
+    ...result,
+    sampled: memoryTopicProfile?.getSnapshot()?.sampledPhotos ?? 0,
   });
+  if (!result.changed || !memoryManager) return;
+  const state = await memoryManager.refreshForProfileChange();
   // Previews render only once indexing is quiet; the next notification retries otherwise.
   if (!memoryProfileBusy()) await prepareAllMemoryPreviews(state.suggestions);
 }
-let memoryPhotoPromptVectors: Promise<{ junk: Float32Array[]; good: Float32Array[]; nonPhoto: Float32Array[] }> | null = null;
+let memoryPhotoPromptVectors: Promise<{
+  junk: Float32Array[];
+  good: Float32Array[];
+}> | null = null;
 
 function memoryPromptVectors() {
   if (!memoryPhotoPromptVectors) {
@@ -2806,58 +2919,82 @@ function memoryPromptVectors() {
       .then((vectors) => ({
         junk: vectors.slice(0, MEMORY_JUNK_PROMPTS.length),
         good: vectors.slice(MEMORY_JUNK_PROMPTS.length),
-        nonPhoto: vectors.filter((_, index) => index < MEMORY_JUNK_PROMPTS.length &&
-          MEMORY_JUNK_PROMPTS[index] !== "a blurry dark accidental photo" &&
-          MEMORY_JUNK_PROMPTS[index] !== "a product photo on a plain white background"),
       }));
-    memoryPhotoPromptVectors.catch(() => { memoryPhotoPromptVectors = null; });
+    memoryPhotoPromptVectors.catch(() => {
+      memoryPhotoPromptVectors = null;
+    });
   }
   return memoryPhotoPromptVectors;
 }
 
-/** Story photos ranked by relevance; every safe indexed image remains eligible. */
+/** Story photos ranked by how much they look like real moments; screenshots and documents are dropped. */
 async function loadMemoryIdeaMedia(
   paths: string[],
   modified: Map<string, number>,
-  query: string,
-  storyKey: string,
 ) {
-  paths = paths.filter(memoryAllowed);
-  if (!paths.length) return [];
-  const [vectors, prompts, conceptPrompts] = await Promise.all([
+  const [vectors, prompts] = await Promise.all([
     semanticIndexer.getImageVectors(paths),
     memoryPromptVectors(),
-    /^concept(?:[-:]|$)/i.test(storyKey)
-      ? semanticIndexer.embedPrompts([`a photo of ${query}`])
-      : Promise.resolve([] as Float32Array[]),
   ]);
-  const conceptPrompt = conceptPrompts[0];
   const media: ScoredMemoryMedia[] = [];
   for (const filePath of paths) {
     const vector = vectors.get(filePath);
-    if (!vector || memoryImageIsObviousNonPhoto(vector, prompts)) continue;
-    const good = Math.max(...prompts.good.map((prompt) => memoryDot(prompt, vector)));
-    const relevance = conceptPrompt ? memoryDot(conceptPrompt, vector) : good;
-    media.push({ path: filePath, name: path.basename(filePath), type: "image",
+    if (!vector) continue;
+    const good = Math.max(
+      ...prompts.good.map((prompt) => memoryDot(prompt, vector)),
+    );
+    const junk = Math.max(
+      ...prompts.junk.map((prompt) => memoryDot(prompt, vector)),
+    );
+    if (junk > good + 0.01) continue;
+    media.push({
+      path: filePath,
+      name: path.basename(filePath),
+      type: "image",
       modified: modified.get(filePath) ?? 0,
-      score: relevance * 100 * memoryImageContentFactor(vector, prompts) });
+      score: good * 100,
+    });
   }
   if (media.length === 0) return [];
-
-  media.sort((first, second) => second.score - first.score
-    || first.modified - second.modified
-    || first.path.localeCompare(second.path));
-  const distinctPaths = await filterMemoryPhotos(media.map((item) => item.path));
+  const magic = await aestheticScorer.rankDistinct(
+    media.map((item) => ({
+      path: item.path,
+      name: item.name,
+      size: item.size ?? 0,
+      modified: item.modified,
+    })),
+    "variety",
+    MEMORY_DUPLICATE_SIMILARITY,
+  );
   const candidatesByPath = new Map(media.map((item) => [item.path, item]));
-  const distinctMedia = distinctPaths.flatMap((filePath) => {
-    const candidate = candidatesByPath.get(filePath);
-    return candidate ? [candidate] : [];
-  });
-  const qualityPhotos = await applyMemoryPhotoQuality(distinctMedia);
-  return selectMemoryPhotoCandidates(qualityPhotos);
+  const rankedPhotos: ScoredMemoryMedia[] = magic.order
+    .slice(0, 38)
+    .flatMap((filePath) => {
+      const candidate = candidatesByPath.get(filePath);
+      if (!candidate) return [];
+      const magicScore = magic.scores[filePath];
+      return [
+        {
+          ...candidate,
+          magicScore: Number.isFinite(magicScore) ? magicScore : -1,
+          score:
+            (Number.isFinite(magicScore) ? magicScore : 0) +
+            candidate.score / 1000,
+        },
+      ];
+    });
+  const qualityPhotos = await applyMemoryPhotoQuality(rankedPhotos);
+  return selectMemoryPhotoCandidates(qualityPhotos).map(
+    ({ magicScore, ...photo }) => photo,
+  );
 }
 
-type MemoryExif = { camera: boolean; width: number; height: number; takenAt: number };
+type MemoryExif = {
+  camera: boolean;
+  width: number;
+  height: number;
+  takenAt: number;
+};
 const memoryExifCache = new Map<string, MemoryExif | null>();
 
 /** Camera make/model, capture date and pixel size; null when unreadable. */
@@ -2866,67 +3003,160 @@ async function readMemoryExif(filePath: string): Promise<MemoryExif | null> {
   let result: MemoryExif | null = null;
   try {
     const data = await exifr.parse(filePath, {
-      pick: ["Make", "Model", "DateTimeOriginal", "ExifImageWidth", "ExifImageHeight",
-        "ImageWidth", "ImageHeight", "PixelXDimension", "PixelYDimension"],
+      pick: [
+        "Make",
+        "Model",
+        "DateTimeOriginal",
+        "ExifImageWidth",
+        "ExifImageHeight",
+        "ImageWidth",
+        "ImageHeight",
+        "PixelXDimension",
+        "PixelYDimension",
+      ],
     });
     if (data) {
-      const taken = data.DateTimeOriginal instanceof Date ? data.DateTimeOriginal.getTime() : 0;
+      const taken =
+        data.DateTimeOriginal instanceof Date
+          ? data.DateTimeOriginal.getTime()
+          : 0;
       result = {
         camera: Boolean(data.Make || data.Model),
-        width: Number(data.ExifImageWidth ?? data.PixelXDimension ?? data.ImageWidth) || 0,
-        height: Number(data.ExifImageHeight ?? data.PixelYDimension ?? data.ImageHeight) || 0,
+        width:
+          Number(
+            data.ExifImageWidth ?? data.PixelXDimension ?? data.ImageWidth,
+          ) || 0,
+        height:
+          Number(
+            data.ExifImageHeight ?? data.PixelYDimension ?? data.ImageHeight,
+          ) || 0,
         takenAt: Number.isFinite(taken) ? taken : 0,
       };
     }
   } catch {
     result = null;
   }
-  if (memoryExifCache.size >= 20000) memoryExifCache.delete(memoryExifCache.keys().next().value!);
+  if (memoryExifCache.size >= 20000)
+    memoryExifCache.delete(memoryExifCache.keys().next().value!);
   memoryExifCache.set(filePath, result);
   return result;
 }
 
 /**
- * Uses camera data, resolution and capture time to rank likely photographs higher.
- * These are ranking hints only: every safe indexed image remains eligible.
+ * Drops low-resolution and artwork-like images (no camera data and square, like album
+ * covers) and favours real camera shots; remote files are kept as-is.
  */
-async function applyMemoryPhotoQuality(media: ScoredMemoryMedia[]): Promise<ScoredMemoryMedia[]> {
+async function applyMemoryPhotoQuality(
+  media: ScoredMemoryMedia[],
+): Promise<ScoredMemoryMedia[]> {
   const kept: ScoredMemoryMedia[] = [];
   for (let start = 0; start < media.length; start += 16) {
     const batch = media.slice(start, start + 16);
-    const exif = await Promise.all(batch.map((item) =>
-      item.type === "image" && !isRemotePath(item.path) ? readMemoryExif(item.path) : Promise.resolve(null)));
+    const exif = await Promise.all(
+      batch.map((item) =>
+        item.type === "image" && !isRemotePath(item.path)
+          ? readMemoryExif(item.path)
+          : Promise.resolve(null),
+      ),
+    );
     batch.forEach((item, index) => {
       const data = exif[index];
       if (!data) return kept.push(item);
       const long = Math.max(data.width, data.height);
       const short = Math.min(data.width, data.height);
-      const square = long > 0 && Math.abs(data.width - data.height) / long < 0.02;
-      const factor = data.camera ? 1.15
-        : data.takenAt ? 1
-          : long && (long < 1280 || short < 720) ? 0.55
-            : square ? 0.55 : 0.7;
-      kept.push({ ...item, score: item.score * factor,
-        ...(data.takenAt ? { modified: data.takenAt } : {}) });
+      if (long && (long < 1280 || short < 720)) return;
+      const square =
+        long > 0 && Math.abs(data.width - data.height) / long < 0.02;
+      if (!data.camera && !data.takenAt && square) return;
+      const factor = data.camera ? 1.15 : data.takenAt ? 1 : 0.7;
+      kept.push({
+        ...item,
+        score: item.score * factor,
+        ...(data.takenAt ? { modified: data.takenAt } : {}),
+      });
     });
   }
   return kept;
 }
 
+let memoryMusicDirectoryCache: {
+  key: string;
+  directories: Set<string>;
+} | null = null;
+
 /** Top-N "key:count" list for compact, path-free diagnostics. */
 function memoryTopCounts(counts: Map<string, number>, limit = 8): string {
-  return Array.from(counts).sort((a, b) => b[1] - a[1]).slice(0, limit)
-    .map(([key, count]) => `${key}:${count}`).join(",");
+  return Array.from(counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([key, count]) => `${key}:${count}`)
+    .join(",");
+}
+
+/**
+ * Why indexed images were not treated as personal photos: reason counts, the
+ * extensions and generic folder keywords responsible. No names or paths.
+ */
+function memoryPersonalRejectionSummary(
+  files: { path: string; size?: number }[],
+  musicDirectories: ReadonlySet<string>,
+): Record<string, number | string> {
+  const reasons = { extension: 0, small: 0, folder: 0, name: 0, music: 0 };
+  const extensions = new Map<string, number>();
+  const folders = new Map<string, number>();
+  const remote = { personal: 0, rejected: 0 };
+  for (const file of files) {
+    const reason = personalPhotoRejection(
+      file.path,
+      file.size,
+      musicDirectories,
+    );
+    if (isRemotePath(file.path)) remote[reason ? "rejected" : "personal"] += 1;
+    if (!reason) continue;
+    reasons[reason] += 1;
+    if (reason === "extension" || reason === "small") {
+      const extension =
+        path.extname(file.path).toLowerCase().slice(1, 8) || "none";
+      const key = reason === "small" ? `${extension}<150k` : extension;
+      extensions.set(key, (extensions.get(key) ?? 0) + 1);
+    } else if (reason === "folder") {
+      const keyword = nonPersonalFolderKeyword(file.path) ?? "other";
+      folders.set(keyword, (folders.get(keyword) ?? 0) + 1);
+    }
+  }
+  return {
+    rejectedExtension: reasons.extension,
+    rejectedSmall: reasons.small,
+    rejectedFolder: reasons.folder,
+    rejectedName: reasons.name,
+    rejectedMusicFolder: reasons.music,
+    rejectedFormats: memoryTopCounts(extensions),
+    rejectedFolders: memoryTopCounts(folders),
+    remotePersonal: remote.personal,
+    remoteRejected: remote.rejected,
+  };
 }
 
 /** Message and the first in-app stack frames, with home-directory paths reduced to "~". */
 function memoryErrorDetails(error: unknown): Record<string, string> {
   const home = os.homedir();
   const scrub = (value: string) => (home ? value.split(home).join("~") : value);
-  if (!(error instanceof Error)) return { message: scrub(String(error)).slice(0, 400) };
+  if (!(error instanceof Error))
+    return { message: scrub(String(error)).slice(0, 400) };
   return {
-    name: error.name, message: scrub(error.message).slice(0, 400),
-    ...(error.stack ? { stack: scrub(error.stack.split("\n").slice(1, 5).map((line) => line.trim()).join(" | ")).slice(0, 600) } : {}),
+    name: error.name,
+    message: scrub(error.message).slice(0, 400),
+    ...(error.stack
+      ? {
+          stack: scrub(
+            error.stack
+              .split("\n")
+              .slice(1, 5)
+              .map((line) => line.trim())
+              .join(" | "),
+          ).slice(0, 600),
+        }
+      : {}),
   };
 }
 
@@ -2938,18 +3168,45 @@ function memoryEnvironmentSnapshot(): Record<string, unknown> {
   const geo = geoIndexer?.getStatus();
   const profile = memoryTopicProfile?.getSnapshot();
   return {
-    platform: process.platform, arch: process.arch, appVersion: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    appVersion: app.getVersion(),
     indexLoaded: Boolean(semanticIndexer?.isLoaded()),
-    indexStatus: progress?.status ?? "missing", indexIndexed: progress?.indexed ?? 0,
-    indexRemaining: progress?.remaining ?? 0, indexErrors: progress?.errors ?? 0,
-    faceStatus: face?.status ?? "missing", petStatus: pet?.status ?? "missing",
-    geoStatus: geo?.status ?? "missing", geoTagged: geo?.geotagged ?? 0,
-    profileTopics: profile?.topics?.length ?? 0, profileSampled: profile?.sampledPhotos ?? 0,
+    indexStatus: progress?.status ?? "missing",
+    indexIndexed: progress?.indexed ?? 0,
+    indexRemaining: progress?.remaining ?? 0,
+    indexErrors: progress?.errors ?? 0,
+    faceStatus: face?.status ?? "missing",
+    petStatus: pet?.status ?? "missing",
+    geoStatus: geo?.status ?? "missing",
+    geoTagged: geo?.geotagged ?? 0,
+    profileTopics: profile?.topics?.length ?? 0,
+    profileSampled: profile?.sampledPhotos ?? 0,
     profileBusy: memoryProfileBusy(),
   };
 }
 
 /** Folders holding several audio files are album folders; their images are cover art. */
+function memoryMusicDirectories(): Set<string> {
+  const snapshot = audioLibraryCache?.getSnapshot();
+  if (!snapshot) return new Set();
+  const key = `${snapshot.scannedAt}:${snapshot.files.length}`;
+  if (memoryMusicDirectoryCache?.key === key)
+    return memoryMusicDirectoryCache.directories;
+  const counts = new Map<string, number>();
+  for (const file of snapshot.files) {
+    const directory = path.dirname(file.path);
+    counts.set(directory, (counts.get(directory) ?? 0) + 1);
+  }
+  const directories = new Set(
+    Array.from(counts)
+      .filter(([, count]) => count >= 3)
+      .map(([directory]) => directory),
+  );
+  memoryMusicDirectoryCache = { key, directories };
+  return directories;
+}
+
 /**
  * Mines story ideas from every available indexed source: prevalent subjects (CLIP),
  * time (this week N years ago, seasons, years, trips), places, people, pets and
@@ -2959,65 +3216,139 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   if (!semanticIndexer) throw new Error("Memory search is not ready yet.");
   const roots = await getAllIndexSources();
   if (!roots.length) return [];
+  const personal = personalMemoryPhotoFilter();
   const profile = getMemoryTopicProfile();
   await profile.refresh();
   const indexedImages = semanticIndexer.getIndexedImages(roots);
-  runtimeLog("memory-environment", { ...memoryEnvironmentSnapshot(), roots: roots.length,
-    remoteRoots: roots.filter((root) => isRemotePath(root)).length });
+  runtimeLog("memory-environment", {
+    ...memoryEnvironmentSnapshot(),
+    roots: roots.length,
+    remoteRoots: roots.filter((root) => isRemotePath(root)).length,
+  });
   const images = indexedImages
-    .filter(({ path: filePath }) => memoryAllowed(filePath))
-    .map(({ path: filePath, modified }) => ({ path: filePath, modified, captured: profile.captureTimeOf(filePath) }));
+    .filter(personal)
+    .map(({ path: filePath, modified }) => ({
+      path: filePath,
+      modified,
+      captured: profile.captureTimeOf(filePath),
+    }));
+  const rejection =
+    images.length < Math.max(40, indexedImages.length * 0.2)
+      ? memoryPersonalRejectionSummary(indexedImages, memoryMusicDirectories())
+      : {};
   if (images.length < 4) {
-    runtimeLog("memory-discover-trace", { architecture: process.arch, roots: roots.length, indexedImages: indexedImages.length,
-      safeIndexedImages: images.length, ideas: 0, reason: "fewer-than-4-safe-indexed-images" });
+    runtimeLog("memory-discover-trace", {
+      roots: roots.length,
+      indexedImages: indexedImages.length,
+      personalImages: images.length,
+      ideas: 0,
+      reason: "fewer-than-4-personal-photos",
+      ...rejection,
+    });
     return [];
   }
-  const modified = new Map(images.map((image) => [image.path, image.captured ?? image.modified]));
+  const modified = new Map(
+    images.map((image) => [image.path, image.captured ?? image.modified]),
+  );
   const topics = profile.getSnapshot()?.topics ?? [];
-  const concepts: DiscoveredConcept[] = topics.filter((topic) => topic.estimatedCount >= 5).slice(0, 18)
-    .map((topic) => ({ id: topic.id, paths: topic.paths.filter(memoryAllowed), count: topic.estimatedCount }));
-  const signals: TopicSignal[] = topics.map((topic) => ({ id: topic.id, interest: topic.interest, lift: topic.lift,
-    recentCount: topic.recentCount, recentPaths: topic.recentPaths.filter(memoryAllowed) }));
+  const concepts: DiscoveredConcept[] = topics
+    .filter((topic) => topic.estimatedCount >= 5)
+    .slice(0, 18)
+    .map((topic) => ({
+      id: topic.id,
+      paths: topic.paths.filter(memoryAllowed),
+      count: topic.estimatedCount,
+    }));
+  const signals: TopicSignal[] = topics.map((topic) => ({
+    id: topic.id,
+    interest: topic.interest,
+    lift: topic.lift,
+    recentCount: topic.recentCount,
+    recentPaths: topic.recentPaths.filter(memoryAllowed),
+  }));
   const places = geoIndexer
-    ? getVisibleDemoMapPhotos(
-        geoIndexer.getState().photos,
-        roots,
-      ).map(({ path: filePath, city, region, country }) =>
-      ({ path: filePath, city, region, country }))
+    ? getVisibleDemoMapPhotos(geoIndexer.getState().photos, roots).map(
+        ({ path: filePath, city, region, country }) => ({
+          path: filePath,
+          city,
+          region,
+          country,
+        }),
+      )
     : [];
   const people = faceIndexer
     ? getDemoPeople()
-      .filter((person) => person.status !== "banned" && person.photoCount >= 6 &&
-        !/^(person|unknown)\s*\d*$/i.test(person.name.trim()))
-      .map((person) => ({ name: person.name, paths: faceIndexer.getPerson(person.id)?.photoPaths ?? [] }))
+        .filter(
+          (person) =>
+            person.status !== "banned" &&
+            person.photoCount >= 6 &&
+            !/^(person|unknown)\s*\d*$/i.test(person.name.trim()),
+        )
+        .map((person) => ({
+          name: person.name,
+          paths: faceIndexer.getPerson(person.id)?.photoPaths ?? [],
+        }))
     : [];
   const pets = petIndexer
-    ? petIndexer.getClusters().map((cluster) => ({ name: cluster.name, paths: petIndexer.getClusterPhotos(cluster.id) }))
+    ? petIndexer
+        .getClusters()
+        .map((cluster) => ({
+          name: cluster.name,
+          paths: petIndexer.getClusterPhotos(cluster.id),
+        }))
     : [];
-  const ideas = discoverMemoryStories({ images, places, people, pets, concepts, topics: signals });
-  runtimeLog("memory-discover-trace", { architecture: process.arch, roots: roots.length, indexedImages: indexedImages.length,
-    safeIndexedImages: images.length, topics: topics.length, concepts: concepts.length, places: places.length,
-    people: people.length, pets: pets.length, ideas: ideas.length,
-    ideaKinds: memoryTopCounts(ideas.reduce((counts, idea) => {
-      const kind = idea.key.split(":")[0];
-      return counts.set(kind, (counts.get(kind) ?? 0) + 1);
-    }, new Map<string, number>())),
-    peopleNamed: people.length, petPhotos: pets.reduce((sum, pet) => sum + pet.paths.length, 0) });
-  return ideas
-    .map((idea) => ({
-      key: idea.key, title: idea.title, description: idea.description, query: idea.query, mood: idea.mood,
-      load: () => loadMemoryIdeaMedia(idea.paths, modified, idea.query, idea.key),
-    }));
+  const ideas = discoverMemoryStories({
+    images,
+    places,
+    people,
+    pets,
+    concepts,
+    topics: signals,
+  });
+  runtimeLog("memory-discover-trace", {
+    roots: roots.length,
+    indexedImages: indexedImages.length,
+    personalImages: images.length,
+    topics: topics.length,
+    concepts: concepts.length,
+    places: places.length,
+    people: people.length,
+    pets: pets.length,
+    ideas: ideas.length,
+    ideaKinds: memoryTopCounts(
+      ideas.reduce((counts, idea) => {
+        const kind = idea.key.split(":")[0];
+        return counts.set(kind, (counts.get(kind) ?? 0) + 1);
+      }, new Map<string, number>()),
+    ),
+    peopleNamed: people.length,
+    petPhotos: pets.reduce((sum, pet) => sum + pet.paths.length, 0),
+    ...rejection,
+  });
+  return ideas.map((idea) => ({
+    key: idea.key,
+    title: idea.title,
+    description: idea.description,
+    query: idea.query,
+    mood: idea.mood,
+    load: () => loadMemoryIdeaMedia(idea.paths, modified),
+  }));
 }
 
-const MEMORY_DEFAULT_MOVIE_DIRECTORY = () => path.join(app.getPath("userData"), "memories", "previews");
+const MEMORY_DEFAULT_MOVIE_DIRECTORY = () =>
+  path.join(app.getPath("userData"), "memories", "previews");
 
 /** Saved memory movies live in the user's chosen folder when it is reachable. */
 async function memoryMovieDirectory(): Promise<string> {
   const chosen = (await memoryManager.getSettings()).movieDirectory;
   if (chosen) {
     const directory = path.join(chosen, "Silo Memories");
-    if (await fsPromises.mkdir(directory, { recursive: true }).then(() => true, () => false))
+    if (
+      await fsPromises.mkdir(directory, { recursive: true }).then(
+        () => true,
+        () => false,
+      )
+    )
       return directory;
   }
   return MEMORY_DEFAULT_MOVIE_DIRECTORY();
@@ -3028,9 +3359,14 @@ async function memoryMovieDirectory(): Promise<string> {
  * folder changed. When duplicate copies exist, prefer the newest valid file so the
  * reveal/open action opens the actual rendered movie instead of a stale older copy.
  */
-async function findMemoryMovie(suggestion: MemorySuggestion): Promise<string | null> {
+async function findMemoryMovie(
+  suggestion: MemorySuggestion,
+): Promise<string | null> {
   const name = memoryPreviewFileName(suggestion);
-  const directories = new Set<string>([await memoryMovieDirectory(), MEMORY_DEFAULT_MOVIE_DIRECTORY()]);
+  const directories = new Set<string>([
+    await memoryMovieDirectory(),
+    MEMORY_DEFAULT_MOVIE_DIRECTORY(),
+  ]);
   let newest: { path: string; mtimeMs: number } | null = null;
   for (const directory of directories) {
     const candidate = path.join(directory, name);
@@ -3052,15 +3388,25 @@ async function prepareMemoryExportImage(localPath: string): Promise<string> {
   if (!scratch) throw new Error("Memory export is not active.");
   let converted: Buffer;
   try {
-    converted = await getConvertedImageBuffer(localPath, 2048, 90, "memory-image-cache");
+    converted = await getConvertedImageBuffer(
+      localPath,
+      2048,
+      90,
+      "memory-image-cache",
+    );
   } catch {
     // No sips (non-macOS) or undecodable by sips: FFmpeg reads the original read-only.
     return localPath;
   }
-  const file = path.join(scratch, `${createHash("sha1").update(localPath).digest("hex")}.jpg`);
-  await fsPromises.writeFile(file, converted, { flag: "wx", mode: 0o600 }).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  });
+  const file = path.join(
+    scratch,
+    `${createHash("sha1").update(localPath).digest("hex")}.jpg`,
+  );
+  await fsPromises
+    .writeFile(file, converted, { flag: "wx", mode: 0o600 })
+    .catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    });
   return file;
 }
 
@@ -3068,20 +3414,48 @@ function memoryExportOptions(value: unknown): MemoryExportOptions | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const options = value as Record<string, unknown>;
   const { minCount, maxCount } = MEMORY_EXPORT_LIMITS;
-  const { suggestionId, soundtrackId, count, duration, originalAudio, rightsAcknowledged, orientation } = options;
+  const {
+    suggestionId,
+    soundtrackId,
+    count,
+    duration,
+    originalAudio,
+    rightsAcknowledged,
+    orientation,
+  } = options;
   if (
-    typeof suggestionId !== "string" || !suggestionId || suggestionId.length > 200 ||
-    typeof soundtrackId !== "string" || !soundtrackId || soundtrackId.length > 250 ||
-    typeof count !== "number" || !Number.isInteger(count) || count < minCount || count > maxCount ||
-    typeof duration !== "number" || !Number.isFinite(duration) || duration !== MEMORY_DURATION_SECONDS ||
-    typeof originalAudio !== "number" || !Number.isFinite(originalAudio) || originalAudio < 0 || originalAudio > 1 ||
-    (orientation !== undefined && !["auto", "landscape", "portrait"].includes(String(orientation))) ||
-    (rightsAcknowledged !== undefined && typeof rightsAcknowledged !== "boolean")
+    typeof suggestionId !== "string" ||
+    !suggestionId ||
+    suggestionId.length > 200 ||
+    typeof soundtrackId !== "string" ||
+    !soundtrackId ||
+    soundtrackId.length > 250 ||
+    typeof count !== "number" ||
+    !Number.isInteger(count) ||
+    count < minCount ||
+    count > maxCount ||
+    typeof duration !== "number" ||
+    !Number.isFinite(duration) ||
+    duration !== MEMORY_DURATION_SECONDS ||
+    typeof originalAudio !== "number" ||
+    !Number.isFinite(originalAudio) ||
+    originalAudio < 0 ||
+    originalAudio > 1 ||
+    (orientation !== undefined &&
+      !["auto", "landscape", "portrait"].includes(String(orientation))) ||
+    (rightsAcknowledged !== undefined &&
+      typeof rightsAcknowledged !== "boolean")
   )
     return null;
   if (!isMemoryDurationAllowed(count, duration)) return null;
-  return { suggestionId, soundtrackId, count, duration, originalAudio,
-    rightsAcknowledged: rightsAcknowledged === true };
+  return {
+    suggestionId,
+    soundtrackId,
+    count,
+    duration,
+    originalAudio,
+    rightsAcknowledged: rightsAcknowledged === true,
+  };
 }
 
 /** Re-resolves the saved suggestion and soundtrack against current safety state. */
@@ -3090,24 +3464,51 @@ async function verifyMemoryExport(options: MemoryExportOptions) {
   if (!suggestion || suggestion.media.length === 0)
     throw new Error("This memory is no longer available. Refresh suggestions.");
   const minimumCount = getMemorySelectionMinimum(suggestion.media.length);
-  const maximumCount = Math.min(MEMORY_EXPORT_LIMITS.maxCount, suggestion.media.length);
+  const maximumCount = Math.min(
+    MEMORY_EXPORT_LIMITS.maxCount,
+    suggestion.media.length,
+  );
   if (options.count < minimumCount || options.count > maximumCount)
-    throw new Error(`Choose ${minimumCount} to ${maximumCount} items to keep this memory moving briskly.`);
-  if (!suggestion.media.every((file) => memoryAllowed(file.path) &&
-    (!file.liveVideoPath || memoryAllowed(file.liveVideoPath))))
-    throw new Error("This memory contains newly hidden photos. Regenerate suggestions before exporting.");
-  const soundtrack = await memoryManager.resolveSoundtrack(options.soundtrackId, suggestion.id);
+    throw new Error(
+      `Choose ${minimumCount} to ${maximumCount} items to keep this memory moving briskly.`,
+    );
+  if (
+    !suggestion.media.every(
+      (file) =>
+        memoryAllowed(file.path) &&
+        (!file.liveVideoPath || memoryAllowed(file.liveVideoPath)),
+    )
+  )
+    throw new Error(
+      "This memory contains newly hidden photos. Regenerate suggestions before exporting.",
+    );
+  const soundtrack = await memoryManager.resolveSoundtrack(
+    options.soundtrackId,
+    suggestion.id,
+  );
   if (!soundtrack) throw new Error("Soundtrack is no longer available.");
-  if (soundtrack.source === "library" && (!soundtrack.path || !memoryAllowed(soundtrack.path)
-    || !await fsPromises.access(soundtrack.path).then(() => true, () => false)))
+  if (
+    soundtrack.source === "library" &&
+    (!soundtrack.path ||
+      !memoryAllowed(soundtrack.path) ||
+      !(await fsPromises.access(soundtrack.path).then(
+        () => true,
+        () => false,
+      )))
+  )
     throw new Error("Soundtrack is no longer available.");
   return { suggestion, soundtrack };
 }
 
 /** Every watchable movie is rendered at the same one-minute length as an export. */
-function memoryPreviewOptions(suggestion: MemorySuggestion): MemoryExportOptions {
+function memoryPreviewOptions(
+  suggestion: MemorySuggestion,
+): MemoryExportOptions {
   const { maxCount } = MEMORY_EXPORT_LIMITS;
-  const count = Math.max(1, Math.min(MEMORY_DEFAULT_SELECTION_COUNT, maxCount, suggestion.media.length));
+  const count = Math.max(
+    1,
+    Math.min(MEMORY_DEFAULT_SELECTION_COUNT, maxCount, suggestion.media.length),
+  );
   return {
     suggestionId: suggestion.id,
     count,
@@ -3119,7 +3520,11 @@ function memoryPreviewOptions(suggestion: MemorySuggestion): MemoryExportOptions
 
 function memoryTitleStem(title: string): string {
   const normalized = title.normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
-  const words = normalized.replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/).filter(Boolean);
+  const words = normalized
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
   const stem = (words.length ? words.slice(0, 5).join("-") : "memory")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
@@ -3131,18 +3536,35 @@ function memoryPreviewFileName(suggestion: MemorySuggestion): string {
   const { count, duration } = memoryPreviewOptions(suggestion);
   const selected = suggestion.media.slice(0, count);
   const titleStem = memoryTitleStem(suggestion.title);
-  const stableSuffix = suggestion.id.replace(/[^a-z0-9]/gi, "").slice(0, 6).toLowerCase();
-  const fingerprint = createHash("sha1").update(JSON.stringify({
-    version: MEMORY_PREVIEW_RENDER_VERSION,
-    id: suggestion.id,
-    frame: "landscape-16:9",
-    media: selected.map(({ path: mediaPath, modified, type, liveVideoPath }) =>
-      ({ path: mediaPath, modified, type, liveVideoPath })),
-    duration,
-    originalAudio: 0.18,
-    soundtrack: suggestion.soundtrackId ?? null,
-  })).digest("hex").slice(0, 4);
-  const safeStem = titleStem.length > 78 ? titleStem.slice(0, 78).replace(/-+$/g, "") : titleStem;
+  const stableSuffix = suggestion.id
+    .replace(/[^a-z0-9]/gi, "")
+    .slice(0, 6)
+    .toLowerCase();
+  const fingerprint = createHash("sha1")
+    .update(
+      JSON.stringify({
+        version: MEMORY_PREVIEW_RENDER_VERSION,
+        id: suggestion.id,
+        frame: "landscape-16:9",
+        media: selected.map(
+          ({ path: mediaPath, modified, type, liveVideoPath }) => ({
+            path: mediaPath,
+            modified,
+            type,
+            liveVideoPath,
+          }),
+        ),
+        duration,
+        originalAudio: 0.18,
+        soundtrack: suggestion.soundtrackId ?? null,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 4);
+  const safeStem =
+    titleStem.length > 78
+      ? titleStem.slice(0, 78).replace(/-+$/g, "")
+      : titleStem;
   return `${safeStem}${stableSuffix ? `-${stableSuffix}` : ""}${fingerprint ? `-${fingerprint}` : ""}.mp4`;
 }
 
@@ -3155,69 +3577,118 @@ function prepareMemoryPreviews(suggestions: MemorySuggestion[]): Promise<void> {
   });
   if (!fresh.length) return memoryPreviewQueue;
   for (const suggestion of fresh)
-    if (memoryPreviewStatus.get(suggestion.id)?.status !== "ready") setMemoryPreviewStatus(suggestion.id, { status: "queued" });
-  const task = memoryPreviewQueue.catch(() => undefined)
+    if (memoryPreviewStatus.get(suggestion.id)?.status !== "ready")
+      setMemoryPreviewStatus(suggestion.id, { status: "queued" });
+  const task = memoryPreviewQueue
+    .catch(() => undefined)
     .then(() => prepareMemoryPreviewsNow(fresh));
-  memoryPreviewQueue = task.then(() => undefined, () => undefined);
+  memoryPreviewQueue = task.then(
+    () => undefined,
+    () => undefined,
+  );
   return task;
 }
 
 /** Visible cards first, then the reserve stockpile, all on the single render queue. */
-async function prepareAllMemoryPreviews(visible: MemorySuggestion[]): Promise<void> {
-  const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
-  void prepareMemoryPreviews(visible).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
-  if (reserve.length) void prepareMemoryPreviews(reserve).catch((error) => runtimeLog("memory-reserve-preview-error", memoryErrorDetails(error)));
+async function prepareAllMemoryPreviews(
+  visible: MemorySuggestion[],
+): Promise<void> {
+  const reserve = await memoryManager
+    .getReserve()
+    .catch(() => [] as MemorySuggestion[]);
+  void prepareMemoryPreviews(visible).catch((error) =>
+    runtimeLog("memory-preview-error", memoryErrorDetails(error)),
+  );
+  if (reserve.length)
+    void prepareMemoryPreviews(reserve).catch((error) =>
+      runtimeLog("memory-reserve-preview-error", memoryErrorDetails(error)),
+    );
 }
 
 let memoryPreviewEmitTimer: NodeJS.Timeout | null = null;
 
 function setMemoryPreviewStatus(id: string, status: MemoryPreviewStatus) {
   memoryPreviewStatus.set(id, status);
-  if (memoryPreviewStatus.size > 64) memoryPreviewStatus.delete(memoryPreviewStatus.keys().next().value!);
+  if (memoryPreviewStatus.size > 64)
+    memoryPreviewStatus.delete(memoryPreviewStatus.keys().next().value!);
   // Progress arrives per frame; the page needs a few updates a second at most.
   if (memoryPreviewEmitTimer) return;
   memoryPreviewEmitTimer = setTimeout(() => {
     memoryPreviewEmitTimer = null;
-    sendToRenderer("memory-preview-progress", Object.fromEntries(memoryPreviewStatus));
+    sendToRenderer(
+      "memory-preview-progress",
+      Object.fromEntries(memoryPreviewStatus),
+    );
   }, 250);
 }
 
 /** Ready/queued/rendering status for each card; a movie on disk is always ready. */
-async function memoryPreviewStatuses(suggestions: MemorySuggestion[]): Promise<Record<string, MemoryPreviewStatus>> {
+async function memoryPreviewStatuses(
+  suggestions: MemorySuggestion[],
+): Promise<Record<string, MemoryPreviewStatus>> {
   const result: Record<string, MemoryPreviewStatus> = {};
   for (const suggestion of suggestions) {
     const known = memoryPreviewStatus.get(suggestion.id);
     if (known && known.status !== "ready") result[suggestion.id] = known;
-    else result[suggestion.id] = await findMemoryMovie(suggestion) ? { status: "ready" } : { status: "queued" };
+    else
+      result[suggestion.id] = (await findMemoryMovie(suggestion))
+        ? { status: "ready" }
+        : { status: "queued" };
   }
   return result;
 }
 
-async function memoryStateWithPreviews(state?: MemoryState): Promise<MemoryState> {
-  const current = state ?? await memoryManager.getState();
-  return { ...current, previews: await memoryPreviewStatuses(current.suggestions) };
+async function memoryStateWithPreviews(
+  state?: MemoryState,
+): Promise<MemoryState> {
+  const current = state ?? (await memoryManager.getState());
+  return {
+    ...current,
+    previews: await memoryPreviewStatuses(current.suggestions),
+  };
 }
 
 function runMemoryRender<T>(render: () => Promise<T>): Promise<T> {
   const task = memoryRenderQueue.then(render, render);
-  memoryRenderQueue = task.then(() => undefined, () => undefined);
+  memoryRenderQueue = task.then(
+    () => undefined,
+    () => undefined,
+  );
   return task;
 }
 
-async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promise<void> {
+async function prepareMemoryPreviewsNow(
+  suggestions: MemorySuggestion[],
+): Promise<void> {
   const cacheDirectory = await memoryMovieDirectory();
   try {
     for (const suggestion of suggestions) {
-      const destination = path.join(cacheDirectory, memoryPreviewFileName(suggestion));
-      if (await fsPromises.stat(destination).then((result) => result.isFile(), () => false)) {
+      const destination = path.join(
+        cacheDirectory,
+        memoryPreviewFileName(suggestion),
+      );
+      if (
+        await fsPromises.stat(destination).then(
+          (result) => result.isFile(),
+          () => false,
+        )
+      ) {
         setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
         continue;
       }
       // Reuse a movie rendered before the folder changed instead of re-rendering it.
       const existing = await findMemoryMovie(suggestion);
       if (existing && existing !== destination) {
-        if (await fsPromises.copyFile(existing, destination).then(() => true, () => false)) {
-          setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
+        if (
+          await fsPromises.copyFile(existing, destination).then(
+            () => true,
+            () => false,
+          )
+        ) {
+          setMemoryPreviewStatus(suggestion.id, {
+            status: "ready",
+            progress: 1,
+          });
           continue;
         }
       }
@@ -3226,25 +3697,55 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
         let options = memoryPreviewOptions(suggestion);
         // An offline music source falls back to the story's own audio rather than no movie.
         const originalAudioId = `original:${suggestion.id}`;
-        const verified = await verifyMemoryExport(options).catch(async (error) => {
-          if (options.soundtrackId === originalAudioId) throw error;
-          options = { ...options, soundtrackId: originalAudioId };
-          return verifyMemoryExport(options);
-        });
+        const verified = await verifyMemoryExport(options).catch(
+          async (error) => {
+            if (options.soundtrackId === originalAudioId) throw error;
+            options = { ...options, soundtrackId: originalAudioId };
+            return verifyMemoryExport(options);
+          },
+        );
         const { suggestion: current, soundtrack } = verified;
         await fsPromises.mkdir(cacheDirectory, { recursive: true });
-        const scratch = await fsPromises.mkdtemp(path.join(os.tmpdir(), "silo-memory-preview-"));
-        const renderPreview = (renderOptions: MemoryExportOptions, track: typeof soundtrack) => runMemoryRender(async () => {
+        const scratch = await fsPromises.mkdtemp(
+          path.join(os.tmpdir(), "silo-memory-preview-"),
+        );
+        const renderPreview = (
+          renderOptions: MemoryExportOptions,
+          track: typeof soundtrack,
+        ) =>
+          runMemoryRender(async () => {
             memoryExportScratch = scratch;
             const startedAt = Date.now();
-            setMemoryPreviewStatus(suggestion.id, { status: "rendering", progress: 0 });
+            setMemoryPreviewStatus(suggestion.id, {
+              status: "rendering",
+              progress: 0,
+            });
             try {
-              await memoryExporter.render(current, renderOptions, track, destination, (progress) => {
-                const fraction = progress.total > 0 ? Math.min(0.99, progress.completed / progress.total) : 0;
-                const elapsed = (Date.now() - startedAt) / 1000;
-                setMemoryPreviewStatus(suggestion.id, { status: "rendering", progress: fraction,
-                  ...(fraction > 0.05 ? { etaSeconds: Math.max(1, Math.round(elapsed / fraction * (1 - fraction))) } : {}) });
-              });
+              await memoryExporter.render(
+                current,
+                renderOptions,
+                track,
+                destination,
+                (progress) => {
+                  const fraction =
+                    progress.total > 0
+                      ? Math.min(0.99, progress.completed / progress.total)
+                      : 0;
+                  const elapsed = (Date.now() - startedAt) / 1000;
+                  setMemoryPreviewStatus(suggestion.id, {
+                    status: "rendering",
+                    progress: fraction,
+                    ...(fraction > 0.05
+                      ? {
+                          etaSeconds: Math.max(
+                            1,
+                            Math.round((elapsed / fraction) * (1 - fraction)),
+                          ),
+                        }
+                      : {}),
+                  });
+                },
+              );
             } finally {
               memoryExportScratch = null;
             }
@@ -3255,13 +3756,21 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
           } catch (error) {
             // A song that vanished mid-render (e.g. drive unplugged) falls back to the story's own audio.
             if (options.soundtrackId === originalAudioId) throw error;
-            runtimeLog("memory-preview-soundtrack-fallback", memoryErrorDetails(error));
-            const fallbackOptions = { ...options, soundtrackId: originalAudioId };
+            runtimeLog(
+              "memory-preview-soundtrack-fallback",
+              memoryErrorDetails(error),
+            );
+            const fallbackOptions = {
+              ...options,
+              soundtrackId: originalAudioId,
+            };
             const fallback = await verifyMemoryExport(fallbackOptions);
             await renderPreview(fallbackOptions, fallback.soundtrack);
           }
         } finally {
-          await fsPromises.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+          await fsPromises
+            .rm(scratch, { recursive: true, force: true })
+            .catch(() => undefined);
         }
         setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
         await rememberMemoryMovieTitles([suggestion]).catch(() => undefined);
@@ -3272,11 +3781,27 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
     }
     // Keep movies of every visible and reserve story; delete only Silo-named leftovers.
     const state = await memoryManager.getState();
-    const retained = new Set([...state.suggestions, ...await memoryManager.getReserve(), ...suggestions]
-      .map(memoryPreviewFileName));
-    const cached = await fsPromises.readdir(cacheDirectory).catch(() => [] as string[]);
-    await Promise.all(cached.filter((name) => /^[a-f0-9]{64}\.mp4$/.test(name) && !retained.has(name))
-      .map((name) => fsPromises.unlink(path.join(cacheDirectory, name)).catch(() => undefined)));
+    const retained = new Set(
+      [
+        ...state.suggestions,
+        ...(await memoryManager.getReserve()),
+        ...suggestions,
+      ].map(memoryPreviewFileName),
+    );
+    const cached = await fsPromises
+      .readdir(cacheDirectory)
+      .catch(() => [] as string[]);
+    await Promise.all(
+      cached
+        .filter(
+          (name) => /^[a-f0-9]{64}\.mp4$/.test(name) && !retained.has(name),
+        )
+        .map((name) =>
+          fsPromises
+            .unlink(path.join(cacheDirectory, name))
+            .catch(() => undefined),
+        ),
+    );
   } finally {
     memoryExportScratch = null;
   }
@@ -3320,12 +3845,6 @@ const ALL_INDEX_RECOVERY_STAGES = [
   "audio",
   "quality",
 ];
-const pendingFaceIndexImages = new Map<string, IndexableFile>();
-const pendingLocationIndexImages = new Map<string, IndexableFile>();
-let progressiveIndexFlushTimer: NodeJS.Timeout | null = null;
-let lastMemoryIndexRefreshRequest = 0;
-let faceInitialCoverageNeeded = true;
-let locationInitialCoverageNeeded = true;
 let geocoder: Geocoder;
 let duplicateManager: DuplicateManager;
 let contentSettingsStore: ContentSettingsStore;
@@ -3340,7 +3859,9 @@ let lastIndexDiagnostic = 0;
 let lastSemanticProgressStatus: string | null = null;
 let lastFaceProgressStatus: string | null = null;
 const indexingStallThresholdMs = 10 * 60 * 1000;
-const indexingDiagnosticEvents: Array<Record<string, string | number | boolean>> = [];
+const indexingDiagnosticEvents: Array<
+  Record<string, string | number | boolean>
+> = [];
 let indexingMonitor: {
   status: string;
   total: number;
@@ -3433,36 +3954,6 @@ function queueSemanticIndexWork(
       );
   } else {
     requestIndexRecoveryStages(["search", ...relatedStages]);
-  }
-}
-
-function takeProgressiveImages(queue: Map<string, IndexableFile>) {
-  const images = Array.from(queue.values());
-  queue.clear();
-  return images;
-}
-
-function flushProgressiveIndexWork() {
-  progressiveIndexFlushTimer = null;
-  if (pendingFaceIndexImages.size || pendingLocationIndexImages.size) {
-    requestIndexRecoveryStages(["faces", "locations"]);
-  }
-  const now = Date.now();
-  if (now - lastMemoryIndexRefreshRequest >= 60_000) {
-    lastMemoryIndexRefreshRequest = now;
-    memoryProfileScheduler?.notify();
-  }
-}
-
-function queueProgressiveIndexedImage(image: IndexableFile) {
-  pendingFaceIndexImages.set(image.path, image);
-  pendingLocationIndexImages.set(image.path, image);
-  if (pendingFaceIndexImages.size >= 128 || pendingLocationIndexImages.size >= 128) {
-    if (progressiveIndexFlushTimer) clearTimeout(progressiveIndexFlushTimer);
-    flushProgressiveIndexWork();
-  } else if (!progressiveIndexFlushTimer) {
-    progressiveIndexFlushTimer = setTimeout(flushProgressiveIndexWork, 1000);
-    progressiveIndexFlushTimer.unref?.();
   }
 }
 
@@ -3623,10 +4114,7 @@ function registerMediaProtocols() {
       return new Response("Not found", { status: 404 });
     }
   });
-  const thumbnailDirectory = path.join(
-    indexStorageRoot,
-    "thumbnail-cache",
-  );
+  const thumbnailDirectory = path.join(indexStorageRoot, "thumbnail-cache");
   protocol.handle("thumb", async (request) => {
     const fileName = new URL(request.url).pathname.slice(1);
     // Only content-hash names from getThumbnail are servable; blocks path traversal.
@@ -3718,8 +4206,7 @@ const seenReadyPhoneKeys = new Set<string>();
 let derivedIndexTimer: NodeJS.Timeout | null = null;
 let derivedIndexPromise: Promise<void> | null = null;
 let derivedIndexRerunRequested = false;
-const safetyCachePath = () =>
-  indexStoragePath("content-safety-index.json");
+const safetyCachePath = () => indexStoragePath("content-safety-index.json");
 const thumbnailMemoryCache = new Map<string, string>();
 const MAX_THUMBNAIL_CACHE_SIZE = 2048; // Limit to 2K cached thumbnails in memory
 const MAX_QUEUE_SIZE = 1024; // Limit queue to prevent memory explosion
@@ -3988,14 +4475,31 @@ const phoneMessageRefreshJobs = new Set<string>();
 /** Refreshes a connected phone's saved message history after its file backup, then tells the Messages view. */
 function refreshPhoneMessagesInBackground(device: PhoneDevice): void {
   const key = `${device.platform}:${device.id}`;
-  if (phoneMessageRefreshJobs.has(key) || typeof messageExportCoordinator === "undefined") return;
+  if (
+    phoneMessageRefreshJobs.has(key) ||
+    typeof messageExportCoordinator === "undefined"
+  )
+    return;
   phoneMessageRefreshJobs.add(key);
   void (async () => {
     try {
-      messageExportCoordinator.setBackupDestination(await phoneManager.getBackupDestination());
-      const threads = await messageExportCoordinator.getDeviceThreads(device.id, device.platform, true, device.name);
-      runtimeLog("phone-messages-auto-refreshed", { platform: device.platform, threads: threads.length });
-      sendToRenderer("phone-messages-updated", { deviceId: device.id, platform: device.platform });
+      messageExportCoordinator.setBackupDestination(
+        await phoneManager.getBackupDestination(),
+      );
+      const threads = await messageExportCoordinator.getDeviceThreads(
+        device.id,
+        device.platform,
+        true,
+        device.name,
+      );
+      runtimeLog("phone-messages-auto-refreshed", {
+        platform: device.platform,
+        threads: threads.length,
+      });
+      sendToRenderer("phone-messages-updated", {
+        deviceId: device.id,
+        platform: device.platform,
+      });
     } catch (error) {
       runtimeLog("phone-messages-auto-refresh-failed", {
         platform: device.platform,
@@ -4079,32 +4583,38 @@ function discoverAndBackupPhones(): Promise<void> {
           (!previous.lastBackupAt ||
             Date.now() - previous.lastBackupAt >= 10 * 60 * 1000);
         const shouldStart =
-          newlyConnected || !previous || previous.status === "error" || refreshDue;
+          newlyConnected ||
+          !previous ||
+          previous.status === "error" ||
+          refreshDue;
         console.log(
           `[PHONE-DISCOVERY] Device ${key}: shouldStart=${shouldStart}, newlyConnected=${newlyConnected}, status=${previous?.status}, refreshDue=${refreshDue}`,
         );
         if (!shouldStart) continue;
         console.log(`[PHONE-DISCOVERY] Triggering backup for ${key}`);
-        void phoneManager.backupDevice(device).then((progress) => {
-          if (newlyConnected) refreshPhoneMessagesInBackground(device);
-          console.log(
-            `[PHONE-DISCOVERY] Backup finished for ${key}:`,
-            progress.status,
-          );
-          runtimeLog("phone-backup-finished", {
-            deviceId: progress.deviceId,
-            platform: progress.platform,
-            status: progress.status,
-            completedFiles: progress.completedFiles,
-            totalFiles: progress.totalFiles,
+        void phoneManager
+          .backupDevice(device)
+          .then((progress) => {
+            if (newlyConnected) refreshPhoneMessagesInBackground(device);
+            console.log(
+              `[PHONE-DISCOVERY] Backup finished for ${key}:`,
+              progress.status,
+            );
+            runtimeLog("phone-backup-finished", {
+              deviceId: progress.deviceId,
+              platform: progress.platform,
+              status: progress.status,
+              completedFiles: progress.completedFiles,
+              totalFiles: progress.totalFiles,
+            });
+          })
+          .catch((error) => {
+            runtimeLog("phone-backup-failed", {
+              platform: device.platform,
+              message: error instanceof Error ? error.message : String(error),
+            });
+            if (newlyConnected) refreshPhoneMessagesInBackground(device);
           });
-        }).catch((error) => {
-          runtimeLog("phone-backup-failed", {
-            platform: device.platform,
-            message: error instanceof Error ? error.message : String(error),
-          });
-          if (newlyConnected) refreshPhoneMessagesInBackground(device);
-        });
       }
       await getEnabledIndexSources();
       seenReadyPhoneKeys.clear();
@@ -4373,10 +4883,7 @@ let thumbnailCacheReady: Promise<void> | null = null;
 /** Version 1 stored QuickLook placeholder icons as thumbnails; move that cache aside and delete it in the background. */
 function ensureThumbnailCacheVersion() {
   thumbnailCacheReady ??= (async () => {
-    const cacheDirectory = path.join(
-      indexStorageRoot,
-      "thumbnail-cache",
-    );
+    const cacheDirectory = path.join(indexStorageRoot, "thumbnail-cache");
     const versionPath = path.join(cacheDirectory, ".version");
     const current = await fsPromises
       .readFile(versionPath, "utf8")
@@ -4500,7 +5007,13 @@ interface SourceClonePlanEntry {
 interface SourceClonePlan {
   id: string;
   operationId: string;
-  destinations: Array<{ destination: string; cloneRoot: string; freeBytes: number; shortfallBytes: number; reusableBytes?: number }>;
+  destinations: Array<{
+    destination: string;
+    cloneRoot: string;
+    freeBytes: number;
+    shortfallBytes: number;
+    reusableBytes?: number;
+  }>;
   entries: SourceClonePlanEntry[];
   totalFiles: number;
   totalBytes: number;
@@ -4522,45 +5035,66 @@ interface ShelterReusableFile {
 
 const sourceClonePlans = new Map<string, SourceClonePlan>();
 const sourceCloneOperations = new Map<string, { cancelled: boolean }>();
-const sourceCloneStatusPath = path.join(app.getPath("userData"), "source-clone-status.json");
+const sourceCloneStatusPath = path.join(
+  app.getPath("userData"),
+  "source-clone-status.json",
+);
 type SourceCloneStatusRecord = {
   lastClonedAt: number;
   destinations: string[];
   sourceFingerprint?: string;
   sourceFingerprintVersion?: number;
-  shelterAudits?: Record<string, {
-    clonePath: string | null;
-    lastFullyVerifiedAt: number | null;
-    lastAttemptAt: number;
-    lastResult: "verified" | "mismatch" | "missing" | "error";
-    verifiedFiles: number;
-    totalFiles: number;
-    sourceFingerprint?: string;
-    message?: string;
-  }>;
+  shelterAudits?: Record<
+    string,
+    {
+      clonePath: string | null;
+      lastFullyVerifiedAt: number | null;
+      lastAttemptAt: number;
+      lastResult: "verified" | "mismatch" | "missing" | "error";
+      verifiedFiles: number;
+      totalFiles: number;
+      sourceFingerprint?: string;
+      message?: string;
+    }
+  >;
 };
-let sourceCloneStatusCache: Record<string, SourceCloneStatusRecord> | null = null;
+let sourceCloneStatusCache: Record<string, SourceCloneStatusRecord> | null =
+  null;
 let sourceCloneStatusWrite: Promise<void> = Promise.resolve();
-const shelterDestinationPath = path.join(app.getPath("userData"), "shelter-destination.json");
+const shelterDestinationPath = path.join(
+  app.getPath("userData"),
+  "shelter-destination.json",
+);
 let shelterDestinationCache: string | null | undefined;
 
 async function getShelterDestination(): Promise<string | null> {
   if (shelterDestinationCache !== undefined) return shelterDestinationCache;
   try {
-    const stored = JSON.parse(await fsPromises.readFile(shelterDestinationPath, "utf8"));
-    shelterDestinationCache = typeof stored.destination === "string" ? stored.destination : null;
+    const stored = JSON.parse(
+      await fsPromises.readFile(shelterDestinationPath, "utf8"),
+    );
+    shelterDestinationCache =
+      typeof stored.destination === "string" ? stored.destination : null;
   } catch {
     shelterDestinationCache = null;
   }
   return shelterDestinationCache ?? null;
 }
 
-async function setShelterDestination(destination: unknown): Promise<string | null> {
-  if (destination !== null && (typeof destination !== "string" || !path.isAbsolute(destination)))
-    throw new Error("Choose a valid absolute Fallout Shelter destination folder.");
-  const resolved = typeof destination === "string"
-    ? await fsPromises.realpath(destination)
-    : null;
+async function setShelterDestination(
+  destination: unknown,
+): Promise<string | null> {
+  if (
+    destination !== null &&
+    (typeof destination !== "string" || !path.isAbsolute(destination))
+  )
+    throw new Error(
+      "Choose a valid absolute Fallout Shelter destination folder.",
+    );
+  const resolved =
+    typeof destination === "string"
+      ? await fsPromises.realpath(destination)
+      : null;
   if (resolved) {
     await fsPromises.access(resolved, fs.constants.R_OK | fs.constants.W_OK);
     const stats = await fsPromises.stat(resolved);
@@ -4568,8 +5102,14 @@ async function setShelterDestination(destination: unknown): Promise<string | nul
       throw new Error("The Fallout Shelter destination must be a folder.");
   }
   const temporaryPath = `${shelterDestinationPath}.tmp`;
-  await fsPromises.mkdir(path.dirname(shelterDestinationPath), { recursive: true });
-  await fsPromises.writeFile(temporaryPath, JSON.stringify({ destination: resolved }), { mode: 0o600 });
+  await fsPromises.mkdir(path.dirname(shelterDestinationPath), {
+    recursive: true,
+  });
+  await fsPromises.writeFile(
+    temporaryPath,
+    JSON.stringify({ destination: resolved }),
+    { mode: 0o600 },
+  );
   await fsPromises.rename(temporaryPath, shelterDestinationPath);
   shelterDestinationCache = resolved;
   return resolved;
@@ -4596,8 +5136,11 @@ async function getShelterDestinationState() {
 async function getSourceCloneStatus() {
   if (!sourceCloneStatusCache) {
     try {
-      const stored = JSON.parse(await fsPromises.readFile(sourceCloneStatusPath, "utf8"));
-      sourceCloneStatusCache = stored && typeof stored === "object" ? stored : {};
+      const stored = JSON.parse(
+        await fsPromises.readFile(sourceCloneStatusPath, "utf8"),
+      );
+      sourceCloneStatusCache =
+        stored && typeof stored === "object" ? stored : {};
     } catch {
       sourceCloneStatusCache = {};
     }
@@ -4605,15 +5148,27 @@ async function getSourceCloneStatus() {
   return sourceCloneStatusCache;
 }
 
-async function persistSourceCloneStatus(update: Record<string, SourceCloneStatusRecord>) {
+async function persistSourceCloneStatus(
+  update: Record<string, SourceCloneStatusRecord>,
+) {
   const status = (await getSourceCloneStatus())!;
   Object.assign(status, update);
   const snapshot = JSON.stringify(status);
-  sourceCloneStatusWrite = sourceCloneStatusWrite.catch(() => undefined).then(async () => {
-    await fsPromises.mkdir(path.dirname(sourceCloneStatusPath), { recursive: true });
-    await fsPromises.writeFile(`${sourceCloneStatusPath}.tmp`, snapshot, { encoding: "utf8", mode: 0o600 });
-    await fsPromises.rename(`${sourceCloneStatusPath}.tmp`, sourceCloneStatusPath);
-  });
+  sourceCloneStatusWrite = sourceCloneStatusWrite
+    .catch(() => undefined)
+    .then(async () => {
+      await fsPromises.mkdir(path.dirname(sourceCloneStatusPath), {
+        recursive: true,
+      });
+      await fsPromises.writeFile(`${sourceCloneStatusPath}.tmp`, snapshot, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await fsPromises.rename(
+        `${sourceCloneStatusPath}.tmp`,
+        sourceCloneStatusPath,
+      );
+    });
   await sourceCloneStatusWrite;
 }
 
@@ -4740,13 +5295,17 @@ async function readFiles(
       appDataPath,
       canonicalAppDataPath,
     );
-  const machineRoot = sourceRootPath && isMacDataVolumeSourceRoot(sourceRootPath);
+  const machineRoot =
+    sourceRootPath && isMacDataVolumeSourceRoot(sourceRootPath);
   const machineDevice = machineRoot
     ? await getMacDataVolumeDeviceId(sourceRootPath)
     : null;
-  if ((machineRoot && machineDevice === null) ||
-      isSiloAppData(rootPath) || isNonLibraryPath(rootPath) ||
-      (sourceRootPath && isMacDataVolumePathExcluded(rootPath, sourceRootPath))) {
+  if (
+    (machineRoot && machineDevice === null) ||
+    isSiloAppData(rootPath) ||
+    isNonLibraryPath(rootPath) ||
+    (sourceRootPath && isMacDataVolumePathExcluded(rootPath, sourceRootPath))
+  ) {
     if (onProgress) onProgress(results);
     return results;
   }
@@ -4763,10 +5322,17 @@ async function readFiles(
 
   while (nextPendingDirectory < pendingDirectories.length) {
     const directoryPath = pendingDirectories[nextPendingDirectory++];
-    if (isSiloAppData(directoryPath) || isNonLibraryPath(directoryPath) ||
-        (sourceRootPath && isMacDataVolumePathExcluded(directoryPath, sourceRootPath))) continue;
+    if (
+      isSiloAppData(directoryPath) ||
+      isNonLibraryPath(directoryPath) ||
+      (sourceRootPath &&
+        isMacDataVolumePathExcluded(directoryPath, sourceRootPath))
+    )
+      continue;
     if (machineDevice !== null) {
-      const directoryStats = await fsPromises.stat(directoryPath).catch(() => null);
+      const directoryStats = await fsPromises
+        .stat(directoryPath)
+        .catch(() => null);
       if (!directoryStats || directoryStats.dev !== machineDevice) continue;
     }
     let entries;
@@ -4783,7 +5349,11 @@ async function readFiles(
       continue;
     }
 
-    if (entries.some((entry) => entry.name === "silo-clone-manifest.json" && entry.isFile()))
+    if (
+      entries.some(
+        (entry) => entry.name === "silo-clone-manifest.json" && entry.isFile(),
+      )
+    )
       cloneRoots.add(directoryPath);
     const ENTRY_BATCH_SIZE = 32;
     for (let offset = 0; offset < entries.length; offset += ENTRY_BATCH_SIZE) {
@@ -4795,8 +5365,13 @@ async function readFiles(
           if (entry.isSymbolicLink()) return null;
 
           const fullPath = path.join(directoryPath, entry.name);
-          if (isSiloAppData(fullPath) || isNonLibraryPath(fullPath) ||
-              (sourceRootPath && isMacDataVolumePathExcluded(fullPath, sourceRootPath))) return null;
+          if (
+            isSiloAppData(fullPath) ||
+            isNonLibraryPath(fullPath) ||
+            (sourceRootPath &&
+              isMacDataVolumePathExcluded(fullPath, sourceRootPath))
+          )
+            return null;
           try {
             let stats;
             try {
@@ -4805,7 +5380,8 @@ async function readFiles(
               if (!timeMachine) throw statError;
               stats = await fsPromises.lstat(fullPath);
             }
-            if (machineDevice !== null && stats.dev !== machineDevice) return null;
+            if (machineDevice !== null && stats.dev !== machineDevice)
+              return null;
 
             const isDirectory = entry.isDirectory() || stats.isDirectory();
             const extension = isDirectory
@@ -4892,8 +5468,19 @@ async function appendSiloOnlyCloneAliases(
   results: FileInfo[],
 ) {
   const root = path.resolve(rootPath);
-  for (let current = path.dirname(root), depth = 0; depth < 32; current = path.dirname(current), depth += 1) {
-    if (await fsPromises.stat(path.join(current, "silo-clone-manifest.json")).then((stats) => stats.isFile(), () => false)) {
+  for (
+    let current = path.dirname(root), depth = 0;
+    depth < 32;
+    current = path.dirname(current), depth += 1
+  ) {
+    if (
+      await fsPromises
+        .stat(path.join(current, "silo-clone-manifest.json"))
+        .then(
+          (stats) => stats.isFile(),
+          () => false,
+        )
+    ) {
       cloneRoots.add(current);
       break;
     }
@@ -4902,21 +5489,50 @@ async function appendSiloOnlyCloneAliases(
   for (const cloneRoot of cloneRoots) {
     let aliases: Array<Record<string, unknown>>;
     try {
-      const manifest = JSON.parse(await fsPromises.readFile(path.join(cloneRoot, "silo-clone-manifest.json"), "utf8"));
-      if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || !Array.isArray(manifest.aliases)) continue;
+      const manifest = JSON.parse(
+        await fsPromises.readFile(
+          path.join(cloneRoot, "silo-clone-manifest.json"),
+          "utf8",
+        ),
+      );
+      if (
+        manifest.format !== "silo-source-clone" ||
+        manifest.version !== 1 ||
+        !Array.isArray(manifest.aliases)
+      )
+        continue;
       aliases = manifest.aliases;
     } catch {
       continue;
     }
     for (const alias of aliases) {
-      if (alias.materialized !== false || typeof alias.path !== "string" || typeof alias.canonicalPath !== "string") continue;
+      if (
+        alias.materialized !== false ||
+        typeof alias.path !== "string" ||
+        typeof alias.canonicalPath !== "string"
+      )
+        continue;
       const aliasPath = path.resolve(cloneRoot, alias.path);
       if (!aliasPath.startsWith(`${cloneRoot}${path.sep}`)) continue;
-      if (exploded ? !aliasPath.startsWith(`${root}${path.sep}`) : path.dirname(aliasPath) !== root) continue;
-      const canonicalClone = typeof alias.canonicalClone === "string" ? alias.canonicalClone : null;
-      if (canonicalClone !== null && (!canonicalClone || canonicalClone !== path.basename(canonicalClone) ||
-          canonicalClone === "." || canonicalClone === "..")) continue;
-      const canonicalRoot = canonicalClone ? path.join(path.dirname(cloneRoot), canonicalClone) : cloneRoot;
+      if (
+        exploded
+          ? !aliasPath.startsWith(`${root}${path.sep}`)
+          : path.dirname(aliasPath) !== root
+      )
+        continue;
+      const canonicalClone =
+        typeof alias.canonicalClone === "string" ? alias.canonicalClone : null;
+      if (
+        canonicalClone !== null &&
+        (!canonicalClone ||
+          canonicalClone !== path.basename(canonicalClone) ||
+          canonicalClone === "." ||
+          canonicalClone === "..")
+      )
+        continue;
+      const canonicalRoot = canonicalClone
+        ? path.join(path.dirname(cloneRoot), canonicalClone)
+        : cloneRoot;
       const canonicalPath = path.resolve(canonicalRoot, alias.canonicalPath);
       if (!canonicalPath.startsWith(`${canonicalRoot}${path.sep}`)) continue;
       const stats = await fsPromises.stat(canonicalPath).catch(() => null);
@@ -4974,7 +5590,13 @@ async function readReferencedFiles(filePaths: string[]): Promise<FileInfo[]> {
 
 const ALL_SOURCES_PATH = "/__sources__/all";
 
-type SourceKind = "local" | "machine" | "ios" | "android" | "gdrive" | "gphotos";
+type SourceKind =
+  | "local"
+  | "machine"
+  | "ios"
+  | "android"
+  | "gdrive"
+  | "gphotos";
 
 interface BrowseSource {
   id: string;
@@ -5018,7 +5640,10 @@ function applyAccessBranding(): void {
   app.setName(name);
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setTitle(name);
   if (applicationMenuInstalled) installApplicationMenu();
-  sendToRenderer("lifetime-access-changed", { fullAccess: fullAccessEnabled(), name });
+  sendToRenderer("lifetime-access-changed", {
+    fullAccess: fullAccessEnabled(),
+    name,
+  });
 }
 
 function enableLifetimeFeatures(): void {
@@ -5099,19 +5724,30 @@ async function buildSourceList(): Promise<BrowseSource[]> {
   const cloneStatus = (await getSourceCloneStatus())!;
   const sources: BrowseSource[] = [];
 
-  const localSources = await Promise.all(appState.indexSources.map(async (source) => {
-    const available = await fsPromises.access(source.path, fs.constants.R_OK).then(() => true, () => false);
-    const includesSiloData = await sourceIncludesSiloAppData(source.path);
-    return { source, available, includesSiloData };
-  }));
+  const localSources = await Promise.all(
+    appState.indexSources.map(async (source) => {
+      const available = await fsPromises
+        .access(source.path, fs.constants.R_OK)
+        .then(
+          () => true,
+          () => false,
+        );
+      const includesSiloData = await sourceIncludesSiloAppData(source.path);
+      return { source, available, includesSiloData };
+    }),
+  );
   for (const { source, available, includesSiloData } of localSources) {
     const cloned = cloneStatus[source.path];
     const machine = source.kind === "machine";
     sources.push({
       id: source.path,
       kind: machine ? "machine" : "local",
-      label: machine ? "This Mac" : source.path.split(path.sep).filter(Boolean).pop() || source.path,
-      detail: machine ? "Internal data volume; mounted external volumes are excluded." : source.path,
+      label: machine
+        ? "This Mac"
+        : source.path.split(path.sep).filter(Boolean).pop() || source.path,
+      detail: machine
+        ? "Internal data volume; mounted external volumes are excluded."
+        : source.path,
       rootPath: source.path,
       enabled: !disabled.has(source.path),
       available,
@@ -5120,19 +5756,28 @@ async function buildSourceList(): Promise<BrowseSource[]> {
         : available
           ? ""
           : "Source is disconnected or unreadable.",
-      ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
+      ...(cloned
+        ? {
+            lastClonedAt: cloned.lastClonedAt,
+            lastCloneDestination: cloned.destinations.at(-1),
+          }
+        : {}),
     });
   }
 
   // Latest saved snapshot per phone stays browseable while its backup drive is reachable.
-  const latestPhoneBackups = new Map<string, Awaited<ReturnType<typeof phoneManager.getOfflineBackups>>[number]>();
+  const latestPhoneBackups = new Map<
+    string,
+    Awaited<ReturnType<typeof phoneManager.getOfflineBackups>>[number]
+  >();
   for (const backup of await phoneManager.getOfflineBackups().catch((error) => {
     console.error("[Sources] Could not list saved phone backups:", error);
     return [];
   })) {
     const key = `${backup.platform}:${backup.id}`;
     const current = latestPhoneBackups.get(key);
-    if (!current || backup.snapshotAt > current.snapshotAt) latestPhoneBackups.set(key, backup);
+    if (!current || backup.snapshotAt > current.snapshotAt)
+      latestPhoneBackups.set(key, backup);
   }
 
   for (const device of scannedPhoneDevices) {
@@ -5141,7 +5786,12 @@ async function buildSourceList(): Promise<BrowseSource[]> {
     const deviceKey = `${device.platform}:${device.id}`;
     const explicitPhoneChoice = explicitPhoneChoiceByDevice.get(deviceKey);
     const cloned = cloneStatus[id];
-    const backupState = phoneManager.getBackupStates().find((state) => state.deviceId === device.id && state.platform === device.platform);
+    const backupState = phoneManager
+      .getBackupStates()
+      .find(
+        (state) =>
+          state.deviceId === device.id && state.platform === device.platform,
+      );
     const savedBackup = latestPhoneBackups.get(deviceKey);
     sources.push({
       id,
@@ -5157,8 +5807,15 @@ async function buildSourceList(): Promise<BrowseSource[]> {
           : !savedBackup || disabled.has(savedBackup.rootPath)),
       available: isReady,
       message: device.status === "ready" ? "" : device.message,
-      ...(backupState?.lastBackupAt ? { snapshotAt: backupState.lastBackupAt } : {}),
-      ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
+      ...(backupState?.lastBackupAt
+        ? { snapshotAt: backupState.lastBackupAt }
+        : {}),
+      ...(cloned
+        ? {
+            lastClonedAt: cloned.lastClonedAt,
+            lastCloneDestination: cloned.destinations.at(-1),
+          }
+        : {}),
     });
   }
 
@@ -5179,17 +5836,26 @@ async function buildSourceList(): Promise<BrowseSource[]> {
       enabled:
         !disabled.has(backup.rootPath) &&
         (explicitPhoneChoice
-          ? Boolean(phoneManager.parsePhonePath(explicitPhoneChoice)?.offlineBackup)
+          ? Boolean(
+              phoneManager.parsePhonePath(explicitPhoneChoice)?.offlineBackup,
+            )
           : true),
       available: true,
       message: "",
       offlineBackup: true,
       snapshotAt: backup.snapshotAt,
-      ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
+      ...(cloned
+        ? {
+            lastClonedAt: cloned.lastClonedAt,
+            lastCloneDestination: cloned.destinations.at(-1),
+          }
+        : {}),
     });
   }
 
-  for (const account of GOOGLE_FEATURES_ENABLED ? googleManager.getState().accounts : []) {
+  for (const account of GOOGLE_FEATURES_ENABLED
+    ? googleManager.getState().accounts
+    : []) {
     const driveClone = cloneStatus[account.driveRootPath];
     sources.push({
       id: account.driveRootPath,
@@ -5200,7 +5866,12 @@ async function buildSourceList(): Promise<BrowseSource[]> {
       enabled: !disabled.has(account.driveRootPath),
       available: !account.needsReauth,
       message: account.needsReauth ? "Reconnect this account" : "",
-      ...(driveClone ? { lastClonedAt: driveClone.lastClonedAt, lastCloneDestination: driveClone.destinations.at(-1) } : {}),
+      ...(driveClone
+        ? {
+            lastClonedAt: driveClone.lastClonedAt,
+            lastCloneDestination: driveClone.destinations.at(-1),
+          }
+        : {}),
     });
     if (account.pickedCount > 0) {
       const photosClone = cloneStatus[account.photosRootPath];
@@ -5213,7 +5884,12 @@ async function buildSourceList(): Promise<BrowseSource[]> {
         enabled: !disabled.has(account.photosRootPath),
         available: !account.needsReauth,
         message: account.needsReauth ? "Reconnect this account" : "",
-        ...(photosClone ? { lastClonedAt: photosClone.lastClonedAt, lastCloneDestination: photosClone.destinations.at(-1) } : {}),
+        ...(photosClone
+          ? {
+              lastClonedAt: photosClone.lastClonedAt,
+              lastCloneDestination: photosClone.destinations.at(-1),
+            }
+          : {}),
       });
     }
   }
@@ -5224,7 +5900,11 @@ async function buildSourceList(): Promise<BrowseSource[]> {
 async function readSourceFiles(
   source: BrowseSource,
   exploded: boolean,
-  onProgress?: (fileDeltas: FileInfo[], scanned: number, audioFound: number) => void,
+  onProgress?: (
+    fileDeltas: FileInfo[],
+    scanned: number,
+    audioFound: number,
+  ) => void,
 ): Promise<FileInfo[]> {
   const annotatedFiles: FileInfo[] = [];
   let reportedCount = 0;
@@ -5440,32 +6120,47 @@ async function listLocalCloneEntries(
       canonicalAppDataPath,
     );
   const machineRoot = isMacDataVolumeSourceRoot(root);
-  const machineDevice = machineRoot ? await getMacDataVolumeDeviceId(root) : null;
+  const machineDevice = machineRoot
+    ? await getMacDataVolumeDeviceId(root)
+    : null;
   if (machineRoot && machineDevice === null)
-    throw new Error("Could not verify the internal data-volume boundary; this machine source was not cloned.");
+    throw new Error(
+      "Could not verify the internal data-volume boundary; this machine source was not cloned.",
+    );
   if (isSiloAppData(root)) return;
-  if (!options.allowMarkedRoot && await isSiloCloneDirectory(root)) return;
+  if (!options.allowMarkedRoot && (await isSiloCloneDirectory(root))) return;
   const stack = [{ directory: root, relativePath: "" }];
   while (stack.length > 0) {
     ensureCloneActive(operationId);
     const current = stack.pop()!;
     if (isMacDataVolumePathExcluded(current.directory, root)) continue;
     if (machineDevice !== null) {
-      const directoryStats = await fsPromises.stat(current.directory).catch(() => null);
+      const directoryStats = await fsPromises
+        .stat(current.directory)
+        .catch(() => null);
       if (!directoryStats || directoryStats.dev !== machineDevice) continue;
     }
     if (isSiloAppData(current.directory)) continue;
-    if (!(options.allowMarkedRoot && current.directory === root) &&
-      await isSiloCloneDirectory(current.directory)) continue;
+    if (
+      !(options.allowMarkedRoot && current.directory === root) &&
+      (await isSiloCloneDirectory(current.directory))
+    )
+      continue;
     const dir = await fsPromises.opendir(current.directory);
     for await (const entry of dir) {
       ensureCloneActive(operationId);
       if (entry.isSymbolicLink()) continue;
       const absolutePath = path.join(current.directory, entry.name);
-      if (options.skipRootManifest && current.directory === root && entry.name === "silo-clone-manifest.json") continue;
+      if (
+        options.skipRootManifest &&
+        current.directory === root &&
+        entry.name === "silo-clone-manifest.json"
+      )
+        continue;
       if (isMacDataVolumePathExcluded(absolutePath, root)) continue;
       if (isSiloAppData(absolutePath)) continue;
-      if (entry.isDirectory() && await isSiloCloneDirectory(absolutePath)) continue;
+      if (entry.isDirectory() && (await isSiloCloneDirectory(absolutePath)))
+        continue;
       const relativePath = path.join(current.relativePath, entry.name);
       const stats = await fsPromises.stat(absolutePath);
       if (machineDevice !== null && stats.dev !== machineDevice) continue;
@@ -5509,17 +6204,25 @@ async function prepareSourceClone(
 ) {
   if (!Array.isArray(sourceIds) || sourceIds.length === 0)
     throw new Error("Select at least one available source to clone.");
-  if (!Array.isArray(destinations) || destinations.length === 0 || destinations.some((item) => typeof item !== "string" || !path.isAbsolute(item)))
+  if (
+    !Array.isArray(destinations) ||
+    destinations.length === 0 ||
+    destinations.some(
+      (item) => typeof item !== "string" || !path.isAbsolute(item),
+    )
+  )
     throw new Error("Choose at least one valid destination folder.");
   const uniqueDestinations = Array.from(new Set(destinations));
   const operation = { cancelled: false };
   sourceCloneOperations.set(operationId, operation);
-  const available = sourceOverrides ?? await listSources();
-  const selected = available.filter((source) =>
-    sourceIds.includes(source.id) && source.available,
+  const available = sourceOverrides ?? (await listSources());
+  const selected = available.filter(
+    (source) => sourceIds.includes(source.id) && source.available,
   );
   if (selected.length !== new Set(sourceIds).size)
-    throw new Error("One or more selected sources are no longer available. Refresh sources and try again.");
+    throw new Error(
+      "One or more selected sources are no longer available. Refresh sources and try again.",
+    );
 
   const resolvedDestinations: string[] = [];
   for (const destination of uniqueDestinations) {
@@ -5529,8 +6232,15 @@ async function prepareSourceClone(
       if (source.kind !== "local" && source.kind !== "machine") continue;
       const sourceResolved = await fsPromises.realpath(source.rootPath);
       const relative = path.relative(sourceResolved, resolved);
-      if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative)))
-        throw new Error(`Destination cannot be inside selected source “${source.label}”. Choose a different folder.`);
+      if (
+        relative === "" ||
+        (!relative.startsWith(`..${path.sep}`) &&
+          relative !== ".." &&
+          !path.isAbsolute(relative))
+      )
+        throw new Error(
+          `Destination cannot be inside selected source “${source.label}”. Choose a different folder.`,
+        );
     }
     resolvedDestinations.push(resolved);
   }
@@ -5541,31 +6251,57 @@ async function prepareSourceClone(
     let cloneRoot = path.join(destination, `Silo Source Clone ${timestamp}`);
     let suffix = 2;
     const taken = async (candidate: string) =>
-      (await fsPromises.access(candidate).then(() => true, () => false)) ||
-      (await fsPromises.access(`${candidate}${CLONE_ARCHIVE_EXTENSION}`).then(() => true, () => false));
+      (await fsPromises.access(candidate).then(
+        () => true,
+        () => false,
+      )) ||
+      (await fsPromises.access(`${candidate}${CLONE_ARCHIVE_EXTENSION}`).then(
+        () => true,
+        () => false,
+      ));
     while (await taken(cloneRoot))
-      cloneRoot = path.join(destination, `Silo Source Clone ${timestamp} (${suffix++})`);
-    destinationPlans.push({ destination, cloneRoot, freeBytes: 0, shortfallBytes: 0 });
+      cloneRoot = path.join(
+        destination,
+        `Silo Source Clone ${timestamp} (${suffix++})`,
+      );
+    destinationPlans.push({
+      destination,
+      cloneRoot,
+      freeBytes: 0,
+      shortfallBytes: 0,
+    });
   }
 
   const entries: SourceClonePlanEntry[] = [];
   const sourcePrefixes = new Map<string, string>();
   let scannedEntries = 0;
   const initial: SourceCloneProgress = {
-    operationId, phase: "scanning", destination: destinationPlans[0].cloneRoot,
-    totalSources: selected.length, totalFiles: 0, completedFiles: 0,
-    totalBytes: 0, copiedBytes: 0, verifiedFiles: 0, failedFiles: 0,
-    currentFile: "", message: "Preparing a read-only source inventory…",
+    operationId,
+    phase: "scanning",
+    destination: destinationPlans[0].cloneRoot,
+    totalSources: selected.length,
+    totalFiles: 0,
+    completedFiles: 0,
+    totalBytes: 0,
+    copiedBytes: 0,
+    verifiedFiles: 0,
+    failedFiles: 0,
+    currentFile: "",
+    message: "Preparing a read-only source inventory…",
   };
   sendSourceCloneProgress(initial);
 
   for (const [sourceIndex, source] of selected.entries()) {
     ensureCloneActive(operationId);
-    sendSourceCloneProgress({ ...initial, currentFile: source.label,
-      message: `Scanning ${source.label} (${sourceIndex + 1} of ${selected.length})…` });
-    const prefix = prepareOptions.prefixSources === false
-      ? ""
-      : `${String(sourceIndex + 1).padStart(2, "0")}-${cloneSafeSegment(source.label)}`;
+    sendSourceCloneProgress({
+      ...initial,
+      currentFile: source.label,
+      message: `Scanning ${source.label} (${sourceIndex + 1} of ${selected.length})…`,
+    });
+    const prefix =
+      prepareOptions.prefixSources === false
+        ? ""
+        : `${String(sourceIndex + 1).padStart(2, "0")}-${cloneSafeSegment(source.label)}`;
     sourcePrefixes.set(source.id, prefix);
     if (prefix)
       entries.push({
@@ -5578,22 +6314,33 @@ async function prepareSourceClone(
         isDirectory: true,
       });
     if (source.kind === "local" || source.kind === "machine") {
-      await listLocalCloneEntries(source.rootPath, operationId, (entry) => {
-        entry.sourceId = source.id;
-        entry.sourceRelativePath = entry.destinationRelativePath;
-        entry.sourceSize = entry.size;
-        entry.sourceModified = entry.modified;
-        entry.destinationRelativePath = path.join(prefix, cloneSafeRelativePath(entry.destinationRelativePath));
-        entries.push(entry);
-        scannedEntries += 1;
-        if (scannedEntries % 250 === 0)
-          sendSourceCloneProgress({ ...initial, totalFiles: entries.filter((item) => !item.isDirectory).length,
-            currentFile: entry.destinationRelativePath,
-            message: `Found ${entries.filter((item) => !item.isDirectory).length.toLocaleString()} files so far…` });
-      }, {
-        allowMarkedRoot: prepareOptions.allowMarkedRoot,
-        skipRootManifest: prepareOptions.skipRootManifest,
-      });
+      await listLocalCloneEntries(
+        source.rootPath,
+        operationId,
+        (entry) => {
+          entry.sourceId = source.id;
+          entry.sourceRelativePath = entry.destinationRelativePath;
+          entry.sourceSize = entry.size;
+          entry.sourceModified = entry.modified;
+          entry.destinationRelativePath = path.join(
+            prefix,
+            cloneSafeRelativePath(entry.destinationRelativePath),
+          );
+          entries.push(entry);
+          scannedEntries += 1;
+          if (scannedEntries % 250 === 0)
+            sendSourceCloneProgress({
+              ...initial,
+              totalFiles: entries.filter((item) => !item.isDirectory).length,
+              currentFile: entry.destinationRelativePath,
+              message: `Found ${entries.filter((item) => !item.isDirectory).length.toLocaleString()} files so far…`,
+            });
+        },
+        {
+          allowMarkedRoot: prepareOptions.allowMarkedRoot,
+          skipRootManifest: prepareOptions.skipRootManifest,
+        },
+      );
       continue;
     }
     const remoteEntries = phoneManager.isPhonePath(source.rootPath)
@@ -5601,16 +6348,27 @@ async function prepareSourceClone(
       : await googleManager.listFilesRecursively(source.rootPath);
     for (const remote of remoteEntries) {
       ensureCloneActive(operationId);
-      const relativePath = cloneSafeRelativePath(remote.relativePath || remote.name);
-      entries.push({ sourcePath: remote.path, destinationRelativePath: path.join(prefix, relativePath),
-        sourceId: source.id, sourceRelativePath: remote.relativePath || remote.name,
-        sourceSize: remote.size, sourceModified: remote.modified,
-        size: remote.size, modified: remote.modified, isDirectory: remote.isDirectory });
+      const relativePath = cloneSafeRelativePath(
+        remote.relativePath || remote.name,
+      );
+      entries.push({
+        sourcePath: remote.path,
+        destinationRelativePath: path.join(prefix, relativePath),
+        sourceId: source.id,
+        sourceRelativePath: remote.relativePath || remote.name,
+        sourceSize: remote.size,
+        sourceModified: remote.modified,
+        size: remote.size,
+        modified: remote.modified,
+        isDirectory: remote.isDirectory,
+      });
       scannedEntries += 1;
     }
   }
 
-  const configDirectory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "silo-clone-config-"));
+  const configDirectory = await fsPromises.mkdtemp(
+    path.join(os.tmpdir(), "silo-clone-config-"),
+  );
   const configArchive = path.join(configDirectory, "silo-config.tar.gz");
   try {
     if (prepareOptions.includeConfig !== false) {
@@ -5624,9 +6382,14 @@ async function prepareSourceClone(
       const configStats = await fsPromises.stat(configArchive);
       for (const source of selected) {
         const prefix = sourcePrefixes.get(source.id)!;
-        entries.push({ sourcePath: configArchive, localPath: configArchive,
+        entries.push({
+          sourcePath: configArchive,
+          localPath: configArchive,
           destinationRelativePath: path.join(prefix, "silo-config.tar.gz"),
-          size: configStats.size, modified: configStats.mtimeMs, isDirectory: false });
+          size: configStats.size,
+          modified: configStats.mtimeMs,
+          isDirectory: false,
+        });
       }
     }
     if (prepareOptions.replicaSourceManifestPath) {
@@ -5642,29 +6405,66 @@ async function prepareSourceClone(
       });
     }
 
-    if (prepareOptions.sourceManifest && Array.isArray(prepareOptions.sourceManifest.aliases)) {
-      const presentPaths = new Set(entries.filter((entry) => !entry.isDirectory).map((entry) => entry.destinationRelativePath));
-      for (const alias of prepareOptions.sourceManifest.aliases as Array<Record<string, unknown>>) {
-        if (alias.materialized !== false || typeof alias.path !== "string" ||
-            typeof alias.canonicalPath !== "string" || typeof alias.sha256 !== "string" ||
-            presentPaths.has(alias.path)) continue;
-        const crossClone = typeof alias.canonicalClone === "string" ? alias.canonicalClone : null;
-        if (crossClone !== null && (!crossClone || crossClone !== path.basename(crossClone) || crossClone === "." || crossClone === ".."))
-          throw new Error("Fallout Shelter manifest contains an unsafe duplicate alias.");
+    if (
+      prepareOptions.sourceManifest &&
+      Array.isArray(prepareOptions.sourceManifest.aliases)
+    ) {
+      const presentPaths = new Set(
+        entries
+          .filter((entry) => !entry.isDirectory)
+          .map((entry) => entry.destinationRelativePath),
+      );
+      for (const alias of prepareOptions.sourceManifest.aliases as Array<
+        Record<string, unknown>
+      >) {
+        if (
+          alias.materialized !== false ||
+          typeof alias.path !== "string" ||
+          typeof alias.canonicalPath !== "string" ||
+          typeof alias.sha256 !== "string" ||
+          presentPaths.has(alias.path)
+        )
+          continue;
+        const crossClone =
+          typeof alias.canonicalClone === "string"
+            ? alias.canonicalClone
+            : null;
+        if (
+          crossClone !== null &&
+          (!crossClone ||
+            crossClone !== path.basename(crossClone) ||
+            crossClone === "." ||
+            crossClone === "..")
+        )
+          throw new Error(
+            "Fallout Shelter manifest contains an unsafe duplicate alias.",
+          );
         const canonicalRoot = crossClone
-          ? path.join(path.dirname(path.resolve(selected[0].rootPath)), crossClone)
+          ? path.join(
+              path.dirname(path.resolve(selected[0].rootPath)),
+              crossClone,
+            )
           : path.resolve(selected[0].rootPath);
         const canonicalPath = path.resolve(canonicalRoot, alias.canonicalPath);
         const relative = path.relative(canonicalRoot, canonicalPath);
-        if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
-          throw new Error("Fallout Shelter manifest contains an unsafe duplicate alias.");
+        if (
+          relative === ".." ||
+          relative.startsWith(`..${path.sep}`) ||
+          path.isAbsolute(relative)
+        )
+          throw new Error(
+            "Fallout Shelter manifest contains an unsafe duplicate alias.",
+          );
         const stats = await fsPromises.stat(canonicalPath);
         entries.push({
           sourcePath: canonicalPath,
           localPath: canonicalPath,
           destinationRelativePath: alias.path,
           sourceId: selected[0].id,
-          sourceRelativePath: typeof alias.sourceRelativePath === "string" ? alias.sourceRelativePath : alias.path,
+          sourceRelativePath:
+            typeof alias.sourceRelativePath === "string"
+              ? alias.sourceRelativePath
+              : alias.path,
           sourceSize: stats.size,
           sourceModified: stats.mtimeMs,
           size: stats.size,
@@ -5679,45 +6479,65 @@ async function prepareSourceClone(
     }
 
     const files = entries.filter((entry) => !entry.isDirectory);
-    if (files.length === 0) throw new Error("The selected sources contain no files to clone.");
+    if (files.length === 0)
+      throw new Error("The selected sources contain no files to clone.");
     const canonicalByDigest = new Map<string, SourceClonePlanEntry>();
     let totalBytes = 0;
     for (let index = 0; index < files.length; index += 1) {
       ensureCloneActive(operationId);
       const entry = files[index];
-      const localPath = entry.localPath ?? await resolveLocalPath(entry.sourcePath);
+      const localPath =
+        entry.localPath ?? (await resolveLocalPath(entry.sourcePath));
       const stats = await fsPromises.stat(localPath);
       entry.localPath = localPath;
       entry.size = stats.size;
       entry.modified = stats.mtimeMs;
       const digest = await hashFile(localPath);
       if (entry.sha256 && entry.sha256 !== digest)
-        throw new Error(`Fallout Shelter alias no longer matches its verified source: ${entry.destinationRelativePath}`);
+        throw new Error(
+          `Fallout Shelter alias no longer matches its verified source: ${entry.destinationRelativePath}`,
+        );
       entry.sha256 = digest;
       if (entry.duplicateOf) {
-        const canonical = entries.find((candidate) => candidate.destinationRelativePath === entry.duplicateOf);
+        const canonical = entries.find(
+          (candidate) =>
+            candidate.destinationRelativePath === entry.duplicateOf,
+        );
         if (!canonical || canonical.sha256 !== entry.sha256)
-          throw new Error(`Fallout Shelter alias target is missing or has changed: ${entry.destinationRelativePath}`);
+          throw new Error(
+            `Fallout Shelter alias target is missing or has changed: ${entry.destinationRelativePath}`,
+          );
         continue;
       }
       const canonical = canonicalByDigest.get(entry.sha256);
       if (canonical) {
         if (canonical.size !== entry.size)
-          throw new Error("SHA-256 collision with mismatched file sizes; aborting duplicate elimination.");
+          throw new Error(
+            "SHA-256 collision with mismatched file sizes; aborting duplicate elimination.",
+          );
         entry.duplicateOf = canonical.destinationRelativePath;
       } else {
         canonicalByDigest.set(entry.sha256, entry);
         totalBytes += stats.size;
       }
       if ((index + 1) % 100 === 0 || index + 1 === files.length)
-        sendSourceCloneProgress({ ...initial, phase: "checking-space", totalFiles: canonicalByDigest.size,
-          completedFiles: index + 1, totalBytes, currentFile: entry.destinationRelativePath,
-          message: `Hashed ${(index + 1).toLocaleString()} of ${files.length.toLocaleString()} paths · ${canonicalByDigest.size.toLocaleString()} unique files…` });
+        sendSourceCloneProgress({
+          ...initial,
+          phase: "checking-space",
+          totalFiles: canonicalByDigest.size,
+          completedFiles: index + 1,
+          totalBytes,
+          currentFile: entry.destinationRelativePath,
+          message: `Hashed ${(index + 1).toLocaleString()} of ${files.length.toLocaleString()} paths · ${canonicalByDigest.size.toLocaleString()} unique files…`,
+        });
     }
     const uniqueFiles = files.filter((entry) => !entry.duplicateOf);
     const duplicateFiles = files.length - uniqueFiles.length;
 
-    const reuseByDestination = new Map<string, Map<string, ShelterReusableFile>>();
+    const reuseByDestination = new Map<
+      string,
+      Map<string, ShelterReusableFile>
+    >();
     const neededBytesByDestination = new Map<string, number>();
     for (const destination of destinationPlans) {
       const reuse = await buildShelterReuseIndex(destination.destination);
@@ -5728,9 +6548,15 @@ async function prepareSourceClone(
         if (prior && prior.size === entry.size) reusableBytes += entry.size;
       }
       destination.reusableBytes = reusableBytes;
-      neededBytesByDestination.set(destination.destination, totalBytes - reusableBytes);
+      neededBytesByDestination.set(
+        destination.destination,
+        totalBytes - reusableBytes,
+      );
     }
-    const destinationDevices = new Map<string, { freeBytes: number; neededBytes: number }>();
+    const destinationDevices = new Map<
+      string,
+      { freeBytes: number; neededBytes: number }
+    >();
     const destinationDeviceByPath = new Map<string, string>();
     for (const destination of destinationPlans) {
       const [stats, disk] = await Promise.all([
@@ -5740,27 +6566,53 @@ async function prepareSourceClone(
       const device = String(disk.dev);
       destinationDeviceByPath.set(destination.destination, device);
       const current = destinationDevices.get(device) ?? {
-        freeBytes: Number(stats.bavail) * Number(stats.bsize), neededBytes: 0,
+        freeBytes: Number(stats.bavail) * Number(stats.bsize),
+        neededBytes: 0,
       };
-      current.neededBytes += neededBytesByDestination.get(destination.destination) ?? totalBytes;
+      current.neededBytes +=
+        neededBytesByDestination.get(destination.destination) ?? totalBytes;
       destinationDevices.set(device, current);
       destination.freeBytes = current.freeBytes;
     }
     for (const destination of destinationPlans) {
-      const group = destinationDevices.get(destinationDeviceByPath.get(destination.destination)!)!;
-      destination.shortfallBytes = Math.max(0, group.neededBytes - group.freeBytes);
+      const group = destinationDevices.get(
+        destinationDeviceByPath.get(destination.destination)!,
+      )!;
+      destination.shortfallBytes = Math.max(
+        0,
+        group.neededBytes - group.freeBytes,
+      );
     }
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const plan: SourceClonePlan = { id, operationId, destinations: destinationPlans,
-      entries, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles,
-      sourceLabels: selected.map((source) => source.label), sourceIds: selected.map((source) => source.id), configDirectory,
+    const plan: SourceClonePlan = {
+      id,
+      operationId,
+      destinations: destinationPlans,
+      entries,
+      totalFiles: uniqueFiles.length,
+      totalBytes,
+      duplicateFiles,
+      sourceLabels: selected.map((source) => source.label),
+      sourceIds: selected.map((source) => source.id),
+      configDirectory,
       replicaOf: prepareOptions.replicaOf,
-      sourceManifest: prepareOptions.sourceManifest, reuseByDestination };
+      sourceManifest: prepareOptions.sourceManifest,
+      reuseByDestination,
+    };
     sourceClonePlans.set(id, plan);
-    return { planId: id, destinations: destinationPlans, totalSources: selected.length,
-      sourceLabels: plan.sourceLabels, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles };
+    return {
+      planId: id,
+      destinations: destinationPlans,
+      totalSources: selected.length,
+      sourceLabels: plan.sourceLabels,
+      totalFiles: uniqueFiles.length,
+      totalBytes,
+      duplicateFiles,
+    };
   } catch (error) {
-    await fsPromises.rm(configDirectory, { recursive: true, force: true }).catch(() => undefined);
+    await fsPromises
+      .rm(configDirectory, { recursive: true, force: true })
+      .catch(() => undefined);
     throw error;
   }
 }
@@ -5774,7 +6626,9 @@ async function findLatestShelterSnapshot(): Promise<{
   if (!destination) return null;
   const root = await fsPromises.realpath(destination).catch(() => null);
   if (!root) return null;
-  const entries = await fsPromises.readdir(root, { withFileTypes: true }).catch(() => []);
+  const entries = await fsPromises
+    .readdir(root, { withFileTypes: true })
+    .catch(() => []);
   const candidates: Array<{
     rootPath: string;
     manifestPath: string;
@@ -5786,51 +6640,109 @@ async function findLatestShelterSnapshot(): Promise<{
     const snapshotPath = path.join(root, entry.name);
     const manifestPath = path.join(snapshotPath, "silo-clone-manifest.json");
     try {
-      const manifest = JSON.parse(await fsPromises.readFile(manifestPath, "utf8")) as Record<string, unknown>;
-      if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || manifest.complete !== true)
+      const manifest = JSON.parse(
+        await fsPromises.readFile(manifestPath, "utf8"),
+      ) as Record<string, unknown>;
+      if (
+        manifest.format !== "silo-source-clone" ||
+        manifest.version !== 1 ||
+        manifest.complete !== true
+      )
         continue;
       const stats = await fsPromises.stat(snapshotPath);
-      const createdAt = typeof manifest.createdAt === "string" ? Date.parse(manifest.createdAt) : 0;
-      candidates.push({ rootPath: snapshotPath, manifestPath, manifest,
-        createdAt: Number.isFinite(createdAt) && createdAt > 0 ? createdAt : stats.mtimeMs });
+      const createdAt =
+        typeof manifest.createdAt === "string"
+          ? Date.parse(manifest.createdAt)
+          : 0;
+      candidates.push({
+        rootPath: snapshotPath,
+        manifestPath,
+        manifest,
+        createdAt:
+          Number.isFinite(createdAt) && createdAt > 0
+            ? createdAt
+            : stats.mtimeMs,
+      });
     } catch {
       // Ignore incomplete, unreadable, or non-Silo directories.
     }
   }
   candidates.sort((first, second) => second.createdAt - first.createdAt);
   const latest = candidates[0];
-  return latest ? { rootPath: latest.rootPath, manifestPath: latest.manifestPath, manifest: latest.manifest } : null;
+  return latest
+    ? {
+        rootPath: latest.rootPath,
+        manifestPath: latest.manifestPath,
+        manifest: latest.manifest,
+      }
+    : null;
 }
 
 // Index every physically stored file in earlier complete directory snapshots in a
 // destination folder so new snapshots can hard-link (or Silo-alias) instead of copying.
-async function buildShelterReuseIndex(destination: string): Promise<Map<string, ShelterReusableFile>> {
+async function buildShelterReuseIndex(
+  destination: string,
+): Promise<Map<string, ShelterReusableFile>> {
   const reusable = new Map<string, ShelterReusableFile>();
   const root = await fsPromises.realpath(destination).catch(() => null);
   if (!root) return reusable;
-  const entries = await fsPromises.readdir(root, { withFileTypes: true }).catch(() => []);
+  const entries = await fsPromises
+    .readdir(root, { withFileTypes: true })
+    .catch(() => []);
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const cloneRoot = path.join(root, entry.name);
     try {
-      if (await fsPromises.access(path.join(cloneRoot, ".silo-clone-in-progress.json")).then(() => true, () => false))
+      if (
+        await fsPromises
+          .access(path.join(cloneRoot, ".silo-clone-in-progress.json"))
+          .then(
+            () => true,
+            () => false,
+          )
+      )
         continue;
-      const manifest = JSON.parse(await fsPromises.readFile(path.join(cloneRoot, "silo-clone-manifest.json"), "utf8"));
-      if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || manifest.complete !== true ||
-          manifest.container === "zip" || !Array.isArray(manifest.files)) continue;
+      const manifest = JSON.parse(
+        await fsPromises.readFile(
+          path.join(cloneRoot, "silo-clone-manifest.json"),
+          "utf8",
+        ),
+      );
+      if (
+        manifest.format !== "silo-source-clone" ||
+        manifest.version !== 1 ||
+        manifest.complete !== true ||
+        manifest.container === "zip" ||
+        !Array.isArray(manifest.files)
+      )
+        continue;
       const physical = [
-        ...(manifest.files as Array<Record<string, unknown>>).filter((file) => !file.error),
-        ...(Array.isArray(manifest.aliases) ? manifest.aliases as Array<Record<string, unknown>> : [])
-          .filter((alias) => alias.materialized === true),
+        ...(manifest.files as Array<Record<string, unknown>>).filter(
+          (file) => !file.error,
+        ),
+        ...(Array.isArray(manifest.aliases)
+          ? (manifest.aliases as Array<Record<string, unknown>>)
+          : []
+        ).filter((alias) => alias.materialized === true),
       ];
       for (const record of physical) {
-        if (typeof record.sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(record.sha256) ||
-            typeof record.path !== "string" || typeof record.size !== "number") continue;
+        if (
+          typeof record.sha256 !== "string" ||
+          !/^[a-f0-9]{64}$/i.test(record.sha256) ||
+          typeof record.path !== "string" ||
+          typeof record.size !== "number"
+        )
+          continue;
         const digest = record.sha256.toLowerCase();
         if (reusable.has(digest)) continue;
         const absolutePath = path.resolve(cloneRoot, record.path);
         if (!absolutePath.startsWith(`${cloneRoot}${path.sep}`)) continue;
-        reusable.set(digest, { cloneName: entry.name, relativePath: record.path, absolutePath, size: record.size });
+        reusable.set(digest, {
+          cloneName: entry.name,
+          relativePath: record.path,
+          absolutePath,
+          size: record.size,
+        });
       }
     } catch {
       // Ignore unreadable, incomplete, or non-Silo directories.
@@ -5839,19 +6751,36 @@ async function buildShelterReuseIndex(destination: string): Promise<Map<string, 
   return reusable;
 }
 
-async function prepareShelterReplica(destinations: string[], operationId: string) {
+async function prepareShelterReplica(
+  destinations: string[],
+  operationId: string,
+) {
   const snapshot = await findLatestShelterSnapshot();
   if (!snapshot)
-    throw new Error("No fully verified Fallout Shelter snapshot is available to replicate.");
+    throw new Error(
+      "No fully verified Fallout Shelter snapshot is available to replicate.",
+    );
   const sourceStats = await fsPromises.stat(snapshot.rootPath);
   for (const destination of destinations) {
     const resolved = await fsPromises.realpath(destination);
-    const relative = path.relative(path.resolve(await getShelterDestination() ?? ""), resolved);
-    if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative)))
-      throw new Error("The Fallout Shelter replica must be outside the primary Fallout Shelter destination.");
+    const relative = path.relative(
+      path.resolve((await getShelterDestination()) ?? ""),
+      resolved,
+    );
+    if (
+      relative === "" ||
+      (!relative.startsWith(`..${path.sep}`) &&
+        relative !== ".." &&
+        !path.isAbsolute(relative))
+    )
+      throw new Error(
+        "The Fallout Shelter replica must be outside the primary Fallout Shelter destination.",
+      );
     const destinationStats = await fsPromises.stat(resolved);
     if (destinationStats.dev === sourceStats.dev)
-      throw new Error("Choose a replica destination on a different physical volume for 3-2-1 protection.");
+      throw new Error(
+        "Choose a replica destination on a different physical volume for 3-2-1 protection.",
+      );
   }
   const source: BrowseSource = {
     id: `shelter-replica:${snapshot.rootPath}`,
@@ -5863,21 +6792,15 @@ async function prepareShelterReplica(destinations: string[], operationId: string
     available: true,
     message: "",
   };
-  return prepareSourceClone(
-    [source.id],
-    destinations,
-    operationId,
-    [source],
-    {
-      includeConfig: false,
-      allowMarkedRoot: true,
-      skipRootManifest: true,
-      prefixSources: false,
-      replicaOf: snapshot.rootPath,
-      replicaSourceManifestPath: snapshot.manifestPath,
-      sourceManifest: snapshot.manifest,
-    },
-  );
+  return prepareSourceClone([source.id], destinations, operationId, [source], {
+    includeConfig: false,
+    allowMarkedRoot: true,
+    skipRootManifest: true,
+    prefixSources: false,
+    replicaOf: snapshot.rootPath,
+    replicaSourceManifestPath: snapshot.manifestPath,
+    sourceManifest: snapshot.manifest,
+  });
 }
 
 async function runSourceClone(
@@ -5900,7 +6823,10 @@ async function runSourceClone(
   const sourceFileCounts = new Map<string, number>();
   for (const entry of plan.entries) {
     if (entry.isDirectory || !entry.sourceId) continue;
-    sourceFileCounts.set(entry.sourceId, (sourceFileCounts.get(entry.sourceId) ?? 0) + 1);
+    sourceFileCounts.set(
+      entry.sourceId,
+      (sourceFileCounts.get(entry.sourceId) ?? 0) + 1,
+    );
     let fingerprint = fingerprints.get(entry.sourceId);
     if (!fingerprint) {
       fingerprint = new InventoryFingerprint();
@@ -5922,7 +6848,9 @@ async function runSourceClone(
     for (const sourceId of plan.sourceIds) {
       const previousRecord = history[sourceId];
       const previous = previousRecord?.destinations ?? [];
-      const sourceFingerprint = fingerprints.get(sourceId)?.finish() ?? new InventoryFingerprint().finish();
+      const sourceFingerprint =
+        fingerprints.get(sourceId)?.finish() ??
+        new InventoryFingerprint().finish();
       const verifiedFiles = sourceFileCounts.get(sourceId) ?? 0;
       const shelterAudits = { ...(previousRecord?.shelterAudits ?? {}) };
       if (verifiedFiles > 0) {
@@ -5941,7 +6869,9 @@ async function runSourceClone(
       update[sourceId] = {
         ...previousRecord,
         lastClonedAt,
-        destinations: Array.from(new Set([...previous, ...successfulDestinations])).slice(-32),
+        destinations: Array.from(
+          new Set([...previous, ...successfulDestinations]),
+        ).slice(-32),
         sourceFingerprint,
         sourceFingerprintVersion: 2,
         shelterAudits,
@@ -5951,85 +6881,196 @@ async function runSourceClone(
   };
 
   try {
-    for (const [destinationIndex, destinationPlan] of plan.destinations.entries()) {
+    for (const [
+      destinationIndex,
+      destinationPlan,
+    ] of plan.destinations.entries()) {
       ensureCloneActive(operationId);
       let completedFiles = 0;
       let copiedBytes = 0;
       let verifiedFiles = 0;
       let failedFiles = 0;
       let lastProgressAt = 0;
-      const manifestFiles: Array<{ path: string; size: number; sha256?: string; modified?: number; sourceId?: string; sourceRelativePath?: string; error?: string }> = [];
-      const manifestAliases: Array<{ path: string; canonicalPath: string; canonicalClone?: string; size: number; sha256: string; sourceId?: string; sourceRelativePath?: string; materialized: boolean }> = [];
-      const emit = (phase: SourceClonePhase, currentFile: string, message: string, force = false) => {
+      const manifestFiles: Array<{
+        path: string;
+        size: number;
+        sha256?: string;
+        modified?: number;
+        sourceId?: string;
+        sourceRelativePath?: string;
+        error?: string;
+      }> = [];
+      const manifestAliases: Array<{
+        path: string;
+        canonicalPath: string;
+        canonicalClone?: string;
+        size: number;
+        sha256: string;
+        sourceId?: string;
+        sourceRelativePath?: string;
+        materialized: boolean;
+      }> = [];
+      const emit = (
+        phase: SourceClonePhase,
+        currentFile: string,
+        message: string,
+        force = false,
+      ) => {
         const now = Date.now();
         if (!force && now - lastProgressAt < 350) return;
         lastProgressAt = now;
-        sendSourceCloneProgress({ operationId, phase, destination: destinationPlan.cloneRoot,
-          totalSources: plan.sourceLabels.length, totalFiles: plan.totalFiles, completedFiles,
-          totalBytes: plan.totalBytes, copiedBytes, verifiedFiles, failedFiles, currentFile,
-          message: `Destination ${destinationIndex + 1} of ${plan.destinations.length}: ${message}` });
+        sendSourceCloneProgress({
+          operationId,
+          phase,
+          destination: destinationPlan.cloneRoot,
+          totalSources: plan.sourceLabels.length,
+          totalFiles: plan.totalFiles,
+          completedFiles,
+          totalBytes: plan.totalBytes,
+          copiedBytes,
+          verifiedFiles,
+          failedFiles,
+          currentFile,
+          message: `Destination ${destinationIndex + 1} of ${plan.destinations.length}: ${message}`,
+        });
       };
       if (runOptions.compress) {
         const archivePath = `${destinationPlan.cloneRoot}${CLONE_ARCHIVE_EXTENSION}`;
-        if ((destinationPlan.reusableBytes ?? 0) > 0 && plan.totalBytes > destinationPlan.freeBytes)
-          throw new Error("Compressed clones cannot reuse earlier snapshots, and this destination does not have enough free space.");
+        if (
+          (destinationPlan.reusableBytes ?? 0) > 0 &&
+          plan.totalBytes > destinationPlan.freeBytes
+        )
+          throw new Error(
+            "Compressed clones cannot reuse earlier snapshots, and this destination does not have enough free space.",
+          );
         try {
-          const uniqueEntries = plan.entries.filter((item) => !item.isDirectory && !item.duplicateOf);
+          const uniqueEntries = plan.entries.filter(
+            (item) => !item.isDirectory && !item.duplicateOf,
+          );
           for (const entry of uniqueEntries) {
-            if (!entry.localPath || !entry.sha256) throw new Error(`Missing staged file for ${entry.sourcePath}`);
-            manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size, sha256: entry.sha256,
-              modified: entry.modified, sourceId: entry.sourceId, sourceRelativePath: entry.sourceRelativePath });
+            if (!entry.localPath || !entry.sha256)
+              throw new Error(`Missing staged file for ${entry.sourcePath}`);
+            manifestFiles.push({
+              path: entry.destinationRelativePath,
+              size: entry.size,
+              sha256: entry.sha256,
+              modified: entry.modified,
+              sourceId: entry.sourceId,
+              sourceRelativePath: entry.sourceRelativePath,
+            });
           }
-          for (const entry of plan.entries.filter((item) => !item.isDirectory && item.duplicateOf))
-            manifestAliases.push({ path: entry.destinationRelativePath, canonicalPath: entry.duplicateOf!,
-              size: entry.size, sha256: entry.sha256!, sourceId: entry.sourceId,
-              sourceRelativePath: entry.sourceRelativePath, materialized: false });
+          for (const entry of plan.entries.filter(
+            (item) => !item.isDirectory && item.duplicateOf,
+          ))
+            manifestAliases.push({
+              path: entry.destinationRelativePath,
+              canonicalPath: entry.duplicateOf!,
+              size: entry.size,
+              sha256: entry.sha256!,
+              sourceId: entry.sourceId,
+              sourceRelativePath: entry.sourceRelativePath,
+              materialized: false,
+            });
           const sourceManifest = plan.sourceManifest;
           const result = await writeCloneArchive({
             archivePath,
-            files: uniqueEntries.map((entry) => ({ localPath: entry.localPath!, archivePath: entry.destinationRelativePath,
-              size: entry.size, modified: entry.modified, sha256: entry.sha256! })),
-            directories: plan.entries.filter((item) => item.isDirectory)
-              .map((entry) => ({ archivePath: entry.destinationRelativePath, modified: entry.modified || undefined })),
+            files: uniqueEntries.map((entry) => ({
+              localPath: entry.localPath!,
+              archivePath: entry.destinationRelativePath,
+              size: entry.size,
+              modified: entry.modified,
+              sha256: entry.sha256!,
+            })),
+            directories: plan.entries
+              .filter((item) => item.isDirectory)
+              .map((entry) => ({
+                archivePath: entry.destinationRelativePath,
+                modified: entry.modified || undefined,
+              })),
             isCancelled: () => operation.cancelled,
             buildManifest: () => ({
-              format: "silo-source-clone", version: 1, container: "zip", createdAt: new Date().toISOString(), complete: true,
-              sourceIds: sourceManifest && Array.isArray(sourceManifest.sourceIds) ? sourceManifest.sourceIds : plan.sourceIds,
-              sourceLabels: sourceManifest && Array.isArray(sourceManifest.sourceLabels) ? sourceManifest.sourceLabels : plan.sourceLabels,
+              format: "silo-source-clone",
+              version: 1,
+              container: "zip",
+              createdAt: new Date().toISOString(),
+              complete: true,
+              sourceIds:
+                sourceManifest && Array.isArray(sourceManifest.sourceIds)
+                  ? sourceManifest.sourceIds
+                  : plan.sourceIds,
+              sourceLabels:
+                sourceManifest && Array.isArray(sourceManifest.sourceLabels)
+                  ? sourceManifest.sourceLabels
+                  : plan.sourceLabels,
               ...(plan.replicaOf ? { replicaOf: plan.replicaOf } : {}),
-              totalFiles: plan.totalFiles, totalBytes: plan.totalBytes, duplicatePaths: manifestAliases.length,
-              verifiedFiles: plan.totalFiles, failedFiles: 0, files: manifestFiles, aliases: manifestAliases,
+              totalFiles: plan.totalFiles,
+              totalBytes: plan.totalBytes,
+              duplicatePaths: manifestAliases.length,
+              verifiedFiles: plan.totalFiles,
+              failedFiles: 0,
+              files: manifestFiles,
+              aliases: manifestAliases,
             }),
             onProgress: (progress) => {
               if (progress.phase === "compressing") {
                 copiedBytes = progress.processedBytes;
                 completedFiles = progress.processedFiles;
-                emit("copying", progress.currentFile, `Compressing ${progress.currentFile || "archive"}`);
+                emit(
+                  "copying",
+                  progress.currentFile,
+                  `Compressing ${progress.currentFile || "archive"}`,
+                );
               } else {
                 verifiedFiles = progress.processedFiles;
-                emit("verifying", progress.currentFile,
-                  `Verifying archive · ${verifiedFiles.toLocaleString()} of ${plan.totalFiles.toLocaleString()} files`);
+                emit(
+                  "verifying",
+                  progress.currentFile,
+                  `Verifying archive · ${verifiedFiles.toLocaleString()} of ${plan.totalFiles.toLocaleString()} files`,
+                );
               }
             },
           });
           completedFiles = result.storedFiles;
           verifiedFiles = result.verifiedFiles;
           copiedBytes = plan.totalBytes;
-          sendSourceCloneProgress({ operationId, phase: "complete", destination: archivePath,
-            totalSources: plan.sourceLabels.length, totalFiles: plan.totalFiles, completedFiles,
-            totalBytes: plan.totalBytes, copiedBytes, verifiedFiles, failedFiles, currentFile: "",
-            message: `Destination ${destinationIndex + 1} of ${plan.destinations.length}: Compressed clone complete. ` +
+          sendSourceCloneProgress({
+            operationId,
+            phase: "complete",
+            destination: archivePath,
+            totalSources: plan.sourceLabels.length,
+            totalFiles: plan.totalFiles,
+            completedFiles,
+            totalBytes: plan.totalBytes,
+            copiedBytes,
+            verifiedFiles,
+            failedFiles,
+            currentFile: "",
+            message:
+              `Destination ${destinationIndex + 1} of ${plan.destinations.length}: Compressed clone complete. ` +
               `${verifiedFiles.toLocaleString()} files verified inside ${path.basename(archivePath)} ` +
-              `(${(result.archiveBytes / 1024 ** 3).toFixed(2)} GB).` });
+              `(${(result.archiveBytes / 1024 ** 3).toFixed(2)} GB).`,
+          });
           successfulDestinations.push(archivePath);
         } catch (error) {
           const cancelled = operation.cancelled;
-          sendSourceCloneProgress({ operationId, phase: cancelled ? "cancelled" : "error", destination: archivePath,
-            totalSources: plan.sourceLabels.length, totalFiles: plan.totalFiles, completedFiles,
-            totalBytes: plan.totalBytes, copiedBytes, verifiedFiles, failedFiles, currentFile: "",
+          sendSourceCloneProgress({
+            operationId,
+            phase: cancelled ? "cancelled" : "error",
+            destination: archivePath,
+            totalSources: plan.sourceLabels.length,
+            totalFiles: plan.totalFiles,
+            completedFiles,
+            totalBytes: plan.totalBytes,
+            copiedBytes,
+            verifiedFiles,
+            failedFiles,
+            currentFile: "",
             message: cancelled
               ? "Compressed clone cancelled; the partial archive was removed. Originals were not changed."
-              : error instanceof Error ? error.message : String(error) });
+              : error instanceof Error
+                ? error.message
+                : String(error),
+          });
           throw error;
         }
         continue;
@@ -6042,35 +7083,71 @@ async function runSourceClone(
         );
         await fsPromises.writeFile(
           inProgressMarker,
-          JSON.stringify({ format: "silo-source-clone", version: 1, startedAt: new Date().toISOString() }),
+          JSON.stringify({
+            format: "silo-source-clone",
+            version: 1,
+            startedAt: new Date().toISOString(),
+          }),
           { mode: 0o600, flag: "wx" },
         );
         invalidateSiloCloneDirectoryCache(destinationPlan.cloneRoot);
         for (const entry of plan.entries.filter((item) => item.isDirectory)) {
           ensureCloneActive(operationId);
-          const directory = path.resolve(destinationPlan.cloneRoot, entry.destinationRelativePath);
-          if (!directory.startsWith(`${destinationPlan.cloneRoot}${path.sep}`)) throw new Error("Unsafe clone directory path.");
+          const directory = path.resolve(
+            destinationPlan.cloneRoot,
+            entry.destinationRelativePath,
+          );
+          if (!directory.startsWith(`${destinationPlan.cloneRoot}${path.sep}`))
+            throw new Error("Unsafe clone directory path.");
           await fsPromises.mkdir(directory, { recursive: true });
         }
-        const hardLinkFallbackCodes = new Set(["EXDEV", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EACCES", "EMLINK"]);
+        const hardLinkFallbackCodes = new Set([
+          "EXDEV",
+          "ENOTSUP",
+          "EOPNOTSUPP",
+          "EPERM",
+          "EACCES",
+          "EMLINK",
+        ]);
         const reuse = plan.reuseByDestination?.get(destinationPlan.destination);
         const preverifiedPaths = new Set<string>();
-        const crossCloneTargets = new Map<string, { cloneName: string; relativePath: string }>();
+        const crossCloneTargets = new Map<
+          string,
+          { cloneName: string; relativePath: string }
+        >();
         let reusedFiles = 0;
-        for (const entry of plan.entries.filter((item) => !item.isDirectory && !item.duplicateOf)) {
+        for (const entry of plan.entries.filter(
+          (item) => !item.isDirectory && !item.duplicateOf,
+        )) {
           ensureCloneActive(operationId);
           const sourcePath = entry.localPath;
-          if (!sourcePath) throw new Error(`Missing staged file for ${entry.sourcePath}`);
-          const destinationPath = path.resolve(destinationPlan.cloneRoot, entry.destinationRelativePath);
-          if (!destinationPath.startsWith(`${destinationPlan.cloneRoot}${path.sep}`)) throw new Error("Unsafe clone file path.");
-          await fsPromises.mkdir(path.dirname(destinationPath), { recursive: true });
+          if (!sourcePath)
+            throw new Error(`Missing staged file for ${entry.sourcePath}`);
+          const destinationPath = path.resolve(
+            destinationPlan.cloneRoot,
+            entry.destinationRelativePath,
+          );
+          if (
+            !destinationPath.startsWith(
+              `${destinationPlan.cloneRoot}${path.sep}`,
+            )
+          )
+            throw new Error("Unsafe clone file path.");
+          await fsPromises.mkdir(path.dirname(destinationPath), {
+            recursive: true,
+          });
           const prior = entry.sha256 ? reuse?.get(entry.sha256) : undefined;
           if (prior && prior.size === entry.size) {
             let linked = false;
             try {
               const sourceStats = await fsPromises.stat(sourcePath);
-              if (sourceStats.size !== entry.size || sourceStats.mtimeMs !== entry.modified)
-                throw new Error(`Source changed after preflight: ${entry.destinationRelativePath}`);
+              if (
+                sourceStats.size !== entry.size ||
+                sourceStats.mtimeMs !== entry.modified
+              )
+                throw new Error(
+                  `Source changed after preflight: ${entry.destinationRelativePath}`,
+                );
               try {
                 await fsPromises.link(prior.absolutePath, destinationPath);
                 linked = true;
@@ -6078,26 +7155,52 @@ async function runSourceClone(
                 const code = (error as NodeJS.ErrnoException).code;
                 if (!code || !hardLinkFallbackCodes.has(code)) throw error;
               }
-              if ((await hashFile(linked ? destinationPath : prior.absolutePath)) !== entry.sha256)
+              if (
+                (await hashFile(
+                  linked ? destinationPath : prior.absolutePath,
+                )) !== entry.sha256
+              )
                 throw new Error("Earlier snapshot copy no longer matches.");
               if (linked) {
-                manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size, sha256: entry.sha256,
-                  sourceId: entry.sourceId, sourceRelativePath: entry.sourceRelativePath });
+                manifestFiles.push({
+                  path: entry.destinationRelativePath,
+                  size: entry.size,
+                  sha256: entry.sha256,
+                  sourceId: entry.sourceId,
+                  sourceRelativePath: entry.sourceRelativePath,
+                });
                 preverifiedPaths.add(entry.destinationRelativePath);
               } else {
-                crossCloneTargets.set(entry.destinationRelativePath, { cloneName: prior.cloneName, relativePath: prior.relativePath });
-                manifestAliases.push({ path: entry.destinationRelativePath, canonicalPath: prior.relativePath,
-                  canonicalClone: prior.cloneName, size: entry.size, sha256: entry.sha256!, sourceId: entry.sourceId,
-                  sourceRelativePath: entry.sourceRelativePath, materialized: false });
+                crossCloneTargets.set(entry.destinationRelativePath, {
+                  cloneName: prior.cloneName,
+                  relativePath: prior.relativePath,
+                });
+                manifestAliases.push({
+                  path: entry.destinationRelativePath,
+                  canonicalPath: prior.relativePath,
+                  canonicalClone: prior.cloneName,
+                  size: entry.size,
+                  sha256: entry.sha256!,
+                  sourceId: entry.sourceId,
+                  sourceRelativePath: entry.sourceRelativePath,
+                  materialized: false,
+                });
                 verifiedFiles += 1;
               }
               reusedFiles += 1;
               completedFiles += 1;
               copiedBytes += entry.size;
-              emit("copying", entry.destinationRelativePath, `Already in shelter · ${entry.destinationRelativePath}`);
+              emit(
+                "copying",
+                entry.destinationRelativePath,
+                `Already in shelter · ${entry.destinationRelativePath}`,
+              );
               continue;
             } catch (error) {
-              if (linked) await fsPromises.rm(destinationPath, { force: true }).catch(() => undefined);
+              if (linked)
+                await fsPromises
+                  .rm(destinationPath, { force: true })
+                  .catch(() => undefined);
               if (operation.cancelled) throw error;
               // Fall back to a normal verified copy.
             }
@@ -6105,38 +7208,74 @@ async function runSourceClone(
           const partialPath = `${destinationPath}.silo-partial`;
           const sourceHash = createHash("sha256");
           const inputStats = await fsPromises.stat(sourcePath);
-          if (inputStats.size !== entry.size || inputStats.mtimeMs !== entry.modified)
-            throw new Error(`Source changed after preflight: ${entry.destinationRelativePath}`);
+          if (
+            inputStats.size !== entry.size ||
+            inputStats.mtimeMs !== entry.modified
+          )
+            throw new Error(
+              `Source changed after preflight: ${entry.destinationRelativePath}`,
+            );
           const meter = new Transform({
             transform: (chunk: Buffer, _encoding, callback) => {
               try {
                 ensureCloneActive(operationId);
                 sourceHash.update(chunk);
                 copiedBytes += chunk.length;
-                emit("copying", entry.destinationRelativePath, `Copying ${entry.destinationRelativePath}`);
+                emit(
+                  "copying",
+                  entry.destinationRelativePath,
+                  `Copying ${entry.destinationRelativePath}`,
+                );
                 callback(null, chunk);
-              } catch (error) { callback(error as Error); }
+              } catch (error) {
+                callback(error as Error);
+              }
             },
           });
           try {
-            await pipeline(fs.createReadStream(sourcePath), meter, fs.createWriteStream(partialPath, { flags: "wx" }));
+            await pipeline(
+              fs.createReadStream(sourcePath),
+              meter,
+              fs.createWriteStream(partialPath, { flags: "wx" }),
+            );
             const hash = sourceHash.digest("hex");
             if (hash !== entry.sha256)
-              throw new Error(`Source content changed after hash preflight: ${entry.destinationRelativePath}`);
+              throw new Error(
+                `Source content changed after hash preflight: ${entry.destinationRelativePath}`,
+              );
             const sourceAfter = await fsPromises.stat(sourcePath);
-            if (sourceAfter.size !== entry.size || sourceAfter.mtimeMs !== entry.modified)
-              throw new Error(`Source changed during copy: ${entry.destinationRelativePath}`);
-            await fsPromises.chmod(partialPath, inputStats.mode & 0o777).catch(() => undefined);
-            await fsPromises.utimes(partialPath, inputStats.atime, inputStats.mtime).catch(() => undefined);
+            if (
+              sourceAfter.size !== entry.size ||
+              sourceAfter.mtimeMs !== entry.modified
+            )
+              throw new Error(
+                `Source changed during copy: ${entry.destinationRelativePath}`,
+              );
+            await fsPromises
+              .chmod(partialPath, inputStats.mode & 0o777)
+              .catch(() => undefined);
+            await fsPromises
+              .utimes(partialPath, inputStats.atime, inputStats.mtime)
+              .catch(() => undefined);
             await fsPromises.rename(partialPath, destinationPath);
-            manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size, sha256: hash,
-              sourceId: entry.sourceId, sourceRelativePath: entry.sourceRelativePath });
+            manifestFiles.push({
+              path: entry.destinationRelativePath,
+              size: entry.size,
+              sha256: hash,
+              sourceId: entry.sourceId,
+              sourceRelativePath: entry.sourceRelativePath,
+            });
             completedFiles += 1;
           } catch (error) {
-            await fsPromises.rm(partialPath, { force: true }).catch(() => undefined);
+            await fsPromises
+              .rm(partialPath, { force: true })
+              .catch(() => undefined);
             failedFiles += 1;
-            manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size,
-              error: error instanceof Error ? error.message : String(error) });
+            manifestFiles.push({
+              path: entry.destinationRelativePath,
+              size: entry.size,
+              error: error instanceof Error ? error.message : String(error),
+            });
             if (operation.cancelled) throw error;
           }
         }
@@ -6147,41 +7286,85 @@ async function runSourceClone(
             verifiedFiles += 1;
             continue;
           }
-          const copiedHash = await hashFile(path.join(destinationPlan.cloneRoot, record.path));
+          const copiedHash = await hashFile(
+            path.join(destinationPlan.cloneRoot, record.path),
+          );
           if (copiedHash !== record.sha256) {
             record.error = "SHA-256 mismatch during verification.";
             record.sha256 = undefined;
             failedFiles += 1;
           } else verifiedFiles += 1;
-          emit("verifying", record.path, `Verified ${verifiedFiles.toLocaleString()} of ${plan.totalFiles.toLocaleString()} files`);
+          emit(
+            "verifying",
+            record.path,
+            `Verified ${verifiedFiles.toLocaleString()} of ${plan.totalFiles.toLocaleString()} files`,
+          );
         }
-        for (const entry of plan.entries.filter((item) => !item.isDirectory && item.duplicateOf)) {
+        for (const entry of plan.entries.filter(
+          (item) => !item.isDirectory && item.duplicateOf,
+        )) {
           ensureCloneActive(operationId);
           const sourceStats = await fsPromises.stat(entry.localPath!);
-          if (sourceStats.size !== entry.size || sourceStats.mtimeMs !== entry.modified)
-            throw new Error(`Duplicate source changed after hash preflight: ${entry.destinationRelativePath}`);
+          if (
+            sourceStats.size !== entry.size ||
+            sourceStats.mtimeMs !== entry.modified
+          )
+            throw new Error(
+              `Duplicate source changed after hash preflight: ${entry.destinationRelativePath}`,
+            );
           const crossCloneTarget = crossCloneTargets.get(entry.duplicateOf!);
           if (crossCloneTarget) {
-            await fsPromises.mkdir(path.dirname(path.resolve(destinationPlan.cloneRoot, entry.destinationRelativePath)), { recursive: true });
-            manifestAliases.push({ path: entry.destinationRelativePath, canonicalPath: crossCloneTarget.relativePath,
-              canonicalClone: crossCloneTarget.cloneName, size: entry.size, sha256: entry.sha256!, sourceId: entry.sourceId,
-              sourceRelativePath: entry.sourceRelativePath, materialized: false });
+            await fsPromises.mkdir(
+              path.dirname(
+                path.resolve(
+                  destinationPlan.cloneRoot,
+                  entry.destinationRelativePath,
+                ),
+              ),
+              { recursive: true },
+            );
+            manifestAliases.push({
+              path: entry.destinationRelativePath,
+              canonicalPath: crossCloneTarget.relativePath,
+              canonicalClone: crossCloneTarget.cloneName,
+              size: entry.size,
+              sha256: entry.sha256!,
+              sourceId: entry.sourceId,
+              sourceRelativePath: entry.sourceRelativePath,
+              materialized: false,
+            });
             continue;
           }
-          const canonicalPath = path.resolve(destinationPlan.cloneRoot, entry.duplicateOf!);
-          const aliasPath = path.resolve(destinationPlan.cloneRoot, entry.destinationRelativePath);
-          if (!canonicalPath.startsWith(`${destinationPlan.cloneRoot}${path.sep}`) ||
-              !aliasPath.startsWith(`${destinationPlan.cloneRoot}${path.sep}`))
+          const canonicalPath = path.resolve(
+            destinationPlan.cloneRoot,
+            entry.duplicateOf!,
+          );
+          const aliasPath = path.resolve(
+            destinationPlan.cloneRoot,
+            entry.destinationRelativePath,
+          );
+          if (
+            !canonicalPath.startsWith(
+              `${destinationPlan.cloneRoot}${path.sep}`,
+            ) ||
+            !aliasPath.startsWith(`${destinationPlan.cloneRoot}${path.sep}`)
+          )
             throw new Error("Unsafe duplicate alias path.");
           await fsPromises.mkdir(path.dirname(aliasPath), { recursive: true });
           let materialized = false;
           try {
             await fsPromises.link(canonicalPath, aliasPath);
             const [canonicalStats, aliasStats] = await Promise.all([
-              fsPromises.stat(canonicalPath), fsPromises.stat(aliasPath),
+              fsPromises.stat(canonicalPath),
+              fsPromises.stat(aliasPath),
             ]);
-            if (canonicalStats.dev !== aliasStats.dev || canonicalStats.ino !== aliasStats.ino)
-              throw new Error("Duplicate path is not a hard link to its canonical copy.");
+            if (
+              canonicalStats.dev !== aliasStats.dev ||
+              canonicalStats.ino !== aliasStats.ino
+            )
+              throw new Error(
+                "Duplicate path is not a hard link to its canonical copy.",
+              );
             materialized = true;
           } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
@@ -6199,27 +7382,65 @@ async function runSourceClone(
         }
         const complete = failedFiles === 0 && verifiedFiles === plan.totalFiles;
         const sourceManifest = plan.sourceManifest;
-        await fsPromises.writeFile(path.join(destinationPlan.cloneRoot, "silo-clone-manifest.json"), JSON.stringify({
-          format: "silo-source-clone", version: 1, createdAt: new Date().toISOString(), complete,
-          sourceIds: sourceManifest && Array.isArray(sourceManifest.sourceIds) ? sourceManifest.sourceIds : plan.sourceIds,
-          sourceLabels: sourceManifest && Array.isArray(sourceManifest.sourceLabels) ? sourceManifest.sourceLabels : plan.sourceLabels,
-          ...(plan.replicaOf ? { replicaOf: plan.replicaOf } : {}),
-          totalFiles: plan.totalFiles, totalBytes: plan.totalBytes, duplicatePaths: manifestAliases.length,
-          verifiedFiles, failedFiles, files: manifestFiles, aliases: manifestAliases,
-        }, null, 2));
+        await fsPromises.writeFile(
+          path.join(destinationPlan.cloneRoot, "silo-clone-manifest.json"),
+          JSON.stringify(
+            {
+              format: "silo-source-clone",
+              version: 1,
+              createdAt: new Date().toISOString(),
+              complete,
+              sourceIds:
+                sourceManifest && Array.isArray(sourceManifest.sourceIds)
+                  ? sourceManifest.sourceIds
+                  : plan.sourceIds,
+              sourceLabels:
+                sourceManifest && Array.isArray(sourceManifest.sourceLabels)
+                  ? sourceManifest.sourceLabels
+                  : plan.sourceLabels,
+              ...(plan.replicaOf ? { replicaOf: plan.replicaOf } : {}),
+              totalFiles: plan.totalFiles,
+              totalBytes: plan.totalBytes,
+              duplicatePaths: manifestAliases.length,
+              verifiedFiles,
+              failedFiles,
+              files: manifestFiles,
+              aliases: manifestAliases,
+            },
+            null,
+            2,
+          ),
+        );
         invalidateSiloCloneDirectoryCache(destinationPlan.cloneRoot);
         await fsPromises.rm(inProgressMarker, { force: true });
-        emit(complete ? "complete" : "error", "", complete
-          ? `Clone complete. Verified ${verifiedFiles.toLocaleString()} files with SHA-256, including Silo config/indexes.` +
-            (reusedFiles ? ` ${reusedFiles.toLocaleString()} were already in the shelter and were linked, not copied.` : "")
-          : `Clone finished with ${failedFiles.toLocaleString()} file error(s). Originals were not changed.`, true);
-        if (!complete) throw new Error(`Verification failed for destination ${destinationPlan.destination}.`);
+        emit(
+          complete ? "complete" : "error",
+          "",
+          complete
+            ? `Clone complete. Verified ${verifiedFiles.toLocaleString()} files with SHA-256, including Silo config/indexes.` +
+                (reusedFiles
+                  ? ` ${reusedFiles.toLocaleString()} were already in the shelter and were linked, not copied.`
+                  : "")
+            : `Clone finished with ${failedFiles.toLocaleString()} file error(s). Originals were not changed.`,
+          true,
+        );
+        if (!complete)
+          throw new Error(
+            `Verification failed for destination ${destinationPlan.destination}.`,
+          );
         successfulDestinations.push(destinationPlan.cloneRoot);
       } catch (error) {
         const cancelled = operation.cancelled;
-        emit(cancelled ? "cancelled" : "error", "", cancelled
-          ? `Clone cancelled after ${completedFiles.toLocaleString()} files. Originals were not changed.`
-          : error instanceof Error ? error.message : String(error), true);
+        emit(
+          cancelled ? "cancelled" : "error",
+          "",
+          cancelled
+            ? `Clone cancelled after ${completedFiles.toLocaleString()} files. Originals were not changed.`
+            : error instanceof Error
+              ? error.message
+              : String(error),
+          true,
+        );
         throw error;
       }
     }
@@ -6229,14 +7450,19 @@ async function runSourceClone(
       await persistVerifiedDestinations();
     } catch (persistError) {
       runtimeLog("source-clone-status-persist-error", {
-        message: persistError instanceof Error ? persistError.message : String(persistError),
+        message:
+          persistError instanceof Error
+            ? persistError.message
+            : String(persistError),
       });
     }
     if (!operation.cancelled) throw error;
   } finally {
     sourceClonePlans.delete(planId);
     sourceCloneOperations.delete(operationId);
-    await fsPromises.rm(plan.configDirectory, { recursive: true, force: true }).catch(() => undefined);
+    await fsPromises
+      .rm(plan.configDirectory, { recursive: true, force: true })
+      .catch(() => undefined);
   }
 }
 
@@ -6389,118 +7615,6 @@ function getPreloadPath(): string {
   return path.join(app.getAppPath(), "public", "preload.js");
 }
 
-function lifecycleDiagnosticSnapshot(reason: string, window?: BrowserWindow | null) {
-  const snapshot: Record<string, unknown> = {
-    lifecycleTrigger: reason,
-    appPhase: lastKnownAppPhase,
-    startupStep: startupState.step,
-    startupTotal: startupState.total,
-    startupReady: startupState.ready,
-    uiSection: lastKnownUiDiagnosticState.section,
-    uiPathSet: lastKnownUiDiagnosticState.pathSet,
-    uiViewMode: lastKnownUiDiagnosticState.viewMode,
-    uiSortField: lastKnownUiDiagnosticState.sortField,
-    uiAscending: lastKnownUiDiagnosticState.ascending,
-    uiTypeFilterActive: lastKnownUiDiagnosticState.typeFilterActive,
-    uiFilterPanelOpen: lastKnownUiDiagnosticState.filterPanelOpen,
-    uiExploded: lastKnownUiDiagnosticState.exploded,
-    searchActive: lastKnownUiDiagnosticState.searchActive,
-    viewerOpen: lastKnownUiDiagnosticState.viewerOpen,
-    shuttingDown,
-  };
-  const read = (get: () => Record<string, unknown>, key: string) => {
-    try {
-      Object.assign(snapshot, get());
-    } catch {
-      snapshot[`${key}Status`] = "unavailable";
-    }
-  };
-
-  if (typeof semanticIndexer !== "undefined" && semanticIndexer)
-    read(() => {
-      const progress = semanticIndexer.getProgress();
-      return {
-        indexStatus: progress.status,
-        indexTotal: progress.total,
-        indexIndexed: progress.indexed,
-        indexRemaining: progress.remaining,
-        indexErrors: progress.errors,
-      };
-    }, "index");
-  if (typeof faceIndexer !== "undefined" && faceIndexer)
-    read(() => {
-      const progress = faceIndexer.getProgress();
-      return {
-        faceStatus: progress.status,
-        faceProcessed: progress.processed,
-        faceRemaining: progress.remaining,
-        faceErrors: progress.errors,
-      };
-    }, "face");
-  if (typeof geoIndexer !== "undefined" && geoIndexer)
-    read(() => {
-      const progress = geoIndexer.getStatus();
-      return {
-        geoStatus: progress.status,
-        geoScanned: progress.scanned,
-        geoTotal: progress.total,
-      };
-    }, "geo");
-  if (typeof duplicateManager !== "undefined" && duplicateManager)
-    read(() => {
-      const progress = duplicateManager.getState();
-      return {
-        duplicateStatus: progress.status,
-        duplicateScanned: progress.scanned,
-        duplicateTotal: progress.total,
-      };
-    }, "duplicate");
-  if (thumbnailPregenerator)
-    read(() => {
-      const progress = thumbnailPregenerator!.getProgress();
-      return {
-        thumbnailStatus: progress.status,
-        thumbnailProcessed: progress.processed,
-        thumbnailGenerated: progress.generated,
-        thumbnailFailed: progress.failed,
-        thumbnailTotal: progress.total,
-      };
-    }, "thumbnail");
-  snapshot.magicRunning = magicLibraryProgress.running;
-  snapshot.magicAnalyzed = magicLibraryProgress.analyzed;
-  snapshot.magicTotal = magicLibraryProgress.total;
-  snapshot.audioRunning = audioInventoryRunning;
-  snapshot.audioScanned = audioInventoryProgress?.scanned ?? 0;
-  snapshot.audioSources = audioInventoryProgress?.sourceCount ?? 0;
-  snapshot.derivedIndexRunning = Boolean(derivedIndexPromise);
-
-  if (window && !window.isDestroyed()) {
-    try {
-      snapshot.rendererId = window.webContents.id;
-      snapshot.rendererPid = window.webContents.getOSProcessId();
-    } catch {
-      snapshot.rendererId = "unavailable";
-    }
-  }
-  return snapshot;
-}
-
-function reloadRendererWithDiagnostics(window: BrowserWindow, reason: string) {
-  runtimeLog(
-    "app-lifecycle-before-reload",
-    lifecycleDiagnosticSnapshot(reason, window),
-  );
-  window.webContents.reload();
-}
-
-function relaunchAppWithDiagnostics(reason: string) {
-  runtimeLog(
-    "app-lifecycle-before-relaunch",
-    lifecycleDiagnosticSnapshot(reason, mainWindow),
-  );
-  app.relaunch();
-}
-
 async function createWindow() {
   const preloadPath = getPreloadPath();
 
@@ -6518,20 +7632,6 @@ async function createWindow() {
     },
   });
   const inventoryOwner = mainWindow.webContents.id;
-  mainWindow.on("close", () => {
-    runtimeLog(
-      "app-lifecycle-before-close",
-      lifecycleDiagnosticSnapshot("window-close", mainWindow),
-    );
-  });
-  mainWindow.webContents.on("will-navigate", (_event, url) => {
-    const currentUrl = mainWindow?.webContents.getURL();
-    if (currentUrl && url === currentUrl)
-      runtimeLog(
-        "app-lifecycle-before-reload",
-        lifecycleDiagnosticSnapshot("renderer-requested-reload", mainWindow),
-      );
-  });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     let isOfficialGuideUrl = false;
     try {
@@ -6627,63 +7727,43 @@ async function createWindow() {
     runtimeLog("renderer-responsive"),
   );
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
-    const window = mainWindow;
-    const rendererDetails = {
-      reason: details.reason,
-      exitCode: details.exitCode,
-    };
-    runtimeLog("renderer-lifecycle", {
-      stage: "before-render-process-gone-handler",
-      ...rendererDetails,
-      ...lifecycleDiagnosticSnapshot("renderer-process-gone", window),
-    });
-    try {
-      runtimeLog("render-process-gone", rendererDetails);
-      if (!shuttingDown)
-        createAppCrashDiagnosticReport("The Silo interface process stopped.", {
-          reason: details.reason,
-          exitCode: details.exitCode,
-        });
-      if (!window || window.isDestroyed()) return;
-      rendererReady = false;
-      inventoryTransfers.releaseOwner(window.webContents.id);
-      const plan = rendererRecovery.plan(details.reason, shuttingDown);
-      if (plan.restart) {
-        if (rendererRecoveryTimer) clearTimeout(rendererRecoveryTimer);
-        runtimeLog("renderer-recovery-scheduled", {
-          reason: details.reason,
-          delayMs: plan.delay,
-        });
-        rendererRecoveryTimer = setTimeout(() => {
-          rendererRecoveryTimer = null;
-          if (!shuttingDown && !window.isDestroyed())
-            reloadRendererWithDiagnostics(window, "renderer-recovery");
-        }, plan.delay);
-      } else if (plan.manual && !shuttingDown) {
-        void dialog
-          .showMessageBox(window, {
-            type: "warning",
-            title: "Silo interface stopped",
-            message: "The interface crashed repeatedly or ran out of memory.",
-            detail:
-              "Index data and original files have not been reset. Automatic reloads stopped to prevent a crash loop.",
-            buttons: ["Reload interface", "Keep closed"],
-            defaultId: 1,
-            cancelId: 1,
-          })
-          .then(({ response }) => {
-            if (response === 0 && !shuttingDown && !window.isDestroyed())
-              reloadRendererWithDiagnostics(window, "manual-renderer-recovery");
-          });
-      }
-    } finally {
-      runtimeLog("renderer-lifecycle", {
-        stage: "after-render-process-gone-handler",
-        ...rendererDetails,
-        rendererReady,
-        recoveryTimerScheduled: Boolean(rendererRecoveryTimer),
-        ...lifecycleDiagnosticSnapshot("renderer-process-gone", window),
+    runtimeLog("render-process-gone", { ...details });
+    if (!shuttingDown)
+      createAppCrashDiagnosticReport("The Silo interface process stopped.", {
+        reason: details.reason,
+        exitCode: details.exitCode,
       });
+    const window = mainWindow;
+    if (!window || window.isDestroyed()) return;
+    rendererReady = false;
+    inventoryTransfers.releaseOwner(window.webContents.id);
+    const plan = rendererRecovery.plan(details.reason, shuttingDown);
+    if (plan.restart) {
+      if (rendererRecoveryTimer) clearTimeout(rendererRecoveryTimer);
+      runtimeLog("renderer-recovery-scheduled", {
+        reason: details.reason,
+        delayMs: plan.delay,
+      });
+      rendererRecoveryTimer = setTimeout(() => {
+        rendererRecoveryTimer = null;
+        if (!shuttingDown && !window.isDestroyed()) window.webContents.reload();
+      }, plan.delay);
+    } else if (plan.manual && !shuttingDown) {
+      void dialog
+        .showMessageBox(window, {
+          type: "warning",
+          title: "Silo interface stopped",
+          message: "The interface crashed repeatedly or ran out of memory.",
+          detail:
+            "Index data and original files have not been reset. Automatic reloads stopped to prevent a crash loop.",
+          buttons: ["Reload interface", "Keep closed"],
+          defaultId: 1,
+          cancelId: 1,
+        })
+        .then(({ response }) => {
+          if (response === 0 && !shuttingDown && !window.isDestroyed())
+            window.webContents.reload();
+        });
     }
   });
 
@@ -6692,10 +7772,6 @@ async function createWindow() {
   }
 
   mainWindow.on("closed", () => {
-    runtimeLog("app-lifecycle-after-close", {
-      appPhase: lastKnownAppPhase,
-      rendererReady,
-    });
     mainWindow = null;
   });
 }
@@ -6761,29 +7837,51 @@ async function getIndexableRootsFromSources(
 ): Promise<string[]> {
   const candidates = sources.filter(
     (source) =>
+      source.available &&
       source.rootPath.trim() &&
-      // Keep configured local roots in memory searches while an external drive
-      // is offline; their indexed records stay useful and reconnects resume them.
-      (!isRemotePath(source.rootPath) || source.available) &&
-      // Source checkboxes control visibility, not index coverage. Preserve the
-      // demo source cap while indexing every source allowed by the current tier.
-      (fullAccessEnabled() || !source.demoLocked),
+      (fullAccessEnabled() || (source.enabled && !source.demoLocked)) &&
+      (!source.offlineBackup || source.enabled),
   );
+  const enabledBackupDevices = new Set<string>();
+  for (const source of sources) {
+    if (!source.offlineBackup || !source.enabled) continue;
+    const parsed = phoneManager?.parsePhonePath(source.rootPath);
+    if (parsed)
+      enabledBackupDevices.add(`${parsed.platform}:${parsed.deviceId}`);
+  }
   const safeRoots: string[] = [];
   for (const source of candidates) {
     if (!(await isSiloInternalRoot(source.rootPath)))
       safeRoots.push(source.rootPath);
   }
-  // Keep virtual source roots even when their backing files are also inside a
-  // local folder. Their virtual paths preserve per-source Search visibility.
-  return Array.from(new Set(safeRoots));
+  // Keep live phone roots out when their local copy is already under an indexed
+  // folder. Saved copies retain separate virtual roots for source-level filtering.
+  const localRoots = safeRoots.filter((root) => !root.startsWith("/__"));
+  const covered = (root: string) => {
+    const phonePath = phoneManager?.parsePhonePath(root);
+    if (!phonePath || phonePath.offlineBackup) return false;
+    const { platform, deviceId } = phonePath;
+    if (enabledBackupDevices.has(`${platform}:${deviceId}`)) return true;
+    const backupRoot = phoneManager?.getBackupRoot?.(platform, deviceId);
+    return Boolean(
+      backupRoot && localRoots.some((local) => isPathWithin(backupRoot, local)),
+    );
+  };
+  return Array.from(new Set(safeRoots.filter((root) => !covered(root))));
 }
 
 async function getEnabledIndexSources(): Promise<string[]> {
   // Selected roots are used only to filter browse/search/map/people results.
-  const uniquePaths = Array.from(new Set((await listSources())
-    .filter((source) => source.enabled && source.available && source.rootPath.trim())
-    .map((source) => source.rootPath)));
+  const uniquePaths = Array.from(
+    new Set(
+      (await listSources())
+        .filter(
+          (source) =>
+            source.enabled && source.available && source.rootPath.trim(),
+        )
+        .map((source) => source.rootPath),
+    ),
+  );
   enabledSourcePathCache = new Set(uniquePaths);
   enabledSourceCacheReady = true;
   return uniquePaths;
@@ -6809,13 +7907,10 @@ function fileIsInEnabledSource(
   sourcePaths: ReadonlySet<string> = enabledSourcePathCache,
 ) {
   for (const sourcePath of sourcePaths) {
-    const root = sourcePath.replace(/[\\/]+$/, "");
-    if (
-      filePath === sourcePath ||
-      filePath === root ||
-      filePath.startsWith(`${root}/`) ||
-      filePath.startsWith(`${root}\\`)
-    ) return true;
+    const prefix = sourcePath.endsWith(path.sep)
+      ? sourcePath
+      : `${sourcePath}${path.sep}`;
+    if (filePath === sourcePath || filePath.startsWith(prefix)) return true;
   }
   return false;
 }
@@ -6835,10 +7930,14 @@ async function indexNewSources(sourcePaths: string[], reason: string) {
   if (added.length === 0) return;
   await semanticIndexer.startWatching(activeSources);
   runtimeLog("auto-index-new-sources", { reason, sources: added });
-  queueSemanticIndexWork(
-    { fullScanRoots: added },
-    ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
-  );
+  queueSemanticIndexWork({ fullScanRoots: added }, [
+    "faces",
+    "locations",
+    "duplicates",
+    "thumbnails",
+    "audio",
+    "quality",
+  ]);
 }
 
 async function createUnifiedScanSource() {
@@ -6929,15 +8028,14 @@ async function createUnifiedScanSource() {
       return !isCancelled();
     };
 
-    while (
-      nextPendingDirectory < pendingDirectories.length &&
-      !isCancelled()
-    ) {
+    while (nextPendingDirectory < pendingDirectories.length && !isCancelled()) {
       if (!(await waitForSearchIdle())) return;
       const directoryPath = pendingDirectories[nextPendingDirectory++];
       if (isMacDataVolumePathExcluded(directoryPath, sourcePath)) continue;
       if (machineDevice !== null) {
-        const directoryStats = await fsPromises.stat(directoryPath).catch(() => null);
+        const directoryStats = await fsPromises
+          .stat(directoryPath)
+          .catch(() => null);
         if (!directoryStats || directoryStats.dev !== machineDevice) continue;
       }
       if (isSiloPrivatePath(directoryPath)) continue;
@@ -6953,56 +8051,65 @@ async function createUnifiedScanSource() {
       }
 
       const ENTRY_BATCH_SIZE = 32;
-      for (let offset = 0; offset < entries.length; offset += ENTRY_BATCH_SIZE) {
+      for (
+        let offset = 0;
+        offset < entries.length;
+        offset += ENTRY_BATCH_SIZE
+      ) {
         if (isCancelled()) return;
         if (!(await waitForSearchIdle())) return;
         const entryResults = await Promise.all(
-          entries.slice(offset, offset + ENTRY_BATCH_SIZE).map(async (entry) => {
-          if (timeMachine && shouldSkipTimeMachineEntry(entry.name))
-            return null;
-          if (entry.isSymbolicLink()) return null;
+          entries
+            .slice(offset, offset + ENTRY_BATCH_SIZE)
+            .map(async (entry) => {
+              if (timeMachine && shouldSkipTimeMachineEntry(entry.name))
+                return null;
+              if (entry.isSymbolicLink()) return null;
 
-          const fullPath = path.join(directoryPath, entry.name);
-          if (isMacDataVolumePathExcluded(fullPath, sourcePath)) return null;
-          if (isSiloPrivatePath(fullPath)) return null;
-          try {
-            let stats;
-            try {
-              stats = await fsPromises.stat(fullPath);
-            } catch {
-              if (!timeMachine) throw new Error("stat failed");
-              stats = await fsPromises.lstat(fullPath);
-            }
-            if (machineDevice !== null && stats.dev !== machineDevice) return null;
+              const fullPath = path.join(directoryPath, entry.name);
+              if (isMacDataVolumePathExcluded(fullPath, sourcePath))
+                return null;
+              if (isSiloPrivatePath(fullPath)) return null;
+              try {
+                let stats;
+                try {
+                  stats = await fsPromises.stat(fullPath);
+                } catch {
+                  if (!timeMachine) throw new Error("stat failed");
+                  stats = await fsPromises.lstat(fullPath);
+                }
+                if (machineDevice !== null && stats.dev !== machineDevice)
+                  return null;
 
-            const isDirectory = entry.isDirectory() || stats.isDirectory();
-            if (isDirectory && await isSiloCloneDirectory(fullPath)) return null;
-            if (isDirectory && isNonLibraryPath(fullPath)) return null;
-            const extension = isDirectory
-              ? ""
-              : path.extname(entry.name).toLowerCase();
-            const mimeType = isDirectory ? null : mime.getType(entry.name);
-            const type = isDirectory
-              ? "folder"
-              : classifyFile(entry.name, mimeType);
+                const isDirectory = entry.isDirectory() || stats.isDirectory();
+                if (isDirectory && (await isSiloCloneDirectory(fullPath)))
+                  return null;
+                if (isDirectory && isNonLibraryPath(fullPath)) return null;
+                const extension = isDirectory
+                  ? ""
+                  : path.extname(entry.name).toLowerCase();
+                const mimeType = isDirectory ? null : mime.getType(entry.name);
+                const type = isDirectory
+                  ? "folder"
+                  : classifyFile(entry.name, mimeType);
 
-            return {
-              file: {
-                name: entry.name,
-                path: fullPath,
-                relativePath: path.relative(sourcePath, fullPath),
-                size: stats.size,
-                modified: stats.mtimeMs,
-                isDirectory,
-                type,
-                extension,
-              },
-              directoryPath: isDirectory ? fullPath : null,
-            };
-          } catch {
-            return null;
-          }
-          }),
+                return {
+                  file: {
+                    name: entry.name,
+                    path: fullPath,
+                    relativePath: path.relative(sourcePath, fullPath),
+                    size: stats.size,
+                    modified: stats.mtimeMs,
+                    isDirectory,
+                    type,
+                    extension,
+                  },
+                  directoryPath: isDirectory ? fullPath : null,
+                };
+              } catch {
+                return null;
+              }
+            }),
         );
 
         for (const result of entryResults) {
@@ -7018,7 +8125,8 @@ async function createUnifiedScanSource() {
           if (entriesSinceCooldown >= DISCOVERY_COOLDOWN_EVERY_ENTRIES) {
             const cpuSinceLastBatch = process.cpuUsage(discoveryCpuBaseline);
             discoveryCpuBaseline = process.cpuUsage();
-            const cpuWorkMs = (cpuSinceLastBatch.user + cpuSinceLastBatch.system) / 1000;
+            const cpuWorkMs =
+              (cpuSinceLastBatch.user + cpuSinceLastBatch.system) / 1000;
             const workBudgetPercent = Math.max(
               5,
               Math.min(
@@ -7037,7 +8145,9 @@ async function createUnifiedScanSource() {
                 continue;
               }
               const sliceMs = Math.min(50, cooldownRemaining);
-              await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
+              await new Promise<void>((resolve) =>
+                setTimeout(resolve, sliceMs),
+              );
               cooldownRemaining -= sliceMs;
             }
             await new Promise<void>((resolve) => setImmediate(resolve));
@@ -7176,7 +8286,10 @@ function schedulePeriodicCleanup() {
 
 /** Standard menus, except Undo/Redo go to the renderer so they can undo People edits outside text fields. */
 function getIndexStorageDestinationLabel() {
-  return path.basename(path.resolve(selectedIndexStorageRoot)) || "selected destination";
+  return (
+    path.basename(path.resolve(selectedIndexStorageRoot)) ||
+    "selected destination"
+  );
 }
 
 function currentIndexStorageStatus(): MainIndexStorageStatus {
@@ -7220,9 +8333,13 @@ async function checkSelectedIndexStorageAvailable() {
   }
 }
 
-async function withIndexStorageCacheWrite<T>(operation: () => Promise<T>): Promise<T> {
+async function withIndexStorageCacheWrite<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
   if (!indexStorageAvailable)
-    throw new Error(indexStorageUnavailableMessage ?? "Index storage is unavailable.");
+    throw new Error(
+      indexStorageUnavailableMessage ?? "Index storage is unavailable.",
+    );
   const activeRootIsAppData =
     path.resolve(indexStorageRoot) === path.resolve(app.getPath("userData"));
   const activeRootAvailable = activeRootIsAppData
@@ -7236,7 +8353,9 @@ async function withIndexStorageCacheWrite<T>(operation: () => Promise<T>): Promi
     throw new Error(unavailableIndexStorageMessage());
   }
   if (indexStorageUsingLocalFallback) {
-    indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(indexStorageRoot).catch(() => null);
+    indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(
+      indexStorageRoot,
+    ).catch(() => null);
     if (
       indexStorageFreeBytes === null ||
       indexStorageFreeBytes < LOCAL_INDEX_STORAGE_RESERVE_BYTES
@@ -7248,30 +8367,45 @@ async function withIndexStorageCacheWrite<T>(operation: () => Promise<T>): Promi
     }
   }
   if (!indexStorageAvailable)
-    throw new Error(indexStorageUnavailableMessage ?? "Index storage is unavailable.");
+    throw new Error(
+      indexStorageUnavailableMessage ?? "Index storage is unavailable.",
+    );
   activeIndexStorageCacheWrites += 1;
   try {
     return await operation();
   } finally {
-    activeIndexStorageCacheWrites = Math.max(0, activeIndexStorageCacheWrites - 1);
+    activeIndexStorageCacheWrites = Math.max(
+      0,
+      activeIndexStorageCacheWrites - 1,
+    );
   }
 }
 
 function isBusyIndexStatus(status: string) {
-  return ["scanning", "indexing", "loading-model", "clustering", "generating"].includes(status);
+  return [
+    "scanning",
+    "indexing",
+    "loading-model",
+    "clustering",
+    "generating",
+  ].includes(status);
 }
 
 function indexStorageWritersBusy() {
   return Boolean(
-    (semanticIndexer && isBusyIndexStatus(semanticIndexer.getProgress().status)) ||
+    (semanticIndexer &&
+      isBusyIndexStatus(semanticIndexer.getProgress().status)) ||
     (faceIndexer && isBusyIndexStatus(faceIndexer.getProgress().status)) ||
     (geoIndexer && isBusyIndexStatus(geoIndexer.getStatus().status)) ||
     (duplicateManager && duplicateManager.getState().status === "scanning") ||
     audioInventoryRunning ||
-    (thumbnailPregenerator && ["scanning", "generating"].includes(thumbnailPregenerator.getProgress().status)) ||
+    (thumbnailPregenerator &&
+      ["scanning", "generating"].includes(
+        thumbnailPregenerator.getProgress().status,
+      )) ||
     magicLibraryProgress.running ||
     activeIndexStorageCacheWrites > 0 ||
-    Boolean(libraryStatsManager?.getSnapshot().running)
+    Boolean(libraryStatsManager?.getSnapshot().running),
   );
 }
 
@@ -7279,7 +8413,9 @@ async function waitForIndexStorageWritersToPause() {
   const deadline = Date.now() + 60_000;
   while (indexStorageWritersBusy()) {
     if (Date.now() >= deadline)
-      throw new Error("Indexing did not pause in time; the local cache was preserved.");
+      throw new Error(
+        "Indexing did not pause in time; the local cache was preserved.",
+      );
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
@@ -7295,11 +8431,13 @@ async function pauseIndexingForStorage(message: string) {
   }
   if (semanticIndexer) await semanticIndexer.setHold(message);
   await indexRecovery?.setBlocked(message);
-  await Promise.allSettled([
-    faceIndexer?.pause(),
-    geoIndexer?.pause(),
-    duplicateManager?.pause(),
-  ].filter(Boolean) as Promise<unknown>[]);
+  await Promise.allSettled(
+    [
+      faceIndexer?.pause(),
+      geoIndexer?.pause(),
+      duplicateManager?.pause(),
+    ].filter(Boolean) as Promise<unknown>[],
+  );
   audioLibraryCache?.cancelScan();
   await waitForIndexStorageWritersToPause();
 }
@@ -7308,7 +8446,8 @@ async function resumeIndexingAfterStorage() {
   if (indexStorageInitializationDeferred) {
     indexStorageTransfer = {
       state: "complete",
-      message: "The selected destination is back. Silo is restarting to reopen its indexes and resume automatically.",
+      message:
+        "The selected destination is back. Silo is restarting to reopen its indexes and resume automatically.",
       filesVerified: 0,
       bytesVerified: 0,
     };
@@ -7325,16 +8464,18 @@ async function resumeIndexingAfterStorage() {
   await indexRecovery?.setBlocked(null);
   if (resumeSources.length && !heapPressureMessage && !shuttingDown)
     queueSemanticIndexWork({ resumeRoots: resumeSources, force: true });
-  publishIndexStorageStatus(indexStorageUsingLocalFallback
-    ? `The selected destination is still unavailable. Silo is using the local cache and keeping at least ${Math.round(LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free.`
-    : null);
+  publishIndexStorageStatus(
+    indexStorageUsingLocalFallback
+      ? `The selected destination is still unavailable. Silo is using the local cache and keeping at least ${Math.round(LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free.`
+      : null,
+  );
 }
 
 function scheduleIndexStorageRelaunch() {
   if (indexStorageRelaunchPending) return;
   indexStorageRelaunchPending = true;
   setTimeout(() => {
-    relaunchAppWithDiagnostics("index-storage-migration");
+    app.relaunch();
     app.quit();
   }, 3500);
 }
@@ -7346,9 +8487,10 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
   const destination = getIndexStorageDestinationLabel();
   indexStorageTransfer = {
     state: "moving",
-    message: reason === "destination"
-      ? "The destination reconnected. Indexing is paused while Silo verifies and moves the cache."
-      : "Indexing is paused while Silo prepares the local fallback cache.",
+    message:
+      reason === "destination"
+        ? "The destination reconnected. Indexing is paused while Silo verifies and moves the cache."
+        : "Indexing is paused while Silo prepares the local fallback cache.",
     filesVerified: 0,
     bytesVerified: 0,
   };
@@ -7368,8 +8510,14 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
         publishIndexStorageStatus();
       },
     );
-    if (storage.migrationError || (!storage.destinationAvailable && !storage.usingLocalFallback))
-      throw new Error(storage.migrationError || "The selected cache destination is still unavailable.");
+    if (
+      storage.migrationError ||
+      (!storage.destinationAvailable && !storage.usingLocalFallback)
+    )
+      throw new Error(
+        storage.migrationError ||
+          "The selected cache destination is still unavailable.",
+      );
 
     indexStorageRoot = storage.storageRoot;
     selectedIndexStorageRoot = storage.selectedStorageRoot;
@@ -7378,7 +8526,8 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
     indexStorageDestinationAvailable = storage.destinationAvailable;
     setActiveIndexStorageRoot(indexStorageRoot);
     if (storage.usingLocalFallback) {
-      indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(indexStorageRoot);
+      indexStorageFreeBytes =
+        await getLocalIndexStorageFreeBytes(indexStorageRoot);
       await assertLocalIndexStorageCapacity(indexStorageRoot);
     } else {
       indexStorageFreeBytes = null;
@@ -7416,8 +8565,13 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
       indexStorageFallbackEnabled &&
       indexStorageRoot;
     if (fallbackCanResume) {
-      indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(indexStorageRoot).catch(() => null);
-      if (indexStorageFreeBytes !== null && indexStorageFreeBytes >= LOCAL_INDEX_STORAGE_RESERVE_BYTES)
+      indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(
+        indexStorageRoot,
+      ).catch(() => null);
+      if (
+        indexStorageFreeBytes !== null &&
+        indexStorageFreeBytes >= LOCAL_INDEX_STORAGE_RESERVE_BYTES
+      )
         await resumeIndexingAfterStorage();
     }
     publishIndexStorageStatus(indexStorageTransfer.message);
@@ -7428,12 +8582,17 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
 }
 
 async function monitorIndexStorageAvailability() {
-  if (indexStorageMonitorRunning || indexStorageTransferRunning || indexStorageRelaunchPending)
+  if (
+    indexStorageMonitorRunning ||
+    indexStorageTransferRunning ||
+    indexStorageRelaunchPending
+  )
     return;
   indexStorageMonitorRunning = true;
   try {
     const externalDestination =
-      path.resolve(selectedIndexStorageRoot) !== path.resolve(app.getPath("userData"));
+      path.resolve(selectedIndexStorageRoot) !==
+      path.resolve(app.getPath("userData"));
     const destinationAvailable = await checkSelectedIndexStorageAvailable();
     indexStorageDestinationAvailable = destinationAvailable;
 
@@ -7464,7 +8623,9 @@ async function monitorIndexStorageAvailability() {
     }
 
     if (indexStorageUsingLocalFallback) {
-      indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(indexStorageRoot).catch(() => null);
+      indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(
+        indexStorageRoot,
+      ).catch(() => null);
       if (!indexStorageFallbackEnabled) {
         const message = `The selected destination, ${getIndexStorageDestinationLabel()}, is unavailable. Local fallback is off, so indexing is paused until it reconnects.`;
         if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
@@ -7472,7 +8633,10 @@ async function monitorIndexStorageAvailability() {
         publishIndexStorageStatus(message);
         return;
       }
-      if (indexStorageFreeBytes === null || indexStorageFreeBytes < LOCAL_INDEX_STORAGE_RESERVE_BYTES) {
+      if (
+        indexStorageFreeBytes === null ||
+        indexStorageFreeBytes < LOCAL_INDEX_STORAGE_RESERVE_BYTES
+      ) {
         const message = `Local cache indexing is paused to keep at least ${Math.round(LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free. Reconnect ${getIndexStorageDestinationLabel()} or free local disk space.`;
         if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
           await pauseIndexingForStorage(message);
@@ -7493,7 +8657,8 @@ async function monitorIndexStorageAvailability() {
       await resumeIndexingAfterStorage();
       return;
     }
-    if (!destinationAvailable) publishIndexStorageStatus(unavailableIndexStorageMessage());
+    if (!destinationAvailable)
+      publishIndexStorageStatus(unavailableIndexStorageMessage());
     else publishIndexStorageStatus(null);
   } catch (error) {
     runtimeLog("index-storage-monitor-error", {
@@ -7563,20 +8728,17 @@ app.whenReady().then(async () => {
   if (startupBetaUrl) queueBetaActivationUrl(startupBetaUrl);
   loadPendingDiagnosticReport();
   const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
-  if (previousSessionWasUnclosed) {
-    const markerContext = lifecycleDiagnosticSnapshot("previous-session-marker-found");
-    runtimeLog("previous-session-marker-found", {
-      interpretation: "symptom-only",
-      ...markerContext,
-    });
+  if (previousSessionWasUnclosed)
     createAppCrashDiagnosticReport(
-      "A previous-session marker remained at startup. It records an interrupted or unclean shutdown symptom but does not identify its cause.",
+      "The previous Silo session did not close normally.",
     );
-  }
   try {
     fs.writeFileSync(
       activeSessionMarkerPath,
-      JSON.stringify({ startedAt: new Date().toISOString(), version: app.getVersion() }),
+      JSON.stringify({
+        startedAt: new Date().toISOString(),
+        version: app.getVersion(),
+      }),
       { encoding: "utf8", mode: 0o600 },
     );
   } catch (error) {
@@ -7633,9 +8795,13 @@ app.whenReady().then(async () => {
   setActiveIndexStorageRoot(indexStorageRoot);
   indexStorageAvailable =
     storage.destinationAvailable ||
-    (storage.usingLocalFallback && storage.localFallbackEnabled && !storage.migrationError);
+    (storage.usingLocalFallback &&
+      storage.localFallbackEnabled &&
+      !storage.migrationError);
   if (storage.usingLocalFallback) {
-    indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(indexStorageRoot).catch(() => null);
+    indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(
+      indexStorageRoot,
+    ).catch(() => null);
     if (
       indexStorageFreeBytes === null ||
       indexStorageFreeBytes < LOCAL_INDEX_STORAGE_RESERVE_BYTES
@@ -7651,15 +8817,22 @@ app.whenReady().then(async () => {
       : storage.localFallbackEnabled
         ? storage.migrationError || unavailableIndexStorageMessage()
         : unavailableIndexStorageMessage();
-    indexStorageUnavailableMessage = indexStorageAvailable ? null : unavailableMessage;
-    indexStorageMessageText = storage.migrationError || (storage.usingLocalFallback
-      ? `Selected destination ${path.basename(storage.selectedStorageRoot)} is unavailable. Silo is using a local cache and keeping at least ${Math.round(LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free.`
-      : unavailableMessage);
+    indexStorageUnavailableMessage = indexStorageAvailable
+      ? null
+      : unavailableMessage;
+    indexStorageMessageText =
+      storage.migrationError ||
+      (storage.usingLocalFallback
+        ? `Selected destination ${path.basename(storage.selectedStorageRoot)} is unavailable. Silo is using a local cache and keeping at least ${Math.round(LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free.`
+        : unavailableMessage);
   } else {
     indexStorageUnavailableMessage = storage.migrationError;
     indexStorageMessageText = storage.migrationError;
   }
-  if (storage.destinationAvailable && path.resolve(selectedIndexStorageRoot) !== path.resolve(userDataPath)) {
+  if (
+    storage.destinationAvailable &&
+    path.resolve(selectedIndexStorageRoot) !== path.resolve(userDataPath)
+  ) {
     const selectedStat = await fsPromises.stat(selectedIndexStorageRoot);
     indexStorageDeviceId = selectedStat.dev;
   } else {
@@ -7676,12 +8849,7 @@ app.whenReady().then(async () => {
   }
   // A restored config is swapped in before any store opens its files.
   try {
-    if (
-      await applyPendingImport(
-        app.getPath("userData"),
-        indexStorageRoot,
-      )
-    )
+    if (await applyPendingImport(app.getPath("userData"), indexStorageRoot))
       runtimeLog("config-import-applied", {});
   } catch (error) {
     runtimeLog("config-import-failed", { message: String(error) });
@@ -7771,7 +8939,6 @@ app.whenReady().then(async () => {
     },
     logIndexingDiagnostic,
     indexStorageRoot,
-    resolveLocalPath,
   );
   semanticIndexer.setPerformanceSettings(
     contentSettingsStore.getSearchPerformanceSnapshot().settings,
@@ -7779,9 +8946,6 @@ app.whenReady().then(async () => {
   semanticIndexer.setBackgroundIndexWorkListener((changedFiles) =>
     queueSemanticIndexWork({ changedFiles }),
   );
-  // Every completed CLIP embedding feeds the independent downstream indexes.
-  // The maps also coalesce bursts while the recovery scheduler is starting up.
-  semanticIndexer.addIndexedImageListener(queueProgressiveIndexedImage);
   libraryShareServer = new LibraryShareServer({
     getSources: async () =>
       (await listSources()).map(({ id, label, rootPath, kind, available }) => ({
@@ -7791,9 +8955,12 @@ app.whenReady().then(async () => {
         kind,
         available,
       })),
-    getIndexedFiles: (sourceRoots) => semanticIndexer.getIndexedFiles(sourceRoots),
+    getIndexedFiles: (sourceRoots) =>
+      semanticIndexer.getIndexedFiles(sourceRoots),
     search: (query, sourceRoots) =>
-      trackInteractiveSearch(() => semanticIndexer.search(query, 0, sourceRoots)),
+      trackInteractiveSearch(() =>
+        semanticIndexer.search(query, 0, sourceRoots),
+      ),
     getThumbnail: async (filePath) => {
       const thumbnailUrl = await getThumbnail(filePath, false, 320);
       if (!thumbnailUrl) return null;
@@ -7820,16 +8987,16 @@ app.whenReady().then(async () => {
         });
       })
     : semanticIndexer.initialize((fraction, records) => {
-      loadedSearchRecords = records;
-      const percentage = Math.min(20, Math.round(fraction * 20));
-      if (percentage === lastSavedRecordPercentage) return;
-      lastSavedRecordPercentage = percentage;
-      updateSearchIndexReadiness({
-        status: "preparing",
-        percentage,
-        records,
-        message: `Reading saved search records · ${percentage}%`,
-      });
+        loadedSearchRecords = records;
+        const percentage = Math.min(20, Math.round(fraction * 20));
+        if (percentage === lastSavedRecordPercentage) return;
+        lastSavedRecordPercentage = percentage;
+        updateSearchIndexReadiness({
+          status: "preparing",
+          percentage,
+          records,
+          message: `Reading saved search records · ${percentage}%`,
+        });
         reportStartupDetail(
           `Opening saved search records… ${percentage}% (${records.toLocaleString()} files)`,
         );
@@ -7870,7 +9037,9 @@ app.whenReady().then(async () => {
         records: Math.max(loadedSearchRecords, records),
         message: `Building the fast local search index · ${percentage}%`,
       });
-      reportStartupDetail(`Building the fast local search index… ${percentage}%`);
+      reportStartupDetail(
+        `Building the fast local search index… ${percentage}%`,
+      );
     });
   });
   const faceModelPath = app.isPackaged
@@ -7900,7 +9069,6 @@ app.whenReady().then(async () => {
     contentSettingsStore.getSearchPerformanceSnapshot().settings
       .backgroundWorkPercent,
     () => activeInteractiveSearches > 0,
-    resolveLocalPath,
   );
   faceIndexer.setRecognitionListener(({ added, removed }) => {
     const showBanned = Boolean(
@@ -8002,13 +9170,15 @@ app.whenReady().then(async () => {
     app.getPath("userData"),
     (progress: PhoneBackupProgress) => {
       const key = `${progress.platform}:${progress.deviceId}`;
-      const active = progress.status === "scanning" || progress.status === "backing-up";
+      const active =
+        progress.status === "scanning" || progress.status === "backing-up";
       // Backups write thousands of files into a possibly indexed folder: hold watcher
       // rescans until the backup ends, then index the new files once.
       const heldRoot = phoneBackupHolds.get(key);
       if (active && !heldRoot) {
-        const root = phoneManager?.getBackupRoot(progress.platform, progress.deviceId)
-          ?? null;
+        const root =
+          phoneManager?.getBackupRoot(progress.platform, progress.deviceId) ??
+          null;
         const destination = root ?? phoneManagerBackupDestination;
         if (destination && semanticIndexer) {
           semanticIndexer.holdWatchReconciliation(destination);
@@ -8023,24 +9193,14 @@ app.whenReady().then(async () => {
       if (statusChanged && progress.status === "complete") {
         // A finished snapshot becomes a browseable source even after the phone is unplugged.
         invalidateSourceList();
-        void phoneManager.getOfflineBackups().then((backups) => {
-          const latest = backups
-            .filter((backup) =>
-              backup.platform === progress.platform &&
-              backup.id === progress.deviceId,
-            )
-            .sort((first, second) => second.snapshotAt - first.snapshotAt)[0];
-          if (!latest) return;
-          return indexNewSources([latest.rootPath], "phone-backup-complete");
-        }).catch((error) => runtimeLog("phone-backup-index-queue-error", {
-          platform: progress.platform,
-          message: error instanceof Error ? error.message : String(error),
-        }));
       }
       if (!mainWindow || mainWindow.isDestroyed()) return;
       mainWindow.webContents.send("phone-backup-progress", progress);
       if (statusChanged && progress.status === "complete")
-        mainWindow.webContents.send("phone-devices-changed", scannedPhoneDevices);
+        mainWindow.webContents.send(
+          "phone-devices-changed",
+          scannedPhoneDevices,
+        );
       // Per-file progress is frequent; log transitions only.
       if (!statusChanged) return;
       runtimeLog("phone-backup-progress", {
@@ -8061,10 +9221,7 @@ app.whenReady().then(async () => {
   console.log(
     "[STARTUP] phoneManager initialized, creating Google/Message managers...",
   );
-  googleManager = new GoogleManager(
-    app.getPath("userData"),
-    indexStorageRoot,
-  );
+  googleManager = new GoogleManager(app.getPath("userData"), indexStorageRoot);
   if (!indexStorageInitializationDeferred)
     await googleManager.initialize(
       (await loadGoogleEnv(path.join(app.getPath("userData"), ".env"))) ??
@@ -8091,19 +9248,27 @@ app.whenReady().then(async () => {
   await contactManager.initialize();
 
   console.log("[STARTUP] Creating geoIndexer...");
-  geoIndexer = new GeoIndexer(app.getPath("userData"), (state) => {
-    // Progress events carry counts only; the renderer fetches photos when photosVersion changes.
-    sendToRenderer("geo-index-progress", state);
-    scheduleThumbnailPregeneration();
-  }, indexStorageRoot, resolveLocalPath);
+  geoIndexer = new GeoIndexer(
+    app.getPath("userData"),
+    (state) => {
+      // Progress events carry counts only; the renderer fetches photos when photosVersion changes.
+      sendToRenderer("geo-index-progress", state);
+      scheduleThumbnailPregeneration();
+    },
+    indexStorageRoot,
+  );
   const geoLoad = indexStorageInitializationDeferred
     ? Promise.resolve()
     : geoIndexer.initialize();
   geocoder = new Geocoder(app.getPath("userData"), indexStorageRoot);
   if (!indexStorageInitializationDeferred) await geocoder.initialize();
-  duplicateManager = new DuplicateManager(app.getPath("userData"), (state) => {
-    sendToRenderer("duplicate-progress", filterDuplicateState(state));
-  }, indexStorageRoot);
+  duplicateManager = new DuplicateManager(
+    app.getPath("userData"),
+    (state) => {
+      sendToRenderer("duplicate-progress", filterDuplicateState(state));
+    },
+    indexStorageRoot,
+  );
   const duplicateLoad = indexStorageInitializationDeferred
     ? Promise.resolve()
     : duplicateManager.initialize();
@@ -8121,7 +9286,9 @@ app.whenReady().then(async () => {
           records: loadedSearchRecords,
           message: "Search index ready.",
         });
-      runtimeLog("search-index-loaded", { elapsedMs: Date.now() - startupStartedAt });
+      runtimeLog("search-index-loaded", {
+        elapsedMs: Date.now() - startupStartedAt,
+      });
     },
     (error) => {
       runtimeLog("startup-load-error", { message: String(error) });
@@ -8216,31 +9383,41 @@ app.whenReady().then(async () => {
   scheduleThumbnailPregeneration();
   memoryManager = new MemoryManager(app.getPath("userData"), {
     search: searchMemoryMedia,
-    searchPrompted: searchPromptedMemoryMedia,
-    hasMovie: async (card: MemorySuggestion) => Boolean(await findMemoryMovie(card)),
+    hasMovie: async (card: MemorySuggestion) =>
+      Boolean(await findMemoryMovie(card)),
     filterImages: filterMemoryPhotos,
-    thumb: async (filePath) => getThumbnail(await resolveLocalPath(filePath), false, 200),
+    thumb: async (filePath) =>
+      getThumbnail(await resolveLocalPath(filePath), false, 200),
     listAudio: () => audioLibraryCache?.getSnapshot().files ?? [],
     discover: discoverMemoryIdeas,
-    onSearchError: (stage, error) => runtimeLog("memory-search-error", {
-      stage, ...memoryErrorDetails(error), ...memoryEnvironmentSnapshot(),
-    }),
+    onSearchError: (stage, error) =>
+      runtimeLog("memory-search-error", {
+        stage,
+        ...memoryErrorDetails(error),
+        ...memoryEnvironmentSnapshot(),
+      }),
     onTrace: (event, details) => runtimeLog(event, details),
-    onGenerationProgress: (status) => sendToRenderer("memory-generation-progress", status),
+    onGenerationProgress: (status) =>
+      sendToRenderer("memory-generation-progress", status),
     isAllowed: memoryAllowed,
     findLiveVideo: memoryLiveVideo,
   });
   await memoryManager.initialize();
-  memoryExporter = new MemoryExporter({ ffmpegPath: getFfmpegPath, resolveLocalPath,
+  memoryExporter = new MemoryExporter({
+    ffmpegPath: getFfmpegPath,
+    resolveLocalPath,
     prepareImage: prepareMemoryExportImage,
   });
   // Coverage and cooldowns are persisted per source. Recheck all available sources
   resolveServicesReady();
   // Warm saved memory movies in the background while indexing starts; popup/page
   // reads join the preview queue instead of racing or failing with a busy error.
-  void memoryManager.getState()
+  void memoryManager
+    .getState()
     .then((state) => prepareAllMemoryPreviews(state.suggestions))
-    .catch((error) => runtimeLog("memory-preview-warmup-error", memoryErrorDetails(error)));
+    .catch((error) =>
+      runtimeLog("memory-preview-warmup-error", memoryErrorDetails(error)),
+    );
   scheduleAutomaticMemories();
   // even when the audio screen is closed, and retry failures once due.
   audioInventoryRetryTimer = setInterval(
@@ -8279,13 +9456,18 @@ app.whenReady().then(async () => {
           const changedFiles = await semanticIndexer.reconcileIndex(sources);
           startupIndexReconciliationSettled = true;
           const pausedByUser =
-            progress.status === "paused" && !/interrupted/i.test(progress.message);
+            progress.status === "paused" &&
+            !/interrupted/i.test(progress.message);
           if (!pausedByUser && lifetimeFullScanPending) {
             lifetimeFullScanPending = false;
-            queueSemanticIndexWork(
-              { fullScanAll: true, force: true },
-              ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
-            );
+            queueSemanticIndexWork({ fullScanAll: true, force: true }, [
+              "faces",
+              "locations",
+              "duplicates",
+              "thumbnails",
+              "audio",
+              "quality",
+            ]);
           } else if (!pausedByUser) {
             queueSemanticIndexWork(
               {
@@ -8298,7 +9480,14 @@ app.whenReady().then(async () => {
                   ...semanticIndexer.getRetryableFiles(sources),
                 ]),
               },
-              ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+              [
+                "faces",
+                "locations",
+                "duplicates",
+                "thumbnails",
+                "audio",
+                "quality",
+              ],
             );
           }
         } finally {
@@ -8314,7 +9503,9 @@ app.whenReady().then(async () => {
     scheduleThumbnailPregeneration(true);
   }
   const searchSettled = () => {
-    const localRoots = recoverySearchSourcePaths.filter((root) => !isRemotePath(root));
+    const localRoots = recoverySearchSourcePaths.filter(
+      (root) => !isRemotePath(root),
+    );
     const coverage = semanticIndexer.getSourceCoverageProgress(localRoots);
     const recovery = indexRecovery?.details("search");
     return (
@@ -8348,13 +9539,6 @@ app.whenReady().then(async () => {
       return "Waiting for search indexing to resume and finish.";
     return "Waiting for processing resources.";
   };
-  const progressiveAnalysisBlocker = () => {
-    if (!semanticIndexer.isLoaded())
-      return "Opening saved indexed photos.";
-    if (semanticRuntimeProgress.status !== "complete")
-      return "Waiting for the offline search model.";
-    return "Waiting for the analysis lane.";
-  };
   const analysisIdle = () =>
     !PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) &&
     !PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status) &&
@@ -8365,300 +9549,293 @@ app.whenReady().then(async () => {
     !["scanning", "generating"].includes(
       thumbnailPregenerator?.getProgress().status ?? "idle",
     );
-  indexRecovery = new IndexingRecovery([
-    {
-      id: "semantic-runtime",
-      progress: () => ({
-        status: semanticRuntimeProgress.status,
-        message: semanticRuntimeProgress.message,
-      }),
-      ready: () => indexStorageAvailable && !indexStorageInitializationDeferred,
-      blockedReason: () =>
-        indexStorageUnavailableMessage ||
-        (indexStorageInitializationDeferred
-          ? "Waiting for index storage initialization."
-          : "") ||
-        "Waiting for index storage to become available.",
-      needsInitialCheck: true,
-      checkOnStartup: true,
-      start: async () => {
-        const attempts = indexRecovery?.details("semantic-runtime").attempts ?? 1;
-        semanticRuntimeProgress = {
-          status: "loading-model",
-          message:
-            attempts > 1
-              ? `Retrying offline search model (attempt ${attempts})…`
-              : "Starting the offline search model…",
-        };
-        updateSearchIndexReadiness({
-          status: "preparing",
-          percentage: 20,
-          records: loadedSearchRecords,
+  indexRecovery = new IndexingRecovery(
+    [
+      {
+        id: "semantic-runtime",
+        progress: () => ({
+          status: semanticRuntimeProgress.status,
           message: semanticRuntimeProgress.message,
-        });
-        try {
-          await semanticIndexer.preloadClipModel();
+        }),
+        ready: () =>
+          indexStorageAvailable && !indexStorageInitializationDeferred,
+        blockedReason: () =>
+          indexStorageUnavailableMessage ||
+          (indexStorageInitializationDeferred
+            ? "Waiting for index storage initialization."
+            : "") ||
+          "Waiting for index storage to become available.",
+        needsInitialCheck: true,
+        checkOnStartup: true,
+        start: async () => {
+          const attempts =
+            indexRecovery?.details("semantic-runtime").attempts ?? 1;
           semanticRuntimeProgress = {
-            status: "complete",
-            message: "Offline search model ready.",
-          };
-          runtimeLog("search-model-preloaded", {
-            elapsedMs: Date.now() - startupStartedAt,
-            records: loadedSearchRecords,
-            attempt: attempts,
-          });
-          resolveSemanticRuntimeReady();
-        } catch (error) {
-          const rawMessage =
-            error instanceof Error ? error.message : String(error);
-          const safeMessage =
-            safeRuntimeDiagnosticText(rawMessage) ||
-            "Offline search model preload failed.";
-          semanticRuntimeProgress = {
-            status: "error",
-            message: `Preload failed during ${safeMessage}. Silo will retry automatically.`,
+            status: "loading-model",
+            message:
+              attempts > 1
+                ? `Retrying offline search model (attempt ${attempts})…`
+                : "Starting the offline search model…",
           };
           updateSearchIndexReadiness({
-            status: "error",
+            status: "preparing",
             percentage: 20,
             records: loadedSearchRecords,
-            message: `Offline search model unavailable. Automatic retry is scheduled. ${safeMessage}`,
+            message: semanticRuntimeProgress.message,
           });
-          runtimeLog("semantic-preload-recovery-failed", {
-            attempt: attempts,
-            message: safeMessage,
-          });
-          if (attempts >= 3)
-            createSemanticPreloadDiagnosticReport(attempts, rawMessage);
-          throw error;
-        }
-      },
-    },
-    {
-      id: "search",
-      lane: "clip",
-      blockedReason: () =>
-        semanticRuntimeProgress.status !== "complete"
-          ? "Waiting for offline search model recovery."
-          : analysisBlocker(),
-      progress: () => semanticIndexer.getProgress(),
-      ready: () =>
-        indexStorageAvailable &&
-        semanticRuntimeProgress.status === "complete" &&
-        !magicLibraryProgress.running &&
-        (startupIndexReconciliationSettled || semanticIndexer.hasPendingIndexWork()),
-      unresolvedWork: () => {
-        const count = semanticIndexer.getRetryableErrorCount(recoverySearchSourcePaths);
-        const coverageErrors = semanticIndexer.getSourceCoverageProgress(
-          recoverySearchSourcePaths,
-        ).errors;
-        return count || coverageErrors
-          ? `${count.toLocaleString()} files and ${coverageErrors.toLocaleString()} source scans still need a search-index retry.`
-          : null;
-      },
-      start: async () => {
-        const sources = await getAllIndexSources();
-        if (!sources.length)
-          throw new Error(
-            "No configured sources are available. Connect a source and retry.",
-          );
-        recoverySearchSourcePaths = sources;
-        await semanticIndexer.startWatching(sources);
-        const fullScanAll = pendingSemanticFullScanAll;
-        pendingSemanticFullScanAll = false;
-        const fullScanRoots = Array.from(pendingSemanticFullScanRoots);
-        pendingSemanticFullScanRoots.clear();
-        const resumeRoots = Array.from(pendingSemanticResumeRoots);
-        pendingSemanticResumeRoots.clear();
-        const changedFiles = new Map(pendingSemanticChangedFiles);
-        pendingSemanticChangedFiles.clear();
-        const retryableFiles = semanticIndexer.getRetryableFiles(sources);
-        retryableFiles.forEach((root, filePath) => {
-          if (!changedFiles.has(filePath)) changedFiles.set(filePath, root);
-        });
-        const coverageRetryRoots =
-          semanticIndexer.getSourceCoverageErrors(sources);
-
-        if (fullScanAll) {
-          await semanticIndexer.startFullScan(sources);
-        } else {
-          // Keep source discovery scoped to newly added or failed roots. Saved
-          // records remain searchable while these roots are scanned in order.
-          for (const root of new Set([...fullScanRoots, ...coverageRetryRoots]))
-            await semanticIndexer.start([root]);
-          if (resumeRoots.length) await semanticIndexer.start(resumeRoots);
-          if (changedFiles.size) {
-            const changedRoots = Array.from(new Set(changedFiles.values()));
-            await semanticIndexer.start(changedRoots, changedFiles);
-          } else if (semanticIndexer.hasPendingIndexWork()) {
-            // Resume only checkpointed work; an empty retry must never trigger a
-            // fresh walk of every configured source.
-            await semanticIndexer.start(sources);
+          try {
+            await semanticIndexer.preloadClipModel();
+            semanticRuntimeProgress = {
+              status: "complete",
+              message: "Offline search model ready.",
+            };
+            runtimeLog("search-model-preloaded", {
+              elapsedMs: Date.now() - startupStartedAt,
+              records: loadedSearchRecords,
+              attempt: attempts,
+            });
+            resolveSemanticRuntimeReady();
+          } catch (error) {
+            const rawMessage =
+              error instanceof Error ? error.message : String(error);
+            const safeMessage =
+              safeRuntimeDiagnosticText(rawMessage) ||
+              "Offline search model preload failed.";
+            semanticRuntimeProgress = {
+              status: "error",
+              message: `Preload failed during ${safeMessage}. Silo will retry automatically.`,
+            };
+            updateSearchIndexReadiness({
+              status: "error",
+              percentage: 20,
+              records: loadedSearchRecords,
+              message: `Offline search model unavailable. Automatic retry is scheduled. ${safeMessage}`,
+            });
+            runtimeLog("semantic-preload-recovery-failed", {
+              attempt: attempts,
+              message: safeMessage,
+            });
+            if (attempts >= 3)
+              createSemanticPreloadDiagnosticReport(attempts, rawMessage);
+            throw error;
           }
-        }
-      },
-      pause: () => semanticIndexer.pause(),
-    },
-    {
-      id: "faces",
-      lane: "analysis",
-      blockedReason: progressiveAnalysisBlocker,
-      needsInitialCheck: true,
-      progress: () => faceIndexer.getProgress(),
-      ready: () =>
-        indexStorageAvailable &&
-        semanticRuntimeProgress.status === "complete" &&
-        semanticIndexer.isLoaded(),
-      unresolvedWork: () => {
-        const errors = faceIndexer.getProgress().errors;
-        return errors
-          ? `${errors.toLocaleString()} photos need another face-analysis attempt.`
-          : null;
-      },
-      start: async () => {
-        const queuedImages = takeProgressiveImages(pendingFaceIndexImages);
-        if (faceInitialCoverageNeeded || queuedImages.length === 0) {
-          await faceIndexer.start();
-          if (faceIndexer.getProgress().status === "complete")
-            faceInitialCoverageNeeded = false;
-        } else {
-          await faceIndexer.start(queuedImages);
-        }
-      },
-      pause: () => faceIndexer.pause(),
-    },
-    {
-      id: "locations",
-      lane: "analysis",
-      blockedReason: progressiveAnalysisBlocker,
-      progress: () => geoIndexer.getStatus(),
-      needsInitialCheck: true,
-      ready: () =>
-        indexStorageAvailable &&
-        semanticRuntimeProgress.status === "complete" &&
-        semanticIndexer.isLoaded() &&
-        geoIndexer.getStatus().status !== "scanning",
-      unresolvedWork: () => {
-        const count = geoIndexer.getRetryableCount();
-        return count
-          ? `${count.toLocaleString()} location records need another check.`
-          : null;
-      },
-      start: async () => {
-        const queuedImages = takeProgressiveImages(pendingLocationIndexImages);
-        if (locationInitialCoverageNeeded || queuedImages.length === 0) {
-          await runGeoCheck();
-          if (geoIndexer.getStatus().status === "complete")
-            locationInitialCoverageNeeded = false;
-        } else {
-          const sources = await getAllIndexSources();
-          await geoIndexer.start(queuedImages, sources);
-        }
-      },
-      pause: () => geoIndexer.pause(),
-    },
-    {
-      id: "duplicates",
-      lane: "background",
-      blockedReason: () =>
-        audioInventoryRunning
-          ? "Recursive audio discovery is using the source disks."
-          : analysisBlocker(),
-      needsInitialCheck: true,
-      progress: () => duplicateManager.getState(),
-      ready: () => indexStorageAvailable && searchSettled() && analysisIdle() && diskIdle(),
-      unresolvedWork: () => {
-        const count = duplicateManager.getRetryableFailureCount();
-        return count
-          ? `${count.toLocaleString()} files could not be hashed and will be retried.`
-          : null;
-      },
-      start: async () => {
-        const sources = await getAllIndexSources();
-        await duplicateManager.scan(
-          semanticIndexer.getIndexedFiles(sources),
-          sources,
-        );
-      },
-      pause: () => duplicateManager.pause(),
-    },
-    {
-      id: "thumbnails",
-      lane: "background",
-      blockedReason: () =>
-        getThumbnailIndexingWaitMessage() ||
-        "Thumbnail generation is already active.",
-      needsInitialCheck: true,
-      progress: () =>
-        thumbnailPregenerator?.getProgress() ?? {
-          status: "idle",
-          message: "Waiting for services",
         },
-      ready: () =>
-        indexStorageAvailable &&
-        Boolean(thumbnailPregenerator) &&
-        !getThumbnailIndexingWaitMessage() &&
-        duplicateManager.getState().status !== "scanning" &&
-        !["scanning", "generating"].includes(
-          thumbnailPregenerator?.getProgress().status ?? "idle",
-        ),
-      unresolvedWork: () => {
-        const failed = thumbnailPregenerator?.getProgress().failed ?? 0;
-        return failed
-          ? `${failed.toLocaleString()} thumbnails could not be generated and will be retried.`
-          : null;
       },
-      start: async () => {
-        thumbnailPregenDirty = false;
-        await thumbnailPregenerator?.start();
+      {
+        id: "search",
+        lane: "background",
+        blockedReason: () =>
+          semanticRuntimeProgress.status !== "complete"
+            ? "Waiting for offline search model recovery."
+            : analysisBlocker(),
+        progress: () => semanticIndexer.getProgress(),
+        ready: () =>
+          indexStorageAvailable &&
+          semanticRuntimeProgress.status === "complete" &&
+          analysisIdle() &&
+          (startupIndexReconciliationSettled ||
+            semanticIndexer.hasPendingIndexWork()),
+        unresolvedWork: () => {
+          const count = semanticIndexer.getRetryableErrorCount(
+            recoverySearchSourcePaths,
+          );
+          const coverageErrors = semanticIndexer.getSourceCoverageProgress(
+            recoverySearchSourcePaths,
+          ).errors;
+          return count || coverageErrors
+            ? `${count.toLocaleString()} files and ${coverageErrors.toLocaleString()} source scans still need a search-index retry.`
+            : null;
+        },
+        start: async () => {
+          const sources = await getAllIndexSources();
+          if (!sources.length)
+            throw new Error(
+              "No configured sources are available. Connect a source and retry.",
+            );
+          recoverySearchSourcePaths = sources;
+          await semanticIndexer.startWatching(sources);
+          const fullScanAll = pendingSemanticFullScanAll;
+          pendingSemanticFullScanAll = false;
+          const fullScanRoots = Array.from(pendingSemanticFullScanRoots);
+          pendingSemanticFullScanRoots.clear();
+          const resumeRoots = Array.from(pendingSemanticResumeRoots);
+          pendingSemanticResumeRoots.clear();
+          const changedFiles = new Map(pendingSemanticChangedFiles);
+          pendingSemanticChangedFiles.clear();
+          const retryableFiles = semanticIndexer.getRetryableFiles(sources);
+          retryableFiles.forEach((root, filePath) => {
+            if (!changedFiles.has(filePath)) changedFiles.set(filePath, root);
+          });
+          const coverageRetryRoots =
+            semanticIndexer.getSourceCoverageErrors(sources);
+
+          if (fullScanAll) {
+            await semanticIndexer.startFullScan(sources);
+          } else {
+            // Keep source discovery scoped to newly added or failed roots. Saved
+            // records remain searchable while these roots are scanned in order.
+            for (const root of new Set([
+              ...fullScanRoots,
+              ...coverageRetryRoots,
+            ]))
+              await semanticIndexer.start([root]);
+            if (resumeRoots.length) await semanticIndexer.start(resumeRoots);
+            if (changedFiles.size) {
+              const changedRoots = Array.from(new Set(changedFiles.values()));
+              await semanticIndexer.start(changedRoots, changedFiles);
+            } else if (semanticIndexer.hasPendingIndexWork()) {
+              // Resume only checkpointed work; an empty retry must never trigger a
+              // fresh walk of every configured source.
+              await semanticIndexer.start(sources);
+            }
+          }
+        },
+        pause: () => semanticIndexer.pause(),
       },
-    },
-    {
-      id: "audio",
-      lane: "background",
-      progress: () => ({
-        status: audioInventoryRunning ? "scanning" : "idle",
-        message: "Source-aware retry coverage",
-      }),
-      ready: () =>
-        indexStorageAvailable &&
-        startupIndexReconciliationSettled &&
-        searchSettled() &&
-        analysisIdle() &&
-        !audioInventoryRunning,
-      start: async () => {
-        const requestId = pendingAudioRefreshRequestId;
-        const force = pendingAudioRefreshForce;
-        pendingAudioRefreshRequestId = -1;
-        pendingAudioRefreshForce = false;
-        const result = await refreshAudioInventory(requestId, force);
-        if (!result.ok) throw new Error(result.error);
+      {
+        id: "faces",
+        lane: "background",
+        blockedReason: analysisBlocker,
+        needsInitialCheck: true,
+        progress: () => faceIndexer.getProgress(),
+        ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
+        unresolvedWork: () => {
+          const errors = faceIndexer.getProgress().errors;
+          return errors
+            ? `${errors.toLocaleString()} photos need another face-analysis attempt.`
+            : null;
+        },
+        start: () => faceIndexer.start(),
+        pause: () => faceIndexer.pause(),
       },
-      pause: () => {
-        if (audioLibraryCache !== null) audioLibraryCache.cancelScan();
+      {
+        id: "locations",
+        lane: "background",
+        blockedReason: analysisBlocker,
+        progress: () => geoIndexer.getStatus(),
+        needsInitialCheck: true,
+        ready: () =>
+          indexStorageAvailable &&
+          searchSettled() &&
+          geoIndexer.getStatus().status !== "scanning",
+        unresolvedWork: () => {
+          const count = geoIndexer.getRetryableCount();
+          return count
+            ? `${count.toLocaleString()} location records need another check.`
+            : null;
+        },
+        start: () => runGeoCheck(),
+        pause: () => geoIndexer.pause(),
       },
-    },
-    {
-      id: "quality",
-      lane: "background",
-      blockedReason: analysisBlocker,
-      progress: () => ({
-        status: magicLibraryProgress.running ? "indexing" : "idle",
-        message: "Quality scoring",
-      }),
-      ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
-      start: async () => {
-        const sources = await getAllIndexSources();
-        await aestheticScorer.analyzeInBackground(
-          semanticIndexer
-            .getIndexedImages(sources)
-            .filter((file) => !isRemotePath(file.path)),
-        );
+      {
+        id: "duplicates",
+        lane: "background",
+        blockedReason: () =>
+          audioInventoryRunning
+            ? "Recursive audio discovery is using the source disks."
+            : analysisBlocker(),
+        needsInitialCheck: true,
+        progress: () => duplicateManager.getState(),
+        ready: () =>
+          indexStorageAvailable &&
+          searchSettled() &&
+          analysisIdle() &&
+          diskIdle(),
+        unresolvedWork: () => {
+          const count = duplicateManager.getRetryableFailureCount();
+          return count
+            ? `${count.toLocaleString()} files could not be hashed and will be retried.`
+            : null;
+        },
+        start: async () => {
+          const sources = await getAllIndexSources();
+          await duplicateManager.scan(
+            semanticIndexer.getIndexedFiles(sources),
+            sources,
+          );
+        },
+        pause: () => duplicateManager.pause(),
       },
-      pause: () => aestheticScorer.setBackgroundPaused(true),
-      resume: () => aestheticScorer.setBackgroundPaused(false),
-    },
-  ], Date.now, path.join(app.getPath("userData"), "indexing-recovery.json"));
+      {
+        id: "thumbnails",
+        lane: "background",
+        blockedReason: () =>
+          getThumbnailIndexingWaitMessage() ||
+          "Thumbnail generation is already active.",
+        needsInitialCheck: true,
+        progress: () =>
+          thumbnailPregenerator?.getProgress() ?? {
+            status: "idle",
+            message: "Waiting for services",
+          },
+        ready: () =>
+          indexStorageAvailable &&
+          Boolean(thumbnailPregenerator) &&
+          !getThumbnailIndexingWaitMessage() &&
+          duplicateManager.getState().status !== "scanning" &&
+          !["scanning", "generating"].includes(
+            thumbnailPregenerator?.getProgress().status ?? "idle",
+          ),
+        unresolvedWork: () => {
+          const failed = thumbnailPregenerator?.getProgress().failed ?? 0;
+          return failed
+            ? `${failed.toLocaleString()} thumbnails could not be generated and will be retried.`
+            : null;
+        },
+        start: async () => {
+          thumbnailPregenDirty = false;
+          await thumbnailPregenerator?.start();
+        },
+      },
+      {
+        id: "audio",
+        lane: "background",
+        progress: () => ({
+          status: audioInventoryRunning ? "scanning" : "idle",
+          message: "Source-aware retry coverage",
+        }),
+        ready: () =>
+          indexStorageAvailable &&
+          startupIndexReconciliationSettled &&
+          searchSettled() &&
+          analysisIdle() &&
+          !audioInventoryRunning,
+        start: async () => {
+          const requestId = pendingAudioRefreshRequestId;
+          const force = pendingAudioRefreshForce;
+          pendingAudioRefreshRequestId = -1;
+          pendingAudioRefreshForce = false;
+          const result = await refreshAudioInventory(requestId, force);
+          if (!result.ok) throw new Error(result.error);
+        },
+        pause: () => {
+          if (audioLibraryCache !== null) audioLibraryCache.cancelScan();
+        },
+      },
+      {
+        id: "quality",
+        lane: "background",
+        blockedReason: analysisBlocker,
+        progress: () => ({
+          status: magicLibraryProgress.running ? "indexing" : "idle",
+          message: "Quality scoring",
+        }),
+        ready: () => indexStorageAvailable && searchSettled() && analysisIdle(),
+        start: async () => {
+          const sources = await getAllIndexSources();
+          await aestheticScorer.analyzeInBackground(
+            semanticIndexer
+              .getIndexedImages(sources)
+              .filter((file) => !isRemotePath(file.path)),
+          );
+        },
+        pause: () => aestheticScorer.setBackgroundPaused(true),
+        resume: () => aestheticScorer.setBackgroundPaused(false),
+      },
+    ],
+    Date.now,
+    path.join(app.getPath("userData"), "indexing-recovery.json"),
+  );
   const semanticRuntimeRecovery = indexRecovery.details("semantic-runtime");
   if (semanticRuntimeRecovery.userPaused) {
     const message =
@@ -8671,16 +9848,17 @@ app.whenReady().then(async () => {
       message,
     });
   }
-  if (activeInteractiveSearches > 0)
-    await indexRecovery.setSearchActive(true);
+  if (activeInteractiveSearches > 0) await indexRecovery.setSearchActive(true);
   await monitorIndexStorageAvailability();
   startIndexStorageAvailabilityMonitor();
   requestIndexRecoveryStages([]);
   indexRecoveryTimer = setInterval(
     () =>
-      void indexRecovery?.tick().catch((error) =>
-        runtimeLog("index-recovery-tick-error", { message: String(error) }),
-      ),
+      void indexRecovery
+        ?.tick()
+        .catch((error) =>
+          runtimeLog("index-recovery-tick-error", { message: String(error) }),
+        ),
     5000,
   );
   const heapGuard = new HeapGuard({
@@ -8696,18 +9874,24 @@ app.whenReady().then(async () => {
       );
     },
     onRelief: async (sample) => {
-      runtimeLog("heap-relief", { usedMb: Math.round(sample.used / 1024 / 1024) });
+      runtimeLog("heap-relief", {
+        usedMb: Math.round(sample.used / 1024 / 1024),
+      });
       heapPressureMessage = null;
-      const resume = await semanticIndexer.setHold(indexStorageUnavailableMessage);
+      const resume = await semanticIndexer.setHold(
+        indexStorageUnavailableMessage,
+      );
       if (!indexStorageUnavailableMessage && resume.length && !shuttingDown)
         queueSemanticIndexWork({ resumeRoots: resume, force: true });
     },
   });
   heapGuardTimer = setInterval(
     () =>
-      void heapGuard.tick().catch((error) =>
-        runtimeLog("heap-guard-error", { message: String(error) }),
-      ),
+      void heapGuard
+        .tick()
+        .catch((error) =>
+          runtimeLog("heap-guard-error", { message: String(error) }),
+        ),
     2000,
   );
   diagnosticsTimer = setInterval(() => {
@@ -8745,7 +9929,6 @@ app.whenReady().then(async () => {
       derivedRunning: Boolean(derivedIndexPromise),
     });
   }, 10000);
-  lastKnownAppPhase = "ready";
   runtimeLog("app-ready");
 });
 
@@ -8757,10 +9940,6 @@ app.on("window-all-closed", () => {
 
 let quitFlushed = false;
 app.on("before-quit", (event) => {
-  runtimeLog("app-lifecycle-before-quit", {
-    quitPass: quitFlushed ? "flush-complete" : "initial",
-    ...lifecycleDiagnosticSnapshot("app-quit", mainWindow),
-  });
   memoryExporter?.cancel();
   void libraryShareServer?.stop();
   shuttingDown = true;
@@ -8800,13 +9979,7 @@ function clearActiveSessionMarker() {
     });
   }
 }
-app.on("will-quit", () => {
-  runtimeLog(
-    "app-lifecycle-will-quit",
-    lifecycleDiagnosticSnapshot("will-quit", mainWindow),
-  );
-  clearActiveSessionMarker();
-});
+app.on("will-quit", clearActiveSessionMarker);
 for (const signal of ["SIGTERM", "SIGINT"] as const)
   process.on(signal, () => app.quit());
 
@@ -8826,53 +9999,58 @@ let autoMemoryTimer: NodeJS.Timeout | null = null;
 const memoryBookPending = new Map<string, MemorySuggestion>();
 
 /** Prompted memories are saved to the Memory Book as soon as they are created. */
-const isCustomMemory = (card: MemorySuggestion) => card.storyKey?.startsWith("custom:") === true;
+const isCustomMemory = (card: MemorySuggestion) =>
+  card.storyKey?.startsWith("custom:") === true;
 
-async function retireMemoriesToBook(before: MemorySuggestion[], after: MemorySuggestion[]) {
+async function retireMemoriesToBook(
+  before: MemorySuggestion[],
+  after: MemorySuggestion[],
+) {
   const kept = new Set(after.map((card) => card.id));
   const retired = before.filter((card) => !kept.has(card.id));
   if (!retired.length) return;
   await rememberMemoryMovieTitles(retired).catch(() => undefined);
   const unfinished: MemorySuggestion[] = [];
-  for (const card of retired) if (!await findMemoryMovie(card).catch(() => null)) unfinished.push(card);
+  for (const card of retired)
+    if (!(await findMemoryMovie(card).catch(() => null))) unfinished.push(card);
   for (const card of unfinished) memoryBookPending.set(card.id, card);
-  if (unfinished.length) void prepareMemoryPreviews(unfinished).catch((error) => runtimeLog("memory-book-preview-error", memoryErrorDetails(error)));
+  if (unfinished.length)
+    void prepareMemoryPreviews(unfinished).catch((error) =>
+      runtimeLog("memory-book-preview-error", memoryErrorDetails(error)),
+    );
 }
 
 async function runMemoryGenerator(reason: string, replace = false) {
   const before = replace ? (await memoryManager.getState()).suggestions : [];
   const state = await memoryManager.generate(replace);
-  if (replace) await retireMemoriesToBook(before, state.suggestions).catch(() => undefined);
+  if (replace)
+    await retireMemoriesToBook(before, state.suggestions).catch(
+      () => undefined,
+    );
   runtimeLog("memory-generate", { reason, count: state.suggestions.length });
   if (state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+    void prepareAllMemoryPreviews(state.suggestions).catch((error) =>
+      runtimeLog("memory-preview-error", memoryErrorDetails(error)),
+    );
   const next = { ...(await memoryStateWithPreviews()), message: state.message };
   sendToRenderer("memories-changed", next);
   return next;
 }
 
-/** Generates from the growing CLIP index, then refreshes daily while running. */
+/** Generates once after startup indexing settles, then every 24 hours while running. */
 function scheduleAutomaticMemories() {
   if (autoMemoryTimer) return;
-  const tick = async () => {
-    if (!memoryManager || !semanticIndexer?.isLoaded() ||
-        semanticRuntimeProgress.status !== "complete") return;
-    const due = lastAutoMemoryRunAt === 0 || Date.now() - lastAutoMemoryRunAt >= AUTO_MEMORY_INTERVAL_MS;
-    if (!due) return;
-    let roots: string[];
-    try {
-      roots = await getAllIndexSources();
-    } catch (error) {
-      runtimeLog("memory-auto-source-list-error", memoryErrorDetails(error));
-      return;
-    }
-    // Use counters here; materializing millions of image records just to decide
-    // whether Memories can start would create avoidable memory pressure.
-    if (semanticIndexer.getIndexSummary(roots).indexed < MEMORY_MIN_SELECTION_COUNT) return;
-    const reason = lastAutoMemoryRunAt === 0 ? "progressive-startup" : "scheduled";
+  const tick = () => {
+    if (!memoryManager) return;
+    const due =
+      lastAutoMemoryRunAt === 0 ||
+      Date.now() - lastAutoMemoryRunAt >= AUTO_MEMORY_INTERVAL_MS;
+    if (!due || getThumbnailIndexingWaitMessage() !== null) return;
+    const reason = lastAutoMemoryRunAt === 0 ? "startup" : "scheduled";
     lastAutoMemoryRunAt = Date.now();
-    void runMemoryGenerator(reason)
-      .catch((error) => runtimeLog("memory-auto-generate-error", memoryErrorDetails(error)));
+    void runMemoryGenerator(reason).catch((error) =>
+      runtimeLog("memory-auto-generate-error", memoryErrorDetails(error)),
+    );
   };
   autoMemoryTimer = setInterval(tick, AUTO_MEMORY_POLL_MS);
   setTimeout(tick, 15000);
@@ -8883,47 +10061,74 @@ ipcMain.handle("get-memories", async (_event, prepareViews: unknown) => {
   // Returns immediately; movies render in the background and report progress per card.
   const state = await memoryManager.getState();
   if (prepareViews === true && state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+    void prepareAllMemoryPreviews(state.suggestions).catch((error) =>
+      runtimeLog("memory-preview-error", memoryErrorDetails(error)),
+    );
   return memoryStateWithPreviews(state);
 });
-ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic: unknown) => {
-  // Generation never throws to the page: failures keep the current cards and explain why.
-  if (customTopic !== undefined && typeof customTopic !== "string") {
-    const current = await memoryStateWithPreviews();
-    return { ...current, message: "Enter a topic using plain text." };
-  }
-  if (customTopic !== undefined && !fullAccessEnabled()) {
-    const current = await memoryStateWithPreviews();
-    return { ...current, message: "Creating a memory from your own prompt is available with Silo Lifetime." };
-  }
-  if (customTopic === undefined) {
+ipcMain.handle(
+  "generate-memories",
+  async (_event, replace: unknown, customTopic: unknown) => {
+    // Generation never throws to the page: failures keep the current cards and explain why.
+    if (customTopic !== undefined && typeof customTopic !== "string") {
+      const current = await memoryStateWithPreviews();
+      return { ...current, message: "Enter a topic using plain text." };
+    }
+    if (customTopic !== undefined && !fullAccessEnabled()) {
+      const current = await memoryStateWithPreviews();
+      return {
+        ...current,
+        message:
+          "Creating a memory from your own prompt is available with Silo Lifetime.",
+      };
+    }
+    if (customTopic === undefined) {
+      try {
+        return await runMemoryGenerator("on-demand", replace === true);
+      } catch (error) {
+        runtimeLog("memory-generate-error", memoryErrorDetails(error));
+        const current = await memoryStateWithPreviews();
+        return {
+          ...current,
+          message:
+            "Memory generation hit a problem; your saved memories are unchanged.",
+        };
+      }
+    }
+    let state;
+    const knownIds = new Set(
+      [
+        ...(await memoryManager.getState()).suggestions,
+        ...(await memoryManager
+          .getReserve()
+          .catch(() => [] as MemorySuggestion[])),
+      ].map((card) => card.id),
+    );
     try {
-      return await runMemoryGenerator("on-demand", replace === true);
+      state = await memoryManager.generate(replace === true, customTopic);
     } catch (error) {
       runtimeLog("memory-generate-error", memoryErrorDetails(error));
       const current = await memoryStateWithPreviews();
-      return { ...current, message: "Memory generation hit a problem; your saved memories are unchanged." };
+      return {
+        ...current,
+        message:
+          "Memory generation hit a problem; your saved memories are unchanged.",
+      };
     }
-  }
-  let state;
-  const knownIds = new Set([
-    ...(await memoryManager.getState()).suggestions,
-    ...await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]),
-  ].map((card) => card.id));
-  try {
-    state = await memoryManager.generate(replace === true, customTopic);
-  } catch (error) {
-    runtimeLog("memory-generate-error", memoryErrorDetails(error));
-    const current = await memoryStateWithPreviews();
-    return { ...current, message: "Memory generation hit a problem; your saved memories are unchanged." };
-  }
-  const created = state.suggestions.filter((card) => isCustomMemory(card) && !knownIds.has(card.id));
-  await rememberMemoryMovieTitles(created).catch(() => undefined);
-  for (const card of created) if (!await findMemoryMovie(card).catch(() => null)) memoryBookPending.set(card.id, card);
-  if (state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
-  return { ...(await memoryStateWithPreviews()), message: state.message };
-});
+    const created = state.suggestions.filter(
+      (card) => isCustomMemory(card) && !knownIds.has(card.id),
+    );
+    await rememberMemoryMovieTitles(created).catch(() => undefined);
+    for (const card of created)
+      if (!(await findMemoryMovie(card).catch(() => null)))
+        memoryBookPending.set(card.id, card);
+    if (state.suggestions.length)
+      void prepareAllMemoryPreviews(state.suggestions).catch((error) =>
+        runtimeLog("memory-preview-error", memoryErrorDetails(error)),
+      );
+    return { ...(await memoryStateWithPreviews()), message: state.message };
+  },
+);
 /**
  * Each destination picker opens at its own saved folder (or a neutral default) so the
  * OS doesn't reopen whichever folder another picker used last.
@@ -8944,7 +10149,12 @@ function destinationPickerOptions(
     title,
     defaultPath,
     ...extra,
-    properties: ["openDirectory", "createDirectory", "promptToCreate", ...(extra.properties ?? [])],
+    properties: [
+      "openDirectory",
+      "createDirectory",
+      "promptToCreate",
+      ...(extra.properties ?? []),
+    ],
   };
 }
 
@@ -8952,7 +10162,10 @@ ipcMain.handle("select-memory-directory", async () => {
   if (!mainWindow || mainWindow.isDestroyed()) return memoryManager.getState();
   const result = await dialog.showOpenDialog(
     mainWindow,
-    destinationPickerOptions("Save memory movies to…", (await memoryManager.getState()).settings.movieDirectory),
+    destinationPickerOptions(
+      "Save memory movies to…",
+      (await memoryManager.getState()).settings.movieDirectory,
+    ),
   );
   const chosen = result.filePaths[0];
   if (result.canceled || !chosen) return memoryManager.getState();
@@ -8960,20 +10173,29 @@ ipcMain.handle("select-memory-directory", async () => {
   await fsPromises.access(directory, fs.constants.W_OK).catch(() => {
     throw new Error("That folder isn't writable. Choose another destination.");
   });
-  const state = await memoryManager.updateSettings({ movieDirectory: directory });
+  const state = await memoryManager.updateSettings({
+    movieDirectory: directory,
+  });
   // Copy already-rendered movies over so saved stories stay viewable offline.
-  void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+  void prepareAllMemoryPreviews(state.suggestions).catch((error) =>
+    runtimeLog("memory-preview-error", memoryErrorDetails(error)),
+  );
   return state;
 });
 ipcMain.handle("dismiss-memory", (_event, id: unknown) => {
-  if (typeof id !== "string" || !id || id.length > 200) throw new Error("Invalid memory.");
+  if (typeof id !== "string" || !id || id.length > 200)
+    throw new Error("Invalid memory.");
   return memoryManager.dismiss(id);
 });
 ipcMain.handle("update-memory-settings", (_event, settings: unknown) => {
   if (!settings || typeof settings !== "object" || Array.isArray(settings))
     throw new Error("Invalid memory settings.");
   const values = settings as Record<string, unknown>;
-  if (Object.keys(values).some((key) => key !== "showOnLaunch" && key !== "movieDirectory"))
+  if (
+    Object.keys(values).some(
+      (key) => key !== "showOnLaunch" && key !== "movieDirectory",
+    )
+  )
     throw new Error("Invalid memory settings.");
   const update: Partial<MemorySettings> = {};
   for (const key of ["showOnLaunch"] as const) {
@@ -8984,49 +10206,95 @@ ipcMain.handle("update-memory-settings", (_event, settings: unknown) => {
   }
   // Only clearing is accepted here; a folder is set through the native picker.
   if (values.movieDirectory === null) update.movieDirectory = null;
-  else if (values.movieDirectory !== undefined) throw new Error("Invalid memory settings.");
+  else if (values.movieDirectory !== undefined)
+    throw new Error("Invalid memory settings.");
   return memoryManager.updateSettings(update);
 });
 ipcMain.handle("get-memory-soundtracks", (_event, id: unknown) => {
-  if (typeof id !== "string" || !id || id.length > 200) throw new Error("Invalid memory.");
+  if (typeof id !== "string" || !id || id.length > 200)
+    throw new Error("Invalid memory.");
   return memoryManager.getSoundtracks(id);
 });
 ipcMain.handle("browse-memory-audio", (_event, raw: unknown) => {
-  const value = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const value =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
   const textField = (field: unknown, max: number) =>
-    typeof field === "string" && field.length <= max && !field.includes("\0") ? field : undefined;
+    typeof field === "string" && field.length <= max && !field.includes("\0")
+      ? field
+      : undefined;
   return memoryManager.browseAudio({
     sourceId: textField(value.sourceId, 4096) || undefined,
     folder: textField(value.folder, 4096),
     query: textField(value.query, 200),
-    sort: value.sort === "modified" || value.sort === "size" ? value.sort : "name",
+    sort:
+      value.sort === "modified" || value.sort === "size" ? value.sort : "name",
     direction: value.direction === "desc" ? "desc" : "asc",
     offset: Number.isSafeInteger(value.offset) ? Number(value.offset) : 0,
     limit: Number.isSafeInteger(value.limit) ? Number(value.limit) : 200,
   });
 });
-ipcMain.handle("set-memory-soundtrack", async (_event, id: unknown, soundtrackId: unknown) => {
-  if (typeof id !== "string" || !id || id.length > 200 || typeof soundtrackId !== "string" || soundtrackId.length > 250)
-    throw new Error("Invalid memory soundtrack.");
-  const card = await memoryManager.setSoundtrack(id, soundtrackId);
-  if (!card) throw new Error("That song is no longer available. Choose another one.");
-  // The watchable movie re-renders with the new song on the single background queue.
-  memoryPreviewStatus.delete(id);
-  void prepareMemoryPreviews([card]).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
-  return memoryStateWithPreviews();
-});
-async function openMemoryMovie(id: string, revealInFolder: boolean): Promise<{ ok: boolean; path?: string; error?: string; preparing?: boolean; upgradeRequired?: boolean }> {
-  if (typeof id !== "string" || !id || id.length > 200) return { ok: false, error: "Invalid memory." };
+ipcMain.handle(
+  "set-memory-soundtrack",
+  async (_event, id: unknown, soundtrackId: unknown) => {
+    if (
+      typeof id !== "string" ||
+      !id ||
+      id.length > 200 ||
+      typeof soundtrackId !== "string" ||
+      soundtrackId.length > 250
+    )
+      throw new Error("Invalid memory soundtrack.");
+    const card = await memoryManager.setSoundtrack(id, soundtrackId);
+    if (!card)
+      throw new Error("That song is no longer available. Choose another one.");
+    // The watchable movie re-renders with the new song on the single background queue.
+    memoryPreviewStatus.delete(id);
+    void prepareMemoryPreviews([card]).catch((error) =>
+      runtimeLog("memory-preview-error", memoryErrorDetails(error)),
+    );
+    return memoryStateWithPreviews();
+  },
+);
+async function openMemoryMovie(
+  id: string,
+  revealInFolder: boolean,
+): Promise<{
+  ok: boolean;
+  path?: string;
+  error?: string;
+  preparing?: boolean;
+  upgradeRequired?: boolean;
+}> {
+  if (typeof id !== "string" || !id || id.length > 200)
+    return { ok: false, error: "Invalid memory." };
   const suggestion = await memoryManager.getSuggestion(id);
-  if (!suggestion || !suggestion.media.every((file) => memoryAllowed(file.path) &&
-    (!file.liveVideoPath || memoryAllowed(file.liveVideoPath))))
-    return { ok: false, error: "This memory is no longer available. Refresh suggestions." };
+  if (
+    !suggestion ||
+    !suggestion.media.every(
+      (file) =>
+        memoryAllowed(file.path) &&
+        (!file.liveVideoPath || memoryAllowed(file.liveVideoPath)),
+    )
+  )
+    return {
+      ok: false,
+      error: "This memory is no longer available. Refresh suggestions.",
+    };
   const moviePath = await findMemoryMovie(suggestion);
   if (!moviePath) {
-    const rendering = Array.from(memoryPreviewStatus.entries()).find(([, status]) => status.status === "rendering");
-    return { ok: false, preparing: true, error: rendering && rendering[0] !== id
-      ? "Please wait for the current memory to finish processing."
-      : "This memory is still being prepared." };
+    const rendering = Array.from(memoryPreviewStatus.entries()).find(
+      ([, status]) => status.status === "rendering",
+    );
+    return {
+      ok: false,
+      preparing: true,
+      error:
+        rendering && rendering[0] !== id
+          ? "Please wait for the current memory to finish processing."
+          : "This memory is still being prepared.",
+    };
   }
   if (!(await consumeDemoMemoryPreview(id))) {
     notifyDemoLimitReached("memoryPreviews");
@@ -9049,17 +10317,24 @@ async function openMemoryMovie(id: string, revealInFolder: boolean): Promise<{ o
 function registerMemoryRevealHandlers() {
   ipcMain.removeHandler("view-memory");
   ipcMain.removeHandler("reveal-memory");
-  ipcMain.handle("view-memory", async (_event, id: unknown) => openMemoryMovie(typeof id === "string" ? id : "", false));
-  ipcMain.handle("reveal-memory", async (_event, id: unknown) => openMemoryMovie(typeof id === "string" ? id : "", true));
+  ipcMain.handle("view-memory", async (_event, id: unknown) =>
+    openMemoryMovie(typeof id === "string" ? id : "", false),
+  );
+  ipcMain.handle("reveal-memory", async (_event, id: unknown) =>
+    openMemoryMovie(typeof id === "string" ? id : "", true),
+  );
 }
 
 registerMemoryRevealHandlers();
 
-const MEMORY_MOVIE_TITLES_PATH = () => path.join(app.getPath("userData"), "memories", "movie-titles.json");
+const MEMORY_MOVIE_TITLES_PATH = () =>
+  path.join(app.getPath("userData"), "memories", "movie-titles.json");
 
 async function readMemoryMovieTitles(): Promise<Record<string, string>> {
   try {
-    const raw = JSON.parse(await fsPromises.readFile(MEMORY_MOVIE_TITLES_PATH(), "utf8"));
+    const raw = JSON.parse(
+      await fsPromises.readFile(MEMORY_MOVIE_TITLES_PATH(), "utf8"),
+    );
     return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   } catch {
     return {};
@@ -9067,46 +10342,73 @@ async function readMemoryMovieTitles(): Promise<Record<string, string>> {
 }
 
 /** Remembers each movie's story title so it keeps a readable name after its card is removed. */
-async function rememberMemoryMovieTitles(suggestions: MemorySuggestion[]): Promise<void> {
+async function rememberMemoryMovieTitles(
+  suggestions: MemorySuggestion[],
+): Promise<void> {
   const titles = await readMemoryMovieTitles();
   let changed = false;
   for (const suggestion of suggestions) {
     const name = memoryPreviewFileName(suggestion);
-    if (titles[name] !== suggestion.title) { titles[name] = suggestion.title; changed = true; }
+    if (titles[name] !== suggestion.title) {
+      titles[name] = suggestion.title;
+      changed = true;
+    }
   }
   if (!changed) return;
-  await fsPromises.mkdir(path.dirname(MEMORY_MOVIE_TITLES_PATH()), { recursive: true });
-  await fsPromises.writeFile(MEMORY_MOVIE_TITLES_PATH(), JSON.stringify(titles)).catch(() => undefined);
+  await fsPromises.mkdir(path.dirname(MEMORY_MOVIE_TITLES_PATH()), {
+    recursive: true,
+  });
+  await fsPromises
+    .writeFile(MEMORY_MOVIE_TITLES_PATH(), JSON.stringify(titles))
+    .catch(() => undefined);
 }
 
 function titleFromMemoryMovieName(name: string): string {
-  const stem = name.replace(/\.mp4$/i, "").replace(/-[a-z0-9]{1,6}-[a-f0-9]{4}$/i, "");
+  const stem = name
+    .replace(/\.mp4$/i, "")
+    .replace(/-[a-z0-9]{1,6}-[a-f0-9]{4}$/i, "");
   const dated = /^(\d{4}-\d{2}-\d{2})-(.+)$/.exec(stem);
   const words = (dated ? dated[2] : stem).replace(/-+/g, " ").trim();
-  const title = words ? `${words.charAt(0).toLocaleUpperCase()}${words.slice(1)}` : "Memory";
+  const title = words
+    ? `${words.charAt(0).toLocaleUpperCase()}${words.slice(1)}`
+    : "Memory";
   return dated ? `${title} · ${dated[1]}` : title;
 }
 
 async function memoryMovieDirectories(): Promise<string[]> {
-  return Array.from(new Set([await memoryMovieDirectory(), MEMORY_DEFAULT_MOVIE_DIRECTORY()]));
+  return Array.from(
+    new Set([await memoryMovieDirectory(), MEMORY_DEFAULT_MOVIE_DIRECTORY()]),
+  );
 }
 
 /** The id fragment embedded in a movie name; every render of one story shares it. */
 function memoryMovieStoryKey(name: string): string | null {
-  return /-([a-z0-9]{1,6})-[a-f0-9]{4}\.mp4$/i.exec(name)?.[1].toLowerCase() ?? null;
+  return (
+    /-([a-z0-9]{1,6})-[a-f0-9]{4}\.mp4$/i.exec(name)?.[1].toLowerCase() ?? null
+  );
 }
 
 ipcMain.handle("list-saved-memory-movies", async () => {
   const state = await memoryManager.getState();
-  const cards = [...state.suggestions, ...await memoryManager.getReserve()];
+  const cards = [...state.suggestions, ...(await memoryManager.getReserve())];
   await rememberMemoryMovieTitles(cards).catch(() => undefined);
   // Editable stories are shown as cards above; any render of them stays out of the book,
   // except prompted memories, which the user asked for and are saved straight away.
-  const editableKeys = new Set(state.suggestions.filter((card) => !isCustomMemory(card)).map((card) => memoryMovieStoryKey(memoryPreviewFileName(card))).filter(Boolean));
+  const editableKeys = new Set(
+    state.suggestions
+      .filter((card) => !isCustomMemory(card))
+      .map((card) => memoryMovieStoryKey(memoryPreviewFileName(card)))
+      .filter(Boolean),
+  );
   const titles = await readMemoryMovieTitles();
-  const movies = new Map<string, { path: string; title: string; modified: number; size: number }>();
+  const movies = new Map<
+    string,
+    { path: string; title: string; modified: number; size: number }
+  >();
   for (const directory of await memoryMovieDirectories()) {
-    const names = await fsPromises.readdir(directory).catch(() => [] as string[]);
+    const names = await fsPromises
+      .readdir(directory)
+      .catch(() => [] as string[]);
     for (const name of names) {
       if (!/\.mp4$/i.test(name) || name.startsWith(".")) continue;
       const storyKey = memoryMovieStoryKey(name);
@@ -9118,30 +10420,72 @@ ipcMain.handle("list-saved-memory-movies", async () => {
       const key = storyKey ? `story:${storyKey}` : `file:${name}`;
       const existing = movies.get(key);
       if (existing && existing.modified >= stat.mtimeMs) continue;
-      movies.set(key, { path: moviePath, title: titles[name] || titleFromMemoryMovieName(name), modified: stat.mtimeMs, size: stat.size });
+      movies.set(key, {
+        path: moviePath,
+        title: titles[name] || titleFromMemoryMovieName(name),
+        modified: stat.mtimeMs,
+        size: stat.size,
+      });
     }
   }
-  const finished = Array.from(movies.values()).sort((a, b) => b.modified - a.modified);
-  const editableIds = new Set(state.suggestions.filter((card) => !isCustomMemory(card)).map((card) => card.id));
-  const pending: Array<{ path: string; title: string; modified: number; size: number; pending: MemorySuggestion }> = [];
+  const finished = Array.from(movies.values()).sort(
+    (a, b) => b.modified - a.modified,
+  );
+  const editableIds = new Set(
+    state.suggestions
+      .filter((card) => !isCustomMemory(card))
+      .map((card) => card.id),
+  );
+  const pending: Array<{
+    path: string;
+    title: string;
+    modified: number;
+    size: number;
+    pending: MemorySuggestion;
+  }> = [];
   for (const [id, card] of memoryBookPending) {
-    if (editableIds.has(id) || await findMemoryMovie(card).catch(() => null)) { memoryBookPending.delete(id); continue; }
-    pending.push({ path: "", title: card.title, modified: Date.now(), size: 0, pending: card });
+    if (
+      editableIds.has(id) ||
+      (await findMemoryMovie(card).catch(() => null))
+    ) {
+      memoryBookPending.delete(id);
+      continue;
+    }
+    pending.push({
+      path: "",
+      title: card.title,
+      modified: Date.now(),
+      size: 0,
+      pending: card,
+    });
   }
   return [...pending, ...finished];
 });
 
-ipcMain.handle("reveal-saved-memory-movie", async (_event, moviePath: unknown) => {
-  if (typeof moviePath !== "string" || !/\.mp4$/i.test(moviePath)) return { ok: false, error: "Invalid movie." };
-  const resolved = path.resolve(moviePath);
-  const directories = await memoryMovieDirectories();
-  if (!directories.some((directory) => path.dirname(resolved) === path.resolve(directory)))
-    return { ok: false, error: "That movie is not in your memories folder." };
-  if (!await fsPromises.stat(resolved).then((stat) => stat.isFile(), () => false))
-    return { ok: false, error: "That movie was moved or deleted." };
-  shell.showItemInFolder(resolved);
-  return { ok: true };
-});
+ipcMain.handle(
+  "reveal-saved-memory-movie",
+  async (_event, moviePath: unknown) => {
+    if (typeof moviePath !== "string" || !/\.mp4$/i.test(moviePath))
+      return { ok: false, error: "Invalid movie." };
+    const resolved = path.resolve(moviePath);
+    const directories = await memoryMovieDirectories();
+    if (
+      !directories.some(
+        (directory) => path.dirname(resolved) === path.resolve(directory),
+      )
+    )
+      return { ok: false, error: "That movie is not in your memories folder." };
+    if (
+      !(await fsPromises.stat(resolved).then(
+        (stat) => stat.isFile(),
+        () => false,
+      ))
+    )
+      return { ok: false, error: "That movie was moved or deleted." };
+    shell.showItemInFolder(resolved);
+    return { ok: true };
+  },
+);
 
 ipcMain.handle("cancel-memory-export", () => {
   // Also covers the save dialog and pre-render checks, before the exporter has a controller.
@@ -9149,7 +10493,8 @@ ipcMain.handle("cancel-memory-export", () => {
   memoryExporter.cancel();
 });
 ipcMain.handle("export-memory", async (_event, rawOptions: unknown) => {
-  if (memoryExportRunning) return { ok: false, error: "Another memory movie is already rendering." };
+  if (memoryExportRunning)
+    return { ok: false, error: "Another memory movie is already rendering." };
   const options = memoryExportOptions(rawOptions);
   if (!options) return { ok: false, error: "Invalid movie settings." };
   memoryExportRunning = true;
@@ -9157,23 +10502,35 @@ ipcMain.handle("export-memory", async (_event, rawOptions: unknown) => {
   let scratch: string | null = null;
   try {
     const initial = await verifyMemoryExport(options);
-    if (!mainWindow || mainWindow.isDestroyed()) throw new Error("The app window is not available.");
+    if (!mainWindow || mainWindow.isDestroyed())
+      throw new Error("The app window is not available.");
     const destination = await dialog.showSaveDialog(mainWindow, {
       title: "Save memory movie",
       defaultPath: `${initial.suggestion.title.replace(/[^\p{L}\p{N} -]/gu, "").trim() || "Memory"}.mp4`,
       filters: [{ name: "Memory movie", extensions: ["mp4"] }],
     });
-    if (destination.canceled || !destination.filePath || memoryExportCancelRequested)
+    if (
+      destination.canceled ||
+      !destination.filePath ||
+      memoryExportCancelRequested
+    )
       return { ok: false, canceled: true };
     // Hidden folders, bans, or the audio index may have changed while the dialog was open.
     const { suggestion, soundtrack } = await verifyMemoryExport(options);
-    scratch = await fsPromises.mkdtemp(path.join(os.tmpdir(), "silo-memory-export-"));
+    scratch = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "silo-memory-export-"),
+    );
     if (memoryExportCancelRequested) return { ok: false, canceled: true };
     await runMemoryRender(async () => {
       memoryExportScratch = scratch;
       try {
-        await memoryExporter.render(suggestion, options, soundtrack, destination.filePath,
-          progress => sendToRenderer("memory-export-progress", progress));
+        await memoryExporter.render(
+          suggestion,
+          options,
+          soundtrack,
+          destination.filePath,
+          (progress) => sendToRenderer("memory-export-progress", progress),
+        );
       } finally {
         memoryExportScratch = null;
       }
@@ -9182,13 +10539,22 @@ ipcMain.handle("export-memory", async (_event, rawOptions: unknown) => {
     await memoryManager.markDownloaded(suggestion.id).catch(() => undefined);
     return { ok: true, path: destination.filePath };
   } catch (cause) {
-    if (memoryExportCancelRequested || cause instanceof MemoryExportCancelledError ||
-      (cause instanceof Error && cause.name === "AbortError"))
+    if (
+      memoryExportCancelRequested ||
+      cause instanceof MemoryExportCancelledError ||
+      (cause instanceof Error && cause.name === "AbortError")
+    )
       return { ok: false, canceled: true };
-    return { ok: false, error: cause instanceof Error ? cause.message : String(cause) };
+    return {
+      ok: false,
+      error: cause instanceof Error ? cause.message : String(cause),
+    };
   } finally {
     memoryExportScratch = null;
-    if (scratch) await fsPromises.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+    if (scratch)
+      await fsPromises
+        .rm(scratch, { recursive: true, force: true })
+        .catch(() => undefined);
     memoryExportRunning = false;
     memoryExportCancelRequested = false;
   }
@@ -9214,7 +10580,9 @@ ipcMain.handle("select-directory", async (_event, options: unknown) => {
   const result = await dialog.showOpenDialog(
     mainWindow,
     destinationPickerOptions(
-      typeof request.title === "string" ? request.title.slice(0, 120) : "Choose a folder",
+      typeof request.title === "string"
+        ? request.title.slice(0, 120)
+        : "Choose a folder",
       request.defaultPath,
     ),
   );
@@ -9229,10 +10597,14 @@ ipcMain.handle("select-source-clone-destination", async () => {
   if (!mainWindow) return [];
   const result = await dialog.showOpenDialog(
     mainWindow,
-    destinationPickerOptions("Choose one or more source-clone destinations", null, {
-      buttonLabel: "Choose destinations",
-      properties: ["multiSelections"],
-    }),
+    destinationPickerOptions(
+      "Choose one or more source-clone destinations",
+      null,
+      {
+        buttonLabel: "Choose destinations",
+        properties: ["multiSelections"],
+      },
+    ),
   );
   return !result.canceled ? result.filePaths : [];
 });
@@ -9253,7 +10625,11 @@ ipcMain.handle(
     try {
       const plan = await prepareSourceClone(
         cleanIds,
-        Array.isArray(destinations) ? destinations.filter((item): item is string => typeof item === "string") : [],
+        Array.isArray(destinations)
+          ? destinations.filter(
+              (item): item is string => typeof item === "string",
+            )
+          : [],
         operationId,
       );
       return { ok: true, plan };
@@ -9263,7 +10639,9 @@ ipcMain.handle(
       sendSourceCloneProgress({
         operationId,
         phase: message.includes("cancel") ? "cancelled" : "error",
-        destination: Array.isArray(destinations) ? destinations.filter((item) => typeof item === "string").join(" / ") : "",
+        destination: Array.isArray(destinations)
+          ? destinations.filter((item) => typeof item === "string").join(" / ")
+          : "",
         totalSources: cleanIds.length,
         totalFiles: 0,
         completedFiles: 0,
@@ -9279,143 +10657,238 @@ ipcMain.handle(
   },
 );
 
-ipcMain.handle("prepare-shelter-replica", async (_event, destinations: unknown, operationId: unknown) => {
-  const cleanDestinations = Array.isArray(destinations)
-    ? destinations.filter((item): item is string => typeof item === "string")
-    : [];
-  if (typeof operationId !== "string" || !operationId)
-    return { ok: false, error: "Invalid Fallout Shelter replica operation." };
-  try {
-    const plan = await prepareShelterReplica(cleanDestinations, operationId);
-    return { ok: true, plan };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    sourceCloneOperations.delete(operationId);
-    sendSourceCloneProgress({
+ipcMain.handle(
+  "prepare-shelter-replica",
+  async (_event, destinations: unknown, operationId: unknown) => {
+    const cleanDestinations = Array.isArray(destinations)
+      ? destinations.filter((item): item is string => typeof item === "string")
+      : [];
+    if (typeof operationId !== "string" || !operationId)
+      return { ok: false, error: "Invalid Fallout Shelter replica operation." };
+    try {
+      const plan = await prepareShelterReplica(cleanDestinations, operationId);
+      return { ok: true, plan };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sourceCloneOperations.delete(operationId);
+      sendSourceCloneProgress({
+        operationId,
+        phase: message.toLowerCase().includes("cancel") ? "cancelled" : "error",
+        destination: cleanDestinations.join(" / "),
+        totalSources: 1,
+        totalFiles: 0,
+        completedFiles: 0,
+        totalBytes: 0,
+        copiedBytes: 0,
+        verifiedFiles: 0,
+        failedFiles: 0,
+        currentFile: "",
+        message,
+      });
+      return { ok: false, error: message };
+    }
+  },
+);
+
+ipcMain.handle(
+  "start-source-clone",
+  async (_event, planId: unknown, options: unknown) => {
+    if (typeof planId !== "string")
+      return { ok: false, error: "Invalid clone plan." };
+    const compress = Boolean(
+      options &&
+      typeof options === "object" &&
+      (options as { compress?: unknown }).compress === true,
+    );
+    const createAppleCompatibleBackup = Boolean(
+      options &&
+      typeof options === "object" &&
+      (options as { createAppleCompatibleBackup?: unknown })
+        .createAppleCompatibleBackup === true,
+    );
+    const plan = sourceClonePlans.get(planId);
+    if (
+      createAppleCompatibleBackup &&
+      (!plan ||
+        plan.sourceIds.length !== 1 ||
+        plan.sourceIds[0] !== MAC_DATA_VOLUME_ROOT ||
+        !stateStore
+          .getState()
+          .indexSources.some(
+            (source) =>
+              source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine",
+          ))
+    )
+      return {
+        ok: false,
+        error:
+          "Time Machine can only be added to a clone of the registered This Mac source.",
+      };
+    try {
+      await runSourceClone(planId, { compress });
+      if (!createAppleCompatibleBackup) return { ok: true };
+      try {
+        await startConfiguredTimeMachineBackup(
+          MAC_DATA_VOLUME_ROOT,
+          stateStore
+            .getState()
+            .indexSources.some(
+              (source) =>
+                source.path === MAC_DATA_VOLUME_ROOT &&
+                source.kind === "machine",
+            ),
+        );
+        return { ok: true, timeMachineStarted: true };
+      } catch (error) {
+        return {
+          ok: true,
+          timeMachineError:
+            error instanceof Error ? error.message : String(error),
+        };
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
+);
+
+ipcMain.handle(
+  "start-machine-time-machine-backup",
+  async (_event, sourceId: unknown) => {
+    if (typeof sourceId !== "string" || sourceId !== MAC_DATA_VOLUME_ROOT)
+      return {
+        ok: false,
+        error: "Time Machine can only be requested for This Mac.",
+      };
+    const sourceRegistered =
+      process.platform === "darwin" &&
+      stateStore
+        .getState()
+        .indexSources.some(
+          (source) =>
+            source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine",
+        );
+    try {
+      await startConfiguredTimeMachineBackup(sourceId, sourceRegistered);
+      return { ok: true, timeMachineStarted: true };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
+);
+
+ipcMain.handle(
+  "extract-source-clone-archive",
+  async (_event, operationId: unknown) => {
+    if (typeof operationId !== "string" || !operationId)
+      return { ok: false, error: "Invalid extraction operation." };
+    if (!mainWindow)
+      return { ok: false, error: "Silo's window is not available." };
+    const archiveChoice = await dialog.showOpenDialog(mainWindow, {
+      title: "Choose a compressed Silo clone (.zip) to extract",
+      buttonLabel: "Choose archive",
+      properties: ["openFile"],
+      filters: [{ name: "Silo clone archive", extensions: ["zip"] }],
+    });
+    if (archiveChoice.canceled || !archiveChoice.filePaths[0])
+      return { ok: false, cancelled: true };
+    const archivePath = archiveChoice.filePaths[0];
+    const destinationChoice = await dialog.showOpenDialog(mainWindow, {
+      title: "Choose where to extract the clone",
+      buttonLabel: "Extract here",
+      defaultPath: path.dirname(archivePath),
+      properties: ["openDirectory", "createDirectory"],
+    });
+    if (destinationChoice.canceled || !destinationChoice.filePaths[0])
+      return { ok: false, cancelled: true };
+    const destinationParent = destinationChoice.filePaths[0];
+    const operation = { cancelled: false };
+    sourceCloneOperations.set(operationId, operation);
+    const base = {
       operationId,
-      phase: message.toLowerCase().includes("cancel") ? "cancelled" : "error",
-      destination: cleanDestinations.join(" / "),
       totalSources: 1,
-      totalFiles: 0,
       completedFiles: 0,
       totalBytes: 0,
       copiedBytes: 0,
       verifiedFiles: 0,
       failedFiles: 0,
+      totalFiles: 0,
       currentFile: "",
-      message,
+    };
+    sendSourceCloneProgress({
+      ...base,
+      phase: "scanning",
+      destination: destinationParent,
+      message: `Reading ${path.basename(archivePath)}…`,
     });
-    return { ok: false, error: message };
-  }
-});
-
-ipcMain.handle("start-source-clone", async (_event, planId: unknown, options: unknown) => {
-  if (typeof planId !== "string")
-    return { ok: false, error: "Invalid clone plan." };
-  const compress = Boolean(options && typeof options === "object" &&
-    (options as { compress?: unknown }).compress === true);
-  const createAppleCompatibleBackup = Boolean(options && typeof options === "object" &&
-    (options as { createAppleCompatibleBackup?: unknown }).createAppleCompatibleBackup === true);
-  const plan = sourceClonePlans.get(planId);
-  if (createAppleCompatibleBackup &&
-      (!plan || plan.sourceIds.length !== 1 || plan.sourceIds[0] !== MAC_DATA_VOLUME_ROOT ||
-        !stateStore.getState().indexSources.some((source) => source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine")))
-    return { ok: false, error: "Time Machine can only be added to a clone of the registered This Mac source." };
-  try {
-    await runSourceClone(planId, { compress });
-    if (!createAppleCompatibleBackup) return { ok: true };
+    let lastProgressAt = 0;
     try {
-      await startConfiguredTimeMachineBackup(
-        MAC_DATA_VOLUME_ROOT,
-        stateStore.getState().indexSources.some((source) => source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine"),
-      );
-      return { ok: true, timeMachineStarted: true };
-    } catch (error) {
+      const result = await extractCloneArchive(archivePath, destinationParent, {
+        isCancelled: () => operation.cancelled,
+        onProgress: (progress) => {
+          const now = Date.now();
+          if (now - lastProgressAt < 350) return;
+          lastProgressAt = now;
+          sendSourceCloneProgress({
+            ...base,
+            phase: "copying",
+            destination: destinationParent,
+            totalFiles: progress.totalFiles,
+            completedFiles: progress.processedFiles,
+            verifiedFiles: progress.processedFiles,
+            totalBytes: progress.totalBytes,
+            copiedBytes: progress.processedBytes,
+            currentFile: progress.currentFile,
+            message: `Extracting and verifying ${progress.currentFile}`,
+          });
+        },
+      });
+      sendSourceCloneProgress({
+        ...base,
+        phase: "complete",
+        destination: result.destinationRoot,
+        totalFiles: result.extractedFiles,
+        completedFiles: result.extractedFiles,
+        verifiedFiles: result.extractedFiles,
+        totalBytes: result.totalBytes,
+        copiedBytes: result.totalBytes,
+        message:
+          `Extracted ${result.extractedFiles.toLocaleString()} files (SHA-256 verified) and ` +
+          `${result.restoredAliases.toLocaleString()} duplicate paths to ${result.destinationRoot}.`,
+      });
+      runtimeLog("source-clone-archive-extracted", {
+        files: result.extractedFiles,
+        aliases: result.restoredAliases,
+      });
       return {
         ok: true,
-        timeMachineError: error instanceof Error ? error.message : String(error),
+        destinationRoot: result.destinationRoot,
+        extractedFiles: result.extractedFiles,
       };
+    } catch (error) {
+      const message = operation.cancelled
+        ? "Extraction cancelled; the partially extracted folder was removed."
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      sendSourceCloneProgress({
+        ...base,
+        phase: operation.cancelled ? "cancelled" : "error",
+        destination: destinationParent,
+        message,
+      });
+      return { ok: false, error: message, cancelled: operation.cancelled };
+    } finally {
+      sourceCloneOperations.delete(operationId);
     }
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-});
-
-ipcMain.handle("start-machine-time-machine-backup", async (_event, sourceId: unknown) => {
-  if (typeof sourceId !== "string" || sourceId !== MAC_DATA_VOLUME_ROOT)
-    return { ok: false, error: "Time Machine can only be requested for This Mac." };
-  const sourceRegistered = process.platform === "darwin" &&
-    stateStore.getState().indexSources.some((source) => source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine");
-  try {
-    await startConfiguredTimeMachineBackup(sourceId, sourceRegistered);
-    return { ok: true, timeMachineStarted: true };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
-
-ipcMain.handle("extract-source-clone-archive", async (_event, operationId: unknown) => {
-  if (typeof operationId !== "string" || !operationId)
-    return { ok: false, error: "Invalid extraction operation." };
-  if (!mainWindow) return { ok: false, error: "Silo's window is not available." };
-  const archiveChoice = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose a compressed Silo clone (.zip) to extract",
-    buttonLabel: "Choose archive",
-    properties: ["openFile"],
-    filters: [{ name: "Silo clone archive", extensions: ["zip"] }],
-  });
-  if (archiveChoice.canceled || !archiveChoice.filePaths[0]) return { ok: false, cancelled: true };
-  const archivePath = archiveChoice.filePaths[0];
-  const destinationChoice = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose where to extract the clone",
-    buttonLabel: "Extract here",
-    defaultPath: path.dirname(archivePath),
-    properties: ["openDirectory", "createDirectory"],
-  });
-  if (destinationChoice.canceled || !destinationChoice.filePaths[0]) return { ok: false, cancelled: true };
-  const destinationParent = destinationChoice.filePaths[0];
-  const operation = { cancelled: false };
-  sourceCloneOperations.set(operationId, operation);
-  const base = { operationId, totalSources: 1, completedFiles: 0, totalBytes: 0, copiedBytes: 0,
-    verifiedFiles: 0, failedFiles: 0, totalFiles: 0, currentFile: "" };
-  sendSourceCloneProgress({ ...base, phase: "scanning", destination: destinationParent,
-    message: `Reading ${path.basename(archivePath)}…` });
-  let lastProgressAt = 0;
-  try {
-    const result = await extractCloneArchive(archivePath, destinationParent, {
-      isCancelled: () => operation.cancelled,
-      onProgress: (progress) => {
-        const now = Date.now();
-        if (now - lastProgressAt < 350) return;
-        lastProgressAt = now;
-        sendSourceCloneProgress({ ...base, phase: "copying", destination: destinationParent,
-          totalFiles: progress.totalFiles, completedFiles: progress.processedFiles,
-          verifiedFiles: progress.processedFiles, totalBytes: progress.totalBytes,
-          copiedBytes: progress.processedBytes, currentFile: progress.currentFile,
-          message: `Extracting and verifying ${progress.currentFile}` });
-      },
-    });
-    sendSourceCloneProgress({ ...base, phase: "complete", destination: result.destinationRoot,
-      totalFiles: result.extractedFiles, completedFiles: result.extractedFiles, verifiedFiles: result.extractedFiles,
-      totalBytes: result.totalBytes, copiedBytes: result.totalBytes,
-      message: `Extracted ${result.extractedFiles.toLocaleString()} files (SHA-256 verified) and ` +
-        `${result.restoredAliases.toLocaleString()} duplicate paths to ${result.destinationRoot}.` });
-    runtimeLog("source-clone-archive-extracted", { files: result.extractedFiles, aliases: result.restoredAliases });
-    return { ok: true, destinationRoot: result.destinationRoot, extractedFiles: result.extractedFiles };
-  } catch (error) {
-    const message = operation.cancelled
-      ? "Extraction cancelled; the partially extracted folder was removed."
-      : error instanceof Error ? error.message : String(error);
-    sendSourceCloneProgress({ ...base, phase: operation.cancelled ? "cancelled" : "error",
-      destination: destinationParent, message });
-    return { ok: false, error: message, cancelled: operation.cancelled };
-  } finally {
-    sourceCloneOperations.delete(operationId);
-  }
-});
+  },
+);
 
 ipcMain.handle("cancel-source-clone", (_event, operationId: unknown) => {
   if (typeof operationId !== "string") return false;
@@ -9599,7 +11072,9 @@ ipcMain.handle(
             ...file,
             sourceId: owningSource?.id,
             sourceLabel: owningSource?.label,
-            ...(owningSource?.snapshotAt ? { sourceSnapshotAt: owningSource.snapshotAt } : {}),
+            ...(owningSource?.snapshotAt
+              ? { sourceSnapshotAt: owningSource.snapshotAt }
+              : {}),
           })),
         );
       } catch (error) {
@@ -9731,7 +11206,10 @@ ipcMain.handle("get-audio-library-cache", async () => {
 
 async function refreshAudioInventory(requestId: number, force = false) {
   if (!indexStorageAvailable)
-    return { ok: false, error: indexStorageUnavailableMessage ?? "Index storage is unavailable." };
+    return {
+      ok: false,
+      error: indexStorageUnavailableMessage ?? "Index storage is unavailable.",
+    };
   if (!audioLibraryCache || typeof requestId !== "number")
     return { ok: false, error: "Audio library is unavailable." };
   const availableSources = (await listSources()).filter(
@@ -9924,8 +11402,7 @@ ipcMain.handle("get-file-preview", async (_event, filePath: string) => {
         });
       }
     }
-    const playablePath =
-      playableAudio?.path ?? playableVideo?.path ?? filePath;
+    const playablePath = playableAudio?.path ?? playableVideo?.path ?? filePath;
     const documentPreview =
       !mimeType?.startsWith("image/") && !isMedia
         ? await getDocumentPreview(localPath, path.basename(filePath), mimeType)
@@ -9946,7 +11423,8 @@ ipcMain.handle("get-file-preview", async (_event, filePath: string) => {
           ? "video/mp4"
           : mime.getType(playablePath),
       playbackError,
-      transcoded: playableAudio?.transcoded ?? playableVideo?.transcoded ?? false,
+      transcoded:
+        playableAudio?.transcoded ?? playableVideo?.transcoded ?? false,
       documentPreview,
     };
   } catch (err) {
@@ -10113,9 +11591,12 @@ ipcMain.handle("get-search-performance-settings", () =>
 ipcMain.handle(
   "update-search-performance-settings",
   async (_event, update: unknown) => {
-    const snapshot = await contentSettingsStore.updateSearchPerformanceSettings(update);
+    const snapshot =
+      await contentSettingsStore.updateSearchPerformanceSettings(update);
     semanticIndexer?.setPerformanceSettings(snapshot.settings);
-    faceIndexer?.setBackgroundWorkPercent(snapshot.settings.backgroundWorkPercent);
+    faceIndexer?.setBackgroundWorkPercent(
+      snapshot.settings.backgroundWorkPercent,
+    );
     return snapshot;
   },
 );
@@ -10237,11 +11718,7 @@ ipcMain.handle("import-config", async (event) => {
 
 ipcMain.handle("apply-config-import", async () => {
   await commitStagedImport(app.getPath("userData"));
-  relaunchAppWithDiagnostics("config-import");
-  runtimeLog(
-    "app-lifecycle-before-exit",
-    lifecycleDiagnosticSnapshot("config-import", mainWindow),
-  );
+  app.relaunch();
   app.exit(0);
 });
 
@@ -10298,8 +11775,7 @@ ipcMain.handle("clear-duplicate-trash", async (_event, ids?: string[]) => {
       (item) => !remainingIds.has(item.id),
     ).length;
     await recordDemoDuplicateDeletes(deletedCount);
-    if (exceedsLimit)
-      notifyDemoLimitReached("duplicateDeletes");
+    if (exceedsLimit) notifyDemoLimitReached("duplicateDeletes");
     return result;
   });
   demoDuplicateDeleteQueue = deletion.then(
@@ -10309,40 +11785,8 @@ ipcMain.handle("clear-duplicate-trash", async (_event, ids?: string[]) => {
   return deletion;
 });
 
-ipcMain.handle(
-  "update-ui-state",
-  async (_event, update, diagnosticUi: DiagnosticUiUpdate = {}) => {
-    const state = await stateStore.updateUi(update);
-    const now = Date.now();
-    if (now - lastUiDiagnosticStateUpdatedAt >= 1000) {
-      const ui = state.ui;
-      const safeDiagnosticUi =
-        diagnosticUi && typeof diagnosticUi === "object" ? diagnosticUi : {};
-      const viewMode = ui.viewMode === "list" ? "list" : "grid";
-      const section = safeDiagnosticUi.section;
-      lastKnownUiDiagnosticState = {
-        section:
-          typeof section === "string" && DIAGNOSTIC_APP_SECTIONS.has(section as DiagnosticAppSection)
-            ? (section as DiagnosticAppSection)
-            : lastKnownUiDiagnosticState.section,
-        pathSet: typeof ui.currentPath === "string" && ui.currentPath.length > 0,
-        viewMode,
-        sortField: DIAGNOSTIC_SORT_FIELDS.has(ui.sortField) ? ui.sortField : "unknown",
-        ascending: ui.sortAscending === true,
-        typeFilterActive: typeof ui.includedType === "string" && ui.includedType !== "all" && ui.includedType.length > 0,
-        filterPanelOpen: ui.showFilters === true,
-        exploded: ui.exploded === true,
-        searchActive: typeof safeDiagnosticUi.searchActive === "boolean"
-          ? safeDiagnosticUi.searchActive
-          : lastKnownUiDiagnosticState.searchActive,
-        viewerOpen: typeof safeDiagnosticUi.viewerOpen === "boolean"
-          ? safeDiagnosticUi.viewerOpen
-          : lastKnownUiDiagnosticState.viewerOpen,
-      };
-      lastUiDiagnosticStateUpdatedAt = now;
-    }
-    return state;
-  },
+ipcMain.handle("update-ui-state", async (_event, update) =>
+  stateStore.updateUi(update),
 );
 
 ipcMain.handle("select-index-source", async () => {
@@ -10373,13 +11817,21 @@ ipcMain.handle("select-index-source", async () => {
 
 ipcMain.handle("add-machine-source", async () => {
   if (process.platform !== "darwin") return null;
-  if (!(await fsPromises.access(MAC_DATA_VOLUME_ROOT, fs.constants.R_OK).then(() => true, () => false)))
+  if (
+    !(await fsPromises.access(MAC_DATA_VOLUME_ROOT, fs.constants.R_OK).then(
+      () => true,
+      () => false,
+    ))
+  )
     return null;
-  const existing = stateStore.getState().indexSources.some(
-    (source) => source.path === MAC_DATA_VOLUME_ROOT,
-  );
-  if (!fullAccessEnabled() && !existing &&
-      (await getDemoSourceCount()) >= DEMO_LIMITS.sources) {
+  const existing = stateStore
+    .getState()
+    .indexSources.some((source) => source.path === MAC_DATA_VOLUME_ROOT);
+  if (
+    !fullAccessEnabled() &&
+    !existing &&
+    (await getDemoSourceCount()) >= DEMO_LIMITS.sources
+  ) {
     notifyDemoLimitReached("sources");
     return null;
   }
@@ -10419,16 +11871,9 @@ ipcMain.handle("start-indexing", async () => {
 });
 
 ipcMain.handle("pause-indexing", async () => {
-  if (indexRecovery) await indexRecovery.pauseStage("search");
-  else await semanticIndexer.pause();
+  indexRecovery?.pause("search");
+  await semanticIndexer.pause();
   return semanticIndexer.getProgress();
-});
-
-ipcMain.handle("pause-indexing-stage", async (_event, id: unknown) => {
-  if (typeof id !== "string" || !indexRecovery)
-    throw new Error("Index recovery is not ready.");
-  await indexRecovery.pauseStage(id);
-  return { ok: true };
 });
 
 const semanticSearchGenerations = new WeakMap<object, number>();
@@ -10448,8 +11893,11 @@ ipcMain.handle(
     const sender = event.sender;
     const generation = supersedeSemanticSearch(sender);
     const isCancelled = () =>
-      sender.isDestroyed() || semanticSearchGenerations.get(sender) !== generation;
-    const progressRequestId = Number.isSafeInteger(requestId) ? requestId : generation;
+      sender.isDestroyed() ||
+      semanticSearchGenerations.get(sender) !== generation;
+    const progressRequestId = Number.isSafeInteger(requestId)
+      ? requestId
+      : generation;
     const contentSettings = contentSettingsStore.getPublicSettings();
     if (contentSettings.safeSearch && containsExplicitTerms(query))
       throw new Error(
@@ -10504,16 +11952,17 @@ ipcMain.handle(
       for (const [filePath, match] of priorityMatches) {
         const semanticResult = semanticResultsByPath.get(filePath);
         allResults.set(filePath, {
-          ...(semanticResult || match.file || {
-            name: path.basename(filePath),
-            path: filePath,
-            relativePath: filePath,
-            size: 0,
-            modified: Date.now(),
-            isDirectory: false,
-            type: "image",
-            extension: path.extname(filePath).slice(1),
-          }),
+          ...(semanticResult ||
+            match.file || {
+              name: path.basename(filePath),
+              path: filePath,
+              relativePath: filePath,
+              size: 0,
+              modified: Date.now(),
+              isDirectory: false,
+              type: "image",
+              extension: path.extname(filePath).slice(1),
+            }),
           ...(match.name ? { name: match.name } : {}),
           confidence: undefined,
           _priority: match.priority,
@@ -10530,8 +11979,12 @@ ipcMain.handle(
       );
       if (isCancelled()) return [];
       return filterForContentSafety(activeResults).sort((first, second) => {
-        const priorityDifference = (first._priority ?? 3) - (second._priority ?? 3);
-        return priorityDifference || (second.confidence ?? 0) - (first.confidence ?? 0);
+        const priorityDifference =
+          (first._priority ?? 3) - (second._priority ?? 3);
+        return (
+          priorityDifference ||
+          (second.confidence ?? 0) - (first.confidence ?? 0)
+        );
       });
     };
 
@@ -10595,16 +12048,22 @@ ipcMain.handle(
           addPriorityMatch(
             file.path,
             lowerName === normalizedQuery ? 0 : nameMatches ? 1 : 2,
-            nameMatches ? "Name match" : pathMatches ? "Path match" : "Name match",
+            nameMatches
+              ? "Name match"
+              : pathMatches
+                ? "Path match"
+                : "Name match",
             undefined,
             file,
           );
         }
         const now = Date.now();
-        if (
-          files.length > 0 || capped
-        ) {
-          if (!hasPublishedTextMatches || now - lastTextPublishAt >= 120 || capped) {
+        if (files.length > 0 || capped) {
+          if (
+            !hasPublishedTextMatches ||
+            now - lastTextPublishAt >= 120 ||
+            capped
+          ) {
             hasPublishedTextMatches = true;
             lastTextPublishAt = now;
             publishProgress("searching");
@@ -10648,7 +12107,8 @@ ipcMain.handle(
         if (
           entry.sourceType === "person" ||
           !entry.name.toLowerCase().includes(normalizedQuery)
-        ) continue;
+        )
+          continue;
         for (const fileEntry of entry.filePaths) {
           addPriorityMatch(fileEntry.path, 1, `Named as: ${entry.name}`);
           if (entry.sourceType === "pet") matchingPetPaths.add(fileEntry.path);
@@ -10938,17 +12398,31 @@ ipcMain.handle("retry-indexing-stage", async (_event, id: unknown) => {
   await indexRecovery.retry(id);
   return { ok: true };
 });
-async function collectShelterSourceFiles(source: BrowseSource, operationId: string) {
-  const files: Array<ShelterSourceFile & { size: number; modified: number }> = [];
+async function collectShelterSourceFiles(
+  source: BrowseSource,
+  operationId: string,
+) {
+  const files: Array<ShelterSourceFile & { size: number; modified: number }> =
+    [];
   const fingerprint = new InventoryFingerprint();
-  const add = (relativePath: string, localPath: string, size: number, modified: number) => {
+  const add = (
+    relativePath: string,
+    localPath: string,
+    size: number,
+    modified: number,
+  ) => {
     files.push({ relativePath, localPath, size, modified });
     fingerprint.add(relativePath, size, modified);
   };
   if (source.kind === "local" || source.kind === "machine") {
     await listLocalCloneEntries(source.rootPath, operationId, (entry) => {
       if (!entry.isDirectory && entry.localPath)
-        add(entry.destinationRelativePath, entry.localPath, entry.size, entry.modified);
+        add(
+          entry.destinationRelativePath,
+          entry.localPath,
+          entry.size,
+          entry.modified,
+        );
     });
   } else {
     const remoteEntries = phoneManager.isPhonePath(source.rootPath)
@@ -10959,8 +12433,13 @@ async function collectShelterSourceFiles(source: BrowseSource, operationId: stri
       if (remote.isDirectory) continue;
       const localPath = await resolveLocalPath(remote.path);
       const stats = await fsPromises.stat(localPath);
-      const size = Number.isFinite(remote.size) && remote.size >= 0 ? remote.size : stats.size;
-      const modified = Number.isFinite(remote.modified) ? remote.modified : stats.mtimeMs;
+      const size =
+        Number.isFinite(remote.size) && remote.size >= 0
+          ? remote.size
+          : stats.size;
+      const modified = Number.isFinite(remote.modified)
+        ? remote.modified
+        : stats.mtimeMs;
       add(remote.relativePath || remote.name, localPath, size, modified);
     }
   }
@@ -10974,16 +12453,22 @@ async function findLatestCompleteShelterClone(
 ) {
   const candidates: Array<{ path: string; modified: number }> = [];
   for (const clonePath of new Set(clonePaths)) {
-    if (path.resolve(path.dirname(clonePath)) !== path.resolve(destination)) continue;
+    if (path.resolve(path.dirname(clonePath)) !== path.resolve(destination))
+      continue;
     try {
       const [stats, linkStats, resolved] = await Promise.all([
         fsPromises.stat(clonePath),
         fsPromises.lstat(clonePath),
         fsPromises.realpath(clonePath),
       ]);
-      const isArchive = path.extname(clonePath).toLowerCase() === CLONE_ARCHIVE_EXTENSION;
-      if (linkStats.isSymbolicLink() || (isArchive ? !stats.isFile() : !stats.isDirectory()) ||
-          path.dirname(resolved) !== path.resolve(destination)) continue;
+      const isArchive =
+        path.extname(clonePath).toLowerCase() === CLONE_ARCHIVE_EXTENSION;
+      if (
+        linkStats.isSymbolicLink() ||
+        (isArchive ? !stats.isFile() : !stats.isDirectory()) ||
+        path.dirname(resolved) !== path.resolve(destination)
+      )
+        continue;
       candidates.push({ path: clonePath, modified: stats.mtimeMs });
     } catch {
       continue;
@@ -10993,9 +12478,10 @@ async function findLatestCompleteShelterClone(
   for (const candidate of candidates) {
     try {
       const manifest = await readShelterCloneManifest(candidate.path);
-      const containsSource = [...(manifest.files as Array<Record<string, unknown>>),
-        ...(manifest.aliases as Array<Record<string, unknown>>)]
-        .some((entry) => entry.sourceId === sourceId);
+      const containsSource = [
+        ...(manifest.files as Array<Record<string, unknown>>),
+        ...(manifest.aliases as Array<Record<string, unknown>>),
+      ].some((entry) => entry.sourceId === sourceId);
       if (containsSource) return candidate.path;
     } catch {
       continue;
@@ -11007,14 +12493,26 @@ async function findLatestCompleteShelterClone(
 async function verifyShelterSources(sourceIds: string[]) {
   const destinationState = await getShelterDestinationState();
   if (!destinationState.destination)
-    throw new Error("Choose a Fallout Shelter destination before verifying backups.");
+    throw new Error(
+      "Choose a Fallout Shelter destination before verifying backups.",
+    );
   if (!destinationState.available)
-    throw new Error("The selected Fallout Shelter destination is not connected and readable.");
+    throw new Error(
+      "The selected Fallout Shelter destination is not connected and readable.",
+    );
   const destination = destinationState.destination;
   const registeredSources = await listSources();
-  const selected = registeredSources.filter((source) => sourceIds.includes(source.id));
-  if (!sourceIds.length || selected.length !== new Set(sourceIds).size || selected.some((source) => !source.available))
-    throw new Error("Select only connected, available sources before verifying backups.");
+  const selected = registeredSources.filter((source) =>
+    sourceIds.includes(source.id),
+  );
+  if (
+    !sourceIds.length ||
+    selected.length !== new Set(sourceIds).size ||
+    selected.some((source) => !source.available)
+  )
+    throw new Error(
+      "Select only connected, available sources before verifying backups.",
+    );
 
   const operationId = `shelter-audit-${Date.now()}-${randomBytes(4).toString("hex")}`;
   sourceCloneOperations.set(operationId, { cancelled: false });
@@ -11025,7 +12523,10 @@ async function verifyShelterSources(sourceIds: string[]) {
       const previousAudit = previous?.shelterAudits?.[destination];
       let audit: NonNullable<SourceCloneStatusRecord["shelterAudits"]>[string];
       try {
-        const { files, fingerprint } = await collectShelterSourceFiles(source, operationId);
+        const { files, fingerprint } = await collectShelterSourceFiles(
+          source,
+          operationId,
+        );
         const clonePath = await findLatestCompleteShelterClone(
           source.id,
           destination,
@@ -11040,11 +12541,18 @@ async function verifyShelterSources(sourceIds: string[]) {
             verifiedFiles: 0,
             totalFiles: files.length,
             sourceFingerprint: fingerprint,
-            message: "No complete source clone was found in the selected shelter destination.",
+            message:
+              "No complete source clone was found in the selected shelter destination.",
           };
         } else {
-          const result = await verifyShelterCloneSource(clonePath, source.id, files);
-          const verifiedAt = result.verified ? Date.now() : previousAudit?.lastFullyVerifiedAt ?? null;
+          const result = await verifyShelterCloneSource(
+            clonePath,
+            source.id,
+            files,
+          );
+          const verifiedAt = result.verified
+            ? Date.now()
+            : (previousAudit?.lastFullyVerifiedAt ?? null);
           audit = {
             clonePath,
             lastFullyVerifiedAt: verifiedAt,
@@ -11052,10 +12560,14 @@ async function verifyShelterSources(sourceIds: string[]) {
             lastResult: result.verified ? "verified" : "mismatch",
             verifiedFiles: result.verifiedFiles,
             totalFiles: result.totalFiles,
-            sourceFingerprint: result.verified ? fingerprint : previousAudit?.sourceFingerprint,
-            message: result.error ?? (result.verified
-              ? undefined
-              : `${result.missingFiles} missing · ${result.changedFiles} changed · ${result.extraFiles} extra`),
+            sourceFingerprint: result.verified
+              ? fingerprint
+              : previousAudit?.sourceFingerprint,
+            message:
+              result.error ??
+              (result.verified
+                ? undefined
+                : `${result.missingFiles} missing · ${result.changedFiles} changed · ${result.extraFiles} extra`),
           };
         }
       } catch (error) {
@@ -11067,7 +12579,10 @@ async function verifyShelterSources(sourceIds: string[]) {
           verifiedFiles: 0,
           totalFiles: previousAudit?.totalFiles ?? 0,
           sourceFingerprint: previousAudit?.sourceFingerprint,
-          message: error instanceof Error ? error.message : "The shelter verification failed.",
+          message:
+            error instanceof Error
+              ? error.message
+              : "The shelter verification failed.",
         };
       }
       await persistSourceCloneStatus({
@@ -11090,9 +12605,27 @@ async function verifyShelterSources(sourceIds: string[]) {
 
 async function getLibraryDashboardSnapshot() {
   const registeredSources = await listSources();
-  const sourceInputs = registeredSources.map(({ id, label, kind, rootPath, available, offlineBackup, snapshotAt, message }) => ({
-    id, label, kind, rootPath, available, offlineBackup, snapshotAt, message,
-  }));
+  const sourceInputs = registeredSources.map(
+    ({
+      id,
+      label,
+      kind,
+      rootPath,
+      available,
+      offlineBackup,
+      snapshotAt,
+      message,
+    }) => ({
+      id,
+      label,
+      kind,
+      rootPath,
+      available,
+      offlineBackup,
+      snapshotAt,
+      message,
+    }),
+  );
   const inventory = libraryStatsManager?.getSnapshot(sourceInputs);
   const cloneStatus = await getSourceCloneStatus();
   const destinationState = await getShelterDestinationState();
@@ -11101,18 +12634,45 @@ async function getLibraryDashboardSnapshot() {
   const sources = (inventory?.sources ?? []).map((source) => {
     const clone = cloneStatus?.[source.id];
     const sourceIndex = semanticIndexer?.getIndexSummary([source.rootPath]);
-    const audit = destinationKey ? clone?.shelterAudits?.[destinationKey] : undefined;
-    const hasCloneInDestination = Boolean(destinationKey && clone?.destinations?.some(
-      (clonePath) => path.resolve(path.dirname(clonePath)) === destinationKey,
-    ));
+    const audit = destinationKey
+      ? clone?.shelterAudits?.[destinationKey]
+      : undefined;
+    const hasCloneInDestination = Boolean(
+      destinationKey &&
+      clone?.destinations?.some(
+        (clonePath) => path.resolve(path.dirname(clonePath)) === destinationKey,
+      ),
+    );
     const hasVerifiedCopy = Number(audit?.lastFullyVerifiedAt) > 0;
-    let shelterState: "unprotected" | "verified" | "changed" | "checking" | "offline" | "unknown";
-    if (audit && audit.lastResult !== "verified") shelterState = audit.lastResult === "missing" && !hasVerifiedCopy ? "unprotected" : "changed";
-    else if (destination && !destinationState.available) shelterState = hasVerifiedCopy || hasCloneInDestination ? "offline" : "unprotected";
-    else if (!hasVerifiedCopy) shelterState = hasCloneInDestination ? "unknown" : "unprotected";
+    let shelterState:
+      | "unprotected"
+      | "verified"
+      | "changed"
+      | "checking"
+      | "offline"
+      | "unknown";
+    if (audit && audit.lastResult !== "verified")
+      shelterState =
+        audit.lastResult === "missing" && !hasVerifiedCopy
+          ? "unprotected"
+          : "changed";
+    else if (destination && !destinationState.available)
+      shelterState =
+        hasVerifiedCopy || hasCloneInDestination ? "offline" : "unprotected";
+    else if (!hasVerifiedCopy)
+      shelterState = hasCloneInDestination ? "unknown" : "unprotected";
     else if (source.status === "offline") shelterState = "offline";
-    else if (source.status === "scanning" || source.status === "pending" || source.status === "error") shelterState = "checking";
-    else shelterState = audit?.sourceFingerprint === source.fingerprint ? "verified" : "changed";
+    else if (
+      source.status === "scanning" ||
+      source.status === "pending" ||
+      source.status === "error"
+    )
+      shelterState = "checking";
+    else
+      shelterState =
+        audit?.sourceFingerprint === source.fingerprint
+          ? "verified"
+          : "changed";
     return {
       ...source,
       hasVerifiedCopy,
@@ -11128,7 +12688,9 @@ async function getLibraryDashboardSnapshot() {
           verifiedFiles: backupAudit.verifiedFiles,
           totalFiles: backupAudit.totalFiles,
         }))
-        .sort((left, right) => left.destination.localeCompare(right.destination)),
+        .sort((left, right) =>
+          left.destination.localeCompare(right.destination),
+        ),
       shelterAuditResult: audit?.lastResult ?? null,
       shelterAuditMessage: audit?.message ?? "",
       shelterVerifiedFiles: audit?.verifiedFiles ?? 0,
@@ -11138,9 +12700,12 @@ async function getLibraryDashboardSnapshot() {
       indexingErrors: sourceIndex?.errors ?? 0,
     };
   });
-  const verifiedSources = sources.filter((source) =>
-    source.shelterState === "verified" ||
-    (source.shelterState === "offline" && source.hasVerifiedCopy && source.shelterAuditResult === "verified"),
+  const verifiedSources = sources.filter(
+    (source) =>
+      source.shelterState === "verified" ||
+      (source.shelterState === "offline" &&
+        source.hasVerifiedCopy &&
+        source.shelterAuditResult === "verified"),
   ).length;
   const freshnessOrder: Record<string, number> = {
     unknown: 0,
@@ -11150,24 +12715,47 @@ async function getLibraryDashboardSnapshot() {
     red: 4,
     "blinking-red": 5,
   };
-  const freshness = sources
-    .filter((source) => source.hasVerifiedCopy)
-    .map((source) => source.shelterFreshness)
-    .sort((left, right) => freshnessOrder[right] - freshnessOrder[left])[0] ?? "unknown";
-  const latestShelterSnapshot = destination ? await findLatestShelterSnapshot() : null;
+  const freshness =
+    sources
+      .filter((source) => source.hasVerifiedCopy)
+      .map((source) => source.shelterFreshness)
+      .sort((left, right) => freshnessOrder[right] - freshnessOrder[left])[0] ??
+    "unknown";
+  const latestShelterSnapshot = destination
+    ? await findLatestShelterSnapshot()
+    : null;
   const eligibleRoots: string[] = [];
   for (const source of registeredSources) {
     if (
-      source.available && source.rootPath.trim() &&
+      source.available &&
+      source.rootPath.trim() &&
       !(await isSiloInternalRoot(source.rootPath))
-    ) eligibleRoots.push(source.rootPath);
+    )
+      eligibleRoots.push(source.rootPath);
   }
   const globalIndex = semanticIndexer?.getIndexSummary(eligibleRoots);
   return {
     ...(inventory ?? {
       running: false,
-      progress: { currentSourceId: null, currentSource: "", sourceIndex: 0, sourceCount: 0, scannedEntries: 0, currentSourceFiles: 0, message: "Inventory statistics are loading." },
-      totals: { fileCount: 0, totalBytes: 0, unknownSizeFiles: 0, categories: {}, sourceCount: registeredSources.length, uniqueSourceCount: 0, staleSourceCount: registeredSources.length, lastInventoryAt: 0 },
+      progress: {
+        currentSourceId: null,
+        currentSource: "",
+        sourceIndex: 0,
+        sourceCount: 0,
+        scannedEntries: 0,
+        currentSourceFiles: 0,
+        message: "Inventory statistics are loading.",
+      },
+      totals: {
+        fileCount: 0,
+        totalBytes: 0,
+        unknownSizeFiles: 0,
+        categories: {},
+        sourceCount: registeredSources.length,
+        uniqueSourceCount: 0,
+        staleSourceCount: registeredSources.length,
+        lastInventoryAt: 0,
+      },
       sources: [],
     }),
     sources,
@@ -11179,14 +12767,18 @@ async function getLibraryDashboardSnapshot() {
       snapshotAvailable: Boolean(latestShelterSnapshot),
       replicas: Object.entries(cloneStatus ?? {})
         .filter(([id]) => id.startsWith("shelter-replica:"))
-        .flatMap(([id, record]) => (record.destinations ?? []).map((replicaPath) => ({
-          path: replicaPath,
-          verifiedAt: record.lastClonedAt,
-          replicaOf: id.slice("shelter-replica:".length),
-        }))),
+        .flatMap(([id, record]) =>
+          (record.destinations ?? []).map((replicaPath) => ({
+            path: replicaPath,
+            verifiedAt: record.lastClonedAt,
+            replicaOf: id.slice("shelter-replica:".length),
+          })),
+        ),
       verifiedSources,
       totalSources: sources.length,
-      percentage: sources.length ? Math.round((verifiedSources / sources.length) * 100) : 0,
+      percentage: sources.length
+        ? Math.round((verifiedSources / sources.length) * 100)
+        : 0,
       freshness,
     },
   };
@@ -11195,15 +12787,35 @@ async function getLibraryDashboardSnapshot() {
 ipcMain.handle("get-library-dashboard", () => getLibraryDashboardSnapshot());
 ipcMain.handle("verify-shelter-sources", async (_event, sourceIds: unknown) => {
   const cleanIds = Array.isArray(sourceIds)
-    ? Array.from(new Set(sourceIds.filter((id): id is string => typeof id === "string")))
+    ? Array.from(
+        new Set(sourceIds.filter((id): id is string => typeof id === "string")),
+      )
     : [];
   return verifyShelterSources(cleanIds);
 });
 ipcMain.handle("refresh-library-stats", async () => {
   if (!libraryStatsManager) throw new Error("Library inventory is not ready.");
-  const sources = (await listSources()).map(({ id, label, kind, rootPath, available, offlineBackup, snapshotAt, message }) => ({
-    id, label, kind, rootPath, available, offlineBackup, snapshotAt, message,
-  }));
+  const sources = (await listSources()).map(
+    ({
+      id,
+      label,
+      kind,
+      rootPath,
+      available,
+      offlineBackup,
+      snapshotAt,
+      message,
+    }) => ({
+      id,
+      label,
+      kind,
+      rootPath,
+      available,
+      offlineBackup,
+      snapshotAt,
+      message,
+    }),
+  );
   libraryStatsManager.requestRefresh(sources);
   return getLibraryDashboardSnapshot();
 });
@@ -11211,9 +12823,13 @@ ipcMain.handle("select-shelter-destination", async () => {
   if (!mainWindow) return null;
   const result = await dialog.showOpenDialog(
     mainWindow,
-    destinationPickerOptions("Choose Silo's primary shelter destination", await getShelterDestination(), {
-      buttonLabel: "Use as shelter",
-    }),
+    destinationPickerOptions(
+      "Choose Silo's primary shelter destination",
+      await getShelterDestination(),
+      {
+        buttonLabel: "Use as shelter",
+      },
+    ),
   );
   if (result.canceled || !result.filePaths[0]) return getShelterDestination();
   return setShelterDestination(result.filePaths[0]);
@@ -11225,14 +12841,18 @@ async function readRuntimeDiagnostics(cursorValue: unknown) {
   const stats = await fsPromises.stat(diagnosticsPath).catch(() => null);
   if (!stats || stats.size === 0)
     return { entries: [], cursor: 0, truncated: false };
-  const requestedCursor = Number.isSafeInteger(cursorValue) && Number(cursorValue) >= 0
-    ? Number(cursorValue)
-    : 0;
+  const requestedCursor =
+    Number.isSafeInteger(cursorValue) && Number(cursorValue) >= 0
+      ? Number(cursorValue)
+      : 0;
   const reset = requestedCursor > stats.size;
-  const truncated = reset ||
+  const truncated =
+    reset ||
     (requestedCursor === 0 && stats.size > maxBytes) ||
     stats.size - requestedCursor > maxBytes;
-  const start = truncated ? Math.max(0, stats.size - maxBytes) : requestedCursor;
+  const start = truncated
+    ? Math.max(0, stats.size - maxBytes)
+    : requestedCursor;
   const length = Math.min(maxBytes, stats.size - start);
   const handle = await fsPromises.open(diagnosticsPath, "r");
   let content = "";
@@ -11247,27 +12867,38 @@ async function readRuntimeDiagnostics(cursorValue: unknown) {
   let contentStart = start;
   if (truncated && contentStart > 0) {
     const firstNewline = content.indexOf("\n");
-    if (firstNewline < 0) return { entries: [], cursor: start + bytesRead, truncated: true };
-    contentStart += Buffer.byteLength(content.slice(0, firstNewline + 1), "utf8");
+    if (firstNewline < 0)
+      return { entries: [], cursor: start + bytesRead, truncated: true };
+    contentStart += Buffer.byteLength(
+      content.slice(0, firstNewline + 1),
+      "utf8",
+    );
     content = content.slice(firstNewline + 1);
   }
   const lastNewline = content.lastIndexOf("\n");
   const completeText = lastNewline >= 0 ? content.slice(0, lastNewline) : "";
-  const entries = completeText.split("\n").filter(Boolean).flatMap((line) => {
-    try {
-      return [JSON.parse(line) as Record<string, unknown>];
-    } catch {
-      return [];
-    }
-  }).slice(-maxEntries);
-  const consumedBytes = lastNewline >= 0
-    ? Buffer.byteLength(content.slice(0, lastNewline + 1), "utf8")
-    : 0;
+  const entries = completeText
+    .split("\n")
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    })
+    .slice(-maxEntries);
+  const consumedBytes =
+    lastNewline >= 0
+      ? Buffer.byteLength(content.slice(0, lastNewline + 1), "utf8")
+      : 0;
   return { entries, cursor: contentStart + consumedBytes, truncated };
 }
 
 /** Memory-generator events from a wider tail, so heartbeats cannot push them out of an export. */
-async function readMemoryDiagnostics(maxEntries = 400): Promise<Record<string, unknown>[]> {
+async function readMemoryDiagnostics(
+  maxEntries = 400,
+): Promise<Record<string, unknown>[]> {
   const maxBytes = 4 * 1024 * 1024;
   try {
     const stats = await fsPromises.stat(diagnosticsPath);
@@ -11283,25 +12914,37 @@ async function readMemoryDiagnostics(maxEntries = 400): Promise<Record<string, u
     }
     const lines = content.split("\n");
     if (start > 0) lines.shift();
-    return lines.flatMap((line) => {
-      if (!line.includes('"event":"memory-')) return [];
-      try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
-    }).slice(-maxEntries);
+    return lines
+      .flatMap((line) => {
+        if (!line.includes('"event":"memory-')) return [];
+        try {
+          return [JSON.parse(line) as Record<string, unknown>];
+        } catch {
+          return [];
+        }
+      })
+      .slice(-maxEntries);
   } catch {
     return [];
   }
 }
 
-ipcMain.handle("get-runtime-diagnostics", (_event, cursor: unknown) => readRuntimeDiagnostics(cursor));
+ipcMain.handle("get-runtime-diagnostics", (_event, cursor: unknown) =>
+  readRuntimeDiagnostics(cursor),
+);
 ipcMain.handle("export-runtime-diagnostics", async (event) => {
   if (!mainWindow || event.sender !== mainWindow.webContents)
-    return { ok: false, error: "The Silo window is not available to export diagnostics." };
+    return {
+      ok: false,
+      error: "The Silo window is not available to export diagnostics.",
+    };
   const choice = await dialog.showOpenDialog(mainWindow, {
     title: "Choose a folder for Silo diagnostics",
     defaultPath: app.getPath("documents"),
     properties: ["openDirectory", "createDirectory"],
   });
-  if (choice.canceled || !choice.filePaths[0]) return { ok: false, canceled: true };
+  if (choice.canceled || !choice.filePaths[0])
+    return { ok: false, canceled: true };
 
   const diagnostics = await readRuntimeDiagnostics(0);
   const report = {
@@ -11322,15 +12965,24 @@ ipcMain.handle("export-runtime-diagnostics", async (event) => {
     textPath = path.join(choice.filePaths[0], `${stem}.txt`);
     jsonPath = path.join(choice.filePaths[0], `${stem}.json`);
     const [textExists, jsonExists] = await Promise.all([
-      fsPromises.access(textPath).then(() => true, () => false),
-      fsPromises.access(jsonPath).then(() => true, () => false),
+      fsPromises.access(textPath).then(
+        () => true,
+        () => false,
+      ),
+      fsPromises.access(jsonPath).then(
+        () => true,
+        () => false,
+      ),
     ]);
     if (!textExists && !jsonExists) break;
     textPath = "";
     jsonPath = "";
   }
   if (!textPath || !jsonPath)
-    return { ok: false, error: "Silo could not find an unused diagnostics filename." };
+    return {
+      ok: false,
+      error: "Silo could not find an unused diagnostics filename.",
+    };
 
   const text = [
     "Silo Runtime Diagnostics",
@@ -11350,14 +13002,22 @@ ipcMain.handle("export-runtime-diagnostics", async (event) => {
   try {
     await fsPromises.writeFile(textPath, text, { flag: "wx" });
   } catch {
-    return { ok: false, error: "Silo could not write the TXT diagnostics file." };
+    return {
+      ok: false,
+      error: "Silo could not write the TXT diagnostics file.",
+    };
   }
   try {
-    await fsPromises.writeFile(jsonPath, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
+    await fsPromises.writeFile(
+      jsonPath,
+      `${JSON.stringify(report, null, 2)}\n`,
+      { flag: "wx" },
+    );
   } catch {
     return {
       ok: false,
-      error: "The TXT diagnostics file was saved, but Silo could not write its JSON companion.",
+      error:
+        "The TXT diagnostics file was saved, but Silo could not write its JSON companion.",
       textPath,
     };
   }
@@ -11396,7 +13056,8 @@ ipcMain.handle("get-indexing-overview", async () => {
   );
   const eligibleRoots = await getIndexableRootsFromSources(registeredSources);
   const unavailableSources = registeredSources.filter(
-    (source) => source.kind !== "local" && source.kind !== "machine" && !source.available,
+    (source) =>
+      source.kind !== "local" && source.kind !== "machine" && !source.available,
   );
   const coverage =
     typeof semanticIndexer.getSourceCoverageProgress === "function"
@@ -11409,11 +13070,17 @@ ipcMain.handle("get-indexing-overview", async () => {
           unavailable: 0,
           pending: eligibleRoots.length,
         };
-  const search = semanticIndexer.isLoaded?.() === false
-    ? { ...semanticIndexer.getProgress(), status: "loading-model", message: "Opening the saved search index…" }
-    : semanticIndexer.getProgress();
+  const search =
+    semanticIndexer.isLoaded?.() === false
+      ? {
+          ...semanticIndexer.getProgress(),
+          status: "loading-model",
+          message: "Opening the saved search index…",
+        }
+      : semanticIndexer.getProgress();
   const globalSearch = semanticIndexer.getIndexSummary();
-  const retryableSearchRecords = semanticIndexer.getRetryableErrorCount(eligibleRoots);
+  const retryableSearchRecords =
+    semanticIndexer.getRetryableErrorCount(eligibleRoots);
   const discovery = semanticIndexer.getReconciliationProgress();
   const currentSource = registeredSources.find(
     (source) => source.rootPath === discovery.sourcePath,
@@ -11456,7 +13123,8 @@ ipcMain.handle("get-indexing-overview", async () => {
       total: 1,
       unit: "model",
       message: semanticRuntimeProgress.message,
-      detail: "Required before Silo can embed new files or run semantic search.",
+      detail:
+        "Required before Silo can embed new files or run semantic search.",
     },
     {
       id: "discovery",
@@ -11596,14 +13264,10 @@ function getVisibleDemoMapPhotos(
   );
 }
 
-function getVisibleGeoState<T extends { photos: GeoPhoto[]; geotagged: number }>(
-  state: T,
-  sourcePaths: readonly string[],
-): T {
-  const photos = getVisibleDemoMapPhotos(
-    state.photos,
-    sourcePaths,
-  );
+function getVisibleGeoState<
+  T extends { photos: GeoPhoto[]; geotagged: number },
+>(state: T, sourcePaths: readonly string[]): T {
+  const photos = getVisibleDemoMapPhotos(state.photos, sourcePaths);
   return { ...state, geotagged: photos.length, photos };
 }
 
@@ -11622,12 +13286,13 @@ function requireDemoMapRelocation(
     files
       .filter(
         (file) =>
-          (file.type === "image" || file.type === "video") &&
-          !file.isDirectory,
+          (file.type === "image" || file.type === "video") && !file.isDirectory,
       )
       .map((file) => file.path),
   );
-  if (Array.from(selectedPaths).some((filePath) => !availablePaths.has(filePath))) {
+  if (
+    Array.from(selectedPaths).some((filePath) => !availablePaths.has(filePath))
+  ) {
     notifyDemoLimitReached("mapPhotos");
     throw new Error(
       `The demo maps up to ${DEMO_LIMITS.mapPhotos.toLocaleString()} photos. Unlock Silo to map more.`,
@@ -11784,8 +13449,8 @@ ipcMain.handle("start-face-indexing", async () => {
   return faceIndexer.getProgress();
 });
 ipcMain.handle("pause-face-indexing", async () => {
-  if (indexRecovery) await indexRecovery.pauseStage("faces");
-  else await faceIndexer.pause();
+  indexRecovery?.pause("faces");
+  await faceIndexer.pause();
   return faceIndexer.getProgress();
 });
 ipcMain.handle("get-person", async (_event, personId: string) => {
@@ -11948,8 +13613,7 @@ ipcMain.handle("confirm-all-person-photos", (_event, personId: string) => {
   return faceIndexer.recordEdit("Confirm all photos", () =>
     faceIndexer.confirmAllPhotos(personId),
   );
-}
-);
+});
 ipcMain.handle(
   "confirm-person-photos",
   (_event, personId: string, imagePaths: unknown) => {
@@ -11976,15 +13640,13 @@ ipcMain.handle("ban-person", (_event, personId: string) => {
   return faceIndexer.recordEdit("Ban person", () =>
     faceIndexer.banPerson(personId),
   );
-}
-);
+});
 ipcMain.handle("unban-person", (_event, personId: string) => {
   requireDemoPersonAccess(personId);
   return faceIndexer.recordEdit("Unban person", () =>
     faceIndexer.unbanPerson(personId),
   );
-}
-);
+});
 ipcMain.handle(
   "accept-person-suggestions",
   (_event, personId: string, imagePaths: unknown) => {
@@ -12014,22 +13676,19 @@ ipcMain.handle("create-person", (_event, name: string) => {
   return faceIndexer.recordEdit("Create person", () =>
     faceIndexer.createPerson(name),
   );
-}
-);
+});
 ipcMain.handle("rename-person", (_event, personId: string, name: string) => {
   requireDemoPersonAccess(personId);
   return faceIndexer.recordEdit("Rename person", () =>
     faceIndexer.renamePerson(personId, name),
   );
-}
-);
+});
 ipcMain.handle("delete-person", (_event, personId: string) => {
   requireDemoPersonAccess(personId);
   return faceIndexer.recordEdit("Delete person", () =>
     faceIndexer.deletePerson(personId),
   );
-}
-);
+});
 ipcMain.handle(
   "assign-face-to-person",
   (_event, personId: string, faceId: string) => {
@@ -12172,8 +13831,7 @@ ipcMain.handle(
 ipcMain.handle("remove-banned-face", (_event, personId: string) => {
   requireDemoPersonAccess(personId);
   return faceIndexer.removeBannedFace(personId);
-}
-);
+});
 ipcMain.handle(
   "set-banned-face-confidence",
   (_event, personId: string, confidence: number) => {
@@ -12276,24 +13934,36 @@ async function createLifetimePurchase(
     payload.claimToken.length < 40 ||
     payload.claimToken.length > 100
   )
-    throw new Error("The payment relay returned an invalid purchase reference.");
+    throw new Error(
+      "The payment relay returned an invalid purchase reference.",
+    );
   return { relayBase, payload };
 }
 
 ipcMain.handle(
   "begin-lifetime-wallet-purchase",
   async (_event, referenceValue: unknown) => {
-    if (typeof referenceValue !== "string" || !isSolanaPayReference(referenceValue))
-      return { ok: false as const, error: "The Solana Pay reference is invalid." };
+    if (
+      typeof referenceValue !== "string" ||
+      !isSolanaPayReference(referenceValue)
+    )
+      return {
+        ok: false as const,
+        error: "The Solana Pay reference is invalid.",
+      };
     try {
       if ((await readLifetimeLicense()).isLicensed)
-        throw new Error("Silo already has a lifetime license on this computer.");
+        throw new Error(
+          "Silo already has a lifetime license on this computer.",
+        );
       const { payload } = await createLifetimePurchase(
         "solana-pay",
         referenceValue,
       );
       if (payload.reference !== referenceValue)
-        throw new Error("The payment relay did not register this wallet request.");
+        throw new Error(
+          "The payment relay did not register this wallet request.",
+        );
       return {
         ok: true as const,
         purchaseId: payload.purchaseId as string,
@@ -12320,8 +13990,11 @@ ipcMain.handle(
       typeof claimTokenValue !== "string" ||
       claimTokenValue.length < 40 ||
       claimTokenValue.length > 100
-      )
-      return { status: "error" as const, message: "The purchase reference is invalid." };
+    )
+      return {
+        status: "error" as const,
+        message: "The purchase reference is invalid.",
+      };
 
     let paymentConfirmed = false;
     try {
@@ -12351,7 +14024,10 @@ ipcMain.handle(
           status: response.statusCode,
           message: message.slice(0, 500),
         });
-        return { status: "error" as const, message: `${message} (HTTP ${response.statusCode})` };
+        return {
+          status: "error" as const,
+          message: `${message} (HTTP ${response.statusCode})`,
+        };
       }
       if (payload.status === "verified") {
         paymentConfirmed = true;
@@ -12367,20 +14043,21 @@ ipcMain.handle(
             status: "error" as const,
             message: LIFETIME_PAYMENT_SUPPORT_GUIDANCE,
           };
-        await writeLifetimeLicense(
-          payload.licenseToken,
-          installationId,
-        );
+        await writeLifetimeLicense(payload.licenseToken, installationId);
         enableLifetimeFeatures();
         const license = await readLifetimeLicense();
         return {
           status: "verified" as const,
-          message: "Payment verified. Your lifetime license is active on this computer.",
+          message:
+            "Payment verified. Your lifetime license is active on this computer.",
           license,
         };
       }
       if (payload.status === "expired")
-        return { status: "expired" as const, message: "This payment request expired. Start a new one." };
+        return {
+          status: "expired" as const,
+          message: "This payment request expired. Start a new one.",
+        };
       if (payload.status === "invalid")
         return {
           status: "invalid" as const,
@@ -12399,7 +14076,10 @@ ipcMain.handle(
     } catch (error) {
       runtimeLog("lifetime-license-poll-network-error", {
         name: error instanceof Error ? error.name : "UnknownError",
-        message: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+        message: (error instanceof Error ? error.message : String(error)).slice(
+          0,
+          500,
+        ),
       });
       if (paymentConfirmed)
         return {
@@ -12408,7 +14088,8 @@ ipcMain.handle(
         };
       return {
         status: "error" as const,
-        message: "The license relay is temporarily unavailable. Silo will keep checking.",
+        message:
+          "The license relay is temporarily unavailable. Silo will keep checking.",
       };
     }
   },
@@ -12463,9 +14144,7 @@ ipcMain.handle("capture-bug-report-screenshot", async (event) => {
   const screenshot = await event.sender.capturePage();
   const size = screenshot.getSize();
   const resized =
-    size.width > 1600
-      ? screenshot.resize({ width: 1600 })
-      : screenshot;
+    size.width > 1600 ? screenshot.resize({ width: 1600 }) : screenshot;
   return `data:image/jpeg;base64,${resized.toJPEG(72).toString("base64")}`;
 });
 ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
@@ -12503,17 +14182,29 @@ ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
     return { ok: false, error: "The selected feature label is too long." };
 
   let screenshotBase64: string | null = null;
-  if (report.screenshotDataUrl !== undefined && report.screenshotDataUrl !== null) {
+  if (
+    report.screenshotDataUrl !== undefined &&
+    report.screenshotDataUrl !== null
+  ) {
     if (
       typeof report.screenshotDataUrl !== "string" ||
       report.screenshotDataUrl.length > maxBugReportScreenshotBytes * 1.4
     )
-      return { ok: false, error: "The screenshot exceeds the attachment limit." };
+      return {
+        ok: false,
+        error: "The screenshot exceeds the attachment limit.",
+      };
     const match = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(
       report.screenshotDataUrl,
     );
-    if (!match || Buffer.from(match[1], "base64").length > maxBugReportScreenshotBytes)
-      return { ok: false, error: "The screenshot attachment is invalid or too large." };
+    if (
+      !match ||
+      Buffer.from(match[1], "base64").length > maxBugReportScreenshotBytes
+    )
+      return {
+        ok: false,
+        error: "The screenshot attachment is invalid or too large.",
+      };
     screenshotBase64 = match[1];
   }
 
@@ -12540,7 +14231,8 @@ ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
   } catch {
     return {
       ok: false,
-      error: "Silo could not reach the report relay. Your report is still here.",
+      error:
+        "Silo could not reach the report relay. Your report is still here.",
     };
   }
 });
@@ -12548,48 +14240,57 @@ ipcMain.handle("get-demo-testing-mode", () => ({
   available: lifetimeLicensed,
   enabled: lifetimeLicensed && demoTestingModeEnabled,
 }));
-ipcMain.handle("set-demo-testing-mode", async (_event, enabledValue: unknown) => {
-  if (typeof enabledValue !== "boolean")
-    throw new Error("Demo testing mode must be enabled or disabled explicitly.");
-  if (!lifetimeLicensed)
-    throw new Error("A saved lifetime license is required for demo testing mode.");
-  if (enabledValue === demoTestingModeEnabled)
-    return {
-      available: true,
-      enabled: demoTestingModeEnabled,
-      restarting: false,
-    };
+ipcMain.handle(
+  "set-demo-testing-mode",
+  async (_event, enabledValue: unknown) => {
+    if (typeof enabledValue !== "boolean")
+      throw new Error(
+        "Demo testing mode must be enabled or disabled explicitly.",
+      );
+    if (!lifetimeLicensed)
+      throw new Error(
+        "A saved lifetime license is required for demo testing mode.",
+      );
+    if (enabledValue === demoTestingModeEnabled)
+      return {
+        available: true,
+        enabled: demoTestingModeEnabled,
+        restarting: false,
+      };
 
-  const enabling = enabledValue;
-  const options = {
-    type: "warning" as const,
-    buttons: ["Restart Silo", "Cancel"],
-    defaultId: 0,
-    cancelId: 1,
-    title: enabling ? "Restart in demo testing mode?" : "Return to full access?",
-    message: enabling
-      ? "Restart Silo with demo limits active?"
-      : "Restart Silo with your full lifetime access?",
-    detail: enabling
-      ? "Your lifetime license remains saved. The 1,000-file demo cap and other demo limits will apply after restart; source media is not changed."
-      : "Your lifetime license and demo usage history remain saved. Full access resumes after restart.",
-  };
-  const confirmation = mainWindow
-    ? await dialog.showMessageBox(mainWindow, options)
-    : await dialog.showMessageBox(options);
-  if (confirmation.response !== 0)
-    return {
-      available: true,
-      enabled: demoTestingModeEnabled,
-      restarting: false,
+    const enabling = enabledValue;
+    const options = {
+      type: "warning" as const,
+      buttons: ["Restart Silo", "Cancel"],
+      defaultId: 0,
+      cancelId: 1,
+      title: enabling
+        ? "Restart in demo testing mode?"
+        : "Return to full access?",
+      message: enabling
+        ? "Restart Silo with demo limits active?"
+        : "Restart Silo with your full lifetime access?",
+      detail: enabling
+        ? "Your lifetime license remains saved. The 1,000-file demo cap and other demo limits will apply after restart; source media is not changed."
+        : "Your lifetime license and demo usage history remain saved. Full access resumes after restart.",
     };
+    const confirmation = mainWindow
+      ? await dialog.showMessageBox(mainWindow, options)
+      : await dialog.showMessageBox(options);
+    if (confirmation.response !== 0)
+      return {
+        available: true,
+        enabled: demoTestingModeEnabled,
+        restarting: false,
+      };
 
-  if (!enabling) queueIndexRecoveryStages(ALL_INDEX_RECOVERY_STAGES);
-  await writeDemoTestingMode(enabling);
-  relaunchAppWithDiagnostics("demo-testing-mode");
-  app.quit();
-  return { available: true, enabled: enabling, restarting: true };
-});
+    if (!enabling) queueIndexRecoveryStages(ALL_INDEX_RECOVERY_STAGES);
+    await writeDemoTestingMode(enabling);
+    app.relaunch();
+    app.quit();
+    return { available: true, enabled: enabling, restarting: true };
+  },
+);
 ipcMain.handle(
   "get-beta-activation-info",
   async (): Promise<BetaActivationInfo> => ({
@@ -12607,12 +14308,16 @@ ipcMain.handle(
       };
 
     const configuredEndpoint =
-      process.env.SILO_BETA_REQUEST_ENDPOINT?.trim() || defaultBetaRequestEndpoint;
+      process.env.SILO_BETA_REQUEST_ENDPOINT?.trim() ||
+      defaultBetaRequestEndpoint;
     let endpoint: URL;
     try {
       endpoint = new URL(configuredEndpoint);
     } catch {
-      return { ok: false, error: "The beta request relay endpoint is invalid." };
+      return {
+        ok: false,
+        error: "The beta request relay endpoint is invalid.",
+      };
     }
     if (endpoint.protocol !== "https:")
       return { ok: false, error: "The beta request relay must use HTTPS." };
@@ -12638,7 +14343,8 @@ ipcMain.handle(
     } catch {
       return {
         ok: false,
-        error: "Silo could not reach the beta request relay. Try again when online.",
+        error:
+          "Silo could not reach the beta request relay. Try again when online.",
       };
     }
   },
@@ -12648,7 +14354,10 @@ async function activateBetaLicenseCode(
   activationCodeValue: unknown,
 ): Promise<BetaActivationResult> {
   if (typeof activationCodeValue !== "string")
-    return { status: "invalid", message: "The Silo activation link is invalid." };
+    return {
+      status: "invalid",
+      message: "The Silo activation link is invalid.",
+    };
   if (!BETA_LICENSE_PUBLIC_KEY.trim())
     return {
       status: "unavailable",
@@ -12709,9 +14418,11 @@ async function handlePendingBetaActivationUrls() {
       runtimeLog("beta-license-activation-link", { status: result.status });
       if (mainWindow && !mainWindow.isDestroyed())
         void dialog.showMessageBox(mainWindow, {
-          type: result.status === "activated" || result.status === "already-licensed"
-            ? "info"
-            : "warning",
+          type:
+            result.status === "activated" ||
+            result.status === "already-licensed"
+              ? "info"
+              : "warning",
           title: "Silo beta access",
           message: result.message,
           buttons: ["OK"],
@@ -12747,7 +14458,8 @@ async function verifyAndSaveLifetimePayment(
 
   let paymentConfirmed = false;
   try {
-    const { relayBase, payload: purchase } = await createLifetimePurchase("manual");
+    const { relayBase, payload: purchase } =
+      await createLifetimePurchase("manual");
     const installationId = await getDeviceBindingId();
     const response = await requestRelayJson(
       new URL(
@@ -12783,7 +14495,8 @@ async function verifyAndSaveLifetimePayment(
       enableLifetimeFeatures();
       return {
         status: "verified",
-        message: "Payment verified. Your lifetime license is active on this computer.",
+        message:
+          "Payment verified. Your lifetime license is active on this computer.",
         license: await readLifetimeLicense(),
       };
     }
@@ -12823,7 +14536,10 @@ async function verifyAndSaveLifetimePayment(
 }
 ipcMain.handle(
   "verify-lifetime-payment",
-  async (_event, signatureValue: unknown): Promise<LifetimePaymentVerification> =>
+  async (
+    _event,
+    signatureValue: unknown,
+  ): Promise<LifetimePaymentVerification> =>
     verifyAndSaveLifetimePayment(signatureValue),
 );
 ipcMain.handle(
@@ -12931,13 +14647,23 @@ ipcMain.handle(
 
 ipcMain.handle(
   "renew-phone-backup",
-  async (_event, deviceId: unknown, platform: unknown, includeTypes: unknown) => {
+  async (
+    _event,
+    deviceId: unknown,
+    platform: unknown,
+    includeTypes: unknown,
+  ) => {
     const device = await readyPhoneForBackup(deviceId, platform);
     const types = Array.isArray(includeTypes)
       ? includeTypes.filter((type): type is string => typeof type === "string")
       : undefined;
     if (types)
-      await phoneManager.setBackupFileTypes(device.platform, device.id, types, device.name);
+      await phoneManager.setBackupFileTypes(
+        device.platform,
+        device.id,
+        types,
+        device.name,
+      );
     return phoneManager.backupDevice(device);
   },
 );
@@ -12950,7 +14676,9 @@ ipcMain.handle(
   "create-phone-restore-archive",
   async (_event, deviceId: unknown, platform: unknown, password: unknown) => {
     if (process.platform !== "darwin")
-      throw new Error("iPhone restore archives are currently supported on macOS only.");
+      throw new Error(
+        "iPhone restore archives are currently supported on macOS only.",
+      );
     if (
       typeof deviceId !== "string" ||
       !deviceId ||
@@ -12966,7 +14694,9 @@ ipcMain.handle(
     );
     if (!device) throw new Error("Connect and trust the iPhone or iPad first.");
     if (!mainWindow || mainWindow.isDestroyed())
-      throw new Error("The app window is unavailable to confirm this device backup.");
+      throw new Error(
+        "The app window is unavailable to confirm this device backup.",
+      );
     const confirmation = await dialog.showMessageBox(mainWindow, {
       type: "warning",
       title: "Enable encrypted device backups?",
@@ -12979,19 +14709,25 @@ ipcMain.handle(
       noLink: true,
     });
     if (confirmation.response !== 1) return null;
-    const archive: PhoneRestoreArchive = await phoneManager.createRestoreArchive(
-      device,
-      password,
-    );
+    const archive: PhoneRestoreArchive =
+      await phoneManager.createRestoreArchive(device, password);
     return archive;
   },
 );
 
 ipcMain.handle(
   "restore-phone-from-archive",
-  async (_event, deviceId: unknown, platform: unknown, archiveId: unknown, password: unknown) => {
+  async (
+    _event,
+    deviceId: unknown,
+    platform: unknown,
+    archiveId: unknown,
+    password: unknown,
+  ) => {
     if (process.platform !== "darwin")
-      throw new Error("iPhone restore archives are currently supported on macOS only.");
+      throw new Error(
+        "iPhone restore archives are currently supported on macOS only.",
+      );
     if (
       typeof deviceId !== "string" ||
       !deviceId ||
@@ -13011,11 +14747,16 @@ ipcMain.handle(
     const archive = (await phoneManager.getRestoreArchives()).find(
       (candidate) => candidate.id === archiveId,
     );
-    if (!archive) throw new Error("The selected restore archive is unavailable.");
+    if (!archive)
+      throw new Error("The selected restore archive is unavailable.");
     if (!device.model || archive.deviceModel !== device.model)
-      throw new Error("The archive can only restore to the same iPhone or iPad model.");
+      throw new Error(
+        "The archive can only restore to the same iPhone or iPad model.",
+      );
     if (!mainWindow || mainWindow.isDestroyed())
-      throw new Error("The app window is unavailable to confirm this device restore.");
+      throw new Error(
+        "The app window is unavailable to confirm this device restore.",
+      );
     const confirmation = await dialog.showMessageBox(mainWindow, {
       type: "warning",
       title: "DEVICE WRITE — Restore iPhone or iPad?",
@@ -13298,14 +15039,18 @@ ipcMain.handle("google-export-photos", async (_event, accountId?: string) => {
 
 ipcMain.handle("list-sources", () => listSources());
 
-ipcMain.handle("get-library-share-status", () =>
-  libraryShareServer?.getStatus() ?? { active: false, sources: [] },
+ipcMain.handle(
+  "get-library-share-status",
+  () => libraryShareServer?.getStatus() ?? { active: false, sources: [] },
 );
 
 ipcMain.handle("start-library-share", async (_event, sourceIds: unknown) => {
   if (!libraryShareServer || !semanticIndexer?.isLoaded())
     throw new Error("Silo is still loading its search index.");
-  if (!Array.isArray(sourceIds) || sourceIds.some((id) => typeof id !== "string"))
+  if (
+    !Array.isArray(sourceIds) ||
+    sourceIds.some((id) => typeof id !== "string")
+  )
     throw new Error("Choose one or more local libraries to share.");
   return libraryShareServer.start(sourceIds as string[]);
 });
@@ -13322,7 +15067,9 @@ ipcMain.handle(
   async (_event, sourceId: string, enabled: boolean) => {
     if (typeof sourceId !== "string" || !sourceId) return listSources();
     const shouldEnable = Boolean(enabled);
-    const target = (await listSources()).find((source) => source.id === sourceId);
+    const target = (await listSources()).find(
+      (source) => source.id === sourceId,
+    );
     const phoneTarget = target
       ? phoneManager.parsePhonePath(target.rootPath)
       : null;
@@ -13396,8 +15143,7 @@ ipcMain.handle("set-all-sources-enabled", async (_event, enabled: boolean) => {
       sources
         .filter(
           (source) =>
-            !source.demoLocked &&
-            !phoneManager.parsePhonePath(source.rootPath),
+            !source.demoLocked && !phoneManager.parsePhonePath(source.rootPath),
         )
         .map((source) => source.id),
     );
@@ -13485,88 +15231,150 @@ let googleReclaimCancelled = false;
 
 function googleAccountIdArgument(accountId: unknown): string | null {
   return typeof accountId === "string" &&
-    googleManager.getState().accounts.some((account) => account.id === accountId)
+    googleManager
+      .getState()
+      .accounts.some((account) => account.id === accountId)
     ? accountId
     : null;
 }
 
-ipcMain.handle("google-reclaim-overview", async (_event, accountId: unknown) => {
-  const id = googleAccountIdArgument(accountId);
-  if (!id) return { ok: false, error: "That Google account is not connected." };
-  try {
-    return { ok: true, overview: await googleManager.getReclaimOverview(id) };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
+ipcMain.handle(
+  "google-reclaim-overview",
+  async (_event, accountId: unknown) => {
+    const id = googleAccountIdArgument(accountId);
+    if (!id)
+      return { ok: false, error: "That Google account is not connected." };
+    try {
+      return { ok: true, overview: await googleManager.getReclaimOverview(id) };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
+);
 
 ipcMain.handle("google-reclaim-choose-destination", async () => {
-  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: "App window is unavailable." };
+  if (!mainWindow || mainWindow.isDestroyed())
+    return { ok: false, error: "App window is unavailable." };
   const current = await googleManager.getReclaimDestination();
   const result = await dialog.showOpenDialog(
     mainWindow,
     destinationPickerOptions("Save Google backups to…", current),
   );
   const chosen = result.filePaths[0];
-  if (result.canceled || !chosen) return { ok: false, canceled: true, destination: current };
+  if (result.canceled || !chosen)
+    return { ok: false, canceled: true, destination: current };
   try {
     await fs.promises.mkdir(chosen, { recursive: true });
     await fs.promises.access(chosen, fs.constants.W_OK);
     await googleManager.setReclaimDestination(chosen);
     return { ok: true, destination: chosen };
   } catch (error) {
-    return { ok: false, destination: current, error: `Silo cannot write to ${chosen}: ${error instanceof Error ? error.message : String(error)}` };
+    return {
+      ok: false,
+      destination: current,
+      error: `Silo cannot write to ${chosen}: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
 });
 
-ipcMain.handle("google-reclaim-run", async (_event, accountId: unknown, items: unknown) => {
-  const id = googleAccountIdArgument(accountId);
-  if (!id) return { ok: false, trashed: 0, bytes: 0, failed: [], destination: null, error: "That Google account is not connected." };
-  if (googleReclaimRunning) return { ok: false, trashed: 0, bytes: 0, failed: [], destination: null, error: "A Google backup is already running." };
-  const valid = Array.isArray(items)
-    ? items.filter((item): item is { id: string; kind: "drive" | "gmail" } =>
-      Boolean(item) && typeof item.id === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(item.id) &&
-      (item.kind === "drive" || item.kind === "gmail"))
-    : [];
-  if (!valid.length) return { ok: false, trashed: 0, bytes: 0, failed: [], destination: null, error: "Select at least one item." };
-  googleReclaimRunning = true;
-  googleReclaimCancelled = false;
-  try {
-    const result = await googleManager.backupAndTrash(
-      id,
-      valid.slice(0, 1000),
-      (progress) => sendToRenderer("google-reclaim-progress", progress),
-      () => googleReclaimCancelled,
-    );
-    runtimeLog("google-reclaim", { trashed: result.trashed, failed: result.failed.length, bytes: result.bytes, canceled: Boolean(result.canceled) });
-    return result;
-  } finally {
-    googleReclaimRunning = false;
-  }
-});
+ipcMain.handle(
+  "google-reclaim-run",
+  async (_event, accountId: unknown, items: unknown) => {
+    const id = googleAccountIdArgument(accountId);
+    if (!id)
+      return {
+        ok: false,
+        trashed: 0,
+        bytes: 0,
+        failed: [],
+        destination: null,
+        error: "That Google account is not connected.",
+      };
+    if (googleReclaimRunning)
+      return {
+        ok: false,
+        trashed: 0,
+        bytes: 0,
+        failed: [],
+        destination: null,
+        error: "A Google backup is already running.",
+      };
+    const valid = Array.isArray(items)
+      ? items.filter(
+          (item): item is { id: string; kind: "drive" | "gmail" } =>
+            Boolean(item) &&
+            typeof item.id === "string" &&
+            /^[A-Za-z0-9_-]{1,200}$/.test(item.id) &&
+            (item.kind === "drive" || item.kind === "gmail"),
+        )
+      : [];
+    if (!valid.length)
+      return {
+        ok: false,
+        trashed: 0,
+        bytes: 0,
+        failed: [],
+        destination: null,
+        error: "Select at least one item.",
+      };
+    googleReclaimRunning = true;
+    googleReclaimCancelled = false;
+    try {
+      const result = await googleManager.backupAndTrash(
+        id,
+        valid.slice(0, 1000),
+        (progress) => sendToRenderer("google-reclaim-progress", progress),
+        () => googleReclaimCancelled,
+      );
+      runtimeLog("google-reclaim", {
+        trashed: result.trashed,
+        failed: result.failed.length,
+        bytes: result.bytes,
+        canceled: Boolean(result.canceled),
+      });
+      return result;
+    } finally {
+      googleReclaimRunning = false;
+    }
+  },
+);
 
 ipcMain.handle("google-reclaim-cancel", () => {
   googleReclaimCancelled = true;
   return { ok: true };
 });
 
-ipcMain.handle("google-empty-drive-trash", async (_event, accountId: unknown) => {
-  const id = googleAccountIdArgument(accountId);
-  if (!id) return { ok: false, error: "That Google account is not connected." };
-  try {
-    await googleManager.emptyDriveTrash(id);
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
+ipcMain.handle(
+  "google-empty-drive-trash",
+  async (_event, accountId: unknown) => {
+    const id = googleAccountIdArgument(accountId);
+    if (!id)
+      return { ok: false, error: "That Google account is not connected." };
+    try {
+      await googleManager.emptyDriveTrash(id);
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
+);
 
-ipcMain.handle("google-open-gmail-trash", async (_event, accountId: unknown) => {
-  const id = googleAccountIdArgument(accountId);
-  if (!id) return { ok: false, error: "That Google account is not connected." };
-  await shell.openExternal(googleManager.gmailTrashUrl(id));
-  return { ok: true };
-});
+ipcMain.handle(
+  "google-open-gmail-trash",
+  async (_event, accountId: unknown) => {
+    const id = googleAccountIdArgument(accountId);
+    if (!id)
+      return { ok: false, error: "That Google account is not connected." };
+    await shell.openExternal(googleManager.gmailTrashUrl(id));
+    return { ok: true };
+  },
+);
 
 ipcMain.handle("google-upload-file", async (_event, parentPath: string) => {
   if (!mainWindow) return { ok: false, error: "App window is unavailable." };
@@ -13736,37 +15544,49 @@ ipcMain.handle("get-contact-name", async (_event, phoneNumber: string) => {
   return contactManager.getContactName(phoneNumber) || null;
 });
 
-ipcMain.handle("select-backup-destination", async (_event, current: unknown) => {
-  if (!mainWindow) return null;
+ipcMain.handle(
+  "select-backup-destination",
+  async (_event, current: unknown) => {
+    if (!mainWindow) return null;
 
-  const result = await dialog.showOpenDialog(
-    mainWindow,
-    destinationPickerOptions("Save conversations to…", current),
-  );
+    const result = await dialog.showOpenDialog(
+      mainWindow,
+      destinationPickerOptions("Save conversations to…", current),
+    );
 
-  if (!result.canceled && result.filePaths[0]) {
-    return result.filePaths[0];
-  }
-  return null;
-});
+    if (!result.canceled && result.filePaths[0]) {
+      return result.filePaths[0];
+    }
+    return null;
+  },
+);
 
 ipcMain.handle("get-index-storage-root", () => selectedIndexStorageRoot);
 ipcMain.handle("get-index-storage-status", () => currentIndexStorageStatus());
-ipcMain.handle("get-local-index-fallback-enabled", () => indexStorageFallbackEnabled);
-ipcMain.handle("set-local-index-fallback-enabled", async (_event, enabled: boolean) => {
-  if (typeof enabled !== "boolean")
-    throw new Error("Choose whether Silo may use a local cache fallback.");
-  await setLocalIndexStorageFallback(app.getPath("userData"), enabled);
-  indexStorageFallbackEnabled = enabled;
-  await monitorIndexStorageAvailability();
-  return { enabled, restarting: indexStorageRelaunchPending };
-});
+ipcMain.handle(
+  "get-local-index-fallback-enabled",
+  () => indexStorageFallbackEnabled,
+);
+ipcMain.handle(
+  "set-local-index-fallback-enabled",
+  async (_event, enabled: boolean) => {
+    if (typeof enabled !== "boolean")
+      throw new Error("Choose whether Silo may use a local cache fallback.");
+    await setLocalIndexStorageFallback(app.getPath("userData"), enabled);
+    indexStorageFallbackEnabled = enabled;
+    await monitorIndexStorageAvailability();
+    return { enabled, restarting: indexStorageRelaunchPending };
+  },
+);
 
 ipcMain.handle("select-index-storage-root", async () => {
   if (!mainWindow) return { canceled: true };
   const result = await dialog.showOpenDialog(
     mainWindow,
-    destinationPickerOptions("Choose Silo Cache Destination", selectedIndexStorageRoot),
+    destinationPickerOptions(
+      "Choose Silo Cache Destination",
+      selectedIndexStorageRoot,
+    ),
   );
   if (result.canceled || !result.filePaths[0]) return { canceled: true };
 
@@ -13782,24 +15602,27 @@ ipcMain.handle("select-index-storage-root", async () => {
     const confirmation = await dialog.showMessageBox(mainWindow, {
       type: "warning",
       title: "Move Silo Cache and Restart?",
-      message: "Silo will move its indexes and generated caches to this folder.",
+      message:
+        "Silo will move its indexes and generated caches to this folder.",
       detail: `About ${(requiredBytes / 1024 / 1024 / 1024).toFixed(1)} GiB may need to be copied and checksum-verified. The old copies are removed only after verification. If the destination disconnects later, Silo follows your local-fallback setting in Settings.`,
       buttons: ["Move and restart", "Cancel"],
       defaultId: 1,
       cancelId: 1,
       noLink: true,
     });
-    if (confirmation.response !== 0)
-      return { canceled: true };
+    if (confirmation.response !== 0) return { canceled: true };
 
     await stageIndexStorageRoot(app.getPath("userData"), storageRoot);
-    relaunchAppWithDiagnostics("index-storage-root-change");
+    app.relaunch();
     app.quit();
     return { canceled: false, restarting: true, path: storageRoot };
   } catch (error) {
     return {
       canceled: false,
-      error: error instanceof Error ? error.message : "Could not select this cache destination.",
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not select this cache destination.",
     };
   }
 });
