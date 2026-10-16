@@ -37,9 +37,12 @@ function cluster(
   manual = false,
   name?: string,
 ): PersonCluster {
+  const clusterName = name ?? `Person ${id}`;
   return {
     id,
-    name: name ?? `Person ${id}`,
+    name: clusterName,
+    nameSource:
+      !manual && /^Person \d+$/.test(clusterName) ? "automatic" : "user",
     faceIds,
     manualPhotoPaths: [],
     confirmedPhotoPaths: [],
