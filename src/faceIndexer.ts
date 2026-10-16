@@ -1931,6 +1931,21 @@ export class FaceIndexer {
         string,
         { person: PersonCluster; distance: number }
       >();
+      const updateNearest = (
+        currentId: string,
+        nextPerson: PersonCluster,
+        distance: number,
+      ) => {
+        const current = nearest.get(currentId);
+        if (
+          !current ||
+          distance < current.distance ||
+          (distance === current.distance &&
+            nextPerson.id.localeCompare(current.person.id) < 0)
+        ) {
+          nearest.set(currentId, { person: nextPerson, distance });
+        }
+      };
 
       for (
         let firstIndex = 0;
@@ -1951,10 +1966,8 @@ export class FaceIndexer {
             this.normalized(second.centroid),
           );
           if (distance > COMBINE_CLUSTER_DISTANCE) continue;
-          if (distance < (nearest.get(first.id)?.distance ?? Infinity))
-            nearest.set(first.id, { person: second, distance });
-          if (distance < (nearest.get(second.id)?.distance ?? Infinity))
-            nearest.set(second.id, { person: first, distance });
+          updateNearest(first.id, second, distance);
+          updateNearest(second.id, first, distance);
         }
       }
 
