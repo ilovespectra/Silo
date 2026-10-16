@@ -367,6 +367,11 @@ export default function MapPage({
   const globeRef = useRef<any>(null);
   const sunDirectionRef = useRef<THREE.Vector3 | null>(null);
   const markerClickTimerRef = useRef<number | null>(null);
+  const surfaceResolutionUpdaterRef = useRef<((altitude: number) => void) | null>(null);
+  const mapServicesAllowedRef = useRef(false);
+  const [mapServicesAllowed, setMapServicesAllowed] = useState(false);
+  const [showMapPrivacyDialog, setShowMapPrivacyDialog] = useState(false);
+  const [mapPrivacyError, setMapPrivacyError] = useState("");
   const [geoState, setGeoState] = useState<GeoIndexState>({
     status: "idle",
     scanned: 0,
@@ -454,6 +459,48 @@ export default function MapPage({
   const autoRotateRef = useRef(autoRotate);
   autoRotateRef.current = autoRotate;
   const altitudeRef = useRef(altitude);
+
+  const chooseMapServices = useCallback(
+    async (allowed: boolean) => {
+      if (!electronAPI) return;
+      setMapPrivacyError("");
+      try {
+        await electronAPI.setMapServiceConsent(allowed);
+        mapServicesAllowedRef.current = allowed;
+        setMapServicesAllowed(allowed);
+        setShowMapPrivacyDialog(false);
+        surfaceResolutionUpdaterRef.current?.(
+          globeRef.current?.pointOfView().altitude ?? altitudeRef.current,
+        );
+      } catch {
+        setMapPrivacyError("Silo couldn't save this privacy choice.");
+      }
+    },
+    [electronAPI],
+  );
+
+  useEffect(() => {
+    if (!electronAPI) return;
+    let active = true;
+    void electronAPI
+      .getMapServiceConsent()
+      .then((allowed) => {
+        if (!active) return;
+        const enabled = allowed === true;
+        mapServicesAllowedRef.current = enabled;
+        setMapServicesAllowed(enabled);
+      })
+      .catch(() => {
+        if (active) {
+          mapServicesAllowedRef.current = false;
+          setMapServicesAllowed(false);
+          setMapPrivacyError("Online map services are off because the saved choice couldn't be read.");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [electronAPI]);
   altitudeRef.current = altitude;
 
   // Clustering only depends on the altitude band, so zooming within a band costs nothing.
@@ -973,7 +1020,7 @@ export default function MapPage({
           );
       }
       if (nextAltitude < 0.95) {
-        if (!tileEngineActive) {
+        if (mapServicesAllowedRef.current && !tileEngineActive) {
           globe
             .globeTileEngineMaxLevel(19)
             .globeTileEngineUrl(
@@ -1005,20 +1052,21 @@ export default function MapPage({
             });
         }
       } else if (nextAltitude > 1.25) {
-        if (tileEngineActive) {
-          globe.globeTileEngineUrl(null);
-          globe.globeTileEngineClearCache();
-          tileEngineActive = false;
-          nightOverlay.visible = false;
-          setDetailSurfaceActive(false);
-        }
         if (usingDetailedBorders && baseBorders.length > 0) {
           configureCountryLayer(baseBorders);
           usingDetailedBorders = false;
         }
       }
+      if ((!mapServicesAllowedRef.current || nextAltitude > 1.25) && tileEngineActive) {
+        globe.globeTileEngineUrl(null);
+        globe.globeTileEngineClearCache();
+        tileEngineActive = false;
+        nightOverlay.visible = false;
+        setDetailSurfaceActive(false);
+      }
       nightOverlay.visible = tileEngineActive && nextAltitude > 0.01;
     };
+    surfaceResolutionUpdaterRef.current = updateSurfaceResolution;
     const onControlsChange = () => {
       const pointOfView = globe.pointOfView();
       const nextAltitude = pointOfView.altitude;
@@ -1078,6 +1126,7 @@ export default function MapPage({
       nightOverlayMaterial.dispose();
       globeMaterial.dispose();
       sunDirectionRef.current = null;
+      surfaceResolutionUpdaterRef.current = null;
       globe._destructor?.();
       globeRef.current = null;
     };
@@ -1662,6 +1711,35 @@ export default function MapPage({
       data-help="Map browsing and selection do not change source files. Relocate changes Silo's location override and organization metadata after review; it does not write GPS/EXIF into photos or move them."
     >
       <div className="map-globe" ref={containerRef} />
+      {electronAPI && (
+        <div className="map-privacy-status">
+          <span>Online map services {mapServicesAllowed ? "on" : "off"}</span>
+          <button
+            type="button"
+            onClick={() => {
+              if (mapServicesAllowed) void chooseMapServices(false);
+              else setShowMapPrivacyDialog(true);
+            }}
+            aria-label={mapServicesAllowed ? "Turn off online map services" : "Review online map services"}
+          >
+            {mapServicesAllowed ? "Turn off" : "Review"}
+          </button>
+        </div>
+      )}
+      {showMapPrivacyDialog && (
+        <div className="map-privacy-backdrop">
+          <section className="map-privacy-dialog" role="dialog" aria-modal="true" aria-labelledby="map-privacy-title">
+            <h2 id="map-privacy-title">Online map privacy</h2>
+            <p>Photo locations stay on this device unless you allow online map services. If enabled, selecting an unlabeled location can send its exact coordinates to Nominatim; place searches send your query to Photon; and close-up imagery requests send tile coordinates to Esri. These services can also see your public IP address and request timing. Their log retention is not known.</p>
+            <p>You can keep local location groups and the offline globe available with online services off. You can change this choice here later.</p>
+            {mapPrivacyError && <p className="map-privacy-error" role="alert">{mapPrivacyError}</p>}
+            <div className="map-privacy-actions">
+              <button type="button" onClick={() => void chooseMapServices(false)}>Keep services off</button>
+              <button type="button" className="primary" onClick={() => void chooseMapServices(true)}>Allow online map services</button>
+            </div>
+          </section>
+        </div>
+      )}
       <div className="map-status" data-tour="map-overview">
         <FiMapPin />
         <div>
@@ -2078,6 +2156,7 @@ export default function MapPage({
             {showLocationPicker && selectedPhotos.length > 0 && (
               <LocationPicker
                 files={selectedPhotos}
+                mapServicesAllowed={mapServicesAllowed}
                 onAssigned={applyGeoAssignment}
                 onClose={() => setShowLocationPicker(false)}
               />

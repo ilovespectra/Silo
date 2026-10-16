@@ -3,6 +3,7 @@ import { FiMapPin, FiSearch, FiX } from "react-icons/fi";
 
 interface LocationPickerProps {
   files: FileInfo[];
+  mapServicesAllowed: boolean;
   onAssigned: (result: GeoAssignmentResult) => void;
   onClose?: () => void;
 }
@@ -16,6 +17,7 @@ function countryFlag(countryCode: string | null) {
 
 export default function LocationPicker({
   files,
+  mapServicesAllowed,
   onAssigned,
   onClose,
 }: LocationPickerProps) {
@@ -28,7 +30,7 @@ export default function LocationPicker({
 
   useEffect(() => {
     const normalized = query.trim();
-    if (!electronAPI || normalized.length < 2) {
+    if (!electronAPI || !mapServicesAllowed || normalized.length < 2) {
       setResults([]);
       setSearching(false);
       return;
@@ -54,7 +56,7 @@ export default function LocationPicker({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [electronAPI, query]);
+  }, [electronAPI, mapServicesAllowed, query]);
 
   const assign = async (location: GeoLocationSuggestion) => {
     if (!electronAPI || files.length === 0) return;
@@ -114,6 +116,9 @@ export default function LocationPicker({
           autoFocus
         />
       </label>
+      {!mapServicesAllowed && (
+        <p className="location-picker-private-note">Online place search is off. Open the map privacy controls to enable it; if allowed, your search query is sent to Photon.</p>
+      )}
       {searching && <p>Searching verified locations...</p>}
       {error && <p className="location-picker-error">{error}</p>}
       {results.length > 0 && (

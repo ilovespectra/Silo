@@ -3491,8 +3491,51 @@ const ALL_INDEX_RECOVERY_STAGES = [
   "quality",
 ];
 let geocoder: Geocoder;
+let mapServicePreference: boolean | null | undefined;
+let mapServicePreferenceLoad: Promise<void> | null = null;
 let duplicateManager: DuplicateManager;
 let contentSettingsStore: ContentSettingsStore;
+
+async function getMapServiceConsent(): Promise<boolean | null> {
+  if (mapServicePreference !== undefined) return mapServicePreference;
+  mapServicePreferenceLoad ??= (async () => {
+    const preferencePath = path.join(
+      app.getPath("userData"),
+      "map-service-preference.json",
+    );
+    try {
+      const parsed = JSON.parse(
+        await fsPromises.readFile(preferencePath, "utf8"),
+      ) as { version?: unknown; allowed?: unknown };
+      mapServicePreference =
+        parsed.version === 1 && typeof parsed.allowed === "boolean"
+          ? parsed.allowed
+          : null;
+    } catch {
+      mapServicePreference = null;
+    }
+  })();
+  await mapServicePreferenceLoad;
+  return mapServicePreference ?? null;
+}
+
+async function saveMapServiceConsent(allowed: boolean): Promise<boolean> {
+  const preferencePath = path.join(
+    app.getPath("userData"),
+    "map-service-preference.json",
+  );
+  const temporaryPath = `${preferencePath}.${process.pid}.${Date.now()}.tmp`;
+  await fsPromises.mkdir(path.dirname(preferencePath), { recursive: true });
+  await fsPromises.writeFile(
+    temporaryPath,
+    JSON.stringify({ version: 1, allowed }),
+    { mode: 0o600 },
+  );
+  await fsPromises.chmod(temporaryPath, 0o600).catch(() => undefined);
+  await fsPromises.rename(temporaryPath, preferencePath);
+  mapServicePreference = allowed;
+  return allowed;
+}
 let semanticUnsafePaths = new Set<string>();
 let safetyScanPromise: Promise<void> | null = null;
 let scannedPhoneDevices: PhoneDevice[] = [];
@@ -6558,6 +6601,21 @@ async function createWindow() {
   const startUrl = isDev
     ? "http://localhost:8787"
     : `file://${path.join(__dirname, "../build/index.html")}`;
+  const expectedAppUrl = new URL(startUrl);
+  const guardMainFrameNavigation = (event: Electron.Event, targetUrl: string) => {
+    try {
+      const target = new URL(targetUrl);
+      const isTrustedAppUrl = isDev
+        ? target.origin === expectedAppUrl.origin
+        : target.protocol === "file:" &&
+          target.pathname === expectedAppUrl.pathname;
+      if (!isTrustedAppUrl) event.preventDefault();
+    } catch {
+      event.preventDefault();
+    }
+  };
+  mainWindow.webContents.on("will-navigate", guardMainFrameNavigation);
+  mainWindow.webContents.on("will-redirect", guardMainFrameNavigation);
 
   // index.html's <title> would otherwise replace the license-aware title on every load.
   mainWindow.on("page-title-updated", (event) => {
@@ -7910,9 +7968,6 @@ app.whenReady().then(async () => {
       fileTextLooksExplicit({ name: path.basename(photoPath), path: photoPath })
     );
   });
-  const faceLoad = indexStorageInitializationDeferred
-    ? Promise.resolve()
-    : faceIndexer.initialize();
   aestheticScorer = new AestheticScorer({
     cachePath: indexStoragePath("aesthetic-index.jsonl"),
     thumbnailFile: async (filePath) => {
@@ -7960,6 +8015,18 @@ app.whenReady().then(async () => {
     },
     imageVectors: (paths) => semanticIndexer.getImageVectors(paths),
     embedPrompts: (prompts) => semanticIndexer.embedPrompts(prompts),
+    imageDimensions: async (filePath) => {
+      try {
+        const localPath = await resolveLocalPath(filePath);
+        const metadata = await require("sharp")(localPath).metadata();
+        return {
+          width: Number(metadata.width) || 0,
+          height: Number(metadata.height) || 0,
+        };
+      } catch {
+        return null;
+      }
+    },
     onProgress: (progress) => {
       magicLibraryProgress = {
         analyzed: progress.libraryAnalyzed,
@@ -7969,6 +8036,12 @@ app.whenReady().then(async () => {
       sendToRenderer("magic-sort-progress", progress);
     },
   });
+  faceIndexer.setPeoplePhotoClassifier((images) =>
+    aestheticScorer.classifyNonPhotoPeopleImages(images),
+  );
+  const faceLoad = indexStorageInitializationDeferred
+    ? Promise.resolve()
+    : faceIndexer.initialize();
   petIndexer = new PetIndexer(
     indexStorageRoot,
     indexStoragePath("semantic-index"),
@@ -11935,13 +12008,24 @@ ipcMain.handle(
   },
 );
 
+ipcMain.handle("get-map-service-consent", () => getMapServiceConsent());
+ipcMain.handle(
+  "set-map-service-consent",
+  (_event, allowed: unknown) => {
+    if (typeof allowed !== "boolean")
+      throw new Error("Choose whether Silo may use online map services.");
+    return saveMapServiceConsent(allowed);
+  },
+);
 ipcMain.handle(
   "reverse-geocode",
-  (_event, latitude: number, longitude: number) =>
-    geocoder.reverse(latitude, longitude),
+  async (_event, latitude: number, longitude: number) =>
+    (await getMapServiceConsent()) === true
+      ? geocoder.reverse(latitude, longitude)
+      : null,
 );
-ipcMain.handle("search-locations", (_event, query: string) =>
-  geocoder.search(query),
+ipcMain.handle("search-locations", async (_event, query: string) =>
+  (await getMapServiceConsent()) === true ? geocoder.search(query) : [],
 );
 ipcMain.handle(
   "set-geo-location",

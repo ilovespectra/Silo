@@ -1,6 +1,6 @@
 import { createServer, Server, ServerResponse } from "http";
 import { createHash, randomBytes } from "crypto";
-import { shell } from "electron";
+import { safeStorage, shell } from "electron";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
 import { isAudioFile } from "./utils/audioTypes";
@@ -104,6 +104,7 @@ export interface GoogleAccountsState {
   allPhotosPath: string;
   totalPickedCount: number;
   message: string;
+  storageWarning?: string;
 }
 
 export interface CloudFileInfo {
@@ -195,6 +196,7 @@ export class GoogleManager {
   private reclaimSettingsPath: string;
   private cacheRoot: string;
   private authServer: Server | null = null;
+  private storageWarning: string | null = null;
 
   constructor(userDataPath: string, cacheRoot: string = userDataPath) {
     this.accountsPath = path.join(userDataPath, "google-accounts.json");
@@ -205,18 +207,82 @@ export class GoogleManager {
   async initialize(config: GoogleConfig | null): Promise<void> {
     this.config = config;
     await fsPromises.mkdir(this.cacheRoot, { recursive: true });
+    let raw: string;
     try {
-      const raw = await fsPromises.readFile(this.accountsPath, "utf8");
-      const stored = JSON.parse(raw) as StoredAccount[];
-      for (const account of stored) {
-        // Accounts saved before identity scopes were requested have no usable email.
-        if (!account.email || account.email === "Google account") {
-          account.needsReauth = true;
-        }
-        this.accounts.set(account.id, account);
-      }
+      raw = await fsPromises.readFile(this.accountsPath, "utf8");
     } catch {
-      // First run, or the file was cleared.
+      return; // First run, or the account file was cleared.
+    }
+
+    let stored: StoredAccount[];
+    let legacyPlaintext = false;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        (parsed as { format?: unknown }).format ===
+          "silo-google-accounts-encrypted"
+      ) {
+        const envelope = parsed as { version?: unknown; ciphertext?: unknown };
+        if (envelope.version !== 1 || typeof envelope.ciphertext !== "string")
+          throw new Error("Google token storage has an unsupported format.");
+        if (!this.secureTokenStorageAvailable()) {
+          this.storageWarning =
+            "Google sign-in is locked because this system has no secure OS credential store. The saved account file was left untouched.";
+          return;
+        }
+        const decrypted = safeStorage.decryptString(
+          Buffer.from(envelope.ciphertext, "base64"),
+        );
+        stored = JSON.parse(decrypted) as StoredAccount[];
+      } else if (Array.isArray(parsed)) {
+        if (!this.secureTokenStorageAvailable()) {
+          this.storageWarning =
+            "Google sign-in is paused because saved tokens are not encrypted and this system has no secure OS credential store. The saved account file was left untouched.";
+          return;
+        }
+        stored = parsed as StoredAccount[];
+        legacyPlaintext = true;
+      } else {
+        throw new Error("Google account storage is invalid.");
+      }
+      if (!Array.isArray(stored))
+        throw new Error("Google account storage is invalid.");
+    } catch (error) {
+      this.storageWarning =
+        error instanceof Error
+          ? `Google account storage could not be opened: ${error.message}`
+          : "Google account storage could not be opened.";
+      return;
+    }
+
+    for (const account of stored) {
+      // Accounts saved before identity scopes were requested have no usable email.
+      if (!account.email || account.email === "Google account") {
+        account.needsReauth = true;
+      }
+      this.accounts.set(account.id, account);
+    }
+    if (legacyPlaintext) {
+      try {
+        await this.persist();
+      } catch {
+        this.storageWarning =
+          "Google tokens were loaded from an older plaintext file, but Silo could not migrate it to OS-encrypted storage. Check file permissions before reconnecting.";
+      }
+    }
+  }
+
+  private secureTokenStorageAvailable(): boolean {
+    try {
+      return (
+        safeStorage.isEncryptionAvailable() &&
+        safeStorage.getSelectedStorageBackend() !== "basic_text"
+      );
+    } catch {
+      return false;
     }
   }
 
@@ -266,6 +332,7 @@ export class GoogleManager {
         accounts.length === 0
           ? "Add a Google account to browse Drive and Photos."
           : `${accounts.length} account${accounts.length === 1 ? "" : "s"} connected.`,
+      ...(this.storageWarning ? { storageWarning: this.storageWarning } : {}),
     };
   }
 
@@ -273,6 +340,15 @@ export class GoogleManager {
 
   async addAccount(): Promise<GoogleAccountsState> {
     if (!this.config) return this.getState();
+    if (!this.secureTokenStorageAvailable()) {
+      this.storageWarning =
+        "Google sign-in is disabled because this system has no secure OS credential store.";
+      return {
+        ...this.getState(),
+        message: this.storageWarning,
+        storageWarning: this.storageWarning,
+      };
+    }
 
     const verifier = randomBytes(48).toString("base64url");
     const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -450,11 +526,26 @@ export class GoogleManager {
   }
 
   private async persist(): Promise<void> {
-    await fsPromises.writeFile(
-      this.accountsPath,
-      JSON.stringify(Array.from(this.accounts.values()), null, 2),
-      { mode: 0o600 },
+    if (!this.secureTokenStorageAvailable())
+      throw new Error(
+        "Google tokens cannot be saved without secure OS credential storage.",
+      );
+    const plaintext = JSON.stringify(
+      Array.from(this.accounts.values()),
+      null,
+      2,
     );
+    const ciphertext = safeStorage.encryptString(plaintext).toString("base64");
+    const envelope = JSON.stringify({
+      format: "silo-google-accounts-encrypted",
+      version: 1,
+      ciphertext,
+    });
+    const temporaryPath = `${this.accountsPath}.${process.pid}.${Date.now()}.tmp`;
+    await fsPromises.writeFile(temporaryPath, envelope, { mode: 0o600 });
+    await fsPromises.chmod(temporaryPath, 0o600).catch(() => undefined);
+    await fsPromises.rename(temporaryPath, this.accountsPath);
+    this.storageWarning = null;
   }
 
   private async accessToken(accountId: string): Promise<string> {

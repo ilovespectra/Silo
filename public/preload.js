@@ -276,6 +276,9 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("get-state-summary", country),
   getPhotosByRegion: (country, state) =>
     ipcRenderer.invoke("get-photos-by-region", country, state),
+  getMapServiceConsent: () => ipcRenderer.invoke("get-map-service-consent"),
+  setMapServiceConsent: (allowed) =>
+    ipcRenderer.invoke("set-map-service-consent", allowed),
   reverseGeocode: (latitude, longitude) =>
     ipcRenderer.invoke("reverse-geocode", latitude, longitude),
   searchLocations: (query) => ipcRenderer.invoke("search-locations", query),

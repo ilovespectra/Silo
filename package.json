@@ -7,7 +7,7 @@
   "private": true,
   "scripts": {
     "react-start": "PORT=8787 react-scripts start",
-    "react-build": "react-scripts build",
+    "react-build": "react-scripts build && node scripts/lockdown-built-csp.cjs",
     "react-test": "react-scripts test",
     "test:auto-indexing": "node test/runAutoIndexingTests.cjs",
     "test:semantic-isolation": "node test/runSemanticIsolationTests.cjs",
@@ -49,7 +49,7 @@
     "test:license": "node test/runLifetimePaymentTests.cjs && node --check scripts/beta-license.cjs && node --check scripts/check-beta-release.cjs && node --check scripts/owner-license.cjs"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.2.0",
+    "@huggingface/transformers": "^4.3.1",
     "@tensorflow/tfjs": "^4.22.0",
     "@tensorflow/tfjs-backend-wasm": "^4.22.0",
     "@types/three": "^0.180.0",
@@ -74,7 +74,7 @@
     "react-icons": "^5.0.1",
     "react-markdown": "^8.0.7",
     "remark-gfm": "^3.0.1",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.5",
     "tar-stream": "^3.2.2",
     "three": "^0.180.0",
     "usearch": "2.26.4",
@@ -88,8 +88,8 @@
     "@types/react-dom": "^18.2.0",
     "@types/yauzl": "^3.4.0",
     "concurrently": "^8.2.0",
-    "electron": "37.10.3",
-    "electron-builder": "^24.6.0",
+    "electron": "44.8.0",
+    "electron-builder": "^26.15.3",
     "js-yaml": "^4.1.0",
     "react-scripts": "5.0.1",
     "typescript": "^4.9.5",
@@ -114,7 +114,7 @@
     "mac": {
       "artifactName": "${productName}-${version}-${arch}.${ext}",
       "category": "public.app-category.utilities",
-      "minimumSystemVersion": "11.0",
+      "minimumSystemVersion": "12.0",
       "extendInfo": {
         "CFBundleName": "Silo",
         "CFBundleDisplayName": "Silo",
@@ -187,5 +187,14 @@
       "icon": "public/icon.png"
     }
   },
-  "productName": "Silo"
+  "productName": "Silo",
+  "overrides": {
+    "@tensorflow/tfjs": {
+      "argparse": "^2.0.1"
+    },
+    "mammoth": {
+      "argparse": "^2.0.1"
+    },
+    "underscore": "^1.13.8"
+  }
 }

@@ -112,6 +112,7 @@ interface FaceState {
   version: 1;
   faceRecordVersion?: number;
   people: PersonCluster[];
+  excludedPeoplePhotoPaths?: string[];
   faceEdits?: Record<string, FaceEdit>;
   bannedFaces?: { [personId: string]: BannedFace };
   bannedPhotoPaths?: string[];
@@ -142,6 +143,9 @@ interface FaceRuntime {
 }
 
 type IndexedImagesProvider = () => IndexableFile[] | Promise<IndexableFile[]>;
+type PeoplePhotoClassifier = (
+  images: IndexableFile[],
+) => Promise<Set<string>>;
 type ProgressListener = (progress: FaceIndexProgress) => void;
 
 // Serialized people (null = did not exist) on each side of one user edit; only changed people are kept.
@@ -202,6 +206,9 @@ export class FaceIndexer {
   private undoStack: EditStep[] = [];
   private redoStack: EditStep[] = [];
   private missingPhotos = new Set<string>();
+  private excludedPeoplePhotoPaths = new Set<string>();
+  private classifyNonPhotoPeopleImages: PeoplePhotoClassifier = async () =>
+    new Set();
   // True when a photo is hidden from review (content protection / another person's ban).
   private hiddenPhoto: (photoPath: string, ownerBanned: boolean) => boolean =
     () => false;
@@ -284,6 +291,10 @@ export class FaceIndexer {
       await this.persistState();
     this.bannedPhotoPaths = new Set(this.state.bannedPhotoPaths ?? []);
     this.missingPhotos = new Set(this.state.missingPhotoPaths ?? []);
+    this.excludedPeoplePhotoPaths = new Set(
+      this.state.excludedPeoplePhotoPaths ?? [],
+    );
+    await this.cleanExistingPeopleClusters();
     const recognitionNeedsRefresh = !hasJournalVersion || recoveredJournal;
     void this.recheckMissingPhotos().then((restoredPhotos) => {
       // Stored suggestions are already current on a clean launch. Matching every
@@ -292,6 +303,131 @@ export class FaceIndexer {
       if (recognitionNeedsRefresh || restoredPhotos)
         void this.refreshRecognition();
     });
+  }
+
+  setPeoplePhotoClassifier(classifier: PeoplePhotoClassifier) {
+    this.classifyNonPhotoPeopleImages = classifier;
+  }
+
+  private isPhotoConfirmed(imagePath: string) {
+    return this.state.people.some(
+      (person) =>
+        person.confirmedPhotoPaths.includes(imagePath) ||
+        person.manualPhotoPaths.includes(imagePath),
+    );
+  }
+
+  private async cleanExistingPeopleClusters() {
+    const clusterPaths = new Set<string>();
+    for (const person of this.state.people) {
+      for (const faceId of [
+        ...person.faceIds,
+        ...(person.suggestedFaceIds ?? []),
+      ]) {
+        const face = this.faces.get(faceId);
+        if (face) clusterPaths.add(face.imagePath);
+      }
+      for (const imagePath of person.manualPhotoPaths)
+        clusterPaths.add(imagePath);
+    }
+    const candidates = Array.from(clusterPaths).filter(
+      (imagePath) => !this.isPhotoConfirmed(imagePath),
+    );
+    if (candidates.length === 0) return;
+
+    const indexed = await this.getIndexedImages();
+    const byPath = new Map(indexed.map((image) => [image.path, image]));
+    const images = candidates.map(
+      (imagePath) =>
+        byPath.get(imagePath) ?? {
+          name: path.basename(imagePath),
+          path: imagePath,
+          relativePath: path.basename(imagePath),
+          size: 0,
+          modified: 0,
+          isDirectory: false,
+          type: "image",
+          extension: path.extname(imagePath).replace(/^\./, "").toLowerCase(),
+        },
+    );
+    let excluded = new Set<string>();
+    try {
+      excluded = await this.classifyNonPhotoPeopleImages(images);
+    } catch {
+      // Classification errors must never hide user photos.
+      return;
+    }
+
+    let changed = false;
+    for (const imagePath of candidates) {
+      if (this.isPhotoConfirmed(imagePath)) continue;
+      if (excluded.has(imagePath)) {
+        this.excludedPeoplePhotoPaths.add(imagePath);
+        changed = this.detachUnconfirmedPhoto(imagePath) || changed;
+      } else if (this.excludedPeoplePhotoPaths.delete(imagePath)) {
+        changed = true;
+      }
+    }
+    if (changed || candidates.some((imagePath) => excluded.has(imagePath))) {
+      this.state.excludedPeoplePhotoPaths = Array.from(
+        this.excludedPeoplePhotoPaths,
+      );
+      await this.persistState();
+      this.peopleChangeListener();
+    }
+  }
+
+  private detachUnconfirmedPhoto(imagePath: string) {
+    let changed = false;
+    for (const person of this.state.people) {
+      if (this.isPhotoConfirmedForPerson(person, imagePath)) continue;
+      const faceIds = new Set(
+        person.faceIds.filter(
+          (faceId) => this.faces.get(faceId)?.imagePath === imagePath,
+        ),
+      );
+      if (faceIds.size > 0) {
+        person.faceIds = person.faceIds.filter((faceId) => !faceIds.has(faceId));
+        this.updateCentroid(person);
+        changed = true;
+      }
+      const suggestions = person.suggestedFaceIds ?? [];
+      const keptSuggestions = suggestions.filter(
+        (faceId) => this.faces.get(faceId)?.imagePath !== imagePath,
+      );
+      if (keptSuggestions.length !== suggestions.length) {
+        person.suggestedFaceIds = keptSuggestions;
+        changed = true;
+      }
+      if (person.manualPhotoPaths.includes(imagePath)) {
+        person.manualPhotoPaths = person.manualPhotoPaths.filter(
+          (item) => item !== imagePath,
+        );
+        changed = true;
+      }
+    }
+    const confirmedPersonIds = new Set(
+      this.state.people
+        .filter((person) => this.isPhotoConfirmedForPerson(person, imagePath))
+        .map((person) => person.id),
+    );
+    for (const face of this.facesByImage.get(imagePath) ?? []) {
+      const keptPersonIds = face.personIds.filter((personId) =>
+        confirmedPersonIds.has(personId),
+      );
+      if (keptPersonIds.length !== face.personIds.length) {
+        face.personIds = keptPersonIds;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  private isPhotoConfirmedForPerson(person: PersonCluster, imagePath: string) {
+    return (
+      person.confirmedPhotoPaths.includes(imagePath) ||
+      person.manualPhotoPaths.includes(imagePath)
+    );
   }
 
   setHiddenPhotoPredicate(
@@ -857,6 +993,7 @@ export class FaceIndexer {
       : this.newManualPerson(target.newName ?? "");
     const affected = new Set<PersonCluster>([person]);
     for (const imagePath of new Set(imagePaths)) {
+      this.excludedPeoplePhotoPaths.delete(imagePath);
       person.rejectedPhotoPaths = person.rejectedPhotoPaths.filter(
         (item) => item !== imagePath,
       );
@@ -1263,10 +1400,47 @@ export class FaceIndexer {
       const images = imagesOrPromise instanceof Promise
         ? await imagesOrPromise
         : imagesOrPromise;
-      const pending = images.filter(
+      const changedImages = images.filter(
         (image) =>
           this.processedSignatures.get(image.path) !== this.signature(image),
       );
+      let newlyExcluded = new Set<string>();
+      const eligibleForClassification = changedImages.filter(
+        (image) =>
+          !this.excludedPeoplePhotoPaths.has(image.path) &&
+          !this.isPhotoConfirmed(image.path),
+      );
+      try {
+        newlyExcluded = await this.classifyNonPhotoPeopleImages(
+          eligibleForClassification,
+        );
+      } catch {
+        // A local classifier failure should fall back to face detection.
+      }
+      const pending: IndexableFile[] = [];
+      for (const image of changedImages) {
+        if (this.isPhotoConfirmed(image.path)) {
+          this.excludedPeoplePhotoPaths.delete(image.path);
+          pending.push(image);
+          continue;
+        }
+        if (
+          this.excludedPeoplePhotoPaths.has(image.path) ||
+          newlyExcluded.has(image.path)
+        ) {
+          this.excludedPeoplePhotoPaths.add(image.path);
+          this.detachUnconfirmedPhoto(image.path);
+          await this.appendProcessed(image, []);
+          continue;
+        }
+        pending.push(image);
+      }
+      if (newlyExcluded.size > 0) {
+        this.state.excludedPeoplePhotoPaths = Array.from(
+          this.excludedPeoplePhotoPaths,
+        );
+        await this.persistState();
+      }
       const processed = images.length - pending.length;
       await this.updateProgress(
         {
@@ -2286,6 +2460,7 @@ export class FaceIndexer {
         await new Promise((resolve) => setImmediate(resolve));
       if (
         skip(face) ||
+        this.excludedPeoplePhotoPaths.has(face.imagePath) ||
         this.isFaceDeleted(face) ||
         face.descriptor.length === 0
       )
@@ -2489,6 +2664,7 @@ export class FaceIndexer {
     this.photoPeopleCache = null;
     const data = JSON.stringify({
       ...this.state,
+      excludedPeoplePhotoPaths: Array.from(this.excludedPeoplePhotoPaths),
       faceRecordVersion: this.faceRecordVersion,
     });
     const write = this.stateWriteChain.then(async () => {

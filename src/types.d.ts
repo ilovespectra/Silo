@@ -240,6 +240,7 @@ interface GoogleAccountsState {
   allPhotosPath: string;
   totalPickedCount: number;
   message: string;
+  storageWarning?: string;
 }
 
 interface ScanIssues {
@@ -1153,6 +1154,8 @@ interface Window {
       country: string | null,
       state?: string | null,
     ): Promise<GeoPhoto[]>;
+    getMapServiceConsent(): Promise<boolean | null>;
+    setMapServiceConsent(allowed: boolean): Promise<boolean>;
     reverseGeocode(
       latitude: number,
       longitude: number,
