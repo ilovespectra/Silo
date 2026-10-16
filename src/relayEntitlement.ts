@@ -66,13 +66,15 @@ export function isSignedEntitlementAllowed(
     if (typeof payload[key] === "undefined") return false;
   }
   if (payload.status !== "allowed") return false;
+  if (typeof payload.deviceId !== "string" || payload.deviceId.trim().length === 0) return false;
   if (payload.deviceId !== expectedDeviceId) return false;
   if (typeof payload.signature !== "string" || payload.signature.trim().length === 0) return false;
   if (typeof payload.issuedAt !== "number" || typeof payload.expiresAt !== "number") return false;
   if (payload.expiresAt <= nowMs) return false;
   if (typeof payload.appVersion !== "string" || payload.appVersion.trim().length === 0) return false;
   if (typeof payload.minimumRequiredVersion !== "string" || payload.minimumRequiredVersion.trim().length === 0) return false;
-  const signedPayload = {
+  if (typeof payload.nonce !== "string" || payload.nonce.trim().length === 0) return false;
+  const signedPayload: Omit<SignedEntitlement, "signature"> = {
     status: payload.status,
     deviceId: payload.deviceId,
     appVersion: payload.appVersion,
