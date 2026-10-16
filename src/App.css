@@ -1173,6 +1173,37 @@ label.settings-row {
   order: 4;
 }
 
+.header-right .search-result-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  order: 4;
+  margin-left: 7px;
+  padding-left: 7px;
+  border-left: 1px solid var(--line);
+}
+
+.search-confidence-tool {
+  display: inline-flex;
+  min-width: 104px;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.search-confidence-tool span {
+  width: 30px;
+  text-align: right;
+}
+
+.search-confidence-tool input {
+  width: 76px;
+  margin: 0;
+  accent-color: var(--orange);
+}
+
 .header-directory:not(:empty) + .header-right {
   padding-left: 12px;
   border-left: 1px solid var(--line);
@@ -1847,6 +1878,13 @@ label.settings-row {
 .digital-folder > button:not(.digital-folder-name):hover:not(:disabled) {
   border-color: var(--orange);
   color: var(--orange);
+}
+
+.sidebar-heading > button.source-backups-toggle[aria-pressed="true"] {
+  border-color: var(--orange);
+  background: color-mix(in srgb, var(--orange) 16%, var(--raised));
+  color: var(--orange);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--orange) 55%, transparent);
 }
 
 .source-list {
@@ -8263,6 +8301,20 @@ input[type="range"]::-moz-range-progress {
     gap: 6px;
   }
 
+  .header-right .search-result-tools {
+    margin-left: 3px;
+    padding-left: 5px;
+  }
+
+  .search-confidence-tool {
+    min-width: 94px;
+    gap: 4px;
+  }
+
+  .search-confidence-tool input {
+    width: 64px;
+  }
+
   .header-directory {
     flex-wrap: wrap;
   }
@@ -8459,6 +8511,13 @@ input[type="range"]::-moz-range-progress {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface);
+}
+
+.phone-scan-notice {
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .phone-manager-settings {

@@ -210,6 +210,10 @@ contextBridge.exposeInMainWorld("electron", {
     return () => ipcRenderer.removeListener("content-safety-changed", listener);
   },
   updateUiState: (update, diagnosticUi) => ipcRenderer.invoke("update-ui-state", update, diagnosticUi),
+  updateSearchFeedback: (filePaths, disposition) =>
+    ipcRenderer.invoke("update-search-feedback", filePaths, disposition),
+  updateMessageFlags: (messageKey, update) =>
+    ipcRenderer.invoke("update-message-flags", messageKey, update),
   selectIndexSource: () => ipcRenderer.invoke("select-index-source"),
   addMachineSource: () => ipcRenderer.invoke("add-machine-source"),
   removeIndexSource: (sourcePath) =>
@@ -424,6 +428,7 @@ contextBridge.exposeInMainWorld("electron", {
   rejectNameFile: (name, filePath) =>
     ipcRenderer.invoke("reject-name-file", name, filePath),
   getPhoneTooling: () => ipcRenderer.invoke("get-phone-tooling"),
+  scanPhones: () => ipcRenderer.invoke("scan-phones"),
   getPhoneBackupStates: () => ipcRenderer.invoke("get-phone-backup-states"),
   renewPhoneBackup: (deviceId, platform, includeTypes) =>
     ipcRenderer.invoke("renew-phone-backup", deviceId, platform, includeTypes),
@@ -554,6 +559,8 @@ contextBridge.exposeInMainWorld("electron", {
     ),
   getMessageThreads: (deviceId, platform, refresh) =>
     ipcRenderer.invoke("get-message-threads", deviceId, platform, refresh),
+  getPhoneMessageBackupMetadata: (deviceId, platform) =>
+    ipcRenderer.invoke("get-phone-message-backup-metadata", deviceId, platform),
   getMessageAttachmentDataUrl: (deviceId, messageId, partId) =>
     ipcRenderer.invoke(
       "get-message-attachment-data-url",

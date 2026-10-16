@@ -8,6 +8,7 @@ import {
   MessageAttachmentPaths,
   MessageThread,
   MessageHistoryEntry,
+  IOSMessageBackupFile,
   messagePartKey,
 } from "./messageManager";
 import { MessagePDFGenerator } from "./messagePDFGenerator";
@@ -271,6 +272,10 @@ export class MessageExportCoordinator {
       refresh,
       deviceName,
     );
+  }
+
+  getIOSMessageBackupFile(deviceId: string): Promise<IOSMessageBackupFile | null> {
+    return this.messageManager.getIOSMessageBackupFile(deviceId);
   }
 
   getMessageAttachmentDataUrl(

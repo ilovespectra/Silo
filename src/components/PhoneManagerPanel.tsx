@@ -28,6 +28,7 @@ export function isPhoneDeviceBackingUp(
 interface PhoneManagementPanelProps {
   devices: PhoneDevice[];
   tooling: PhoneTooling | null;
+  notice: string;
   busyDeviceId: string | null;
   activeDeviceKey: string | null;
   backups: Record<string, PhoneBackupProgress>;
@@ -573,6 +574,7 @@ function PhoneBackupTypePicker({
 export function PhoneManagementPanel({
   devices,
   tooling,
+  notice,
   busyDeviceId,
   activeDeviceKey,
   backups,
@@ -611,6 +613,7 @@ export function PhoneManagementPanel({
   };
   return (
     <section className="phone-management-panel" aria-label="Mobile manager" data-tour="mobile-devices">
+      {notice && <p className="phone-scan-notice" role="status">{notice}</p>}
       {devices.length > 0 ? (
         <>
           <div className="phone-device-list">

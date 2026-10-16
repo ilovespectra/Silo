@@ -10,6 +10,7 @@ import { DEFAULT_SEMANTIC_SEARCH_CONFIDENCE } from "./searchSettings";
 import {
   FiArrowUp,
   FiCheck,
+  FiCheckCircle,
   FiChevronDown,
   FiChevronLeft,
   FiChevronRight,
@@ -97,7 +98,6 @@ import GoogleReclaimDialog from "./components/GoogleReclaimDialog";
 import { GOOGLE_FEATURES_ENABLED } from "./featureFlags";
 import AudioLibrary from "./components/AudioLibrary";
 import IndexingPanel from "./components/IndexingPanel";
-import SourceClonePanel from "./components/SourceClonePanel";
 import LocationPicker from "./components/LocationPicker";
 import DuplicatesPage from "./components/DuplicatesPage";
 import SettingsPanel, {
@@ -645,6 +645,8 @@ const fileListKey = (file: { path: string; relativePath?: string; siloAlias?: bo
 
 function App() {
   const electronAPI = window.electron;
+  const searchFeedbackApiReady =
+    typeof electronAPI?.updateSearchFeedback === "function";
   const appRootRef = useRef<HTMLDivElement | null>(null);
   const [appVersion, setAppVersion] = useState("…");
   const [currentPath, setCurrentPath] = useState<string | null>(null);
@@ -787,7 +789,6 @@ function App() {
   } | null>(null);
   const [folderOrderBusy, setFolderOrderBusy] = useState(false);
   const [folderOrderError, setFolderOrderError] = useState("");
-  const [showSourceClone, setShowSourceClone] = useState(false);
   const [profilePicturePicker, setProfilePicturePicker] = useState<{
     x: number;
     y: number;
@@ -802,6 +803,7 @@ function App() {
   const [contentSettings, setContentSettings] = useState(
     defaultContentSettings,
   );
+  const [showHiddenMessages, setShowHiddenMessages] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsTourTarget, setSettingsTourTarget] = useState<string | null>(null);
   const [showBugReport, setShowBugReport] = useState(false);
@@ -911,6 +913,10 @@ function App() {
   const [searchResults, setSearchResults] = useState<SemanticSearchResult[]>(
     [],
   );
+  const [searchFeedback, setSearchFeedback] = useState<
+    Record<string, "confirmed" | "removed">
+  >({});
+  const [searchFeedbackBusy, setSearchFeedbackBusy] = useState(false);
   const [searchIndexReadiness, setSearchIndexReadiness] =
     useState<SearchIndexReadiness>({
       status: "preparing",
@@ -1248,10 +1254,6 @@ function App() {
       );
       });
   }, [showPhoneBackups, sourceSort, sources]);
-  const cloneableSources = useMemo(
-    () => sources.filter((source) => source.enabled && source.available),
-    [sources],
-  );
   const sourcesRef = useRef<BrowseSource[]>([]);
   const sourcesRefreshRequestRef = useRef(0);
   sourcesRef.current = sources;
@@ -1797,6 +1799,7 @@ function App() {
   }, [dialogBusy, dialogRequest, dialogValue]);
 
   const applyPersistedState = useCallback((state: PersistedAppState) => {
+    setShowHiddenMessages(state.ui.showHiddenMessages ?? false);
     setDigitalFolders(state.digitalFolders);
     const hiddenPaths = new Set<string>();
     state.digitalFolders
@@ -1818,8 +1821,28 @@ function App() {
         ? current
         : nextMetadata,
     );
+    const nextSearchFeedback = state.searchFeedback ?? {};
+    setSearchFeedback((current) =>
+      JSON.stringify(current) === JSON.stringify(nextSearchFeedback)
+        ? current
+        : nextSearchFeedback,
+    );
     if (state.indexProgress) setIndexProgress(state.indexProgress);
   }, []);
+
+  const updateHiddenMessageVisibility = useCallback(
+    async (show: boolean) => {
+      if (!electronAPI) return;
+      try {
+        applyPersistedState(
+          await electronAPI.updateUiState({ showHiddenMessages: show }),
+        );
+      } catch (error) {
+        console.error("Could not save message display preference:", error);
+      }
+    },
+    [applyPersistedState, electronAPI],
+  );
 
   const rememberSearchResultOrder = useCallback(
     (results: readonly { path: string }[], query: string) => {
@@ -2418,18 +2441,34 @@ function App() {
     try {
       const [tooling, devices] = await Promise.all([
         electronAPI.getPhoneTooling(),
-        electronAPI.listPhones(),
+        electronAPI.scanPhones(),
       ]);
       setPhoneTooling(tooling);
       setPhoneDevices(devices);
       setSources(await electronAPI.listSources());
       if (devices.length === 0) {
+        const missingTools = [
+          ...tooling.ios.missing,
+          ...tooling.android.missing,
+        ];
         setPhoneNotice(
           !tooling.ios.available && !tooling.android.available
-            ? "No device tooling installed yet."
+            ? `Phone scanning is unavailable. Missing device tools: ${missingTools.join(", ")}.`
             : "No phone detected. Connect one over USB and unlock it.",
         );
+      } else {
+        const needsTrust = devices.find(
+          (device) => device.status === "untrusted" || device.status === "unauthorized",
+        );
+        setPhoneNotice(
+          needsTrust?.message ||
+            `Found ${devices.length} connected ${devices.length === 1 ? "device" : "devices"}. Scanning did not start a backup.`,
+        );
       }
+    } catch (error) {
+      setPhoneNotice(
+        error instanceof Error ? error.message : "Could not scan for phones.",
+      );
     } finally {
       setPhoneScanning(false);
     }
@@ -4716,6 +4755,7 @@ function App() {
     const resultsByPath = new Map<string, SemanticSearchResult>();
     for (const result of fastFileSearchResults)
       if (
+        searchFeedback[result.path] !== "removed" &&
         !bannedHiddenPaths.has(result.path) &&
         pathIsVisibleForSelectedSources(
           result.path,
@@ -4726,6 +4766,7 @@ function App() {
         resultsByPath.set(result.path, result);
     for (const result of searchResults) {
       if (
+        searchFeedback[result.path] === "removed" ||
         bannedHiddenPaths.has(result.path) ||
         !pathIsVisibleForSelectedSources(
           result.path,
@@ -4770,6 +4811,7 @@ function App() {
     allSourcePaths,
     searchQuery,
     searchResults,
+    searchFeedback,
   ]);
   const contentFiles = useMemo(
     () => {
@@ -4963,6 +5005,12 @@ function App() {
     });
 
     if (!deferBrowseSort) filtered.sort((first, second) => {
+      if (searchQuery.trim()) {
+        const firstConfirmed = searchFeedback[first.path] === "confirmed";
+        const secondConfirmed = searchFeedback[second.path] === "confirmed";
+        if (firstConfirmed !== secondConfirmed)
+          return firstConfirmed ? -1 : 1;
+      }
       if (
         searchQuery.trim() &&
         freezeSearchResultOrder &&
@@ -5009,6 +5057,7 @@ function App() {
     filters,
     magicState.ranks,
     searchQuery,
+    searchFeedback,
     sortIndicators,
     freezeSearchResultOrder,
     loading,
@@ -5023,6 +5072,18 @@ function App() {
   const hasSelectableFiles = useMemo(
     () => filteredAndSortedFiles.some((file) => !file.isDirectory),
     [filteredAndSortedFiles],
+  );
+  const selectedSearchResultCount = useMemo(
+    () =>
+      filteredAndSortedFiles.reduce(
+        (count, file) =>
+          count +
+          Number(
+            !file.isDirectory && selectedFilePaths.has(file.path),
+          ),
+        0,
+      ),
+    [filteredAndSortedFiles, selectedFilePaths],
   );
 
   const yearOptions = useMemo(
@@ -5070,6 +5131,57 @@ function App() {
   const clearAllFiles = useCallback(() => {
     setSelectedFilePaths(new Set());
   }, []);
+
+  const updateSelectedSearchFeedback = useCallback(
+    async (disposition: "confirmed" | "removed") => {
+      if (
+        !searchFeedbackApiReady ||
+        !electronAPI ||
+        searchFeedbackBusy ||
+        selectedFilePaths.size === 0
+      )
+        return;
+      const visibleSearchPaths = new Set(
+        filteredAndSortedFiles
+          .filter((file) => !file.isDirectory)
+          .map((file) => file.path),
+      );
+      const filePaths = Array.from(selectedFilePaths).filter((filePath) =>
+        visibleSearchPaths.has(filePath),
+      );
+      if (filePaths.length === 0) return;
+
+      setSearchFeedbackBusy(true);
+      setSearchError("");
+      try {
+        const state = await electronAPI.updateSearchFeedback(
+          filePaths,
+          disposition,
+        );
+        applyPersistedState(state);
+        const updatedPaths = new Set(filePaths);
+        setSelectedFilePaths((current) =>
+          new Set(Array.from(current).filter((filePath) => !updatedPaths.has(filePath))),
+        );
+      } catch (cause) {
+        setSearchError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not save search feedback.",
+        );
+      } finally {
+        setSearchFeedbackBusy(false);
+      }
+    },
+    [
+      applyPersistedState,
+      electronAPI,
+      filteredAndSortedFiles,
+      searchFeedbackApiReady,
+      searchFeedbackBusy,
+      selectedFilePaths,
+    ],
+  );
 
   const navigateViewer = useCallback(
     async (offset: number) => {
@@ -6042,7 +6154,7 @@ function App() {
                 >
                   <FiSliders /> Sort &amp; Filter
                 </button>
-                {(currentPath || activeDigitalFolderId) && (
+                {!searchQuery.trim() && (currentPath || activeDigitalFolderId) && (
                   <>
                     <button
                       className="btn btn-icon header-tool-selection"
@@ -6065,6 +6177,59 @@ function App() {
                       <FiX />
                     </button>
                   </>
+                )}
+                {searchQuery.trim() && (
+                  <div className="search-result-tools" role="toolbar" aria-label="Search tools">
+                    <button
+                      className="btn btn-icon header-tool-selection"
+                      onClick={selectAllFiles}
+                      disabled={!hasSelectableFiles}
+                      title="Select all search results"
+                      aria-label="Select all search results"
+                    >
+                      <FiCheck />
+                    </button>
+                    <label
+                      className="search-confidence-tool"
+                      title={`Search confidence: ${confidence}%`}
+                    >
+                      <span aria-hidden="true">{confidence}%</span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        step="1"
+                        value={confidence}
+                        aria-label="Search confidence"
+                        aria-valuetext={`${confidence}%`}
+                        onChange={(event) =>
+                          setConfidence(Number(event.target.value))
+                        }
+                      />
+                    </label>
+                    <button
+                      className="btn btn-icon header-tool-selection"
+                      onClick={() => void updateSelectedSearchFeedback("confirmed")}
+                      disabled={!searchFeedbackApiReady || selectedSearchResultCount === 0 || searchFeedbackBusy}
+                      title={searchFeedbackApiReady
+                        ? "Confirm selected results and prioritize them in future searches"
+                        : "Restart Silo to load search feedback tools"}
+                      aria-label="Confirm selected search results"
+                    >
+                      <FiCheckCircle />
+                    </button>
+                    <button
+                      className="btn btn-icon header-tool-selection"
+                      onClick={() => void updateSelectedSearchFeedback("removed")}
+                      disabled={!searchFeedbackApiReady || selectedSearchResultCount === 0 || searchFeedbackBusy}
+                      title={searchFeedbackApiReady
+                        ? "Remove selected results from future searches; source files stay unchanged"
+                        : "Restart Silo to load search feedback tools"}
+                      aria-label="Remove selected search results"
+                    >
+                      <FiEyeOff />
+                    </button>
+                  </div>
                 )}
               </>
             ) : null}
@@ -6436,21 +6601,6 @@ function App() {
             </select>
             {!audioOnlySelected && magicTools(false)}
           </div>
-          {searchQuery.trim() && (
-            <div className="filter-section confidence-filter">
-              <h3>
-                Confidence <span>{confidence}%</span>
-              </h3>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                step="1"
-                value={confidence}
-                onChange={(event) => setConfidence(Number(event.target.value))}
-              />
-            </div>
-          )}
         </div>
       )}
 
@@ -7336,11 +7486,15 @@ function App() {
       ) : appSection === "mobile" ? (
         <main className="mobile-page" data-retained-scroll="mobile" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
           <section className="mobile-messages-section" aria-label="Mobile manager">
-            <MessageExportPanel
-              devicePanel={
+        <MessageExportPanel
+            showHiddenMessages={showHiddenMessages}
+            onScanPhones={() => void scanForPhones()}
+            scanningPhones={phoneScanning}
+            devicePanel={
                 <PhoneManagementPanel
                   devices={phoneDevices}
                   tooling={phoneTooling}
+                  notice={phoneNotice}
                   busyDeviceId={phoneBusyId}
                   activeDeviceKey={
                     connectedPhone
@@ -7414,16 +7568,6 @@ function App() {
                 >
                   <FiHardDrive />
                 </button>
-                <button
-                  onClick={() => setShowSourceClone(true)}
-                  disabled={cloneableSources.length === 0}
-                  title="Create a separate Fallout Shelter copy without modifying originals"
-                  aria-label="Create a verified Fallout Shelter copy"
-                  data-tour="source-clone"
-                  data-help="Create a Fallout Shelter copy of enabled sources and verify it with SHA-256. Original files are not modified or removed."
-                >
-                  <FiCopy />
-                </button>
                 <button onClick={refreshSources} title="Refresh sources" aria-label="Refresh sources"
                   data-help="Refresh source availability and registered-source details.">
                   <FiRefreshCw />
@@ -7435,6 +7579,7 @@ function App() {
                     title={showPhoneBackups ? "Hide cached phone backups" : "Show cached phone backups"}
                     aria-label={showPhoneBackups ? "Hide cached phone backups" : "Show cached phone backups"}
                     aria-pressed={showPhoneBackups}
+                    className={showPhoneBackups ? "source-backups-toggle active" : "source-backups-toggle"}
                   >
                     <FiClock aria-hidden="true" />
                   </button>
@@ -7509,19 +7654,6 @@ function App() {
                           </small>
                         )}
                       </span>
-                      {source.available && (
-                        <button
-                          className="volume-open"
-                          onClick={(event) => {
-                            event.preventDefault();
-                            void navigateToPath(source.rootPath);
-                          }}
-                          title={`Browse ${source.label}`}
-                          aria-label={`Browse ${source.label}`}
-                        >
-                          <FiChevronRight />
-                        </button>
-                      )}
                       {(source.kind === "local" || source.kind === "machine") && (
                         <button
                           className="source-unplug-button"
@@ -8583,17 +8715,6 @@ function App() {
         </nav>
       </footer>
 
-      {showSourceClone && electronAPI && (
-        <SourceClonePanel
-          electronAPI={electronAPI}
-          sources={cloneableSources}
-          onClose={() => {
-            setShowSourceClone(false);
-            void refreshSources();
-          }}
-        />
-      )}
-
       {showFolderSelector && (
         <div
           className="dialog-backdrop"
@@ -8723,6 +8844,10 @@ function App() {
       {showSettings && (
         <SettingsPanel
           settings={contentSettings}
+          showHiddenMessages={showHiddenMessages}
+          onShowHiddenMessagesChange={(show) =>
+            void updateHiddenMessageVisibility(show)
+          }
           onChange={setContentSettings}
           focusTarget={settingsTourTarget}
           onClose={() => {

@@ -16,6 +16,7 @@ import {
   FiFolder,
   FiHardDrive,
   FiLock,
+  FiMessageSquare,
   FiSearch,
   FiShare2,
   FiShield,
@@ -35,6 +36,7 @@ type SettingsPageId =
   | "share"
   | "backup"
   | "privacy"
+  | "messages"
   | "performance"
   | "statistics"
   | "cache"
@@ -61,6 +63,7 @@ const SETTINGS_PAGES: SettingsPageDefinition[] = [
   { id: "share", label: "Share a library", description: "Let family browse and save originals on your local network.", icon: FiShare2, tint: "#8d6549", keywords: "wifi network family link qr phone browse download", section: 1 },
   { id: "backup", label: "Backup & restore", description: "Save Silo's whole setup to one file and restore it later.", icon: FiArchive, tint: "#746c65", keywords: "export import config configuration reinstall restore", section: 1 },
   { id: "privacy", label: "Privacy & safety", description: "Explicit content is hidden and blocked from search by default.", icon: FiShield, tint: "#696560", keywords: "nsfw safe search explicit banned people parental content protection", section: 1 },
+  { id: "messages", label: "Messages", description: "Choose how saved phone conversations appear.", icon: FiMessageSquare, tint: "#82756a", keywords: "messages texts conversations hidden display", section: 1 },
   { id: "performance", label: "Performance", description: "How much CPU time search and indexing can use.", icon: FiCpu, tint: "#986b47", keywords: "cpu threads indexing speed pace", section: 1 },
   { id: "statistics", label: "Library statistics", description: "Inventory, source coverage and indexer progress.", icon: FiBarChart2, tint: "#78716c", keywords: "statistics dashboard totals inventory sources coverage indexing", section: 1 },
   { id: "cache", label: "Silo cache destination", description: "Where indexes, faces, places, thumbnails and previews are stored.", icon: FiHardDrive, tint: "#78716c", keywords: "cache index thumbnails previews external drive storage fallback", section: 2 },
@@ -108,6 +111,8 @@ function SettingsIconTile({ page, size = "small" }: { page: SettingsPageDefiniti
 
 interface SettingsPanelProps {
   settings: PublicContentSettings;
+  showHiddenMessages: boolean;
+  onShowHiddenMessagesChange: (show: boolean) => void;
   onChange: (settings: PublicContentSettings) => void;
   onClose: () => void;
   onOpenStatistics: () => void;
@@ -826,6 +831,8 @@ export function BugReportDialog({
 
 export default function SettingsPanel({
   settings,
+  showHiddenMessages,
+  onShowHiddenMessagesChange,
   onChange,
   onClose,
   onOpenStatistics,
@@ -1624,6 +1631,29 @@ export default function SettingsPanel({
               )}
             </section>
           </>
+        );
+      case "messages":
+        return (
+          <section className="settings-card" aria-label="Messages display">
+            <label className="settings-row settings-toggle">
+              <div className="settings-row-text">
+                <strong>Display hidden messages</strong>
+                <span>
+                  Show messages you have hidden in phone conversations. Hidden
+                  messages stay saved and can be hidden again at any time.
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                className="settings-switch"
+                checked={showHiddenMessages}
+                data-help="Temporarily reveal messages marked hidden in the Messages view."
+                onChange={(event) =>
+                  onShowHiddenMessagesChange(event.target.checked)
+                }
+              />
+            </label>
+          </section>
         );
       case "performance":
         return <PerformanceSettingsSection />;

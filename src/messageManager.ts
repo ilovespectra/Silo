@@ -4,6 +4,7 @@ import * as fsPromises from "fs/promises";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import { createHash } from "crypto";
+import { isPathWithin } from "./indexingPathPolicy";
 
 const execFileAsync = promisify(execFile);
 const MAX_MMS_ATTACHMENT_BYTES = 32 * 1024 * 1024;
@@ -107,6 +108,13 @@ export interface MessageHistoryEntry {
   deviceName: string;
   threadCount: number;
   lastMessageDate: number;
+}
+
+export interface IOSMessageBackupFile {
+  backupRoot: string;
+  databasePath: string;
+  size: number;
+  modified: number;
 }
 
 export interface ExportOptions {
@@ -794,27 +802,57 @@ export class MessageManager {
     ];
   }
 
-  /** Returns a backup folder whose Manifest.db lists Messages, preferring the write root. */
-  private async findIOSMessageBackup(deviceId: string): Promise<string | null> {
+  /** Resolves only a confirmed sms.db inside a Silo-managed iPhone backup root. */
+  async getIOSMessageBackupFile(deviceId: string): Promise<IOSMessageBackupFile | null> {
+    if (!/^[A-Za-z0-9-]{1,128}$/.test(deviceId)) return null;
     for (const root of this.iosBackupRoots()) {
-      const deviceBackup = path.join(root, deviceId);
-      const manifestPath = path.join(deviceBackup, "Manifest.db");
       try {
-        await fsPromises.access(manifestPath);
+        const managedRoot = await fsPromises.realpath(root);
+        const deviceBackup = await fsPromises.realpath(path.join(managedRoot, deviceId));
+        if (deviceBackup === managedRoot || !isPathWithin(deviceBackup, managedRoot))
+          continue;
+        const backupStats = await fsPromises.stat(deviceBackup);
+        if (!backupStats.isDirectory()) continue;
+        const manifestPath = await fsPromises.realpath(path.join(deviceBackup, "Manifest.db"));
+        if (!isPathWithin(manifestPath, deviceBackup)) continue;
+        const manifestStats = await fsPromises.stat(manifestPath);
+        if (!manifestStats.isFile()) continue;
         const fileId = (
           await this.sqliteValue(
             manifestPath,
             "SELECT fileID FROM Files WHERE domain='HomeDomain' AND relativePath='Library/SMS/sms.db' LIMIT 1;",
           )
         ).trim();
-        if (!fileId) continue;
-        await fsPromises.access(path.join(deviceBackup, fileId.slice(0, 2), fileId));
-        return deviceBackup;
+        if (!/^[a-f0-9]{40}$/i.test(fileId)) continue;
+        const databasePath = await fsPromises.realpath(
+          path.join(deviceBackup, fileId.slice(0, 2), fileId),
+        );
+        if (!isPathWithin(databasePath, deviceBackup)) continue;
+        const databaseStats = await fsPromises.stat(databasePath);
+        if (!databaseStats.isFile() || databaseStats.size < 16) continue;
+        const messageTable = (
+          await this.sqliteValue(
+            databasePath,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='message' LIMIT 1;",
+          )
+        ).trim();
+        if (messageTable !== "message") continue;
+        return {
+          backupRoot: deviceBackup,
+          databasePath,
+          size: databaseStats.size,
+          modified: databaseStats.mtimeMs,
+        };
       } catch {
         continue;
       }
     }
     return null;
+  }
+
+  /** Returns a validated Silo backup folder whose Manifest.db lists Messages. */
+  private async findIOSMessageBackup(deviceId: string): Promise<string | null> {
+    return (await this.getIOSMessageBackupFile(deviceId))?.backupRoot ?? null;
   }
 
   private readonly iosBackupJobs = new Map<string, Promise<void>>();
@@ -954,16 +992,11 @@ export class MessageManager {
   }
 
   protected iosBusyRetryDelayMs = 15000;
-  protected allowIOSBackupsOnAnyPlatform = false;
 
   private async getIOSMessageThreads(
     deviceId: string,
     refresh: boolean,
   ): Promise<MessageThread[]> {
-    if (process.platform !== "darwin" && !this.allowIOSBackupsOnAnyPlatform)
-      throw new Error(
-        "Reading iPhone Messages from device backups is currently supported on macOS only.",
-      );
     if (!this.userDataPath)
       throw new Error("Message backup directory is unavailable.");
 
@@ -984,24 +1017,14 @@ export class MessageManager {
         );
       }
     }
-    const deviceBackup = await this.findIOSMessageBackup(deviceId);
-    if (!deviceBackup)
+    const backupFile = await this.getIOSMessageBackupFile(deviceId);
+    if (!backupFile)
       throw new Error(
         refresh
           ? "The iPhone backup finished but does not contain Messages data."
-          : "No Silo iPhone message backup exists yet. Choose Refresh iPhone Messages to create one.",
+          : "No Silo iPhone Messages backup exists yet. Connect and trust this iPhone, then choose Update Messages from phone or run a phone backup to create one.",
       );
-    this.log(`Loading messages from iPhone backup at: ${deviceBackup}`);
-    const manifestPath = path.join(deviceBackup, "Manifest.db");
-    const fileId = (
-      await this.sqliteValue(
-        manifestPath,
-        "SELECT fileID FROM Files WHERE domain='HomeDomain' AND relativePath='Library/SMS/sms.db' LIMIT 1;",
-      )
-    ).trim();
-    if (!fileId)
-      throw new Error("The iPhone backup does not contain Messages data.");
-    const smsDatabase = path.join(deviceBackup, fileId.slice(0, 2), fileId);
+    this.log(`Loading messages from iPhone backup at: ${backupFile.backupRoot}`);
     const query = `
       SELECT json_object(
         'threadId', CAST(c.ROWID AS TEXT),
@@ -1019,7 +1042,7 @@ export class MessageManager {
       LEFT JOIN handle h ON h.ROWID = m.handle_id
       ORDER BY c.ROWID, m.date;
     `;
-    const output = await this.sqliteValue(smsDatabase, query);
+    const output = await this.sqliteValue(backupFile.databasePath, query);
     const threads = new Map<string, MessageThread>();
     for (const line of output.split("\n").filter(Boolean)) {
       const row = JSON.parse(line) as {

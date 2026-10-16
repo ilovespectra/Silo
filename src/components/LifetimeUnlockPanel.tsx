@@ -66,6 +66,7 @@ export default function LifetimeUnlockPanel({
     purchaseId: string;
     claimToken: string;
   } | null>(null);
+  const [preparingWalletPurchase, setPreparingWalletPurchase] = useState(false);
   const [paymentStatus, setPaymentStatus] =
     useState<LifetimePaymentStatus | "idle">("idle");
   const [signature, setSignature] = useState("");
@@ -170,39 +171,6 @@ export default function LifetimeUnlockPanel({
   }, []);
 
   useEffect(() => {
-    if (license.isLicensed || !paymentRequest || !window.electron) return;
-
-    const electron = window.electron;
-    let disposed = false;
-    setPaymentNotice("Preparing a payment request for this computer…");
-    void electron
-      .beginLifetimeWalletPurchase(paymentRequest.reference)
-      .then((result) => {
-        if (disposed) return;
-        if (!result.ok) {
-          setPaymentStatus("error");
-          setPaymentNotice(result.error);
-          return;
-        }
-        setWalletPurchase({
-          purchaseId: result.purchaseId,
-          claimToken: result.claimToken,
-        });
-        setPaymentStatus("pending");
-        setPaymentNotice("Ready. Approve the $25 USDC transfer in your Solana wallet.");
-      })
-      .catch(() => {
-        if (disposed) return;
-        setPaymentStatus("error");
-        setPaymentNotice("The license relay could not prepare this wallet payment.");
-      });
-
-    return () => {
-      disposed = true;
-    };
-  }, [license.isLicensed, paymentRequest]);
-
-  useEffect(() => {
     if (license.isLicensed || !walletPurchase || !window.electron) return;
 
     const electron = window.electron;
@@ -268,6 +236,44 @@ export default function LifetimeUnlockPanel({
       ?.openLifetimePaymentLink?.(paymentRequest.reference)
       .catch(() => false);
     setPaymentLinkCopyState(opened ? "copied" : "error");
+  };
+
+  const prepareWalletPayment = async () => {
+    const electron = window.electron;
+    if (
+      !electron ||
+      !paymentRequest ||
+      walletPurchase ||
+      preparingWalletPurchase
+    )
+      return;
+
+    setPreparingWalletPurchase(true);
+    setPaymentStatus("pending");
+    setPaymentNotice("Preparing a payment request for this computer…");
+    try {
+      const result = await electron.beginLifetimeWalletPurchase(
+        paymentRequest.reference,
+      );
+      if (!result.ok) {
+        setPaymentStatus("error");
+        setPaymentNotice(result.error);
+        return;
+      }
+      setWalletPurchase({
+        purchaseId: result.purchaseId,
+        claimToken: result.claimToken,
+      });
+      setPaymentStatus("pending");
+      setPaymentNotice("Ready. Approve the $25 USDC transfer in your Solana wallet.");
+    } catch {
+      setPaymentStatus("error");
+      setPaymentNotice(
+        "Silo could not reach the license service. No payment was made. If you have already paid for this Mac, do not pay again; verify your existing transaction when online.",
+      );
+    } finally {
+      setPreparingWalletPurchase(false);
+    }
   };
 
   const verifyPayment = async (event: FormEvent<HTMLFormElement>) => {
@@ -546,7 +552,16 @@ export default function LifetimeUnlockPanel({
                     aria-label="Solana Pay request for 25 USDC"
                   />
                 ) : paymentRequest ? (
-                  <p>Preparing your computer-bound payment request…</p>
+                  <button
+                    type="button"
+                    className="lifetime-solana-copy-link"
+                    onClick={() => void prepareWalletPayment()}
+                    disabled={preparingWalletPurchase}
+                  >
+                    {preparingWalletPurchase
+                      ? "Preparing payment QR…"
+                      : "Prepare payment QR"}
+                  </button>
                 ) : (
                   <p role="alert">Silo could not create a secure payment request.</p>
                 )}
@@ -714,7 +729,17 @@ export default function LifetimeUnlockPanel({
                         : "Send beta access request"}
                   </button>
                   {betaEmailNotice && (
-                    <p className="lifetime-unlock-inline-note" role="status">
+                    <p
+                      className="lifetime-unlock-inline-note"
+                      data-status={
+                        betaEmailState === "sent"
+                          ? "activated"
+                          : betaEmailState === "error"
+                            ? "error"
+                            : undefined
+                      }
+                      role="status"
+                    >
                       {betaEmailNotice}
                     </p>
                   )}

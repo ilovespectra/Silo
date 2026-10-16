@@ -11,6 +11,9 @@ import {
   FiEdit2,
   FiBook,
   FiSave,
+  FiStar,
+  FiEye,
+  FiEyeOff,
   FiUser,
   FiWifi,
   FiX,
@@ -215,14 +218,28 @@ function formatDivider(time: number, platform: "ios" | "android") {
 
 const DIVIDER_GAP_MS = 60 * 60 * 1000;
 
-export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = ({
-  devicePanel,
-}) => {
+function messagePreferenceKey(
+  platform: PhonePlatform,
+  deviceId: string,
+  threadId: string,
+  messageId: string,
+) {
+  return JSON.stringify([platform, deviceId, threadId, messageId]);
+}
+
+export const MessageExportPanel: React.FC<{
+  devicePanel?: React.ReactNode;
+  onScanPhones: () => void;
+  scanningPhones: boolean;
+  showHiddenMessages: boolean;
+}> = ({ devicePanel, onScanPhones, scanningPhones, showHiddenMessages }) => {
   const electronAPI = window.electron;
   const [devices, setDevices] = useState<PhoneDevice[]>([]);
   const [historyEntries, setHistoryEntries] = useState<MessageHistoryEntry[]>(
     [],
   );
+  const [phoneMessageBackup, setPhoneMessageBackup] =
+    useState<PhoneMessageBackupMetadata | null>(null);
   const [selectedDeviceKey, setSelectedDeviceKey] = useState("");
   const [threads, setThreads] = useState<DeviceMessageThread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState("");
@@ -236,6 +253,12 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
   const [showAddressBook, setShowAddressBook] = useState(false);
   const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
   const [editingThreadName, setEditingThreadName] = useState("");
+  const [messageFlags, setMessageFlags] = useState<
+    Record<string, MessageDisplayFlags>
+  >({});
+  const [messageSort, setMessageSort] = useState<
+    PersistedUiState["messageSort"]
+  >("newest");
 
   const selectedHistory = historyEntries.find(
     (entry) => `${entry.platform}:${entry.deviceId}` === selectedDeviceKey,
@@ -254,23 +277,152 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
     selectedIdentity?.platform === "android" ? "android" : "ios";
   const selectedThread =
     threads.find((thread) => thread.threadId === selectedThreadId) ?? null;
+  const preferenceKeyFor = (threadId: string, messageId: string) =>
+    selectedIdentity
+      ? messagePreferenceKey(
+          selectedIdentity.platform,
+          selectedIdentity.deviceId,
+          threadId,
+          messageId,
+        )
+      : "";
+  const isMessageHidden = (threadId: string, messageId: string) =>
+    Boolean(messageFlags[preferenceKeyFor(threadId, messageId)]?.hidden);
   const filteredThreads = useMemo(() => {
     const normalized = query.trim().toLowerCase();
-    if (!normalized) return threads;
+    if (!normalized && showHiddenMessages) return threads;
     return threads.filter(
       (thread) =>
+        !normalized ||
         conversationName(thread).toLowerCase().includes(normalized) ||
-        thread.messages.some((message) =>
-          messageText(message).toLowerCase().includes(normalized),
+        thread.messages.some(
+          (message) =>
+            (showHiddenMessages ||
+              !messageFlags[
+                selectedIdentity
+                  ? messagePreferenceKey(
+                      selectedIdentity.platform,
+                      selectedIdentity.deviceId,
+                      thread.threadId,
+                      message.id,
+                    )
+                  : ""
+              ]?.hidden) &&
+            messageText(message).toLowerCase().includes(normalized),
         ),
     );
-  }, [query, threads]);
+  }, [
+    query,
+    threads,
+    messageFlags,
+    selectedIdentity?.deviceId,
+    selectedIdentity?.platform,
+    showHiddenMessages,
+  ]);
+
+  const visibleMessages = useMemo(() => {
+    if (!selectedThread || !selectedIdentity) return [];
+    return selectedThread.messages
+      .filter(
+        (message) =>
+          showHiddenMessages ||
+          !messageFlags[
+            messagePreferenceKey(
+              selectedIdentity.platform,
+              selectedIdentity.deviceId,
+              selectedThread.threadId,
+              message.id,
+            )
+          ]?.hidden,
+      )
+      .sort((first, second) => {
+        if (messageSort === "favorites") {
+          const firstFavorite = messageFlags[
+            messagePreferenceKey(
+              selectedIdentity.platform,
+              selectedIdentity.deviceId,
+              selectedThread.threadId,
+              first.id,
+            )
+          ]?.favorite;
+          const secondFavorite = messageFlags[
+            messagePreferenceKey(
+              selectedIdentity.platform,
+              selectedIdentity.deviceId,
+              selectedThread.threadId,
+              second.id,
+            )
+          ]?.favorite;
+          if (firstFavorite !== secondFavorite)
+            return firstFavorite ? -1 : 1;
+          return second.date - first.date;
+        }
+        return messageSort === "oldest"
+          ? first.date - second.date
+          : second.date - first.date;
+      });
+  }, [
+    selectedThread,
+    selectedIdentity?.deviceId,
+    selectedIdentity?.platform,
+    messageFlags,
+    messageSort,
+    showHiddenMessages,
+  ]);
+
+  React.useEffect(() => {
+    if (!electronAPI) return;
+    let active = true;
+    void electronAPI
+      .getAppState()
+      .then((state) => {
+        if (!active) return;
+        setMessageFlags(state.messageFlags ?? {});
+        if (
+          state.ui.messageSort === "oldest" ||
+          state.ui.messageSort === "favorites"
+        )
+          setMessageSort(state.ui.messageSort);
+        else setMessageSort("newest");
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [electronAPI]);
+
+  React.useEffect(() => {
+    if (!electronAPI || selectedIdentity?.platform !== "ios") {
+      setPhoneMessageBackup(null);
+      return;
+    }
+    let active = true;
+    setPhoneMessageBackup(null);
+    void electronAPI
+      .getPhoneMessageBackupMetadata(
+        selectedIdentity.deviceId,
+        selectedIdentity.platform,
+      )
+      .then((metadata) => {
+        if (active) setPhoneMessageBackup(metadata);
+      })
+      .catch(() => {
+        if (active) setPhoneMessageBackup(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    electronAPI,
+    selectedIdentity?.deviceId,
+    selectedIdentity?.platform,
+  ]);
 
   React.useEffect(() => {
     // Load the persistent phone backup destination when component mounts
     if (!electronAPI) return;
     void electronAPI
-      .listPhones()
+      .scanPhones()
       .then(setDevices)
       .catch(() => undefined);
     void electronAPI.getPhoneBackupDestination().then((dest) => {
@@ -333,6 +485,13 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
     if (!electronAPI?.onPhoneMessagesUpdated) return;
     return electronAPI.onPhoneMessagesUpdated(async (update) => {
       const key = `${update.platform}:${update.deviceId}`;
+      if (update.platform === "ios") {
+        const metadata = await electronAPI
+          .getPhoneMessageBackupMetadata(update.deviceId, update.platform)
+          .catch(() => null);
+        if (selectedKeyRef.current === key)
+          setPhoneMessageBackup(metadata);
+      }
       const entries = await electronAPI.listMessageHistory().catch(() => null);
       if (entries) setHistoryEntries(entries);
       const entry = entries?.find((item) => `${item.platform}:${item.deviceId}` === key);
@@ -376,6 +535,12 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
       setNotice(
         `${sorted.length.toLocaleString()} saved conversations · ${identity.deviceName}${connected ? " · connected" : " · offline history"}`,
       );
+      if (identity.platform === "ios") {
+        const metadata = await electronAPI
+          .getPhoneMessageBackupMetadata(identity.deviceId, identity.platform)
+          .catch(() => null);
+        setPhoneMessageBackup(metadata);
+      }
     } catch (cause) {
       setThreads([]);
       setSelectedThreadId("");
@@ -388,6 +553,41 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
   };
 
   loadMessagesRef.current = loadMessages;
+
+  const toggleMessageFlag = async (
+    threadId: string,
+    messageId: string,
+    field: "favorite" | "hidden",
+  ) => {
+    if (!electronAPI) return;
+    const key = preferenceKeyFor(threadId, messageId);
+    if (!key) return;
+    const current = messageFlags[key] ?? { favorite: false, hidden: false };
+    const nextValue = !current[field];
+    const next = { ...current, [field]: nextValue };
+    setMessageFlags((stored) => ({ ...stored, [key]: next }));
+    setError("");
+    try {
+      const state = await electronAPI.updateMessageFlags(key, {
+        [field]: nextValue,
+      });
+      setMessageFlags(state.messageFlags ?? {});
+    } catch (cause) {
+      setMessageFlags((stored) => ({ ...stored, [key]: current }));
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not save this message preference.",
+      );
+    }
+  };
+
+  const changeMessageSort = (sort: PersistedUiState["messageSort"]) => {
+    setMessageSort(sort);
+    void electronAPI
+      ?.updateUiState({ messageSort: sort })
+      .catch(() => setError("Could not save the message sort order."));
+  };
 
   const chooseDestination = async () => {
     const selected = await electronAPI?.selectBackupDestination(outputDir);
@@ -450,46 +650,35 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
     <main className={`messages-browser platform-${platform}`} data-tour="mobile-messages" data-help="Select a connected phone or saved message history, load and review a conversation, then choose an export folder and format. Refresh and update actions can read device history, so use them only when you intend to.">
       <header className="messages-toolbar">
         <h2>Mobile manager</h2>
-        <select
-          aria-label="Phone message history"
-          value={selectedDeviceKey}
-          onChange={(event) => {
-            setSelectedDeviceKey(event.target.value);
-            setThreads([]);
-            setSelectedThreadId("");
-            setError("");
-            const key = event.target.value;
-            const phone = devices.find(
-              (device) => `${device.platform}:${device.id}` === key,
-            );
-            const history = historyEntries.find(
-              (entry) => `${entry.platform}:${entry.deviceId}` === key,
-            );
-            const identity = phone
-              ? {
-                  deviceId: phone.id,
-                  platform: phone.platform,
-                  deviceName: phone.name,
-                }
-              : history;
-            if (identity) void loadMessages(false, identity);
-          }}
-        >
-          <option value="">Choose a phone history</option>
-          {Array.from(
-            new Map([
-              ...historyEntries.map(
-                (entry) =>
-                  [
-                    `${entry.platform}:${entry.deviceId}`,
-                    {
-                      key: `${entry.platform}:${entry.deviceId}`,
-                      name: entry.deviceName,
-                      platform: entry.platform,
-                      suffix: "saved history",
-                    },
-                  ] as const,
-              ),
+        <div className="messages-device-select-tools">
+          <select
+            aria-label="Phone message history"
+            value={selectedDeviceKey}
+            onChange={(event) => {
+              setSelectedDeviceKey(event.target.value);
+              setThreads([]);
+              setSelectedThreadId("");
+              setError("");
+              const key = event.target.value;
+              const phone = devices.find(
+                (device) => `${device.platform}:${device.id}` === key,
+              );
+              const history = historyEntries.find(
+                (entry) => `${entry.platform}:${entry.deviceId}` === key,
+              );
+              const identity = phone
+                ? {
+                    deviceId: phone.id,
+                    platform: phone.platform,
+                    deviceName: phone.name,
+                  }
+                : history;
+              if (identity) void loadMessages(false, identity);
+            }}
+          >
+            <option value="">Choose a phone history</option>
+            {Array.from(
+              new Map([
               ...devices.map(
                 (device) =>
                   [
@@ -502,6 +691,27 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
                     },
                   ] as const,
               ),
+              ...historyEntries
+                .filter(
+                  (entry) =>
+                    !devices.some(
+                      (device) =>
+                        device.platform === entry.platform &&
+                        device.id === entry.deviceId,
+                    ),
+                )
+                .map(
+                  (entry) =>
+                  [
+                    `${entry.platform}:${entry.deviceId}`,
+                    {
+                      key: `${entry.platform}:${entry.deviceId}`,
+                      name: entry.deviceName,
+                      platform: entry.platform,
+                      suffix: "saved history",
+                    },
+                  ] as const,
+                ),
             ]).values(),
           ).map((option) => (
             <option key={option.key} value={option.key}>
@@ -509,7 +719,20 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
               · {option.suffix}
             </option>
           ))}
-        </select>
+          </select>
+          <button
+            type="button"
+            className="messages-scan-button"
+            disabled={scanningPhones}
+            onClick={onScanPhones}
+            title="Scan for connected phones and tablets"
+            aria-label="Scan for phones"
+            data-help="Discover phones connected to this Mac. Scanning does not start a backup."
+          >
+            <FiRefreshCw className={scanningPhones ? "spinning" : ""} />
+            {scanningPhones ? "Scanning…" : "Scan for phones"}
+          </button>
+        </div>
         <button
           className="messages-icon-button"
           disabled={
@@ -524,6 +747,18 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
           <FiRefreshCw className={loadingMessages ? "spinning" : ""} />
         </button>
       </header>
+
+      {selectedIdentity?.platform === "ios" && (
+        <div
+          className={`phone-message-backup-status ${phoneMessageBackup?.included ? "included" : "pending"}`}
+          role="status"
+          title={phoneMessageBackup?.virtualPath ?? undefined}
+        >
+          {phoneMessageBackup?.included
+            ? `Messages database included in phone snapshot · ${(phoneMessageBackup.size! / (1024 * 1024)).toFixed(1)} MB · Files: Messages/sms.db`
+            : "Messages database will appear in Files after a successful phone backup."}
+        </div>
+      )}
 
       {devicePanel && <div className="mobile-manager-devices">{devicePanel}</div>}
 
@@ -554,7 +789,13 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
           </div>
           <div className="conversation-list">
             {filteredThreads.map((thread) => {
-              const lastMessage = thread.messages[thread.messages.length - 1];
+              const lastMessage = [...thread.messages]
+                .reverse()
+                .find(
+                  (message) =>
+                    showHiddenMessages ||
+                    !isMessageHidden(thread.threadId, message.id),
+                );
               const isEditing = editingThreadId === thread.threadId;
               return (
                 <div
@@ -610,16 +851,17 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
                           <span className="conversation-title-row">
                             <strong>{conversationName(thread)}</strong>
                             <time>
-                              {formatThreadDate(
-                                thread.lastMessageDate,
-                                platform,
-                              )}
+                              {lastMessage
+                                ? formatThreadDate(lastMessage.date, platform)
+                                : ""}
                             </time>
                           </span>
                           <span className="conversation-preview">
                             {lastMessage
                               ? messageText(lastMessage)
-                              : "No messages"}
+                              : thread.messages.length
+                                ? "All messages are hidden"
+                                : "No messages"}
                           </span>
                         </span>
                       </button>
@@ -684,31 +926,59 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
                 <div className="phone-thread-title">
                   <strong>{conversationName(selectedThread)}</strong>
                   <span>
-                    {selectedThread.messageCount.toLocaleString()} messages
+                    {visibleMessages.length.toLocaleString()} of {selectedThread.messageCount.toLocaleString()} messages
                   </span>
                 </div>
+                <label className="message-sort-control">
+                  <span>Sort</span>
+                  <select
+                    aria-label="Sort messages"
+                    value={messageSort}
+                    onChange={(event) =>
+                      changeMessageSort(
+                        event.target.value as PersistedUiState["messageSort"],
+                      )
+                    }
+                  >
+                    <option value="oldest">Oldest first</option>
+                    <option value="newest">Newest first</option>
+                    <option value="favorites">Favorites first</option>
+                  </select>
+                </label>
               </header>
               <div className="message-bubbles">
-                {selectedThread.messages.length === 0 ? (
+                {visibleMessages.length === 0 ? (
                   <div className="messages-empty history">
                     <FiMessageSquare />
-                    <span>No messages are stored in this conversation.</span>
+                    <span>
+                      {selectedThread.messages.length > 0
+                        ? "All messages are hidden. Turn on Display hidden messages in Settings to reveal them."
+                        : "No messages are stored in this conversation."}
+                    </span>
                   </div>
                 ) : (
-                  selectedThread.messages.map((message, index) => {
-                    const previous = selectedThread.messages[index - 1];
+                  visibleMessages.map((message, index) => {
+                    const preferenceKey = preferenceKeyFor(
+                      selectedThread.threadId,
+                      message.id,
+                    );
+                    const flags = messageFlags[preferenceKey] ?? {
+                      favorite: false,
+                      hidden: false,
+                    };
+                    const previous = visibleMessages[index - 1];
                     const showDivider =
                       !previous ||
                       new Date(previous.date).toDateString() !==
                         new Date(message.date).toDateString() ||
-                      message.date - previous.date > DIVIDER_GAP_MS;
+                      Math.abs(message.date - previous.date) > DIVIDER_GAP_MS;
                     const isSent = message.type === 2;
-                    const nextMessage = selectedThread.messages[index + 1];
+                    const nextMessage = visibleMessages[index + 1];
                     const nextStartsSection =
                       nextMessage &&
                       (new Date(nextMessage.date).toDateString() !==
                         new Date(message.date).toDateString() ||
-                        nextMessage.date - message.date > DIVIDER_GAP_MS);
+                        Math.abs(nextMessage.date - message.date) > DIVIDER_GAP_MS);
                     const firstInGroup =
                       showDivider || (previous.type === 2) !== isSent;
                     const lastInGroup =
@@ -727,7 +997,7 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
                           </div>
                         )}
                         <div
-                          className={`message-row ${isSent ? "sent" : "received"} ${firstInGroup ? "first-in-group" : ""} ${lastInGroup ? "last-in-group" : ""}`}
+                          className={`message-row ${isSent ? "sent" : "received"} ${firstInGroup ? "first-in-group" : ""} ${lastInGroup ? "last-in-group" : ""} ${flags.hidden ? "hidden-message" : ""}`}
                         >
                           <div
                             className="message-bubble"
@@ -748,6 +1018,43 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
                                   part={part}
                                 />
                               ))}
+                            <div className="message-bubble-actions">
+                              {flags.hidden && (
+                                <span className="hidden-message-label">Hidden</span>
+                              )}
+                              <button
+                                type="button"
+                                className={`message-flag-button favorite ${flags.favorite ? "active" : ""}`}
+                                aria-label={flags.favorite ? "Remove message from favorites" : "Favorite message"}
+                                aria-pressed={flags.favorite}
+                                title={flags.favorite ? "Remove favorite" : "Favorite message"}
+                                onClick={() =>
+                                  void toggleMessageFlag(
+                                    selectedThread.threadId,
+                                    message.id,
+                                    "favorite",
+                                  )
+                                }
+                              >
+                                <FiStar />
+                              </button>
+                              <button
+                                type="button"
+                                className={`message-flag-button hide ${flags.hidden ? "active" : ""}`}
+                                aria-label={flags.hidden ? "Show message" : "Hide message"}
+                                aria-pressed={flags.hidden}
+                                title={flags.hidden ? "Show message" : "Hide message"}
+                                onClick={() =>
+                                  void toggleMessageFlag(
+                                    selectedThread.threadId,
+                                    message.id,
+                                    "hidden",
+                                  )
+                                }
+                              >
+                                {flags.hidden ? <FiEye /> : <FiEyeOff />}
+                              </button>
+                            </div>
                           </div>
                           {platform === "android" && lastInGroup && (
                             <time>

@@ -20,6 +20,13 @@ export interface PersistedUiState {
   viewMode: "list" | "grid";
   showFilters: boolean;
   confidence: number;
+  messageSort: "oldest" | "newest" | "favorites";
+  showHiddenMessages: boolean;
+}
+
+export interface MessageDisplayFlags {
+  favorite: boolean;
+  hidden: boolean;
 }
 
 export interface IndexSource {
@@ -98,6 +105,8 @@ export interface PersistedAppState {
   digitalFolders: DigitalFolder[];
   nameIndex: NameIndexEntry[];
   fileMetadata: Record<string, FileMetadata>;
+  searchFeedback: Record<string, "confirmed" | "removed">;
+  messageFlags: Record<string, MessageDisplayFlags>;
   geoOverrides: Record<string, GeoOverride>;
   /** Sources are enabled by default, so only exclusions are stored. */
   disabledSourceIds: string[];
@@ -116,11 +125,15 @@ const defaultState: PersistedAppState = {
     viewMode: "grid",
     showFilters: false,
     confidence: DEFAULT_SEMANTIC_SEARCH_CONFIDENCE,
+    messageSort: "newest",
+    showHiddenMessages: false,
   },
   indexSources: [],
   digitalFolders: [favoritesFolder(), refuseFolder()],
   nameIndex: [],
   fileMetadata: {},
+  searchFeedback: {},
+  messageFlags: {},
   geoOverrides: {},
   disabledSourceIds: [],
   enabledSourceIds: [],
@@ -147,7 +160,16 @@ export class StateStore {
       this.state = {
         ...structuredClone(defaultState),
         ...stored,
-        ui: { ...defaultState.ui, ...stored.ui },
+        ui: {
+          ...defaultState.ui,
+          ...stored.ui,
+          messageSort:
+            stored.ui?.messageSort === "oldest" ||
+            stored.ui?.messageSort === "favorites"
+              ? stored.ui.messageSort
+              : "newest",
+          showHiddenMessages: stored.ui?.showHiddenMessages === true,
+        },
         indexSources: Array.isArray(stored.indexSources)
           ? stored.indexSources
           : [],
@@ -164,6 +186,34 @@ export class StateStore {
         fileMetadata:
           stored.fileMetadata && typeof stored.fileMetadata === "object"
             ? stored.fileMetadata
+            : {},
+        searchFeedback:
+          stored.searchFeedback && typeof stored.searchFeedback === "object"
+            ? Object.fromEntries(
+                Object.entries(stored.searchFeedback).filter(
+                  ([, value]) => value === "confirmed" || value === "removed",
+                ),
+              )
+            : {},
+        messageFlags:
+          stored.messageFlags && typeof stored.messageFlags === "object"
+            ? Object.fromEntries(
+                Object.entries(stored.messageFlags).flatMap(([key, value]) => {
+                  if (
+                    !key ||
+                    key.length > 4096 ||
+                    !value ||
+                    typeof value !== "object" ||
+                    Array.isArray(value)
+                  )
+                    return [];
+                  const flags = {
+                    favorite: (value as Partial<MessageDisplayFlags>).favorite === true,
+                    hidden: (value as Partial<MessageDisplayFlags>).hidden === true,
+                  };
+                  return flags.favorite || flags.hidden ? [[key, flags]] : [];
+                }),
+              )
             : {},
         geoOverrides:
           stored.geoOverrides && typeof stored.geoOverrides === "object"
@@ -188,17 +238,45 @@ export class StateStore {
   /** Search reads this small live view instead of cloning the full library state. */
   getSearchState(): Pick<
     PersistedAppState,
-    "digitalFolders" | "nameIndex" | "fileMetadata"
+    "digitalFolders" | "nameIndex" | "fileMetadata" | "searchFeedback"
   > {
     return {
       digitalFolders: this.state.digitalFolders,
       nameIndex: this.state.nameIndex,
       fileMetadata: this.state.fileMetadata,
+      searchFeedback: this.state.searchFeedback,
     };
   }
 
   async updateUi(update: Partial<PersistedUiState>) {
     this.state.ui = { ...this.state.ui, ...update };
+    await this.write();
+    return this.getState();
+  }
+
+  async updateSearchFeedback(
+    filePaths: string[],
+    disposition: "confirmed" | "removed",
+  ) {
+    for (const filePath of new Set(filePaths))
+      this.state.searchFeedback[filePath] = disposition;
+    await this.write();
+    return this.getState();
+  }
+
+  async updateMessageFlags(
+    messageKey: string,
+    update: Partial<MessageDisplayFlags>,
+  ) {
+    const next = {
+      ...(this.state.messageFlags[messageKey] ?? {
+        favorite: false,
+        hidden: false,
+      }),
+      ...update,
+    };
+    if (!next.favorite && !next.hidden) delete this.state.messageFlags[messageKey];
+    else this.state.messageFlags[messageKey] = next;
     await this.write();
     return this.getState();
   }

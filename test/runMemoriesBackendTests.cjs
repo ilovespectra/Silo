@@ -106,6 +106,8 @@ const context = vm.createContext({
   __names: [],
   __people: [],
   __metadata: {},
+  __geoPhotos: [],
+  geoIndexer: { getState: () => ({ photos: context.__geoPhotos }) },
   contentSettingsStore: { getPublicSettings: () => { throw new Error("Memories must not consult reveal toggles"); } },
   hiddenPaths: new Set(),
   getHiddenFolderPaths: (except) => { assert.equal(except, undefined); return context.hiddenPaths; },
@@ -532,6 +534,51 @@ async function run() {
     } finally {
       context.__folders = originalFolders;
       context.resolveLocalPath = originalResolve;
+    }
+  });
+
+  await test("generated prompts include saved folder, mapped place and person names with extra keywords", async () => {
+    const directory = path.join(library, "prompted-named");
+    await fsp.mkdir(directory, { recursive: true });
+    const folderPhoto = path.join(directory, "folder-photo.jpg");
+    const placePhoto = path.join(directory, "place-photo.jpg");
+    const personPhoto = path.join(directory, "person-photo.jpg");
+    for (const filePath of [folderPhoto, placePhoto, personPhoto])
+      await fsp.writeFile(filePath, Buffer.alloc(200_000));
+
+    const original = {
+      folders: context.__folders,
+      names: context.__names,
+      people: context.__people,
+      geoPhotos: context.__geoPhotos,
+      searchResults,
+    };
+    context.__folders = [{ name: "Lake Bled", filePaths: [folderPhoto] }];
+    context.__names = [];
+    context.__people = [{ id: "p-lake", name: "Maja", confirmedPhotoPaths: [personPhoto] }];
+    context.__geoPhotos = [{ path: placePhoto, locationLabel: "Piran, Slovenia", city: "Piran",
+      region: "Coastal", country: "Slovenia" }];
+    searchResults = [];
+    indexedImages = [];
+
+    try {
+      const folderHits = await context.searchPromptedMemoryMedia("Lake Bled summer picnic");
+      assert(folderHits.some((hit) => hit.path === folderPhoto),
+        "a saved virtual folder matches when extra prompt keywords follow its name");
+
+      const placeHits = await context.searchPromptedMemoryMedia("Piran weekend coast");
+      assert(placeHits.some((hit) => hit.path === placePhoto),
+        "a mapped place label contributes its photos to a generated prompt");
+
+      const personHits = await context.searchPromptedMemoryMedia("Maja birthday");
+      assert(personHits.some((hit) => hit.path === personPhoto),
+        "a saved person's confirmed photos contribute to a generated prompt");
+    } finally {
+      context.__folders = original.folders;
+      context.__names = original.names;
+      context.__people = original.people;
+      context.__geoPhotos = original.geoPhotos;
+      searchResults = original.searchResults;
     }
   });
 

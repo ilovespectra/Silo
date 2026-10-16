@@ -1,8 +1,13 @@
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import * as path from "path";
+import fs from "fs";
 import * as fsPromises from "fs/promises";
 import { constants as fsConstants } from "fs";
+import archiver from "archiver";
+import yauzl from "yauzl";
+import { Transform } from "stream";
+import { pipeline } from "stream/promises";
 import { isAudioFile } from "./utils/audioTypes";
 import {
   ANDROID_INSTALL_HINT,
@@ -133,6 +138,21 @@ export interface OfflinePhoneBackup {
   failedFiles: number;
 }
 
+export interface PhoneBackupSupplementalFile {
+  remotePath: string;
+  sourcePath: string;
+  kind: "messages-database";
+}
+
+export interface PhoneMessageBackupMetadata {
+  included: boolean;
+  virtualPath: string | null;
+  snapshotId: string | null;
+  snapshotAt: number | null;
+  size: number | null;
+  modified: number | null;
+}
+
 export interface PhoneRestoreArchive {
   id: string;
   deviceId: string;
@@ -151,7 +171,18 @@ interface PhoneBackupSnapshot {
   totalFiles: number;
   failedFiles: number;
   files: Record<string, string>;
+  /**
+   * Storage overrides for paths added or changed in this snapshot. Other paths inherit
+   * their storage through parentSnapshotId; snapshots without either field are legacy folders.
+   */
+  fileLocations?: Record<string, PhoneSnapshotFileLocation>;
+  parentSnapshotId?: string;
+  messageDatabase?: { remotePath: string; size: number; modified: number };
 }
+
+type PhoneSnapshotFileLocation =
+  | { kind: "snapshot"; snapshotId: string }
+  | { kind: "archive"; archiveId: string };
 
 interface PhoneBackupManifest {
   files: Record<string, string>;
@@ -291,6 +322,9 @@ export class PhoneManager {
   private backupDestinationPath: string | null = null;
   private deviceNames: Record<string, string> = {};
   private deviceNameWrites: Promise<void> = Promise.resolve();
+  private supplementalBackupFilesProvider: (
+    device: PhoneDevice,
+  ) => Promise<PhoneBackupSupplementalFile[]> = async () => [];
 
   private namedDevice(device: PhoneDevice): PhoneDevice {
     return {
@@ -340,6 +374,12 @@ export class PhoneManager {
     this.onBackupProgress = onBackupProgress;
     this.log(`Constructor called with userDataPath: ${userDataPath}`);
     this.log(`Pull cache root: ${this.pullCacheRoot}`);
+  }
+
+  setSupplementalBackupFilesProvider(
+    provider: (device: PhoneDevice) => Promise<PhoneBackupSupplementalFile[]>,
+  ): void {
+    this.supplementalBackupFilesProvider = provider;
   }
 
   // Safe logging that handles EPIPE errors during shutdown
@@ -557,27 +597,164 @@ export class PhoneManager {
     return backups;
   }
 
+  private phoneSnapshotsRoot(cacheRoot: string, platform: PhonePlatform, deviceId: string) {
+    return path.join(cacheRoot, ".silo-phone-snapshots", platform, deviceId);
+  }
+
+  private snapshotFileLocation(
+    snapshot: PhoneBackupSnapshot,
+    remotePath: string,
+    snapshots: PhoneBackupSnapshot[] = [],
+    visited = new Set<string>(),
+  ): PhoneSnapshotFileLocation {
+    const direct = snapshot.fileLocations?.[remotePath];
+    if (direct) return direct;
+    if (snapshot.parentSnapshotId && !visited.has(snapshot.id)) {
+      visited.add(snapshot.id);
+      const parent = snapshots.find((entry) => entry.id === snapshot.parentSnapshotId);
+      if (parent) return this.snapshotFileLocation(parent, remotePath, snapshots, visited);
+    }
+    return { kind: "snapshot", snapshotId: snapshot.id };
+  }
+
+  private snapshotArchivePath(
+    cacheRoot: string,
+    platform: PhonePlatform,
+    deviceId: string,
+    archiveId: string,
+  ) {
+    if (!/^\d+(?:-\d+)?$/.test(archiveId))
+      throw new Error("The saved phone archive has an invalid identifier.");
+    return path.join(
+      this.phoneSnapshotsRoot(cacheRoot, platform, deviceId),
+      "archives",
+      `${archiveId}.zip`,
+    );
+  }
+
+  private snapshotFolderFilePath(
+    cacheRoot: string,
+    platform: PhonePlatform,
+    deviceId: string,
+    snapshotId: string,
+    remotePath: string,
+  ) {
+    if (!/^\d+(?:-\d+)?$/.test(snapshotId))
+      throw new Error("The saved phone snapshot has an invalid identifier.");
+    return path.join(
+      this.phoneSnapshotsRoot(cacheRoot, platform, deviceId),
+      "snapshots",
+      snapshotId,
+      localRelativePath(remotePath),
+    );
+  }
+
+  private snapshotMaterializedFilePath(
+    cacheRoot: string,
+    platform: PhonePlatform,
+    deviceId: string,
+    snapshotId: string,
+    remotePath: string,
+  ) {
+    return path.join(
+      this.phoneSnapshotsRoot(cacheRoot, platform, deviceId),
+      "materialized",
+      snapshotId,
+      localRelativePath(remotePath),
+    );
+  }
+
+  private async snapshotFileIsPresent(
+    manifest: PhoneBackupManifest,
+    snapshot: PhoneBackupSnapshot,
+    remotePath: string,
+    signature: string,
+    cacheRoot: string,
+  ): Promise<boolean> {
+    const { platform, deviceId } = manifest.progress;
+    const location = this.snapshotFileLocation(snapshot, remotePath, manifest.snapshots);
+    if (location.kind === "archive") {
+      const archivePath = this.snapshotArchivePath(
+        cacheRoot,
+        platform,
+        deviceId,
+        location.archiveId,
+      );
+      return fsPromises.stat(archivePath).then(
+        (stats) => stats.isFile() && stats.size > 22,
+        () => false,
+      );
+    }
+    const storedPath = this.snapshotFolderFilePath(
+      cacheRoot,
+      platform,
+      deviceId,
+      location.snapshotId,
+      remotePath,
+    );
+    const expectedSize = Number(signature.split(":", 1)[0]);
+    return fsPromises.stat(storedPath).then(
+      (stats) => stats.isFile() && Number.isFinite(expectedSize) && stats.size === expectedSize,
+      () => false,
+    );
+  }
+
+  private async cachedPhoneFileIsPresent(
+    manifest: PhoneBackupManifest,
+    virtualPath: string,
+    signature: string,
+    cacheRoot?: string,
+  ): Promise<boolean> {
+    const parsed = this.parsePhonePath(virtualPath);
+    if (!parsed) return false;
+    const root = cacheRoot ?? manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot;
+    const remotePath = path.posix.normalize(parsed.remotePath);
+    const expectedSize = Number(signature.split(":", 1)[0]);
+
+    if (parsed.offlineBackup && parsed.snapshotId) {
+      const snapshot = manifest.snapshots?.find((entry) => entry.id === parsed.snapshotId);
+      return !!snapshot && this.snapshotFileIsPresent(
+        manifest,
+        snapshot,
+        remotePath,
+        signature,
+        root,
+      );
+    }
+
+    if (!parsed.offlineBackup && manifest.files[virtualPath] === signature) {
+      const snapshot = [...(manifest.snapshots ?? [])]
+        .reverse()
+        .find((entry) => entry.files[remotePath] === signature);
+      if (snapshot && await this.snapshotFileIsPresent(
+        manifest,
+        snapshot,
+        remotePath,
+        signature,
+        root,
+      )) return true;
+    }
+
+    const cached = this.localCachePath(virtualPath, root);
+    return fsPromises.stat(cached).then(
+      (stats) => stats.isFile() && Number.isFinite(expectedSize) && stats.size === expectedSize,
+      () => false,
+    );
+  }
+
   private async hasSnapshotFile(
     manifest: PhoneBackupManifest,
     snapshot: PhoneBackupSnapshot,
     cacheRoot: string,
   ): Promise<boolean> {
-    const device = manifest.progress;
     for (const [remotePath, signature] of Object.entries(snapshot.files)) {
-      const virtualPath = this.virtualPath(
-        device.platform,
-        device.deviceId,
+      if (await this.snapshotFileIsPresent(
+        manifest,
+        snapshot,
         remotePath,
-        true,
-        snapshot.id,
-      );
-      const cached = this.localCachePath(virtualPath, cacheRoot);
-      const expectedSize = Number(signature.split(":", 1)[0]);
-      const present = await fsPromises.stat(cached).then(
-        (stats) => stats.isFile() && stats.size === expectedSize,
-        () => false,
-      );
-      if (present) return true;
+        signature,
+        cacheRoot,
+      )) return true;
     }
     return false;
   }
@@ -589,22 +766,14 @@ export class PhoneManager {
   ): Promise<boolean> {
     const entries = Object.entries(snapshot.files);
     if (!entries.length) return false;
-    const device = manifest.progress;
     for (const [remotePath, signature] of entries) {
-      const virtualPath = this.virtualPath(
-        device.platform,
-        device.deviceId,
+      if (!(await this.snapshotFileIsPresent(
+        manifest,
+        snapshot,
         remotePath,
-        true,
-        snapshot.id,
-      );
-      const cached = this.localCachePath(virtualPath, cacheRoot);
-      const expectedSize = Number(signature.split(":", 1)[0]);
-      const present = await fsPromises.stat(cached).then(
-        (stats) => stats.isFile() && stats.size === expectedSize,
-        () => false,
-      );
-      if (!present) return false;
+        signature,
+        cacheRoot,
+      ))) return false;
     }
     return true;
   }
@@ -1396,20 +1565,36 @@ export class PhoneManager {
       }
       this.onBackupProgress({ ...manifest.progress });
       await this.persistBackupState();
+      let supplementalFiles: PhoneBackupSupplementalFile[] = [];
+      let supplementalBackupError: string | null = null;
+      if (device.platform === "ios") {
+        try {
+          manifest.progress.currentFile = "Messages/sms.db";
+          manifest.progress.message = `Updating the Messages backup for ${device.name}...`;
+          this.onBackupProgress({ ...manifest.progress });
+          supplementalFiles = await this.supplementalBackupFilesProvider(device);
+        } catch (error) {
+          supplementalBackupError = error instanceof Error ? error.message : String(error);
+          this.logError(`Could not include the Messages database for ${key}:`, error);
+        }
+      }
       const snapshot = await this.createBrowseableSnapshot(
         device,
         manifest,
         files,
         backupDir,
+        supplementalFiles,
       );
       manifest.progress.status = "complete";
       manifest.progress.currentFile = null;
       manifest.progress.lastBackupAt = snapshot.createdAt;
-      manifest.progress.message =
-        snapshot.failedFiles > 0
+      manifest.progress.message = supplementalBackupError
+        ? `${device.name} phone snapshot saved, but its Messages backup could not be updated: ${supplementalBackupError}`
+        : snapshot.failedFiles > 0
           ? `${device.name} browseable snapshot saved with ${snapshot.failedFiles.toLocaleString()} inaccessible files skipped.`
           : `${device.name} browseable snapshot saved.`;
       await this.persistBackupState();
+      await this.removeArchivedRawCopies(manifest, snapshot, backupDir);
       this.onBackupProgress({ ...manifest.progress });
       return { ...manifest.progress };
     } catch (error) {
@@ -1424,18 +1609,69 @@ export class PhoneManager {
     }
   }
 
+  /** Adds a freshly updated Messages database to the phone's dated snapshot. */
+  async includeSupplementalFilesInBackup(
+    device: PhoneDevice,
+    supplementalFiles: PhoneBackupSupplementalFile[],
+  ): Promise<PhoneMessageBackupMetadata> {
+    const key = this.deviceKey(device.platform, device.id);
+    const active = this.backupJobs.get(key);
+    if (active) await active;
+
+    const manifest = this.backupManifests.get(key) ?? {
+      files: {},
+      progress: this.emptyBackupProgress(device),
+    };
+    const backupDir = manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot;
+    const writeError = await this.probeWritableDirectory(backupDir);
+    if (writeError)
+      throw new Error(`Silo cannot write the phone backup destination (${backupDir}): ${writeError}`);
+    manifest.cacheRoot = backupDir;
+    this.backupManifests.set(key, manifest);
+    const snapshot = await this.createBrowseableSnapshot(
+      device,
+      manifest,
+      [],
+      backupDir,
+      supplementalFiles,
+    );
+    manifest.progress.status = "complete";
+    manifest.progress.currentFile = null;
+    manifest.progress.lastBackupAt = snapshot.createdAt;
+    manifest.progress.message = `${device.name} Messages database added to its phone snapshot.`;
+    await this.persistBackupState();
+    this.onBackupProgress({ ...manifest.progress });
+    return this.getMessageBackupMetadata(device.id, device.platform);
+  }
+
   /**
-   * A saved copy counts when it exists and matches the phone's size. Copies already on
-   * the destination are reused even if Silo's state was reset, so a backup never starts over.
+   * A saved copy counts when its current raw cache or the newest matching snapshot
+   * still contains it. Archive-backed files do not need to be expanded to compare.
    */
   private async isAlreadyBackedUp(
     manifest: PhoneBackupManifest,
     file: PhoneFileInfo,
   ): Promise<boolean> {
     const stats = await fsPromises.stat(this.localCachePath(file.path)).catch(() => null);
-    if (!stats?.isFile()) return false;
-    if (manifest.files[file.path]) return file.size === 0 || stats.size === file.size;
-    return file.size > 0 && stats.size === file.size;
+    if (stats?.isFile()) {
+      if (manifest.files[file.path]) return file.size === 0 || stats.size === file.size;
+      return file.size > 0 && stats.size === file.size;
+    }
+
+    const parsed = this.parsePhonePath(file.path);
+    if (!parsed || parsed.offlineBackup) return false;
+    const remotePath = path.posix.normalize(parsed.remotePath);
+    const signature = `${file.size}:${file.modified}`;
+    const snapshot = [...(manifest.snapshots ?? [])]
+      .reverse()
+      .find((entry) => entry.files[remotePath] === signature);
+    return !!snapshot && this.snapshotFileIsPresent(
+      manifest,
+      snapshot,
+      remotePath,
+      signature,
+      manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+    );
   }
 
   private async createBrowseableSnapshot(
@@ -1443,23 +1679,55 @@ export class PhoneManager {
     manifest: PhoneBackupManifest,
     files: PhoneFileInfo[],
     backupDir: string,
+    supplementalFiles: PhoneBackupSupplementalFile[] = [],
   ): Promise<PhoneBackupSnapshot> {
+    const latest = manifest.snapshots?.at(-1);
     const snapshotFiles: Record<string, string> = {};
+    const fileLocations: Record<string, PhoneSnapshotFileLocation> = {};
     const sourceFiles: Array<{ remotePath: string; source: string; signature: string }> = [];
+    const observedRemotePaths = new Set<string>();
     let failedFiles = manifest.progress.failedFiles;
+    let messageDatabase = latest?.messageDatabase;
+
+    // Inherit every previous path first. A phone deleting or hiding a file can never
+    // make that file disappear from this logical backup.
+    if (latest) {
+      for (const [remotePath, signature] of Object.entries(latest.files)) {
+        snapshotFiles[remotePath] = signature;
+      }
+    }
 
     for (const file of files) {
       const parsed = this.parsePhonePath(file.path);
-      if (!parsed || parsed.offlineBackup) continue;
+      if (!parsed || parsed.offlineBackup || parsed.deviceId !== device.id) continue;
       const remotePath = path.posix.normalize(parsed.remotePath);
       if (remotePath === "/" || remotePath.startsWith("/../") || remotePath === "/..") {
         failedFiles += 1;
         continue;
       }
+      observedRemotePaths.add(remotePath);
       const signature = `${file.size}:${file.modified}`;
+      const previousSignature = latest?.files[remotePath];
+      const previousLocation = latest && previousSignature === signature
+        ? this.snapshotFileLocation(latest, remotePath, manifest.snapshots)
+        : null;
+      if (
+        latest && previousLocation && await this.snapshotFileIsPresent(
+          manifest,
+          latest,
+          remotePath,
+          signature,
+          backupDir,
+        )
+      ) {
+        snapshotFiles[remotePath] = signature;
+        continue;
+      }
+
       const source = this.localCachePath(file.path, backupDir);
       const stats = await fsPromises.stat(source).catch(() => null);
       if (!stats?.isFile() || stats.size !== file.size) {
+        // Preserve the previous version if a newer copy could not be read.
         failedFiles += 1;
         continue;
       }
@@ -1467,20 +1735,84 @@ export class PhoneManager {
       sourceFiles.push({ remotePath, source, signature });
     }
 
-    // Files deleted from the phone stay in the browseable copy; backups only ever add.
+    // Preserve files from older raw-cache backups that were not part of the latest
+    // snapshot (for example, files no longer listed by the phone). The bytes must
+    // still exist locally before they can be added to the new archive.
     for (const [virtualPath, signature] of Object.entries(manifest.files)) {
       const parsed = this.parsePhonePath(virtualPath);
-      if (!parsed || parsed.offlineBackup || parsed.deviceId !== device.id) continue;
+      if (
+        !parsed || parsed.offlineBackup || parsed.platform !== device.platform ||
+        parsed.deviceId !== device.id
+      ) continue;
       const remotePath = path.posix.normalize(parsed.remotePath);
-      if (snapshotFiles[remotePath] || remotePath === "/" || remotePath.startsWith("/..")) continue;
+      if (
+        observedRemotePaths.has(remotePath) || remotePath === "/" ||
+        remotePath.startsWith("/../") || remotePath === "/.."
+      ) continue;
+
+      if (
+        latest && snapshotFiles[remotePath] === signature &&
+        await this.snapshotFileIsPresent(manifest, latest, remotePath, signature, backupDir)
+      ) continue;
+
       const source = this.localCachePath(virtualPath, backupDir);
       const stats = await fsPromises.stat(source).catch(() => null);
-      if (!stats?.isFile()) continue;
+      const expectedSize = Number(signature.split(":", 1)[0]);
+      if (!stats?.isFile() || !Number.isFinite(expectedSize) || stats.size !== expectedSize) continue;
       snapshotFiles[remotePath] = signature;
       sourceFiles.push({ remotePath, source, signature });
     }
 
-    const latest = manifest.snapshots?.at(-1);
+    for (const supplemental of supplementalFiles) {
+      const suppliedPath = supplemental.remotePath.replace(/\\/g, "/");
+      const suppliedSegments = suppliedPath.split("/");
+      if (
+        !suppliedPath.startsWith("/") ||
+        /[\u0000-\u001f]/.test(suppliedPath) ||
+        suppliedSegments.some((segment) => segment === "..")
+      ) {
+        failedFiles += 1;
+        continue;
+      }
+      const remotePath = path.posix.normalize(suppliedPath);
+      if (
+        remotePath === "/" ||
+        remotePath.startsWith("/../") ||
+        remotePath === "/.."
+      ) {
+        failedFiles += 1;
+        continue;
+      }
+      const stats = await fsPromises.stat(supplemental.sourcePath).catch(() => null);
+      if (!stats?.isFile()) {
+        failedFiles += 1;
+        continue;
+      }
+      const signature = `${stats.size}:${stats.mtimeMs}`;
+      const previousSignature = latest?.files[remotePath];
+      const previousLocation = latest && previousSignature === signature
+        ? this.snapshotFileLocation(latest, remotePath, manifest.snapshots)
+        : null;
+      if (
+        latest && previousLocation && await this.snapshotFileIsPresent(
+          manifest,
+          latest,
+          remotePath,
+          signature,
+          backupDir,
+        )
+      ) {
+        snapshotFiles[remotePath] = signature;
+        if (supplemental.kind === "messages-database")
+          messageDatabase = { remotePath, size: stats.size, modified: stats.mtimeMs };
+        continue;
+      }
+      snapshotFiles[remotePath] = signature;
+      sourceFiles.push({ remotePath, source: supplemental.sourcePath, signature });
+      if (supplemental.kind === "messages-database")
+        messageDatabase = { remotePath, size: stats.size, modified: stats.mtimeMs };
+    }
+
     const latestHasSameFiles =
       latest &&
       Object.keys(latest.files).length === Object.keys(snapshotFiles).length &&
@@ -1494,52 +1826,42 @@ export class PhoneManager {
     const createdAt = Date.now();
     let snapshotId = String(createdAt);
     let suffix = 1;
-    while (manifest.snapshots?.some((snapshot) => snapshot.id === snapshotId)) {
+    while (true) {
+      const archiveCandidate = this.snapshotArchivePath(
+        backupDir,
+        device.platform,
+        device.id,
+        snapshotId,
+      );
+      const archiveAlreadyExists = await fsPromises.access(archiveCandidate).then(
+        () => true,
+        () => false,
+      );
+      if (!manifest.snapshots?.some((snapshot) => snapshot.id === snapshotId) && !archiveAlreadyExists)
+        break;
       snapshotId = `${createdAt}-${suffix++}`;
     }
 
     const snapshotsRoot = path.join(
-      backupDir,
-      ".silo-phone-snapshots",
-      device.platform,
-      device.id,
+      this.phoneSnapshotsRoot(backupDir, device.platform, device.id),
       "snapshots",
     );
     const stageRoot = path.join(snapshotsRoot, `.${snapshotId}.partial`);
     const finalRoot = path.join(snapshotsRoot, snapshotId);
     await fsPromises.mkdir(snapshotsRoot, { recursive: true });
     await fsPromises.rm(stageRoot, { recursive: true, force: true });
-    await fsPromises.mkdir(stageRoot, { recursive: true });
 
     try {
-      let fallbackCopyBytes = 0;
-      for (const { remotePath, source } of sourceFiles) {
-        const relative = localRelativePath(remotePath);
-        const destination = path.resolve(stageRoot, relative);
-        const pathFromRoot = path.relative(stageRoot, destination);
-        if (pathFromRoot.startsWith("..") || path.isAbsolute(pathFromRoot)) {
-          failedFiles += 1;
-          continue;
-        }
-        await fsPromises.mkdir(path.dirname(destination), { recursive: true });
-        try {
-          await fsPromises.link(source, destination);
-        } catch (error) {
-          const code = (error as NodeJS.ErrnoException).code;
-          if (!["EXDEV", "EPERM", "ENOTSUP", "EOPNOTSUPP"].includes(code || "")) {
-            throw error;
-          }
-          const sourceStats = await fsPromises.stat(source);
-          const disk = await fsPromises.statfs(snapshotsRoot);
-          const availableBytes = disk.bavail * disk.bsize - 5 * 1024 * 1024 * 1024;
-          if (sourceStats.size > availableBytes - fallbackCopyBytes) {
-            throw new Error(
-              `Not enough free space to retain a dated browseable copy of ${device.name} while preserving a 5 GB safety reserve.`,
-            );
-          }
-          await fsPromises.copyFile(source, destination, fsConstants.COPYFILE_EXCL);
-          fallbackCopyBytes += sourceStats.size;
-        }
+      if (sourceFiles.length) {
+        const archivePath = this.snapshotArchivePath(
+          backupDir,
+          device.platform,
+          device.id,
+          snapshotId,
+        );
+        await this.writePhoneSnapshotArchive(archivePath, sourceFiles, backupDir);
+        for (const { remotePath } of sourceFiles)
+          fileLocations[remotePath] = { kind: "archive", archiveId: snapshotId };
       }
 
       const snapshot: PhoneBackupSnapshot = {
@@ -1548,7 +1870,11 @@ export class PhoneManager {
         totalFiles: Object.keys(snapshotFiles).length,
         failedFiles,
         files: snapshotFiles,
+        fileLocations,
+        ...(latest ? { parentSnapshotId: latest.id } : {}),
+        ...(messageDatabase ? { messageDatabase } : {}),
       };
+      await fsPromises.mkdir(stageRoot, { recursive: true });
       await fsPromises.writeFile(
         path.join(stageRoot, ".silo-snapshot.json"),
         JSON.stringify(snapshot, null, 2),
@@ -1561,6 +1887,225 @@ export class PhoneManager {
     } catch (error) {
       await fsPromises.rm(stageRoot, { recursive: true, force: true });
       throw error;
+    }
+  }
+
+  async getMessageBackupMetadata(
+    deviceId: string,
+    platform: PhonePlatform,
+  ): Promise<PhoneMessageBackupMetadata> {
+    const manifest = this.backupManifests.get(this.deviceKey(platform, deviceId));
+    const cacheRoot = manifest?.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot;
+    const snapshots = [...(manifest?.snapshots ?? [])].reverse();
+    for (const snapshot of snapshots) {
+      const database = snapshot.messageDatabase;
+      if (!database) continue;
+      const signature = snapshot.files[database.remotePath];
+      if (
+        !signature ||
+        !(await this.snapshotFileIsPresent(
+          manifest!, snapshot, database.remotePath, signature, cacheRoot,
+        ))
+      ) continue;
+      return {
+        included: true,
+        virtualPath: this.virtualPath(platform, deviceId, database.remotePath, true, snapshot.id),
+        snapshotId: snapshot.id,
+        snapshotAt: snapshot.createdAt,
+        size: database.size,
+        modified: database.modified,
+      };
+    }
+    return {
+      included: false,
+      virtualPath: null,
+      snapshotId: null,
+      snapshotAt: null,
+      size: null,
+      modified: null,
+    };
+  }
+
+  private async writePhoneSnapshotArchive(
+    archivePath: string,
+    files: Array<{ remotePath: string; source: string; signature: string }>,
+    destinationRoot: string,
+  ) {
+    const partialPath = `${archivePath}.partial`;
+    await fsPromises.mkdir(path.dirname(archivePath), { recursive: true });
+    await fsPromises.rm(partialPath, { force: true });
+
+    const disk = await fsPromises.statfs(destinationRoot).catch(() => null);
+    const availableBytes = disk ? disk.bavail * disk.bsize : Number.POSITIVE_INFINITY;
+    const reserveBytes = 5 * 1024 * 1024 * 1024;
+    const outputLimit = Math.max(0, availableBytes - reserveBytes);
+    if (files.length && outputLimit <= 0)
+      throw new Error("Not enough free space to create the compressed phone backup while preserving a 5 GB safety reserve.");
+
+    const expectedEntries = new Map<string, number>();
+    const output = fs.createWriteStream(partialPath, { flags: "wx" });
+    let writtenBytes = 0;
+    const outputGuard = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        writtenBytes += chunk.length;
+        if (writtenBytes > outputLimit) {
+          callback(new Error("The compressed phone backup reached the 5 GB free-space safety reserve."));
+          return;
+        }
+        callback(null, chunk);
+      },
+    });
+    const archive = archiver("zip", { zlib: { level: 1 } });
+    let archiveError: Error | null = null;
+    const failed = new Promise<never>((_resolve, reject) => {
+      const fail = (error: Error) => {
+        archiveError ??= error;
+        reject(error);
+      };
+      archive.on("error", fail);
+      archive.on("warning", fail);
+      outputGuard.on("error", fail);
+      output.on("error", fail);
+    });
+    failed.catch(() => undefined);
+    const closed = new Promise<void>((resolve) => output.on("close", resolve));
+    archive.pipe(outputGuard).pipe(output);
+
+    let appendedEntries = 0;
+    let writtenEntries = 0;
+    let entryWaiter: (() => void) | null = null;
+    archive.on("entry", () => {
+      writtenEntries += 1;
+      if (entryWaiter && writtenEntries >= appendedEntries) {
+        const waiter = entryWaiter;
+        entryWaiter = null;
+        waiter();
+      }
+    });
+    const allEntriesWritten = () => writtenEntries >= appendedEntries
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => { entryWaiter = resolve; });
+
+    try {
+      for (const file of files) {
+        if (archiveError) throw archiveError;
+        const archiveName = localRelativePath(file.remotePath).replace(/\\/g, "/");
+        const segments = archiveName.split("/");
+        if (!archiveName || archiveName.startsWith("/") || segments.some((segment) => !segment || segment === "." || segment === ".."))
+          throw new Error(`Unsafe phone backup path: ${file.remotePath}`);
+        const expectedSize = Number(file.signature.split(":", 1)[0]);
+        const expectedModified = Number(file.signature.split(":")[1]);
+        const before = await fsPromises.stat(file.source);
+        if (!before.isFile() || before.size !== expectedSize)
+          throw new Error(`Phone backup source changed before compression: ${file.remotePath}`);
+        expectedEntries.set(archiveName, expectedSize);
+        archive.file(file.source, {
+          name: archiveName,
+          date: Number.isFinite(expectedModified) && expectedModified > 0
+            ? new Date(expectedModified)
+            : new Date(),
+          mode: 0o600,
+        });
+        appendedEntries += 1;
+        await Promise.race([allEntriesWritten(), failed]);
+        const after = await fsPromises.stat(file.source);
+        if (after.size !== before.size || after.mtimeMs !== before.mtimeMs)
+          throw new Error(`Phone backup source changed during compression: ${file.remotePath}`);
+      }
+
+      if (archiveError) throw archiveError;
+      await Promise.race([archive.finalize(), failed]);
+      await Promise.race([closed, failed]);
+      await this.verifyPhoneSnapshotArchive(partialPath, expectedEntries);
+      await fsPromises.rename(partialPath, archivePath);
+    } catch (error) {
+      archive.abort();
+      outputGuard.destroy();
+      output.destroy();
+      await closed;
+      await fsPromises.rm(partialPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async verifyPhoneSnapshotArchive(
+    archivePath: string,
+    expectedEntries: Map<string, number>,
+  ) {
+    const zipfile = await new Promise<yauzl.ZipFile>((resolve, reject) => {
+      yauzl.open(
+        archivePath,
+        { lazyEntries: true, autoClose: false, validateEntrySizes: true, decodeStrings: true },
+        (error, opened) => error || !opened
+          ? reject(error ?? new Error("Could not verify the compressed phone backup."))
+          : resolve(opened),
+      );
+    });
+    const found = new Set<string>();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const fail = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          reject(error);
+        };
+        zipfile.on("error", fail);
+        zipfile.on("end", () => {
+          if (settled) return;
+          if (found.size !== expectedEntries.size) {
+            fail(new Error("The compressed phone backup is missing one or more files."));
+            return;
+          }
+          settled = true;
+          resolve();
+        });
+        zipfile.on("entry", (entry) => {
+          const expectedSize = expectedEntries.get(entry.fileName);
+          if (expectedSize === undefined || found.has(entry.fileName) || entry.uncompressedSize !== expectedSize) {
+            fail(new Error(`The compressed phone backup failed verification for ${entry.fileName}.`));
+            return;
+          }
+          zipfile.openReadStream(entry, (error, stream) => {
+            if (error || !stream) {
+              fail(error ?? new Error(`Could not verify ${entry.fileName} in the phone backup.`));
+              return;
+            }
+            void (async () => {
+              for await (const _chunk of stream) { /* Stream through to validate the ZIP entry. */ }
+              found.add(entry.fileName);
+              if (!settled) zipfile.readEntry();
+            })().catch(fail);
+          });
+        });
+        zipfile.readEntry();
+      });
+    } finally {
+      zipfile.close();
+    }
+  }
+
+  private async removeArchivedRawCopies(
+    manifest: PhoneBackupManifest,
+    snapshot: PhoneBackupSnapshot,
+    cacheRoot: string,
+  ) {
+    for (const [remotePath, signature] of Object.entries(snapshot.files)) {
+      const location = this.snapshotFileLocation(snapshot, remotePath, manifest.snapshots);
+      if (location.kind !== "archive") continue;
+      const virtualPath = this.virtualPath(
+        manifest.progress.platform,
+        manifest.progress.deviceId,
+        remotePath,
+      );
+      if (manifest.files[virtualPath] !== signature) continue;
+      const rawPath = this.localCachePath(virtualPath, cacheRoot);
+      const expectedSize = Number(signature.split(":", 1)[0]);
+      const stats = await fsPromises.stat(rawPath).catch(() => null);
+      if (!stats?.isFile() || stats.size !== expectedSize) continue;
+      await fsPromises.rm(rawPath, { force: true }).catch((error) =>
+        this.logError(`Could not remove compressed phone cache file ${rawPath}:`, error),
+      );
     }
   }
 
@@ -1614,14 +2159,34 @@ export class PhoneManager {
     const manifest = this.backupManifests.get(this.deviceKey(parsed.platform, parsed.deviceId));
     const root = explicitRoot ?? manifest?.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot;
     if (parsed.offlineBackup && parsed.snapshotId) {
-      return path.join(
+      const snapshot = manifest?.snapshots?.find((entry) => entry.id === parsed.snapshotId);
+      const location = snapshot && this.snapshotFileLocation(
+        snapshot,
+        path.posix.normalize(parsed.remotePath),
+        manifest?.snapshots,
+      );
+      if (location?.kind === "archive")
+        return this.snapshotMaterializedFilePath(
+          root,
+          parsed.platform,
+          parsed.deviceId,
+          parsed.snapshotId,
+          parsed.remotePath,
+        );
+      if (location?.kind === "snapshot")
+        return this.snapshotFolderFilePath(
+          root,
+          parsed.platform,
+          parsed.deviceId,
+          location.snapshotId,
+          parsed.remotePath,
+        );
+      return this.snapshotFolderFilePath(
         root,
-        ".silo-phone-snapshots",
         parsed.platform,
         parsed.deviceId,
-        "snapshots",
         parsed.snapshotId,
-        localRelativePath(parsed.remotePath),
+        parsed.remotePath,
       );
     }
     return path.join(
@@ -1871,6 +2436,21 @@ export class PhoneManager {
       // Return empty array on error instead of throwing to prevent app crash
       return [];
     }
+  }
+
+  /** Discover phones and request iOS trust only for devices that need pairing. */
+  async scanConnectedDevices(): Promise<PhoneDevice[]> {
+    const devices = await this.listDevices();
+    for (const device of devices) {
+      if (device.platform !== "ios" || device.status !== "untrusted") continue;
+      const pairing = classifyIosPairing(
+        await this.run("idevicepair", ["-u", device.id, "validate"], 8000),
+      );
+      if (pairing !== "unpaired") continue;
+      // Pairing asks the user to trust this Mac; scanning itself never backs up.
+      await this.run("idevicepair", ["-u", device.id, "pair"], 45000);
+    }
+    return this.listDevices();
   }
 
   private async listIosDevices(): Promise<PhoneDevice[]> {
@@ -2490,18 +3070,26 @@ export class PhoneManager {
     return index;
   }
 
-  private async cachedDirectoryHasFile(index: PhoneListingIndex, directory: string): Promise<boolean> {
+  private async cachedDirectoryHasFile(
+    index: PhoneListingIndex,
+    directory: string,
+    manifest: PhoneBackupManifest,
+  ): Promise<boolean> {
     const known = index.hasFile.get(directory);
     if (known !== undefined) return known;
     let found = false;
     for (const [name, child] of index.dirs.get(directory) ?? []) {
       if (child.kind === "dir") {
-        found = await this.cachedDirectoryHasFile(index, path.posix.join(directory, name));
+        found = await this.cachedDirectoryHasFile(
+          index,
+          path.posix.join(directory, name),
+          manifest,
+        );
       } else {
-        const expectedSize = Number(child.signature.split(":", 1)[0]);
-        found = await fsPromises.stat(this.localCachePath(child.virtualPath)).then(
-          (stats) => stats.isFile() && Number.isFinite(expectedSize) && stats.size === expectedSize,
-          () => false,
+        found = await this.cachedPhoneFileIsPresent(
+          manifest,
+          child.virtualPath,
+          child.signature,
         );
       }
       if (found) break;
@@ -2547,7 +3135,7 @@ export class PhoneManager {
       );
       if (child.kind === "dir") {
         // A folder is listed only when at least one cached file below it is intact.
-        if (!(await this.cachedDirectoryHasFile(index, childRemotePath))) continue;
+        if (!(await this.cachedDirectoryHasFile(index, childRemotePath, manifest))) continue;
         entries.set(name, {
           name, path: childVirtualPath, relativePath: name, size: 0, modified: 0,
           isDirectory: true, type: "folder", extension: "",
@@ -2556,11 +3144,13 @@ export class PhoneManager {
       }
       const [sizeText, modifiedText] = child.signature.split(":");
       const expectedSize = Number(sizeText);
-      const stats = await fsPromises.stat(this.localCachePath(child.virtualPath)).catch(() => null);
-      if (!stats?.isFile() || !Number.isFinite(expectedSize) || stats.size !== expectedSize) continue;
+      if (
+        !Number.isFinite(expectedSize) ||
+        !(await this.cachedPhoneFileIsPresent(manifest, child.virtualPath, child.signature))
+      ) continue;
       entries.set(name, {
-        name, path: childVirtualPath, relativePath: name, size: stats.size,
-        modified: Number(modifiedText) || stats.mtimeMs, isDirectory: false,
+        name, path: childVirtualPath, relativePath: name, size: expectedSize,
+        modified: Number(modifiedText) || 0, isDirectory: false,
         type: classifyPhoneFile(name, false), extension: path.extname(name).toLowerCase(),
       });
     }
@@ -3235,6 +3825,115 @@ export class PhoneManager {
 
   // -------------------------------------------------------------- downloading
 
+  private async extractPhoneSnapshotFile(
+    manifest: PhoneBackupManifest,
+    snapshot: PhoneBackupSnapshot,
+    remotePath: string,
+    targetPath: string,
+    cacheRoot: string,
+  ) {
+    const normalizedRemotePath = path.posix.normalize(remotePath);
+    const location = this.snapshotFileLocation(snapshot, normalizedRemotePath, manifest.snapshots);
+    if (location.kind !== "archive")
+      return this.snapshotFolderFilePath(
+        cacheRoot,
+        manifest.progress.platform,
+        manifest.progress.deviceId,
+        location.snapshotId,
+        normalizedRemotePath,
+      );
+
+    const signature = snapshot.files[normalizedRemotePath];
+    const expectedSize = Number(signature?.split(":", 1)[0]);
+    if (!Number.isFinite(expectedSize) || expectedSize < 0)
+      throw new Error(`The saved phone file has invalid size information: ${normalizedRemotePath}`);
+    const archiveName = localRelativePath(normalizedRemotePath).replace(/\\/g, "/");
+    const segments = archiveName.split("/");
+    if (!archiveName || archiveName.startsWith("/") || segments.some((segment) => !segment || segment === "." || segment === ".."))
+      throw new Error(`The saved phone file has an unsafe archive path: ${normalizedRemotePath}`);
+
+    const archivePath = this.snapshotArchivePath(
+      cacheRoot,
+      manifest.progress.platform,
+      manifest.progress.deviceId,
+      location.archiveId,
+    );
+    const root = path.resolve(
+      this.phoneSnapshotsRoot(
+        cacheRoot,
+        manifest.progress.platform,
+        manifest.progress.deviceId,
+      ),
+      "materialized",
+      snapshot.id,
+    );
+    const destination = path.resolve(targetPath);
+    const relativeDestination = path.relative(root, destination);
+    if (relativeDestination.startsWith("..") || path.isAbsolute(relativeDestination))
+      throw new Error("The saved phone file points outside its extraction cache.");
+
+    const existing = await fsPromises.stat(destination).catch(() => null);
+    if (existing?.isFile() && existing.size === expectedSize) return destination;
+    await fsPromises.mkdir(path.dirname(destination), { recursive: true });
+    const partialPath = `${destination}.silo-partial`;
+    await fsPromises.rm(partialPath, { force: true });
+    const zipfile = await new Promise<yauzl.ZipFile>((resolve, reject) => {
+      yauzl.open(
+        archivePath,
+        { lazyEntries: true, autoClose: false, validateEntrySizes: true, decodeStrings: true },
+        (error, opened) => error || !opened
+          ? reject(error ?? new Error("Could not open the compressed phone backup."))
+          : resolve(opened),
+      );
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const fail = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          reject(error);
+        };
+        zipfile.on("error", fail);
+        zipfile.on("end", () => fail(new Error(`The saved phone file is missing from its ZIP: ${normalizedRemotePath}`)));
+        zipfile.on("entry", (entry) => {
+          if (entry.fileName !== archiveName) {
+            zipfile.readEntry();
+            return;
+          }
+          if (entry.uncompressedSize !== expectedSize) {
+            fail(new Error(`The saved phone file failed size verification: ${normalizedRemotePath}`));
+            return;
+          }
+          zipfile.openReadStream(entry, (error, stream) => {
+            if (error || !stream) {
+              fail(error ?? new Error(`Could not read ${normalizedRemotePath} from the phone backup.`));
+              return;
+            }
+            void pipeline(stream, fs.createWriteStream(partialPath, { flags: "wx" }))
+              .then(async () => {
+                const stats = await fsPromises.stat(partialPath);
+                if (!stats.isFile() || stats.size !== expectedSize)
+                  throw new Error(`The extracted phone file failed size verification: ${normalizedRemotePath}`);
+                await fsPromises.rename(partialPath, destination);
+                settled = true;
+                resolve();
+              })
+              .catch(fail);
+          });
+        });
+        zipfile.readEntry();
+      });
+      return destination;
+    } catch (error) {
+      await fsPromises.rm(partialPath, { force: true }).catch(() => undefined);
+      throw error;
+    } finally {
+      zipfile.close();
+    }
+  }
+
   /** Copies a device file into the local cache so normal file code paths work. */
   async materialize(candidate: string, force = false): Promise<string> {
     debugLog(`[PhoneManager] materialize: Materializing ${candidate}`);
@@ -3254,9 +3953,71 @@ export class PhoneManager {
     debugLog(`[PhoneManager] materialize: Local cache path: ${localPath}`);
 
     if (parsed.offlineBackup) {
+      if (parsed.snapshotId) {
+        const manifest = this.backupManifests.get(this.deviceKey(platform, deviceId));
+        const snapshot = manifest?.snapshots?.find((entry) => entry.id === parsed.snapshotId);
+        const normalizedRemotePath = path.posix.normalize(remotePath);
+        const signature = snapshot?.files[normalizedRemotePath];
+        if (!manifest || !snapshot || !signature || !(await this.snapshotFileIsPresent(
+          manifest,
+          snapshot,
+          normalizedRemotePath,
+          signature,
+          manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+        )))
+          throw new Error(`This file is missing from the saved phone copy: ${remotePath}`);
+        const location = this.snapshotFileLocation(snapshot, normalizedRemotePath, manifest.snapshots);
+        if (location.kind === "archive")
+          return this.extractPhoneSnapshotFile(
+            manifest,
+            snapshot,
+            normalizedRemotePath,
+            localPath,
+            manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+          );
+      }
       const stats = await fsPromises.stat(localPath).catch(() => null);
       if (stats?.isFile()) return localPath;
       throw new Error(`This file is missing from the saved phone copy: ${remotePath}`);
+    }
+
+    if (!this.connectedDeviceKeys.has(this.deviceKey(platform, deviceId))) {
+      const manifest = this.backupManifests.get(this.deviceKey(platform, deviceId));
+      const signature = manifest?.files[candidate];
+      const normalizedRemotePath = path.posix.normalize(remotePath);
+      const snapshot = signature && manifest?.snapshots
+        ? [...manifest.snapshots].reverse().find((entry) => entry.files[normalizedRemotePath] === signature)
+        : undefined;
+      if (manifest && signature && snapshot && await this.snapshotFileIsPresent(
+        manifest,
+        snapshot,
+        normalizedRemotePath,
+        signature,
+        manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+      )) {
+        const location = this.snapshotFileLocation(snapshot, normalizedRemotePath, manifest.snapshots);
+        if (location.kind === "archive")
+          return this.extractPhoneSnapshotFile(
+            manifest,
+            snapshot,
+            normalizedRemotePath,
+            this.snapshotMaterializedFilePath(
+              manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+              platform,
+              deviceId,
+              snapshot.id,
+              normalizedRemotePath,
+            ),
+            manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+          );
+        return this.snapshotFolderFilePath(
+          manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+          platform,
+          deviceId,
+          location.snapshotId,
+          normalizedRemotePath,
+        );
+      }
     }
 
     try {
@@ -3319,6 +4080,33 @@ export class PhoneManager {
     );
 
     if (parsed.offlineBackup) {
+      if (parsed.snapshotId) {
+        const manifest = this.backupManifests.get(this.deviceKey(platform, deviceId));
+        const snapshot = manifest?.snapshots?.find((entry) => entry.id === parsed.snapshotId);
+        const normalizedRemotePath = path.posix.normalize(remotePath);
+        const signature = snapshot?.files[normalizedRemotePath];
+        if (
+          manifest && snapshot && signature && await this.snapshotFileIsPresent(
+            manifest,
+            snapshot,
+            normalizedRemotePath,
+            signature,
+            manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+          )
+        ) {
+          const [sizeText, modifiedText] = signature.split(":");
+          return {
+            name,
+            path: candidate,
+            relativePath: name,
+            size: Number(sizeText) || 0,
+            modified: Number(modifiedText) || 0,
+            isDirectory: false,
+            type: classifyPhoneFile(name, false),
+            extension: path.extname(name).toLowerCase(),
+          };
+        }
+      }
       const localPath = this.localCachePath(candidate);
       const stats = await fsPromises.stat(localPath).catch(() => null);
       if (!stats?.isFile()) return null;
@@ -3332,6 +4120,34 @@ export class PhoneManager {
         type: classifyPhoneFile(name, false),
         extension: path.extname(name).toLowerCase(),
       };
+    }
+
+    if (!this.connectedDeviceKeys.has(this.deviceKey(platform, deviceId))) {
+      const manifest = this.backupManifests.get(this.deviceKey(platform, deviceId));
+      const signature = manifest?.files[candidate];
+      const normalizedRemotePath = path.posix.normalize(remotePath);
+      const snapshot = signature && manifest?.snapshots
+        ? [...manifest.snapshots].reverse().find((entry) => entry.files[normalizedRemotePath] === signature)
+        : undefined;
+      if (manifest && signature && snapshot && await this.snapshotFileIsPresent(
+        manifest,
+        snapshot,
+        normalizedRemotePath,
+        signature,
+        manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot,
+      )) {
+        const [sizeText, modifiedText] = signature.split(":");
+        return {
+          name,
+          path: candidate,
+          relativePath: name,
+          size: Number(sizeText) || 0,
+          modified: Number(modifiedText) || 0,
+          isDirectory: false,
+          type: classifyPhoneFile(name, false),
+          extension: path.extname(name).toLowerCase(),
+        };
+      }
     }
 
     if (platform === "ios") {

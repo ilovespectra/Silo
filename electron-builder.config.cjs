@@ -57,7 +57,7 @@ module.exports = {
     ...(testOutput ? { output: testOutput } : {}),
   },
   extraResources,
-  afterPack: require('./signing/after-pack.cjs'),
+  afterPack: require('./scripts/after-pack.cjs'),
   mac: {
     ...packageJson.build.mac,
     identity: hasCompleteSigningSetup ? undefined : null,

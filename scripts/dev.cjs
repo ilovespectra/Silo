@@ -5,6 +5,7 @@
  * whole tree down together. Electron gets SIGTERM first so index writes flush.
  */
 const { spawn, spawnSync, execFileSync } = require("node:child_process");
+const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 
@@ -13,6 +14,19 @@ const PORT = 8787;
 const GRACE_MS = 12000; // Electron flushes index writes for up to 8s on quit.
 const log = (message) => console.log(`[dev] ${message}`);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function compatibleInstalledPhoneTools() {
+  if (process.platform !== "darwin") return "";
+  const directory = "/Applications/Silo.app/Contents/Resources/phone-tools";
+  const architecture = process.arch === "x64" ? "x86_64" : process.arch;
+  for (const name of ["idevice_id", "ideviceinfo", "idevicepair", "afcclient", "idevicebackup2", "adb"]) {
+    const binary = path.join(directory, name);
+    if (!fs.existsSync(binary)) return "";
+    const result = spawnSync("lipo", [binary, "-verify_arch", architecture], { stdio: "ignore" });
+    if (result.status !== 0) return "";
+  }
+  return directory;
+}
 
 function processTable() {
   const output = execFileSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" });
@@ -146,9 +160,13 @@ async function main() {
   if (shuttingDown) return;
   log("Launching Silo…");
   // Large libraries hold ~1M index records in the main process; V8's default heap is too tight.
+  const phoneToolsDirectory = process.env.SILO_PHONE_TOOLS_DIR || compatibleInstalledPhoneTools();
+  if (phoneToolsDirectory) log(`Using compatible phone tools from ${phoneToolsDirectory}.`);
+  const electronEnvironment = { SILO_LOCAL_DEV: "1" };
+  if (phoneToolsDirectory) electronEnvironment.SILO_PHONE_TOOLS_DIR = phoneToolsDirectory;
   electron = start(path.join(root, "node_modules/.bin/electron"),
     [".", "--enable-logging", "--js-flags=--max-old-space-size=8192 --expose-gc", ...process.argv.slice(2)],
-    { SILO_LOCAL_DEV: "1" });
+    electronEnvironment);
   electron.on("exit", (code) => {
     log(`Silo exited${code ? ` with code ${code}` : ""}.`);
     void shutdown(code ?? 0);

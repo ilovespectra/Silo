@@ -147,12 +147,29 @@
 
 .messages-toolbar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(180px, 280px) auto auto;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 430px) auto;
   align-items: center;
   gap: 8px;
   padding: 10px 16px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
+}
+
+.messages-device-select-tools {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.messages-device-select-tools select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.messages-toolbar .messages-scan-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .messages-toolbar h2 {
@@ -209,6 +226,21 @@
   color: var(--error-text);
 }
 
+.phone-message-backup-status {
+  padding: 6px 18px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.phone-message-backup-status.included {
+  color: var(--success-text);
+}
+
+.phone-message-backup-status.pending {
+  color: var(--warning-text, var(--muted));
+}
+
 .messages-layout {
   display: grid;
   grid-template-columns: minmax(300px, 360px) minmax(360px, 1fr) 230px;
@@ -225,6 +257,10 @@
 }
 
 .messages-toolbar .messages-icon-button svg.spinning {
+  animation: stats-spin 1s linear infinite;
+}
+
+.messages-toolbar .messages-scan-button svg.spinning {
   animation: stats-spin 1s linear infinite;
 }
 
@@ -657,6 +693,32 @@
   font-size: 11px;
 }
 
+.message-sort-control {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  color: var(--msg-muted);
+  font-size: 11px;
+}
+
+.message-sort-control select {
+  min-height: 28px;
+  max-width: 150px;
+  padding: 3px 7px;
+  border: 1px solid var(--msg-separator);
+  border-radius: 7px;
+  background: var(--msg-search-bg);
+  color: var(--msg-text);
+  font: inherit;
+}
+
+.platform-ios .message-sort-control {
+  justify-content: center;
+  margin: 4px 0 0;
+}
+
 .message-bubbles {
   display: flex;
   flex: 1 1 0;
@@ -725,6 +787,70 @@
   font-size: 15px;
   line-height: 1.32;
   white-space: pre-wrap;
+}
+
+.message-bubble-actions {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  min-height: 23px;
+  margin: 4px -5px -3px 0;
+}
+
+.message-flag-button {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: currentColor;
+  opacity: 0.68;
+  cursor: pointer;
+}
+
+.message-flag-button:hover,
+.message-flag-button:focus-visible {
+  background: rgba(127, 127, 127, 0.2);
+  opacity: 1;
+}
+
+.message-flag-button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
+}
+
+.message-flag-button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.message-flag-button.favorite.active {
+  color: #ffd166;
+  opacity: 1;
+}
+
+.message-flag-button.hide.active {
+  opacity: 1;
+}
+
+.hidden-message-label {
+  margin-right: auto;
+  font-size: 10px;
+  font-weight: 600;
+  opacity: 0.8;
+}
+
+.message-row.hidden-message .message-bubble {
+  outline: 1px dashed currentColor;
+  outline-offset: 2px;
+  opacity: 0.76;
 }
 
 .message-attachment {
@@ -981,9 +1107,9 @@
 
 @media (max-width: 900px) {
   .messages-toolbar {
-    grid-template-columns: 1fr auto auto;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
-  .messages-toolbar select {
+  .messages-device-select-tools {
     grid-column: 1 / -1;
     grid-row: 2;
   }

@@ -306,6 +306,13 @@ interface PersistedUiState {
   viewMode: "list" | "grid";
   showFilters: boolean;
   confidence: number;
+  messageSort: "oldest" | "newest" | "favorites";
+  showHiddenMessages: boolean;
+}
+
+interface MessageDisplayFlags {
+  favorite: boolean;
+  hidden: boolean;
 }
 
 interface IndexSource {
@@ -434,6 +441,15 @@ interface MessageHistoryEntry {
   deviceName: string;
   threadCount: number;
   lastMessageDate: number;
+}
+
+interface PhoneMessageBackupMetadata {
+  included: boolean;
+  virtualPath: string | null;
+  snapshotId: string | null;
+  snapshotAt: number | null;
+  size: number | null;
+  modified: number | null;
 }
 
 interface IndexingStageProgress {
@@ -662,6 +678,8 @@ interface PersistedAppState {
   indexSources: IndexSource[];
   digitalFolders: DigitalFolder[];
   fileMetadata: Record<string, FileMetadata>;
+  searchFeedback: Record<string, "confirmed" | "removed">;
+  messageFlags: Record<string, MessageDisplayFlags>;
   geoOverrides: Record<string, GeoOverride>;
   indexProgress?: IndexProgress;
 }
@@ -1075,6 +1093,14 @@ interface Window {
       update: Partial<PersistedUiState>,
       diagnosticUi?: DiagnosticUiUpdate,
     ): Promise<PersistedAppState>;
+    updateSearchFeedback(
+      filePaths: string[],
+      disposition: "confirmed" | "removed",
+    ): Promise<PersistedAppState>;
+    updateMessageFlags(
+      messageKey: string,
+      update: Partial<MessageDisplayFlags>,
+    ): Promise<PersistedAppState>;
     selectIndexSource(): Promise<PersistedAppState | null>;
     addMachineSource(): Promise<PersistedAppState | null>;
     addMachineSource(): Promise<PersistedAppState | null>;
@@ -1345,6 +1371,7 @@ interface Window {
     confirmNameFile(name: string, filePath: string): Promise<PersistedAppState>;
     rejectNameFile(name: string, filePath: string): Promise<PersistedAppState>;
     getPhoneTooling(): Promise<PhoneTooling>;
+    scanPhones(): Promise<PhoneDevice[]>;
     getPhoneBackupStates(): Promise<PhoneBackupProgress[]>;
     getPhoneRestoreArchives(): Promise<PhoneRestoreArchive[]>;
     createPhoneRestoreArchive(
@@ -1415,6 +1442,10 @@ interface Window {
       platform: PhonePlatform,
       refresh?: boolean,
     ): Promise<{ ok: boolean; threads: DeviceMessageThread[]; error?: string }>;
+    getPhoneMessageBackupMetadata(
+      deviceId: string,
+      platform: PhonePlatform,
+    ): Promise<PhoneMessageBackupMetadata>;
     getMessageAttachmentDataUrl(
       deviceId: string,
       messageId: string,

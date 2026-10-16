@@ -38,6 +38,7 @@ import {
   FileMetadata,
   GeoFileSnapshot,
   StateStore,
+  type MessageDisplayFlags,
 } from "./stateStore";
 import { FaceIndexer } from "./faceIndexer";
 import { PetIndexer } from "./petIndexer";
@@ -787,6 +788,38 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
           verifiedAt: payload.verifiedAt,
         };
       runtimeLog("lifetime-license-device-or-signature-mismatch", {});
+    } else if (
+      (stored.version === 1 || stored.version === 2) &&
+      stored.network === "solana-mainnet" &&
+      stored.paymentAddress === LIFETIME_PAYMENT_ADDRESS &&
+      stored.usdcMint === LIFETIME_USDC_MINT &&
+      typeof stored.signature === "string" &&
+      isSolanaTransactionSignature(stored.signature) &&
+      typeof stored.verifiedAt === "number" &&
+      Number.isFinite(stored.verifiedAt)
+    ) {
+      const installationMatches =
+        stored.version === 1 ||
+        (typeof stored.installationId === "string" &&
+          /^[a-f0-9]{32}$/.test(stored.installationId) &&
+          stored.installationId === (await getBetaInstallationId()));
+      if (
+        installationMatches &&
+        !(await isLegacyLicenseRejected(
+          lifetimeLicenseRejectionPath,
+          stored.signature,
+        ))
+      ) {
+        return {
+          isLicensed: true,
+          licenseType: "purchase",
+          signature: stored.signature,
+          verifiedAt: stored.verifiedAt,
+        };
+      }
+      runtimeLog("legacy-lifetime-license-not-active-offline", {
+        version: stored.version,
+      });
     } else if (stored.version === 1 || stored.version === 2) {
       runtimeLog("legacy-lifetime-license-needs-online-migration", {});
     }
@@ -924,8 +957,8 @@ async function migrateLegacyLifetimeLicense(): Promise<void> {
       });
     }
   } catch (error) {
-    // Existing unsigned receipts stay on disk; paid access remains locked until
-    // the relay can convert the receipt into a signed, device-bound token.
+    // Leave the receipt untouched; readLifetimeLicense can preserve offline
+    // access for a valid legacy purchase without waiting for this migration.
     runtimeLog("legacy-lifetime-license-migration-unavailable", {
       message: error instanceof Error ? error.message : String(error),
     });
@@ -2439,9 +2472,21 @@ const MEMORY_NAMED_IMAGE_EXTENSIONS = new Set([
 ]);
 
 function memoryNameMatches(name: string | undefined, query: string): boolean {
-  const normalized = name?.trim().toLocaleLowerCase();
-  if (!normalized || normalized.length < 3) return false;
-  return query.includes(normalized) || normalized.includes(query);
+  const normalize = (value: string) => value.normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+  const normalizedName = typeof name === "string" ? normalize(name) : "";
+  const normalizedQuery = normalize(query);
+  if (normalizedName.length < 3 || normalizedQuery.length < 3) return false;
+  const nameWords = normalizedName.split(/\s+/).filter(Boolean);
+  const queryWords = new Set(normalizedQuery.split(/\s+/).filter(Boolean));
+  const nameWordSet = new Set(nameWords);
+  // Match complete saved names inside a longer prompt, and allow a shorter
+  // exact name phrase from a longer saved label (for example, a city in a
+  // "city, country" mapped-place label).
+  return nameWords.every((word) => queryWords.has(word))
+    || normalizedQuery.split(/\s+/).every((word) => nameWordSet.has(word));
 }
 
 /** Photos the user has named via digital folders, people, pets, keywords or virtual names. */
@@ -2458,6 +2503,14 @@ async function namedMemoryMedia(query: string, roots: string[]): Promise<ScoredM
   for (const entry of state.nameIndex)
     if (entry.sourceType !== "person" && memoryNameMatches(entry.name, normalizedQuery))
       entry.filePaths.forEach(({ path: filePath }) => paths.add(filePath));
+  for (const photo of geoIndexer.getState().photos) {
+    const locationNames = [photo.locationLabel, photo.city, photo.region, photo.country]
+      .flatMap((value) => typeof value === "string" ? value.split(/[,;|\n]+/) : [])
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (locationNames.some((name) => memoryNameMatches(name, normalizedQuery)))
+      paths.add(photo.path);
+  }
   for (const filePath in state.fileMetadata) {
     const metadata = state.fileMetadata[filePath];
     if (memoryNameMatches(metadata.displayName, normalizedQuery)
@@ -2707,6 +2760,11 @@ async function searchPromptedMemoryMedia(query: string): Promise<ScoredMemoryMed
     (file) => promptedVideoPhotoCandidate(file as SearchResult, musicDirectories) !== null,
   );
   const byPath = new Map<string, ScoredMemoryMedia>();
+  // Names the user saved are strong prompt anchors: retain them alongside
+  // semantic matches so folder/person/place prompts can seed a memory even
+  // when the visual model scores those photos below its normal confidence floor.
+  for (const candidate of await namedMemoryMedia(cleanQuery, roots))
+    byPath.set(candidate.path, candidate);
   for (const file of matches) {
     const candidate = promptedVideoPhotoCandidate(file, musicDirectories);
     if (candidate && (!byPath.has(candidate.path) || byPath.get(candidate.path)!.score < candidate.score))
@@ -3994,30 +4052,6 @@ function runDerivedIndexes(): Promise<void> {
   */
 }
 
-const phoneMessageRefreshJobs = new Set<string>();
-
-/** Refreshes a connected phone's saved message history after its file backup, then tells the Messages view. */
-function refreshPhoneMessagesInBackground(device: PhoneDevice): void {
-  const key = `${device.platform}:${device.id}`;
-  if (phoneMessageRefreshJobs.has(key) || typeof messageExportCoordinator === "undefined") return;
-  phoneMessageRefreshJobs.add(key);
-  void (async () => {
-    try {
-      messageExportCoordinator.setBackupDestination(await phoneManager.getBackupDestination());
-      const threads = await messageExportCoordinator.getDeviceThreads(device.id, device.platform, true, device.name);
-      runtimeLog("phone-messages-auto-refreshed", { platform: device.platform, threads: threads.length });
-      sendToRenderer("phone-messages-updated", { deviceId: device.id, platform: device.platform });
-    } catch (error) {
-      runtimeLog("phone-messages-auto-refresh-failed", {
-        platform: device.platform,
-        message: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      phoneMessageRefreshJobs.delete(key);
-    }
-  })();
-}
-
 function discoverAndBackupPhones(): Promise<void> {
   if (phoneDiscoveryPromise) return phoneDiscoveryPromise;
   phoneDiscoveryPromise = (async () => {
@@ -4097,7 +4131,6 @@ function discoverAndBackupPhones(): Promise<void> {
         if (!shouldStart) continue;
         console.log(`[PHONE-DISCOVERY] Triggering backup for ${key}`);
         void phoneManager.backupDevice(device).then((progress) => {
-          if (newlyConnected) refreshPhoneMessagesInBackground(device);
           console.log(
             `[PHONE-DISCOVERY] Backup finished for ${key}:`,
             progress.status,
@@ -4114,7 +4147,6 @@ function discoverAndBackupPhones(): Promise<void> {
             platform: device.platform,
             message: error instanceof Error ? error.message : String(error),
           });
-          if (newlyConnected) refreshPhoneMessagesInBackground(device);
         });
       }
       await getEnabledIndexSources();
@@ -7556,8 +7588,13 @@ app.whenReady().then(async () => {
   }
   stateStore = new StateStore(app.getPath("userData"));
   await stateStore.initialize();
-  await migrateLegacyLifetimeLicense();
-  const effectiveLicense = await readLifetimeLicense();
+  // Paid and beta licenses are verified from local signed data so an activated
+  // computer keeps full access offline; the relay is only for initial recovery.
+  let effectiveLicense = await readLifetimeLicense();
+  if (!effectiveLicense.isLicensed) {
+    await migrateLegacyLifetimeLicense();
+    effectiveLicense = await readLifetimeLicense();
+  }
   lifetimeLicensed = effectiveLicense.isLicensed;
   if (lifetimeLicensed) {
     const persistedDemoMode = await readDemoTestingMode();
@@ -7888,6 +7925,11 @@ app.whenReady().then(async () => {
         // A finished snapshot becomes a browseable source even after the phone is unplugged.
         invalidateSourceList();
       }
+      if (progress.status === "complete" && progress.platform === "ios")
+        sendToRenderer("phone-messages-updated", {
+          deviceId: progress.deviceId,
+          platform: progress.platform,
+        });
       if (!mainWindow || mainWindow.isDestroyed()) return;
       mainWindow.webContents.send("phone-backup-progress", progress);
       if (statusChanged && progress.status === "complete")
@@ -7930,6 +7972,33 @@ app.whenReady().then(async () => {
   messageExportCoordinator = new MessageExportCoordinator(
     app.getPath("userData"),
   );
+
+  phoneManager.setSupplementalBackupFilesProvider(async (device) => {
+    if (device.platform !== "ios") return [];
+    messageExportCoordinator.setBackupDestination(
+      await phoneManager.getBackupDestination(),
+    );
+    const threads = await messageExportCoordinator.getDeviceThreads(
+      device.id,
+      device.platform,
+      true,
+      device.name,
+    );
+    const source = await messageExportCoordinator.getIOSMessageBackupFile(device.id);
+    runtimeLog("phone-messages-snapshot-source", {
+      platform: device.platform,
+      threads: threads.length,
+      available: Boolean(source),
+      size: source?.size ?? 0,
+    });
+    return source
+      ? [{
+          remotePath: "/Messages/sms.db",
+          sourcePath: source.databasePath,
+          kind: "messages-database" as const,
+        }]
+      : [];
+  });
 
   // Sync phone backup destination to message coordinator
   const phoneBackupDest = await phoneManager.getBackupDestination();
@@ -10203,6 +10272,51 @@ ipcMain.handle("update-ui-state", async (_event, update) =>
   stateStore.updateUi(update),
 );
 
+ipcMain.handle(
+  "update-search-feedback",
+  async (_event, filePaths: unknown, disposition: unknown) => {
+    if (
+      !Array.isArray(filePaths) ||
+      (disposition !== "confirmed" && disposition !== "removed")
+    )
+      throw new Error("Invalid search feedback request.");
+    const validPaths = filePaths.filter(
+      (filePath): filePath is string =>
+        typeof filePath === "string" && filePath.trim().length > 0,
+    );
+    if (validPaths.length === 0)
+      throw new Error("Select at least one search result.");
+    return stateStore.updateSearchFeedback(validPaths, disposition);
+  },
+);
+
+ipcMain.handle(
+  "update-message-flags",
+  async (_event, messageKey: unknown, update: unknown) => {
+    if (
+      typeof messageKey !== "string" ||
+      !messageKey.trim() ||
+      messageKey.length > 4096 ||
+      !update ||
+      typeof update !== "object" ||
+      Array.isArray(update)
+    )
+      throw new Error("Invalid message preference request.");
+    const candidate = update as Record<string, unknown>;
+    const validKeys = Object.keys(candidate);
+    if (
+      !validKeys.length ||
+      validKeys.some((key) => key !== "favorite" && key !== "hidden") ||
+      validKeys.some((key) => typeof candidate[key] !== "boolean")
+    )
+      throw new Error("Invalid message preference request.");
+    return stateStore.updateMessageFlags(
+      messageKey,
+      candidate as Partial<MessageDisplayFlags>,
+    );
+  },
+);
+
 ipcMain.handle("select-index-source", async () => {
   if (!mainWindow) return null;
   const result = await dialog.showOpenDialog(mainWindow, {
@@ -10453,10 +10567,15 @@ ipcMain.handle(
         new Set(sources),
       ).filter(
         (result) =>
-          result._priority !== 3 || Number.isFinite(result.confidence),
+          state.searchFeedback[result.path] !== "removed" &&
+          (result._priority !== 3 || Number.isFinite(result.confidence)),
       );
       if (isCancelled()) return [];
       return filterForContentSafety(activeResults).sort((first, second) => {
+        const firstConfirmed = state.searchFeedback[first.path] === "confirmed";
+        const secondConfirmed = state.searchFeedback[second.path] === "confirmed";
+        if (firstConfirmed !== secondConfirmed)
+          return firstConfirmed ? -1 : 1;
         const priorityDifference = (first._priority ?? 3) - (second._priority ?? 3);
         return priorityDifference || (second.confidence ?? 0) - (first.confidence ?? 0);
       });
@@ -12269,6 +12388,17 @@ ipcMain.handle(
 // Handle isDev check for client
 ipcMain.handle("get-lifetime-license", () => readLifetimeLicense());
 
+function lifetimePurchaseRequestError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    /\b(?:ENOTFOUND|EAI_AGAIN|ENETUNREACH|ECONNREFUSED|ECONNRESET|ETIMEDOUT)\b|timed out|network|socket/i.test(
+      message,
+    )
+  )
+    return "Silo couldn't reach the license service. No payment was made. Check your internet connection and try again. If you've already paid for this Mac, don't pay again; verify your existing transaction.";
+  return message || "The wallet payment request could not be started.";
+}
+
 async function createLifetimePurchase(
   paymentMethod: "solana-pay" | "manual",
   reference?: string,
@@ -12323,10 +12453,7 @@ ipcMain.handle(
     } catch (error) {
       return {
         ok: false as const,
-        error:
-          error instanceof Error
-            ? error.message
-            : "The wallet payment request could not be started.",
+        error: lifetimePurchaseRequestError(error),
       };
     }
   },
@@ -12930,6 +13057,13 @@ ipcMain.handle("get-access-identity", () => {
 ipcMain.handle("get-phone-tooling", () => phoneManager.getTooling());
 ipcMain.handle("get-phone-backup-states", () => phoneManager.getBackupStates());
 
+ipcMain.handle("scan-phones", async () => {
+  scannedPhoneDevices = await phoneManager.scanConnectedDevices();
+  invalidateSourceList();
+  sendToRenderer("phone-devices-changed", scannedPhoneDevices);
+  return scannedPhoneDevices;
+});
+
 async function readyPhoneForBackup(deviceId: unknown, platform: unknown) {
   if (
     typeof deviceId !== "string" ||
@@ -13166,8 +13300,12 @@ ipcMain.handle(
     if (connected.status === "ready" && connected.rootPath) {
       void phoneManager
         .backupDevice(connected)
-        .catch(() => undefined)
-        .then(() => refreshPhoneMessagesInBackground(connected));
+        .catch((error) =>
+          runtimeLog("phone-backup-failed", {
+            platform: connected.platform,
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
       void indexNewSources([connected.rootPath], "phone-connected");
     }
     return connected;
@@ -13704,6 +13842,31 @@ ipcMain.handle(
         refresh,
         device?.name ?? deviceId,
       );
+      if (refresh && platform === "ios" && device?.status === "ready") {
+        try {
+          const source = await messageExportCoordinator.getIOSMessageBackupFile(deviceId);
+          if (source) {
+            const metadata = await phoneManager.includeSupplementalFilesInBackup(
+              device,
+              [{
+                remotePath: "/Messages/sms.db",
+                sourcePath: source.databasePath,
+                kind: "messages-database",
+              }],
+            );
+            runtimeLog("phone-messages-added-to-snapshot", {
+              deviceId,
+              snapshotId: metadata.snapshotId,
+              size: metadata.size,
+            });
+          }
+        } catch (error) {
+          runtimeLog("phone-messages-snapshot-update-failed", {
+            deviceId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       return { ok: true, threads };
     } catch (error) {
       return {
@@ -13711,6 +13874,28 @@ ipcMain.handle(
         threads: [],
         error:
           error instanceof Error ? error.message : "Could not load messages.",
+      };
+    }
+  },
+);
+
+ipcMain.handle(
+  "get-phone-message-backup-metadata",
+  async (_event, deviceId: string, platform: PhonePlatform) => {
+    try {
+      return await phoneManager.getMessageBackupMetadata(deviceId, platform);
+    } catch (error) {
+      runtimeLog("phone-message-backup-metadata-failed", {
+        platform,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        included: false,
+        virtualPath: null,
+        snapshotId: null,
+        snapshotAt: null,
+        size: null,
+        modified: null,
       };
     }
   },

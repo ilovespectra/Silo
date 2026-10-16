@@ -13,6 +13,7 @@ export function bundledPhoneToolsDirectories(): string[] {
     .resourcesPath;
   return [
     resourcesPath ? path.join(resourcesPath, "phone-tools") : "",
+    process.env.SILO_PHONE_TOOLS_DIR || "",
     path.join(__dirname, "..", "vendor", "phone-tools", platformArch),
   ].filter(Boolean);
 }
