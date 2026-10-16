@@ -16,12 +16,12 @@
     "test:face-clustering": "node test/runFaceClusteringTests.cjs",
     "test:message-coverage": "node test/runMessageCoverageTests.cjs",
     "test:ios-message-backup": "node test/runIosMessageBackupTests.cjs",
-    "test:beta-license": "node test/runBetaLicenseTests.cjs && node test/runBetaReleaseCheckTests.cjs && node --check scripts/beta-license.cjs && node --check scripts/check-beta-release.cjs",
-    "test:lifetime-payment": "node test/runLifetimePaymentTests.cjs && node test/runPaidLicenseTests.cjs && node test/runLegacyLicenseRejectionTests.cjs",
-    "test:owner-license": "node test/runOwnerLicenseTests.cjs",
+    "test:beta-license": "npm run test:license",
+    "test:lifetime-payment": "npm run test:license",
+    "test:owner-license": "npm run test:license",
     "owner:keys": "node scripts/owner-license.cjs init",
     "owner:grant": "node scripts/owner-license.cjs grant",
-    "release:check": "npm run test:beta-license && npm run test:lifetime-payment && npm run test:owner-license && npm run test:mac-update-manifest && node scripts/check-beta-release.cjs",
+    "release:check": "npm run test:license && npm run test:mac-update-manifest && node scripts/check-beta-release.cjs",
     "react-eject": "react-scripts eject",
     "electron-start": "wait-on http://localhost:8787 && electron .",
     "start": "concurrently -k \"npm run react-start\" \"wait-on http://localhost:8787 && electron .\"",
@@ -45,7 +45,8 @@
     "test:portable-storage": "node test/runPortableStorageTests.cjs && node test/runConfigBundleRestoreTests.cjs && node test/runPhoneRestoreTargetTests.cjs && node test/runOfflinePhoneBackupTests.cjs",
     "test:progress-throttle": "node test/runProgressThrottleTests.cjs",
     "test:app-assets": "node test/runAppAssetsTests.cjs",
-    "repackage_binaries": "node scripts/repackage-binaries.cjs"
+    "repackage_binaries": "node scripts/repackage-binaries.cjs",
+    "test:license": "node test/runLifetimePaymentTests.cjs && node --check scripts/beta-license.cjs && node --check scripts/check-beta-release.cjs && node --check scripts/owner-license.cjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

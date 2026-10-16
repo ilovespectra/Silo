@@ -34,8 +34,8 @@ export function verifyRelaySignature(
     const buffer = Buffer.from(canonicalizeEntitlementPayload(payload), "utf8");
     const signature = Buffer.from(signatureB64Url, "base64url");
     const algorithm =
-      (key as { asymmetricKey?: { type?: string } }).asymmetricKey?.type?.toLowerCase() === "ed25519"
-        ? "ed25519"
+      key.asymmetricKeyType?.toLowerCase() === "ed25519"
+        ? null
         : "RSA-SHA256";
     return verify(algorithm, buffer, key, signature);
   } catch {

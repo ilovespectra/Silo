@@ -792,6 +792,72 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
     return { isLicensed: false };
   }
 
+  // Local owner/unlock tokens are intentionally rejected so a cloned or locally-run
+  // app cannot bypass the paid gate by supplying a self-signed token.
+  try {
+    const stored = JSON.parse(
+      await fsPromises.readFile(lifetimeLicensePath, "utf8"),
+    ) as Record<string, unknown>;
+    if (
+      stored.version === 3 &&
+      isDeviceBindingId(stored.deviceId) &&
+      typeof stored.licenseToken === "string"
+    ) {
+      if (shouldRejectLicenseForCurrentBuild(stored)) {
+        runtimeLog("stored-lifetime-license-rejected-by-build-gate", {
+          appVersion: typeof stored.appVersion === "string" ? stored.appVersion : "unknown",
+          minimumRequiredVersion,
+        });
+        return { isLicensed: false };
+      }
+      const deviceId = await getDeviceBindingId();
+      const payload = verifyPaidLicenseToken(
+        stored.licenseToken,
+        deviceId,
+        PAID_LICENSE_PUBLIC_KEY,
+      );
+      if (stored.deviceId === deviceId && payload)
+        return {
+          isLicensed: true,
+          licenseType: "purchase",
+          signature: payload.paymentSignature,
+          verifiedAt: payload.verifiedAt,
+        };
+      runtimeLog("lifetime-license-device-or-signature-mismatch", {});
+    } else if (stored.version === 1 || stored.version === 2) {
+      // Legacy receipt fields are not proof of purchase: only the relay can
+      // verify and bind one to this device. Startup migrates verified receipts
+      // to a signed v3 token before evaluating offline access again.
+      runtimeLog("legacy-lifetime-license-needs-online-migration", {});
+    }
+  } catch {}
+
+  try {
+    const stored = JSON.parse(await fsPromises.readFile(betaLicensePath, "utf8"));
+    if (typeof stored?.activationCode === "string") {
+      if (shouldRejectLicenseForCurrentBuild(stored)) {
+        runtimeLog("beta-license-rejected-by-build-gate", {
+          minimumRequiredVersion,
+        });
+      } else {
+        const installationId = await getBetaInstallationId();
+        const payload = verifyBetaActivationCode(
+          stored.activationCode,
+          BETA_LICENSE_PUBLIC_KEY,
+          installationId,
+        );
+        if (payload)
+          return {
+            isLicensed: true,
+            licenseType: "beta",
+            verifiedAt: payload.issuedAt,
+          };
+      }
+    }
+  } catch {}
+
+  // Valid local signatures keep paid and beta access available offline. The
+  // optional relay can grant a fresh entitlement only after local checks fail.
   const relayEntitlementUrl = process.env.SILO_ENTITLEMENT_URL?.trim();
   const relayPublicKeyPem = process.env.SILO_RELAY_PUBLIC_KEY_PEM?.trim();
   if (relayEntitlementUrl && relayPublicKeyPem) {
@@ -839,105 +905,6 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
       return { isLicensed: false };
     }
   }
-
-  // Local owner/unlock tokens are intentionally rejected so a cloned or locally-run
-  // app cannot bypass the paid gate by supplying a self-signed token.
-  try {
-    const stored = JSON.parse(
-      await fsPromises.readFile(lifetimeLicensePath, "utf8"),
-    ) as Record<string, unknown>;
-    if (
-      stored.version === 3 &&
-      isDeviceBindingId(stored.deviceId) &&
-      typeof stored.licenseToken === "string"
-    ) {
-      if (shouldRejectLicenseForCurrentBuild(stored)) {
-        runtimeLog("stored-lifetime-license-rejected-by-build-gate", {
-          appVersion: typeof stored.appVersion === "string" ? stored.appVersion : "unknown",
-          minimumRequiredVersion,
-        });
-        return { isLicensed: false };
-      }
-      const deviceId = await getDeviceBindingId();
-      const payload = verifyPaidLicenseToken(
-        stored.licenseToken,
-        deviceId,
-        PAID_LICENSE_PUBLIC_KEY,
-      );
-      if (stored.deviceId === deviceId && payload)
-        return {
-          isLicensed: true,
-          licenseType: "purchase",
-          signature: payload.paymentSignature,
-          verifiedAt: payload.verifiedAt,
-        };
-      runtimeLog("lifetime-license-device-or-signature-mismatch", {});
-    } else if (
-      (stored.version === 1 || stored.version === 2) &&
-      stored.network === "solana-mainnet" &&
-      stored.paymentAddress === LIFETIME_PAYMENT_ADDRESS &&
-      stored.usdcMint === LIFETIME_USDC_MINT &&
-      typeof stored.signature === "string" &&
-      isSolanaTransactionSignature(stored.signature) &&
-      typeof stored.verifiedAt === "number" &&
-      Number.isFinite(stored.verifiedAt)
-    ) {
-      if (shouldRejectLicenseForCurrentBuild(stored)) {
-        runtimeLog("legacy-lifetime-license-rejected-by-build-gate", {
-          minimumRequiredVersion,
-        });
-        return { isLicensed: false };
-      }
-      const installationMatches =
-        stored.version === 1 ||
-        (typeof stored.installationId === "string" &&
-          /^[a-f0-9]{32}$/.test(stored.installationId) &&
-          stored.installationId === (await getBetaInstallationId()));
-      if (
-        installationMatches &&
-        !(await isLegacyLicenseRejected(
-          lifetimeLicenseRejectionPath,
-          stored.signature,
-        ))
-      ) {
-        return {
-          isLicensed: true,
-          licenseType: "purchase",
-          signature: stored.signature,
-          verifiedAt: stored.verifiedAt,
-        };
-      }
-      runtimeLog("legacy-lifetime-license-not-active-offline", {
-        version: stored.version,
-      });
-    } else if (stored.version === 1 || stored.version === 2) {
-      runtimeLog("legacy-lifetime-license-needs-online-migration", {});
-    }
-  } catch {}
-
-  try {
-    const stored = JSON.parse(await fsPromises.readFile(betaLicensePath, "utf8"));
-    if (typeof stored?.activationCode !== "string")
-      return { isLicensed: false };
-    if (shouldRejectLicenseForCurrentBuild(stored)) {
-      runtimeLog("beta-license-rejected-by-build-gate", {
-        minimumRequiredVersion,
-      });
-      return { isLicensed: false };
-    }
-    const installationId = await getBetaInstallationId();
-    const payload = verifyBetaActivationCode(
-      stored.activationCode,
-      BETA_LICENSE_PUBLIC_KEY,
-      installationId,
-    );
-    if (payload)
-      return {
-        isLicensed: true,
-        licenseType: "beta",
-        verifiedAt: payload.issuedAt,
-      };
-  } catch {}
   return { isLicensed: false };
 }
 
@@ -1055,8 +1022,8 @@ async function migrateLegacyLifetimeLicense(): Promise<void> {
       });
     }
   } catch (error) {
-    // Leave the receipt untouched; readLifetimeLicense can preserve offline
-    // access for a valid legacy purchase without waiting for this migration.
+    // Leave the receipt untouched so startup can retry online migration later.
+    // readLifetimeLicense never grants access from an unsigned legacy receipt.
     runtimeLog("legacy-lifetime-license-migration-unavailable", {
       message: error instanceof Error ? error.message : String(error),
     });
@@ -7686,8 +7653,8 @@ app.whenReady().then(async () => {
   }
   stateStore = new StateStore(app.getPath("userData"));
   await stateStore.initialize();
-  // Paid and beta licenses are verified from local signed data so an activated
-  // computer keeps full access offline; the relay is only for initial recovery.
+  // Signed purchase and beta licenses remain usable offline. The relay can
+  // migrate a legacy receipt or provide a current signed entitlement.
   let effectiveLicense = await readLifetimeLicense();
   if (!effectiveLicense.isLicensed) {
     await migrateLegacyLifetimeLicense();
