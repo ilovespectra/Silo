@@ -802,8 +802,7 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 200, o
     })()}
     {toast && <p className="memories-toast" role="status" aria-live="assertive">{toast}</p>}
     {ready && !loading && !generating && !state?.suggestions.length && !savedMovies.length && <div className="memories-empty"><div className="memories-empty-orbit"><FiFilm /></div>
-      <h2>A little nostalgia goes a long way.</h2><p>Find themed stories in your indexed photos and clips, then choose the mood, frame and length of your movie.</p>
-      <p className="memories-hint">Nothing runs until you choose Generate Memories. It uses what is indexed now, even while indexing continues. Each movie is then prepared in the background, one at a time, with progress shown on its card.</p>
+      <h2>A little nostalgia goes a long way.</h2>
     </div>}
     {exporting && <ExportDialog api={api} memory={exporting.memory} options={exporting.options} onClose={() => setExporting(null)} onDownloaded={refreshAfterDownload} />}
   </section>;

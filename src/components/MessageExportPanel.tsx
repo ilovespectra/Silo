@@ -8,7 +8,6 @@ import {
   FiRefreshCw,
   FiSearch,
   FiSend,
-  FiSmartphone,
   FiEdit2,
   FiBook,
   FiSave,
@@ -228,7 +227,6 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
   const [threads, setThreads] = useState<DeviceMessageThread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [query, setQuery] = useState("");
-  const [loadingDevices, setLoadingDevices] = useState(false);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [error, setError] = useState("");
   const [outputDir, setOutputDir] = useState("");
@@ -267,36 +265,6 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
         ),
     );
   }, [query, threads]);
-
-  const scanDevices = async () => {
-    if (!electronAPI) return;
-    setLoadingDevices(true);
-    setError("");
-    try {
-      const found = await electronAPI.listPhones();
-      setDevices(found);
-      const keys = new Set([
-        ...found.map((device) => `${device.platform}:${device.id}`),
-        ...historyEntries.map((entry) => `${entry.platform}:${entry.deviceId}`),
-      ]);
-      if (!keys.has(selectedDeviceKey))
-        setSelectedDeviceKey(
-          found[0]
-            ? `${found[0].platform}:${found[0].id}`
-            : historyEntries[0]
-              ? `${historyEntries[0].platform}:${historyEntries[0].deviceId}`
-              : "",
-        );
-    } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : "Could not scan connected devices.",
-      );
-    } finally {
-      setLoadingDevices(false);
-    }
-  };
 
   React.useEffect(() => {
     // Load the persistent phone backup destination when component mounts
@@ -542,16 +510,6 @@ export const MessageExportPanel: React.FC<{ devicePanel?: React.ReactNode }> = (
             </option>
           ))}
         </select>
-        <button
-          className="messages-icon-button"
-          onClick={() => void scanDevices()}
-          disabled={loadingDevices}
-          title={loadingDevices ? "Scanning for phones…" : "Scan for phones"}
-          aria-label="Scan for phones"
-          data-help="Refresh connected-device and saved-message-backup choices."
-        >
-          <FiSmartphone className={loadingDevices ? "spinning" : ""} />
-        </button>
         <button
           className="messages-icon-button"
           disabled={

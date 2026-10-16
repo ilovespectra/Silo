@@ -13,6 +13,7 @@ import {
   FiChevronDown,
   FiChevronLeft,
   FiChevronRight,
+  FiClock,
   FiCloud,
   FiColumns,
   FiCopy,
@@ -39,6 +40,7 @@ import {
   FiRefreshCw,
   FiRewind,
   FiRepeat,
+  FiRotateCcw,
   FiSearch,
   FiSkipBack,
   FiSkipForward,
@@ -1216,6 +1218,8 @@ function App() {
   enabledSourcePathsRef.current = enabledSourcePaths;
   const allSourcePathsRef = useRef(allSourcePaths);
   allSourcePathsRef.current = allSourcePaths;
+  const [showPhoneBackups, setShowPhoneBackups] = useState(false);
+  const hasCachedPhoneBackups = sources.some((source) => source.offlineBackup);
   const [sourceSort, setSourceSort] = useState<"name" | "kind" | "backup">(
     "name",
   );
@@ -1224,7 +1228,9 @@ function App() {
       numeric: true,
       sensitivity: "base",
     });
-    return [...sources].sort((first, second) => {
+    return [...sources]
+      .filter((source) => showPhoneBackups || !source.offlineBackup)
+      .sort((first, second) => {
       if (sourceSort === "kind") {
         const kindOrder = collator.compare(
           sourceKindLabels[first.kind],
@@ -1240,8 +1246,8 @@ function App() {
         collator.compare(first.label, second.label) ||
         first.id.localeCompare(second.id)
       );
-    });
-  }, [sourceSort, sources]);
+      });
+  }, [showPhoneBackups, sourceSort, sources]);
   const cloneableSources = useMemo(
     () => sources.filter((source) => source.enabled && source.available),
     [sources],
@@ -2917,7 +2923,7 @@ function App() {
     ],
   );
 
-  const unplugSource = useCallback(async (source: BrowseSource) => {
+  const removeSource = useCallback(async (source: BrowseSource) => {
     if (!electronAPI || (source.kind !== "local" && source.kind !== "machine")) return;
     try {
       await electronAPI.removeIndexSource(source.rootPath);
@@ -2933,7 +2939,7 @@ function App() {
         await loadDirectory(allSourcesPath, explodedRef.current, true, true);
       }
     } catch (cause) {
-      setBrowseError(`Could not unplug “${source.label}”. ${cause instanceof Error ? cause.message : String(cause)}`);
+      setBrowseError(`Could not remove “${source.label}”. ${cause instanceof Error ? cause.message : String(cause)}`);
     }
   }, [activeDigitalFolderId, allSourcesPath, currentPath, electronAPI, loadDirectory]);
 
@@ -7422,6 +7428,17 @@ function App() {
                   data-help="Refresh source availability and registered-source details.">
                   <FiRefreshCw />
                 </button>
+                {hasCachedPhoneBackups && (
+                  <button
+                    type="button"
+                    onClick={() => setShowPhoneBackups((visible) => !visible)}
+                    title={showPhoneBackups ? "Hide cached phone backups" : "Show cached phone backups"}
+                    aria-label={showPhoneBackups ? "Hide cached phone backups" : "Show cached phone backups"}
+                    aria-pressed={showPhoneBackups}
+                  >
+                    <FiClock aria-hidden="true" />
+                  </button>
+                )}
               </div>
 
               {!sidebarCollapsed.sources && (sources.length === 0 ? (
@@ -7509,12 +7526,12 @@ function App() {
                         <button
                           className="source-unplug-button"
                           type="button"
-                          onClick={(event) => { event.preventDefault(); event.stopPropagation(); void unplugSource(source); }}
-                          title="Unplug this source from Silo. Its files and folders will stay on disk."
-                          aria-label={`Unplug ${source.label} from Silo. Files stay on disk.`}
-                          data-help="Unplug only removes this folder from Silo's source list. It never deletes or moves files on disk."
+                          onClick={(event) => { event.preventDefault(); event.stopPropagation(); void removeSource(source); }}
+                          title="Remove Source"
+                          aria-label={`Remove ${source.label} from Silo. Its files stay on disk.`}
+                          data-help="Remove this source and its saved indexes from Silo. Files and folders remain on disk."
                         >
-                          <FiX aria-hidden="true" /><span>Unplug</span>
+                          <FiRotateCcw aria-hidden="true" />
                         </button>
                       )}
                     </div>

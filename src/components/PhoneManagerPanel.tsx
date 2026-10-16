@@ -148,14 +148,13 @@ function PhoneDeviceCard({
         {device.status === "ready" && device.rootPath ? (
           <>
             <button
-              className={`phone-icon-button ${busy ? "busy" : ""}`}
+              className="phone-renew-backup-button"
               onClick={() => onRenewBackup(device)}
               disabled={busy}
-              title={busy ? "Backing up…" : "Backs up automatically on connect. Click to back up now or choose file types."}
-              aria-label={busy ? `Backing up ${device.name}` : `Back up ${device.name} now`}
+              title={busy ? "Backing up…" : "Start a fresh browseable backup of this phone."}
               data-help="Copy this connected phone’s photos, messages, and readable files into a dated browseable snapshot in Silo. This does not change files on the phone."
             >
-              <FiRefreshCw className={busy ? "spinning" : ""} />
+              {busy ? "Backing up…" : "Back up now"}
             </button>
             <button
               className="phone-icon-button"
@@ -310,22 +309,29 @@ function PhoneBackupStatus({
     : backup.totalFiles
       ? Math.min(100, (backup.completedFiles / backup.totalFiles) * 100)
       : 0;
+  const indeterminate =
+    (backup.status === "scanning" || backup.status === "backing-up") &&
+    backup.totalFiles === 0 &&
+    backup.totalBytes === 0;
 
   return (
-    <div className={`phone-backup-progress ${backup.status}`} role="group" aria-label={`${device.name} backup status`}>
+    <div className={`phone-backup-progress ${backup.status}`} role="group" aria-label={`${device.name} backup status`} aria-live="polite">
       <div>
         <span>
           <strong>{device.name}:</strong> {backup.message}
         </span>
         <strong>
-          {backup.status === "complete"
+          {indeterminate
+            ? "Working…"
+            : backup.status === "complete"
             ? "100%"
             : `${Math.round(backupPercent)}%`}
         </strong>
       </div>
       <progress
-        value={backup.status === "complete" ? 100 : backupPercent}
+        value={indeterminate ? undefined : backup.status === "complete" ? 100 : backupPercent}
         max={100}
+        aria-label={`${device.name} phone backup progress`}
       />
       <small>
         {backup.completedFiles.toLocaleString()} / {backup.totalFiles.toLocaleString()} files

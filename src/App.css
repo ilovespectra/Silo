@@ -1959,6 +1959,10 @@ label.settings-row {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.indexing-stage-detail {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
 .indexing-stage-errors,
 .indexing-panel-error {
   color: #e6b779;

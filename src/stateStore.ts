@@ -226,6 +226,8 @@ export class StateStore {
   }
 
   async removeIndexSource(sourcePath: string) {
+    const previous = this.state;
+    this.state = structuredClone(this.state);
     this.state.indexSources = this.state.indexSources.filter(
       (source) => source.path !== sourcePath,
     );
@@ -235,7 +237,12 @@ export class StateStore {
     this.state.enabledSourceIds = this.state.enabledSourceIds.filter(
       (sourceId) => sourceId !== sourcePath,
     );
-    await this.write();
+    try {
+      await this.write();
+    } catch (error) {
+      this.state = previous;
+      throw error;
+    }
     return this.getState();
   }
 

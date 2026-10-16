@@ -410,6 +410,20 @@ export class IndexingRecovery {
     await this.tick();
   }
 
+  async restart(id: string) {
+    const stage = this.stages.find((item) => item.id === id);
+    if (!stage) throw new Error("This index does not support recovery.");
+    const record = this.records.get(id);
+    const active = ["scanning", "indexing", "loading-model", "clustering", "generating"]
+      .includes(stage.progress().status) || Boolean(record?.running);
+    if (active) {
+      if (!stage.pause)
+        throw new Error("This index cannot be stopped safely while it is running.");
+      await this.pauseStage(id);
+    }
+    await this.retry(id);
+  }
+
   async tick() {
     if (
       this.stopped ||

@@ -2,7 +2,7 @@ import { promises as fsPromises } from "fs";
 import path from "path";
 
 export interface ThumbnailPregenProgress {
-  status: "idle" | "waiting" | "scanning" | "generating" | "complete" | "error";
+  status: "idle" | "waiting" | "scanning" | "generating" | "paused" | "complete" | "error";
   total: number;
   processed: number;
   generated: number;
@@ -39,6 +39,7 @@ export class ThumbnailPregenerator {
   };
   private runPromise: Promise<void> | null = null;
   private rerunRequested = false;
+  private pauseRequested = false;
   private lastEmit = 0;
 
   constructor(private readonly deps: Dependencies) {}
@@ -52,20 +53,34 @@ export class ThumbnailPregenerator {
     this.update({ status: "waiting", message }, true);
   }
 
-  start() {
+  start(): Promise<void> {
     if (this.runPromise) {
+      if (this.pauseRequested)
+        return this.runPromise.then(() => this.start());
       this.rerunRequested = true;
       return this.runPromise;
     }
+    this.pauseRequested = false;
     this.runPromise = (async () => {
       do {
         this.rerunRequested = false;
         await this.run();
-      } while (this.rerunRequested);
+      } while (this.rerunRequested && !this.pauseRequested);
     })().finally(() => {
       this.runPromise = null;
     });
     return this.runPromise;
+  }
+
+  /** Finish current filesystem work, then leave the generated-thumbnail cache checkpointed. */
+  async pause() {
+    this.pauseRequested = true;
+    this.rerunRequested = false;
+    await this.runPromise?.catch(() => undefined);
+    this.update(
+      { status: "paused", message: "Paused · generated thumbnails are saved." },
+      true,
+    );
   }
 
   private async run() {
@@ -83,9 +98,12 @@ export class ThumbnailPregenerator {
     try {
       const files: string[] = [];
       for (const root of new Set(await this.deps.getSourceRoots())) {
+        if (this.pauseRequested) return this.updatePaused();
         await this.waitForIndexingIdle();
+        if (this.pauseRequested) return this.updatePaused();
         await this.collect(root, files);
       }
+      if (this.pauseRequested) return this.updatePaused();
       this.update(
         {
           status: "generating",
@@ -96,10 +114,10 @@ export class ThumbnailPregenerator {
       );
       let next = 0;
       const worker = async () => {
-        while (next < files.length) {
+        while (next < files.length && !this.pauseRequested) {
           const filePath = files[next++];
           let waitMessage = this.deps.getIndexingWaitMessage();
-          while (waitMessage) {
+          while (waitMessage && !this.pauseRequested) {
             if (
               this.progress.status !== "waiting" ||
               this.progress.message !== waitMessage
@@ -108,12 +126,14 @@ export class ThumbnailPregenerator {
             await new Promise((resolve) => setTimeout(resolve, 250));
             waitMessage = this.deps.getIndexingWaitMessage();
           }
+          if (this.pauseRequested) return;
           this.update({
             status: "generating",
             message: "Generating thumbnails…",
           });
-          while (this.deps.isInteractiveBusy())
+          while (this.deps.isInteractiveBusy() && !this.pauseRequested)
             await new Promise((resolve) => setTimeout(resolve, 250));
+          if (this.pauseRequested) return;
           const ok = await this.deps.generate(filePath).catch(() => false);
           this.progress.processed += 1;
           if (ok) this.progress.generated += 1;
@@ -122,6 +142,7 @@ export class ThumbnailPregenerator {
         }
       };
       await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+      if (this.pauseRequested) return this.updatePaused();
       this.update(
         {
           status: "complete",
@@ -140,16 +161,26 @@ export class ThumbnailPregenerator {
     }
   }
 
+  private updatePaused() {
+    this.update(
+      { status: "paused", message: "Paused · generated thumbnails are saved." },
+      true,
+    );
+  }
+
   // Iterative walk keeps memory flat on very large libraries.
   private async collect(root: string, files: string[]) {
+    if (this.pauseRequested) return;
     if (this.deps.isRemotePath(root)) {
       await this.waitForIndexingIdle();
+      if (this.pauseRequested) return;
       files.push(...(await this.deps.listRemoteMediaFiles(root)));
       return;
     }
     const stack = [root];
-    while (stack.length > 0) {
+    while (stack.length > 0 && !this.pauseRequested) {
       await this.waitForIndexingIdle();
+      if (this.pauseRequested) return;
       const directory = stack.pop()!;
       let handle;
       try {
@@ -158,7 +189,9 @@ export class ThumbnailPregenerator {
         continue;
       }
       for await (const entry of handle) {
+        if (this.pauseRequested) return;
         await this.waitForIndexingIdle();
+        if (this.pauseRequested) return;
         if (entry.name.startsWith(".")) continue;
         const fullPath = path.join(directory, entry.name);
         if (entry.isDirectory()) stack.push(fullPath);
@@ -174,7 +207,7 @@ export class ThumbnailPregenerator {
   }
 
   private async waitForIndexingIdle() {
-    while (this.deps.getIndexingWaitMessage())
+    while (!this.pauseRequested && this.deps.getIndexingWaitMessage())
       await new Promise((resolve) => setTimeout(resolve, 100));
   }
 

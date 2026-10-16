@@ -214,6 +214,7 @@ export class AestheticScorer {
   private backgroundQueue: MagicItem[] = [];
   private libraryTotal = 0;
   private running = false;
+  private drainPromise: Promise<void> | null = null;
   private backgroundPaused = false;
   private generation = 0;
   private requestTotal = 0;
@@ -222,10 +223,13 @@ export class AestheticScorer {
   constructor(private readonly deps: AestheticDeps) {}
 
   /** Pause library-wide work while keeping user-requested ranking work available. */
-  setBackgroundPaused(paused: boolean) {
+  async setBackgroundPaused(paused: boolean) {
     this.backgroundPaused = paused;
-    if (!paused && (this.queue.length > 0 || this.backgroundQueue.length > 0))
+    if (!paused && (this.queue.length > 0 || this.backgroundQueue.length > 0)) {
       void this.drain();
+      return;
+    }
+    if (paused) await this.drainPromise?.catch(() => undefined);
   }
 
   /** Analyzes the whole library at low priority; whatever the user is viewing always goes first. */
@@ -438,10 +442,10 @@ export class AestheticScorer {
     );
   }
 
-  private async drain() {
-    if (this.running) return;
+  private drain(): Promise<void> {
+    if (this.drainPromise) return this.drainPromise;
     this.running = true;
-    try {
+    const active = (async () => {
       this.emitProgress();
       this.promptVectors ??= await this.deps
         .embedPrompts(PROMPTS)
@@ -488,10 +492,15 @@ export class AestheticScorer {
         }
       };
       await Promise.all(Array.from({ length: ANALYSIS_CONCURRENCY }, worker));
-    } finally {
+    })();
+    this.drainPromise = active.finally(() => {
       this.running = false;
+      this.drainPromise = null;
       this.emitProgress();
-    }
+      if (!this.backgroundPaused && (this.queue.length > 0 || this.backgroundQueue.length > 0))
+        void this.drain();
+    });
+    return this.drainPromise;
   }
 
   private emitProgress() {

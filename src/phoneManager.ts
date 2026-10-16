@@ -1179,6 +1179,8 @@ export class PhoneManager {
           const manifest = this.backupManifests.get(key);
           if (manifest?.progress.status === "scanning")
             this.updateBackup(manifest, {
+              totalFiles: files.length,
+              totalBytes: bytes,
               message: `Scanning ${device.name}… ${files.length.toLocaleString()} files found`,
             });
         }
@@ -1261,8 +1263,6 @@ export class PhoneManager {
     this.log(
       `runBackup: Using destination: ${this.backupDestinationPath || "default (local cache)"}`,
     );
-    if (device.status !== "ready" || !device.rootPath)
-      throw new Error("The phone is not trusted and ready for backup.");
     const key = this.deviceKey(device.platform, device.id);
     const manifest = this.backupManifests.get(key) ?? {
       files: {},
@@ -1271,6 +1271,10 @@ export class PhoneManager {
     let backupDir = manifest.cacheRoot ?? this.backupDestinationPath ?? this.pullCacheRoot;
     this.backupManifests.set(key, manifest);
     try {
+      if (device.status !== "ready" || !device.rootPath)
+        throw new Error(
+          device.message || "Unlock and trust the phone before backing it up.",
+        );
       const writeError = await this.probeWritableDirectory(backupDir);
       if (writeError) {
         const fallback = this.backupDestinationPath ?? this.pullCacheRoot;

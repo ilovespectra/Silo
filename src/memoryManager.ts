@@ -118,6 +118,16 @@ function normalizeCustomTopic(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function isWithinSource(filePath: string, sourcePath: string): boolean {
+  const normalize = (value: string) => {
+    const normalized = value.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+    return process.platform === "win32" ? normalized.toLocaleLowerCase() : normalized;
+  };
+  const candidate = normalize(filePath).replace(/\/$/, "");
+  const root = normalize(sourcePath).replace(/\/$/, "");
+  return candidate === root || candidate.startsWith(`${root}/`);
+}
+
 function customTopicQueries(topic: string): string[] {
   const normalized = normalizeCustomTopic(topic);
   if (!normalized) return [];
@@ -824,6 +834,82 @@ export class MemoryManager {
       await this.persist();
     }
     return this.getState();
+  }
+
+  /** Remove saved stories that reference a source being detached; originals and movie files stay untouched. */
+  async removeSource(
+    sourcePath: string,
+    retainedSourcePaths: string[] = [],
+  ): Promise<{ removed: number; rollback: () => Promise<void> }> {
+    await this.initialize();
+    if (this.generation) await this.generation.catch(() => undefined);
+    const previousSuggestions = structuredClone(this.state.suggestions);
+    const previousReserve = structuredClone(this.reserve);
+    const removed = await this.removeFilesFromMemories(
+      [sourcePath],
+      true,
+      retainedSourcePaths,
+    );
+    let rolledBack = false;
+    return {
+      removed,
+      rollback: async () => {
+        if (rolledBack || !removed) return;
+        rolledBack = true;
+        const currentSuggestions = this.state.suggestions;
+        const currentReserve = this.reserve;
+        this.state.suggestions = structuredClone(previousSuggestions);
+        this.reserve = structuredClone(previousReserve);
+        try {
+          await this.persist();
+        } catch (error) {
+          this.state.suggestions = currentSuggestions;
+          this.reserve = currentReserve;
+          rolledBack = false;
+          throw error;
+        }
+      },
+    };
+  }
+
+  async removeFilesFromMemories(
+    filePaths: string[],
+    matchSourceRoots = false,
+    retainedSourcePaths: string[] = [],
+  ): Promise<number> {
+    await this.initialize();
+    if (this.generation) await this.generation.catch(() => undefined);
+    if (!filePaths.length) return 0;
+    const exactPaths = new Set(filePaths);
+    const removedSourceRoot = matchSourceRoots ? filePaths[0] : null;
+    const isNoLongerCovered = (filePath: string) =>
+      exactPaths.has(filePath) ||
+      Boolean(
+        removedSourceRoot &&
+          isWithinSource(filePath, removedSourceRoot) &&
+          !retainedSourcePaths.some((root) => isWithinSource(filePath, root)),
+      );
+    const referencesSource = (card: MemorySuggestion) =>
+      card.media.some((media) =>
+        isNoLongerCovered(media.path) ||
+        Boolean(media.liveVideoPath && isNoLongerCovered(media.liveVideoPath)),
+      );
+    const previousSuggestions = this.state.suggestions;
+    const previousReserve = this.reserve;
+    const before = previousSuggestions.length + previousReserve.length;
+    this.state.suggestions = this.state.suggestions.filter((card) => !referencesSource(card));
+    this.reserve = this.reserve.filter((card) => !referencesSource(card));
+    const removed = before - this.state.suggestions.length - this.reserve.length;
+    if (removed) {
+      try {
+        await this.persist();
+      } catch (error) {
+        this.state.suggestions = previousSuggestions;
+        this.reserve = previousReserve;
+        throw error;
+      }
+    }
+    return removed;
   }
 
   async rename(id: string, title: string): Promise<MemoryState> {

@@ -79,6 +79,10 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
     if (actionAccepted) setStageActionNotice(null);
   }, [stageActionNotice, stages]);
   const retryStage = async (id: string) => {
+    const label = stages.find((stage) => stage.id === id)?.label ?? "this indexer";
+    if (!window.confirm(
+      `Restart ${label}? Silo will save progress at the current checkpoint, stop the indexer cleanly, then start it again. This may take some time and temporarily reduce performance while it restarts.`,
+    )) return;
     setRetryingStage(id);
     setStageActionError(null);
     setStageActionNotice({ id, kind: "retry", message: "Queueing retry…" });
@@ -256,8 +260,12 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
             : total > 0
               ? Math.min(100, Math.round((processed / total) * 100))
               : 0;
-        const processDescription =
-          stage.id === "semantic-runtime"
+        const isPhoneBackup = stage.id.startsWith("phone-backup:");
+        const processDescription = isPhoneBackup
+          ? stage.status === "error"
+            ? "Phone backup needs attention"
+            : stage.message
+          : stage.id === "semantic-runtime"
             ? stage.message
             : stageDescriptions[stage.id] ?? "Indexing files";
         const showStageReason =
@@ -307,12 +315,18 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
           >
             <header>
               <strong>{stage.label}</strong>
-              <span>{percent}%</span>
+              <span>
+                {isPhoneBackup && stage.status === "scanning"
+                  ? "Scanning…"
+                  : running && total === 0
+                    ? "Working…"
+                    : `${percent}%`}
+              </span>
             </header>
             <progress
               aria-label={`${stage.label} progress`}
               value={
-                running && total === 0
+                (isPhoneBackup && stage.status === "scanning") || (running && total === 0)
                   ? undefined
                   : complete
                     ? Math.max(total, 1)
@@ -323,6 +337,9 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
             <small className="indexing-stage-message" title={stage.message}>
               {processDescription}
             </small>
+            {stage.detail && (
+              <small className="indexing-stage-detail">{stage.detail}</small>
+            )}
             {statusLine && (
               <small
                 role={statusLine.alert

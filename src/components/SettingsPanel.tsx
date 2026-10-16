@@ -26,6 +26,7 @@ import {
 import type { LifetimeLicenseState } from "../lifetimePayment";
 import LifetimeUnlockPanel from "./LifetimeUnlockPanel";
 import LibraryShareSettings from "./LibraryShareSettings";
+import { FalloutShelterSettings } from "./StatsDashboard";
 
 type SettingsPageId =
   | "update"
@@ -38,6 +39,7 @@ type SettingsPageId =
   | "statistics"
   | "cache"
   | "memories"
+  | "shelter"
   | "password"
   | "help";
 
@@ -60,9 +62,10 @@ const SETTINGS_PAGES: SettingsPageDefinition[] = [
   { id: "backup", label: "Backup & restore", description: "Save Silo's whole setup to one file and restore it later.", icon: FiArchive, tint: "#746c65", keywords: "export import config configuration reinstall restore", section: 1 },
   { id: "privacy", label: "Privacy & safety", description: "Explicit content is hidden and blocked from search by default.", icon: FiShield, tint: "#696560", keywords: "nsfw safe search explicit banned people parental content protection", section: 1 },
   { id: "performance", label: "Performance", description: "How much CPU time search and indexing can use.", icon: FiCpu, tint: "#986b47", keywords: "cpu threads indexing speed pace", section: 1 },
-  { id: "statistics", label: "Library statistics", description: "Inventory, source coverage, indexing and backup health.", icon: FiBarChart2, tint: "#78716c", keywords: "statistics dashboard totals inventory sources coverage indexing backup shelter", section: 1 },
+  { id: "statistics", label: "Library statistics", description: "Inventory, source coverage and indexer progress.", icon: FiBarChart2, tint: "#78716c", keywords: "statistics dashboard totals inventory sources coverage indexing", section: 1 },
   { id: "cache", label: "Silo cache destination", description: "Where indexes, faces, places, thumbnails and previews are stored.", icon: FiHardDrive, tint: "#78716c", keywords: "cache index thumbnails previews external drive storage fallback", section: 2 },
   { id: "memories", label: "Memory destination", description: "Where Memory movies are saved so they play without the source drive.", icon: FiFilm, tint: "#8d6549", keywords: "memories movies videos folder storage", section: 2 },
+  { id: "shelter", label: "Fallout Shelter", description: "Choose and verify your separate library backup destination.", icon: FiShield, tint: "#696560", keywords: "fallout shelter backup readiness verify destination", section: 2 },
   { id: "password", label: "Password", description: "The parental password that protects content settings.", icon: FiLock, tint: "#696560", keywords: "parental password change create", section: 2 },
   { id: "help", label: "Help & documentation", description: "Guides, walkthroughs and troubleshooting.", icon: FiBookOpen, tint: "#82756a", keywords: "docs documentation guide github source walkthrough", section: 3 },
 ];
@@ -78,6 +81,7 @@ const SETTINGS_TOUR_PAGES: Record<string, SettingsPageId> = {
   '[data-tour="library-statistics"]': "statistics",
   '[data-tour="settings-cache-destination"]': "cache",
   '[data-tour="settings-memories"]': "memories",
+  '[data-tour="fallout-shelter"]': "shelter",
   '[data-tour="settings-password"]': "password",
 };
 
@@ -1180,8 +1184,15 @@ export default function SettingsPanel({
       if (protectedChange) setPassword("");
       setNotice("Settings saved.");
     } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "";
+      const readableMessage = message
+        .replace(/^Error invoking remote method ['"‘’“”]?update-content-settings['"‘’“”]?:\s*/i, "")
+        .replace(/^Error:\s*/i, "")
+        .trim();
       setError(
-        cause instanceof Error ? cause.message : "Settings could not be saved.",
+        readableMessage && readableMessage.toLowerCase() !== "error"
+          ? readableMessage
+          : "Privacy & Safety settings could not be saved. Please try again.",
       );
     } finally {
       setBusy(false);
@@ -1622,13 +1633,13 @@ export default function SettingsPanel({
             <section
               className="settings-card settings-statistics-section"
               data-tour="library-statistics"
-              data-help="Open the full dashboard to review source inventory, indexing progress, and verified Fallout Shelter status. Refresh measurements or start a backup only after checking source selections and destinations."
+              data-help="Open the full dashboard to review source inventory and indexing progress. Refresh measurements when you need current totals."
             >
               <button type="button" className="settings-row settings-link-row" onClick={onOpenStatistics}>
                 <span className="settings-row-icon" aria-hidden="true"><FiBarChart2 /></span>
                 <div className="settings-row-text">
                   <strong>Library statistics</strong>
-                  <span>Inventory, source coverage, indexing and backup health.</span>
+                  <span>Inventory, source coverage and indexer progress.</span>
                 </div>
                 <FiChevronRight aria-hidden="true" />
               </button>
@@ -1723,6 +1734,10 @@ export default function SettingsPanel({
             </div>
           </section>
         );
+      case "shelter":
+        return electronAPI
+          ? <FalloutShelterSettings api={electronAPI} />
+          : <section className="settings-card" role="status">Fallout Shelter controls are available in the Silo desktop app.</section>;
       case "password":
         return (
           <>

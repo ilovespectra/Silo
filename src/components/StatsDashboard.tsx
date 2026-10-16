@@ -17,7 +17,6 @@ import SourceClonePanel from "./SourceClonePanel";
 import {
   formatShelterAge,
   getShelterFreshness,
-  getWorstShelterFreshness,
 } from "../shelterFreshness";
 
 interface StatsDashboardProps {
@@ -199,17 +198,176 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
   );
 }
 
+export function FalloutShelterSettings({ api }: StatsDashboardProps) {
+  const [snapshot, setSnapshot] = useState<LibraryDashboardSnapshot | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [showClone, setShowClone] = useState(false);
+  const [showReplica, setShowReplica] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [clock, setClock] = useState(() => Date.now());
+  const mounted = useRef(true);
+  const lastAutoRefresh = useRef(0);
+
+  const loadSnapshot = useCallback(async () => {
+    const next = await api.getLibraryDashboard();
+    if (!isLibraryDashboardSnapshot(next))
+      throw new Error("Fallout Shelter status is unavailable in this Silo window.");
+    if (mounted.current) setSnapshot(next);
+    return next;
+  }, [api]);
+
+  const refreshInventory = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const next = await api.refreshLibraryStats();
+      if (!isLibraryDashboardSnapshot(next))
+        throw new Error("Shelter readiness could not be refreshed.");
+      if (mounted.current) setSnapshot(next);
+    } catch (cause) {
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }, [api]);
+
+  const verifySelected = async () => {
+    const ids = availableSources.filter((source) => selectedIds.has(source.id)).map((source) => source.id);
+    if (!ids.length) return;
+    setVerifying(true);
+    setError("");
+    try {
+      const next = await api.verifyShelterSources(ids);
+      if (!isLibraryDashboardSnapshot(next))
+        throw new Error("Shelter verification results are unavailable.");
+      if (mounted.current) setSnapshot(next);
+    } catch (cause) {
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (mounted.current) setVerifying(false);
+    }
+  };
+
+  const chooseDestination = async () => {
+    try {
+      const destination = await api.selectShelterDestination();
+      if (destination) await loadSnapshot();
+    } catch (cause) {
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const toggleSource = (id: string) => setSelectedIds((current) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  });
+  const toggleAll = () => setSelectedIds((current) =>
+    current.size === availableSources.length
+      ? new Set()
+      : new Set(availableSources.map((source) => source.id)),
+  );
+
+  useEffect(() => {
+    mounted.current = true;
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const next = await loadSnapshot();
+        const stale = !next.running && next.sources.some((source) => source.available &&
+          (!source.scannedAt || Date.now() - source.scannedAt > 15 * 60 * 1000));
+        if (stale && Date.now() - lastAutoRefresh.current > 60 * 1000) {
+          lastAutoRefresh.current = Date.now();
+          const refreshed = await api.refreshLibraryStats();
+          if (isLibraryDashboardSnapshot(refreshed) && mounted.current) setSnapshot(refreshed);
+        }
+      } catch (cause) {
+        if (!disposed) setError(cause instanceof Error ? cause.message : String(cause));
+      }
+      if (!disposed) timer = window.setTimeout(() => void poll(), 8000);
+    };
+    void poll();
+    const clockTimer = window.setInterval(() => setClock(Date.now()), 30_000);
+    return () => {
+      disposed = true;
+      mounted.current = false;
+      window.clearTimeout(timer);
+      window.clearInterval(clockTimer);
+    };
+  }, [api, loadSnapshot]);
+
+  const availableSources = (snapshot?.sources ?? []).filter((source) => source.available && source.rootPath);
+  const selectedSources = availableSources.filter((source) => selectedIds.has(source.id));
+  const needsRefresh = selectedSources.some((source) => source.shelterState === "changed");
+  const mismatch = (snapshot?.sources ?? []).some((source) => source.shelterState === "changed" ||
+    source.shelterBackups.some((backup) => backup.lastResult !== "verified"));
+  const freshness = mismatch ? "red" : snapshot?.shelter.freshness ?? "unknown";
+  return (
+    <div className="fallout-shelter-settings" data-tour="fallout-shelter">
+      <section className="stats-card stats-shelter-card">
+        <header className="stats-card-heading">
+          <div className="stats-heading-icon vault"><FiShield /></div>
+          <div><span className="stats-kicker">FALLOUT SHELTER</span><h2>Backup readiness</h2></div>
+        </header>
+        <p className="stats-shelter-copy">Silo creates a separate copy, then verifies files with SHA-256. Your source files remain unchanged.</p>
+        <div className="stats-destination-box">
+          <FiHardDrive />
+          <div><span>PRIMARY DESTINATION</span><strong title={snapshot?.shelter.destination ?? "Not configured"}>{snapshot?.shelter.destination ?? "No Fallout Shelter destination configured"}</strong><small className={`stats-destination-status ${snapshot?.shelter.destinationAvailable ? "online" : "offline"}`}>{snapshot?.shelter.destinationAvailable ? "Connected and readable" : "Unavailable · connect this drive to verify"}</small></div>
+          <button className="settings-save" onClick={() => void chooseDestination()}><FiHardDrive /> {snapshot?.shelter.destination ? "Change shelter" : "Set shelter"}</button>
+        </div>
+        <div className={`stats-shelter-meter stats-freshness-${freshness}`}>
+          <div><span>Fallout Shelter readiness</span><strong>{snapshot ? `${snapshot.shelter.verifiedSources} / ${snapshot.shelter.totalSources} sources · ${snapshot.shelter.percentage}%` : "Loading status…"}</strong></div>
+          <div className="stats-progress-track"><div style={{ width: `${snapshot?.shelter.percentage ?? 0}%` }} /></div>
+        </div>
+        <small className="stats-footnote">Oldest full verification: {snapshot ? `${freshness} · ${formatShelterAge(snapshot.sources.flatMap((source) => source.shelterBackups.map((backup) => backup.lastVerifiedAt)).filter((value): value is number => value !== null), clock)}` : "waiting for source data"}. Freshness grades: green ≤1 week, yellow ≤1 month, orange ≤6 months, red ≤1 year, blinking red &gt;1 year.</small>
+        <div className="stats-source-actions fallout-shelter-actions">
+          <button className="stats-button small" onClick={() => void verifySelected()} disabled={!selectedSources.length || !snapshot?.shelter.destinationAvailable || verifying} title={!snapshot?.shelter.destinationAvailable ? "Connect the selected Fallout Shelter drive first" : "Compare selected source and shelter SHA-256 hashes"}><FiRefreshCw className={verifying ? "stats-spin" : ""} /> {verifying ? "Hash-verifying…" : "Verify selected"}</button>
+          <button className="stats-button small" onClick={() => setShowClone(true)} disabled={!selectedSources.length || !snapshot?.shelter.destination || !snapshot.shelter.destinationAvailable || verifying} title={!snapshot?.shelter.destination ? "Set the primary Fallout Shelter destination first" : !snapshot.shelter.destinationAvailable ? "Connect the selected Fallout Shelter drive first" : needsRefresh ? "Create and verify an updated Fallout Shelter copy" : "Check space, then create and verify a Fallout Shelter copy"}>{needsRefresh ? <FiRefreshCw /> : <FiShield />} {needsRefresh ? "Refresh Fallout Shelter" : "Back up to Fallout Shelter"}</button>
+          <button className="stats-button small" onClick={() => void refreshInventory()} disabled={busy || Boolean(snapshot?.running)}><FiRefreshCw className={busy ? "stats-spin" : ""} /> {busy || snapshot?.running ? "Measuring…" : "Refresh readiness"}</button>
+        </div>
+        <button className="stats-button small fallout-shelter-replica-button" disabled={!snapshot?.shelter.snapshotAvailable} title={snapshot?.shelter.snapshotAvailable ? "Verify the latest complete shelter on another physical volume" : "Create and verify the primary shelter first"} onClick={() => setShowReplica(true)} data-tour="shelter-replica"><FiCopy /> Replicate shelter to another volume</button>
+        {(snapshot?.shelter.replicas ?? []).map((replica) => <div className="stats-shelter-replica" key={`${replica.path}:${replica.verifiedAt}`}><FiCheckCircle /><span><strong>Verified replica</strong><small title={replica.path}>{replica.path}</small></span><time>{formatDate(replica.verifiedAt)}</time></div>)}
+      </section>
+
+      {error && <div className="stats-inline-error"><FiAlertCircle /> {error}</div>}
+      <section className="stats-card stats-sources-card fallout-shelter-sources">
+        <header className="stats-card-heading stats-source-heading">
+          <div className="stats-heading-icon"><FiHardDrive /></div>
+          <div><span className="stats-kicker">BACKUP SCOPE</span><h2>Choose sources</h2></div>
+          <div className="stats-source-actions">
+            <button className="stats-text-button" onClick={toggleAll} disabled={!availableSources.length}>{selectedIds.size === availableSources.length && availableSources.length ? "Clear selection" : "Select available"}</button>
+          </div>
+        </header>
+        <div className="stats-source-table-wrap"><table className="stats-source-table">
+          <thead><tr><th>Source</th><th>Inventory</th><th>Fallout Shelter status</th></tr></thead>
+          <tbody>{(snapshot?.sources ?? []).map((source) => {
+            const icon = source.hasVerifiedCopy ? <FiShield /> : source.shelterState === "offline" ? <FiCloudOff /> : source.shelterState === "changed" ? <FiAlertCircle /> : <FiCheckCircle />;
+            const statusFreshness = source.shelterState === "changed" || (source.shelterAuditResult && source.shelterAuditResult !== "verified") ? "red" : getShelterFreshness(source.lastVerifiedAt, clock);
+            return <tr key={source.id}>
+              <td className="stats-source-name-cell"><label className="stats-source-select"><input type="checkbox" checked={selectedIds.has(source.id)} disabled={!source.available || !source.rootPath} onChange={() => toggleSource(source.id)} /><span className="stats-source-name"><strong>{source.label}</strong><small>{sourceKindLabel(source.kind)} · {source.rootPath || "No active device path"}</small></span></label>{source.message && <small className="stats-source-overlap">{source.message}</small>}<span className={`stats-source-connection ${source.available ? "online" : "offline"}`}><i />{source.offlineBackup ? "Offline snapshot available" : source.available ? "Connected / available" : "Unavailable"}</span>{source.offlineBackup && source.snapshotAt && <small className="stats-source-overlap">Phone snapshot from {formatDate(source.snapshotAt)}</small>}</td>
+              <td><strong>{source.fileCount === null ? "—" : source.fileCount.toLocaleString()}</strong><small>{formatBytes(source.totalBytes)} known logical size</small>{Boolean(source.unknownSizeFiles) && <small className="stats-source-overlap">{source.unknownSizeFiles} file sizes unavailable</small>}{source.status === "scanning" && <small className="stats-source-scan">Measuring…</small>}{source.stale && source.status !== "scanning" && <small className="stats-source-overlap">Last measured {source.scannedAt ? formatDate(source.scannedAt) : "not yet"}</small>}{source.error && <small className="stats-source-error">{source.error}</small>}{source.overlapsAnotherSource && <small className="stats-source-overlap">Overlapping root · deduplicated overall</small>}</td>
+              <td><div className={`stats-shelter-state ${source.shelterState} stats-freshness-${statusFreshness}`}>{icon}<strong>{shelterLabel(source)}</strong></div>{source.lastVerifiedAt && <small title={formatDate(source.lastVerifiedAt)}>Last full SHA-256 match · {formatShelterAge(source.lastVerifiedAt, clock)}</small>}{source.shelterAuditResult && <small>Latest check {source.shelterVerifiedFiles} / {source.shelterTotalFiles} files matched</small>}{source.shelterBackups.length > 0 && <div className="stats-shelter-backups" aria-label={`Verified backup destinations for ${source.label}`}>{source.shelterBackups.map((backup) => { const age = getShelterFreshness(backup.lastVerifiedAt, clock); const driveName = backup.destination.split(/[\/]/).filter(Boolean).pop() || backup.destination; const resultLabel = backup.lastResult === "verified" ? formatShelterAge(backup.lastVerifiedAt, clock) : `${backup.lastResult} · ${formatShelterAge(backup.lastVerifiedAt, clock).toLowerCase()}`; return <div className={`stats-shelter-backup stats-freshness-${backup.lastResult === "verified" ? age : "red"}`} key={backup.destination} title={`${backup.destination}${backup.clonePath ? ` · ${backup.clonePath}` : ""}`} aria-label={`${driveName}: ${resultLabel}; ${age} freshness`}>{backup.lastResult === "verified" ? <FiShield /> : <FiAlertCircle />}<span><strong>{driveName}</strong><small>{resultLabel}</small></span></div>; })}</div>}{source.cloneDestination && <small className="stats-destination-path" title={source.cloneDestination}>At {source.cloneDestination}</small>}{source.shelterAuditMessage && <small className="stats-source-error">{source.shelterAuditMessage}</small>}{source.shelterState === "changed" && <small className="stats-source-error">Select this source and choose Refresh Fallout Shelter to create and verify an updated copy.</small>}</td>
+            </tr>;
+          })}{(snapshot?.sources.length ?? 0) === 0 && <tr><td colSpan={3} className="stats-empty-row">{snapshot ? "No sources have been added yet." : "Waiting for the desktop source registry…"}</td></tr>}</tbody>
+        </table></div>
+        <div className="stats-source-foot"><span>{snapshot?.sources.length ?? 0} registered sources</span><span>Inventory as of {formatDate(snapshot?.totals.lastInventoryAt)}</span></div>
+      </section>
+      {showClone && snapshot?.shelter.destination && <SourceClonePanel electronAPI={api} sources={selectedSources.map(({ id, label, kind }) => ({ id, label, kind }))} initialDestinations={[snapshot.shelter.destination]} onClose={() => { setShowClone(false); setSelectedIds(new Set()); void refreshInventory(); }} />}
+      {showReplica && snapshot?.shelter.snapshotAvailable && <SourceClonePanel electronAPI={api} mode="shelter-replica" sources={[{ id: "fallout-shelter", label: "Fallout Shelter", kind: "verified snapshot" }]} onClose={() => { setShowReplica(false); void loadSnapshot(); }} />}
+    </div>
+  );
+}
+
 export default function StatsDashboard({ api }: StatsDashboardProps) {
   const [snapshot, setSnapshot] = useState<LibraryDashboardSnapshot | null>(null);
   const [stages, setStages] = useState<IndexingStageProgress[]>([]);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [showConsole, setShowConsole] = useState(false);
-  const [showClone, setShowClone] = useState(false);
-  const [showShelterReplica, setShowShelterReplica] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [verifyingShelter, setVerifyingShelter] = useState(false);
   const [error, setError] = useState("");
-  const [shelterClock, setShelterClock] = useState(() => Date.now());
   const mounted = useRef(true);
   const lastAutoRefresh = useRef(0);
 
@@ -234,22 +392,6 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
       if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       if (mounted.current) setBusy(false);
-    }
-  }, [api]);
-
-  const verifyShelterSources = useCallback(async (sourceIds: string[]) => {
-    if (!sourceIds.length) return;
-    setVerifyingShelter(true);
-    setError("");
-    try {
-      const next = await api.verifyShelterSources(sourceIds);
-      if (!isLibraryDashboardSnapshot(next))
-        throw new Error("Shelter verification results are unavailable in this Silo window.");
-      if (mounted.current) setSnapshot(next);
-    } catch (cause) {
-      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      if (mounted.current) setVerifyingShelter(false);
     }
   }, [api]);
 
@@ -283,41 +425,13 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
     };
   }, [api, loadSnapshot]);
 
-  useEffect(() => {
-    const timer = window.setInterval(() => setShelterClock(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, []);
 
-  const availableSources = useMemo(
-    () => (snapshot?.sources ?? []).filter((source) => source.available && source.rootPath),
-    [snapshot?.sources],
-  );
-  const selectedSources = useMemo(
-    () => availableSources.filter((source) => selectedIds.has(source.id)),
-    [availableSources, selectedIds],
-  );
-  const selectedSourcesNeedRefresh = selectedSources.some((source) => source.shelterState === "changed");
   const currentStage = stages.find((stage) => activeIndexerStatuses.has(stage.status));
   const queuedStages = stages.filter((stage) => stage.resumeQueued);
   const currentPercent = currentStage && currentStage.total > 0
     ? Math.min(100, Math.round((currentStage.processed / currentStage.total) * 100))
     : 0;
   const categories = snapshot?.totals.categories ?? {};
-  const shelterSources = snapshot?.sources ?? [];
-  const hasShelterMismatch = shelterSources.some((source) =>
-    source.shelterState === "changed" ||
-    source.shelterBackups?.some((backup) => backup.lastResult !== "verified"),
-  );
-  const shelterFreshness = hasShelterMismatch
-    ? "red"
-    : getWorstShelterFreshness(
-      shelterSources.flatMap((source) =>
-        source.shelterBackups?.length
-          ? source.shelterBackups.map((backup) => backup.lastVerifiedAt)
-          : [source.lastVerifiedAt],
-      ),
-      shelterClock,
-    );
   const inventoryValues = categoryOrder.map((category) => ({
     category,
     files: Math.max(0, categories[category]?.files ?? 0),
@@ -338,18 +452,6 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
       ? "No files in the inventory yet"
       : "Inventory chart will appear when data loads";
 
-  const toggleSource = (id: string) => setSelectedIds((current) => {
-    const next = new Set(current);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    return next;
-  });
-  const toggleAll = () => setSelectedIds((current) =>
-    current.size === availableSources.length
-      ? new Set()
-      : new Set(availableSources.map((source) => source.id)),
-  );
-
   return (
     <main className="stats-page" data-retained-scroll="stats">
       <header className="stats-page-heading">
@@ -362,16 +464,6 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
           <button className="stats-button quiet" onClick={() => void startInventory()} disabled={busy || Boolean(snapshot?.running)}>
             <FiRefreshCw className={snapshot?.running ? "stats-spin" : ""} />
             {snapshot?.running ? "Measuring…" : "Refresh inventory"}
-          </button>
-          <button className="stats-button" onClick={async () => {
-            try {
-              const destination = await api.selectShelterDestination();
-              if (destination) await loadSnapshot();
-            } catch (cause) {
-              setError(cause instanceof Error ? cause.message : String(cause));
-            }
-          }}>
-            <FiHardDrive /> {snapshot?.shelter.destination ? "Change shelter" : "Set shelter"}
           </button>
         </div>
       </header>
@@ -394,11 +486,7 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
           <strong>{snapshot ? snapshot.indexedFiles.toLocaleString() : "—"}</strong>
           <span>{snapshot ? `${snapshot.indexingErrors.toLocaleString()} unresolved index errors · semantic search records` : "Waiting for desktop indexing data"}</span>
         </article>
-        <article className={`stats-metric-card stats-shelter-metric stats-freshness-${shelterFreshness}`}>
-          <div className="stats-metric-label"><FiShield /> SHELTER COVERAGE</div>
-          <strong>{snapshot ? <>{snapshot.shelter.percentage}<small>%</small></> : "—"}</strong>
-          <span>{snapshot ? `${snapshot.shelter.verifiedSources} of ${snapshot.shelter.totalSources} sources have a full hash-verified copy · ${shelterFreshness === "unknown" ? "freshness unknown" : `${shelterFreshness} oldest-copy freshness`}` : "Waiting for shelter verification data"}</span>
-        </article>
+
       </section>
 
       <section className="stats-live-indexer-card">
@@ -459,89 +547,37 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
           <small className="stats-footnote">Sizes are logical file lengths, not allocated disk blocks. Overlapping local roots are counted once in headline totals.</small>
         </section>
 
-        <section className="stats-card stats-shelter-card" data-tour="fallout-shelter">
-          <header className="stats-card-heading">
-            <div className="stats-heading-icon vault"><FiShield /></div>
-            <div><span className="stats-kicker">FALLOUT SHELTER</span><h2>Backup readiness</h2></div>
-          </header>
-          <p className="stats-shelter-copy">Re-verify compares every selected source file hash with the latest complete Fallout Shelter clone, and checks for missing, changed, or unexpected destination files. The timestamp records the last full SHA-256 match.</p>
-          <div className="stats-destination-box">
-            <FiHardDrive />
-            <div><span>FALLOUT SHELTER · PRIMARY DESTINATION</span><strong title={snapshot?.shelter.destination ?? "Not configured"}>{snapshot?.shelter.destination ?? "No Fallout Shelter destination configured"}</strong><small className={`stats-destination-status ${snapshot?.shelter.destinationAvailable ? "online" : "offline"}`}>{snapshot?.shelter.destinationAvailable ? "Connected and readable" : "Unavailable · connect this drive to verify"}</small></div>
-            {!snapshot?.shelter.destination && <button onClick={async () => {
-              try {
-                const destination = await api.selectShelterDestination();
-                if (destination) await loadSnapshot();
-              } catch (cause) {
-                setError(cause instanceof Error ? cause.message : String(cause));
-              }
-            }}>Choose</button>}
-          </div>
-          <div className={`stats-shelter-meter stats-freshness-${snapshot?.shelter.freshness ?? "unknown"}`}><div><span>Full hash-verified source coverage</span><strong>{snapshot ? `${snapshot.shelter.verifiedSources} / ${snapshot.shelter.totalSources} · ${snapshot.shelter.percentage}%` : "—"}</strong></div><div className="stats-progress-track"><div style={{ width: `${snapshot?.shelter.percentage ?? 0}%` }} /></div></div>
-          <small className="stats-footnote">Freshness grades use the oldest successful full verification: green ≤1 week, yellow ≤1 month, orange ≤6 months, red ≤1 year, blinking red &gt;1 year.</small>
-          <button
-            className="stats-button small"
-            disabled={!snapshot?.shelter.snapshotAvailable}
-            title={snapshot?.shelter.snapshotAvailable ? "Verify the latest complete shelter on another physical volume" : "Create and verify the primary shelter first"}
-            onClick={() => setShowShelterReplica(true)}
-            data-tour="shelter-replica"
-          ><FiCopy /> Replicate shelter to another volume</button>
-          {(snapshot?.shelter.replicas ?? []).map((replica) => (
-            <div className="stats-shelter-replica" key={`${replica.path}:${replica.verifiedAt}`}>
-              <FiCheckCircle />
-              <span><strong>Verified replica</strong><small title={replica.path}>{replica.path}</small></span>
-              <time>{formatDate(replica.verifiedAt)}</time>
-            </div>
-          ))}
-          <small className="stats-footnote">Verification time is shown per source. A changed inventory is flagged; the existing verified copy is never silently treated as a sync.</small>
-        </section>
-      </div>
+
 
       <section className="stats-card stats-sources-card">
         <header className="stats-card-heading stats-source-heading">
           <div className="stats-heading-icon"><FiHardDrive /></div>
           <div><span className="stats-kicker">CONNECTED &amp; ADDED</span><h2>Source map</h2></div>
-          <div className="stats-source-actions">
-            <button className="stats-text-button" onClick={toggleAll} disabled={availableSources.length === 0}>{selectedIds.size === availableSources.length && availableSources.length ? "Clear selection" : "Select available"}</button>
-            <button className="stats-button small" onClick={() => void verifyShelterSources(selectedSources.map((source) => source.id))} disabled={!selectedSources.length || !snapshot?.shelter.destinationAvailable || verifyingShelter} title={!snapshot?.shelter.destinationAvailable ? "Connect the selected Fallout Shelter drive first" : "Compare all source and shelter SHA-256 hashes"}><FiRefreshCw className={verifyingShelter ? "stats-spin" : ""} /> {verifyingShelter ? "Hash-verifying…" : "Verify selected"}</button>
-            <button className="stats-button small" onClick={() => setShowClone(true)} disabled={!selectedSources.length || !snapshot?.shelter.destination || !snapshot.shelter.destinationAvailable || verifyingShelter} title={!snapshot?.shelter.destination ? "Set the primary Fallout Shelter destination first" : !snapshot.shelter.destinationAvailable ? "Connect the selected Fallout Shelter drive first" : selectedSourcesNeedRefresh ? "Create and SHA-256-verify an updated Fallout Shelter copy for the selected sources" : "Preflight space, then create and verify a Fallout Shelter copy"}>{selectedSourcesNeedRefresh ? <FiRefreshCw /> : <FiShield />} {selectedSourcesNeedRefresh ? "Refresh Fallout Shelter" : "Back up to Fallout Shelter"}</button>
-          </div>
         </header>
         <div className="stats-source-table-wrap">
           <table className="stats-source-table">
-            <thead><tr><th>Source</th><th>Inventory</th><th>Indexed</th><th>Shelter state</th></tr></thead>
+            <thead><tr><th>Source</th><th>Inventory</th><th>Indexed</th></tr></thead>
             <tbody>
               {(snapshot?.sources ?? []).map((source) => {
-                const shelterIcon = source.hasVerifiedCopy ? <FiShield /> : source.shelterState === "offline" ? <FiCloudOff /> : source.shelterState === "changed" ? <FiAlertCircle /> : <FiCheckCircle />;
                 return <tr key={source.id}>
                   <td className="stats-source-name-cell">
-                    <label className="stats-source-select">
-                      <input type="checkbox" checked={selectedIds.has(source.id)} disabled={!source.available || !source.rootPath} onChange={() => toggleSource(source.id)} />
-                      <span className="stats-source-name"><strong>{source.label}</strong><small>{sourceKindLabel(source.kind)} · {source.rootPath || "No active device path"}</small></span>
-                    </label>
+                    <span className="stats-source-name"><strong>{source.label}</strong><small>{sourceKindLabel(source.kind)} · {source.rootPath || "No active device path"}</small></span>
                     {source.message && <small className="stats-source-overlap">{source.message}</small>}
                     <span className={`stats-source-connection ${source.available ? "online" : "offline"}`}><i />{source.offlineBackup ? "Offline snapshot available" : source.available ? "Connected / available" : "Unavailable"}</span>
                     {source.offlineBackup && source.snapshotAt && <small className="stats-source-overlap">Phone snapshot from {formatDate(source.snapshotAt)}</small>}
                   </td>
                   <td><strong>{source.fileCount === null ? "—" : source.fileCount.toLocaleString()}</strong><small>{formatBytes(source.totalBytes)} known logical size</small>{Boolean(source.unknownSizeFiles) && <small className="stats-source-overlap">{source.unknownSizeFiles} file sizes unavailable</small>}{source.status === "scanning" && <small className="stats-source-scan">Measuring…</small>}{source.stale && source.status !== "scanning" && <small className="stats-source-overlap">Last measured {source.scannedAt ? formatDate(source.scannedAt) : "not yet"}</small>}{source.error && <small className="stats-source-error">{source.error}</small>}{source.overlapsAnotherSource && <small className="stats-source-overlap">Overlapping root · deduplicated overall</small>}</td>
                   <td><strong>{source.indexedFiles.toLocaleString()}</strong><small>search-indexed files{source.indexingErrors ? ` · ${source.indexingErrors} errors` : ""}</small></td>
-                  <td><div className={`stats-shelter-state ${source.shelterState} stats-freshness-${source.shelterState === "changed" || (source.shelterAuditResult && source.shelterAuditResult !== "verified") ? "red" : getShelterFreshness(source.lastVerifiedAt, shelterClock)}`}>{shelterIcon}<strong>{shelterLabel(source)}</strong></div>{source.lastVerifiedAt && <small title={formatDate(source.lastVerifiedAt)}>Last full SHA-256 match · {formatShelterAge(source.lastVerifiedAt, shelterClock)}</small>}{source.shelterAuditResult && <small>Latest check {source.shelterVerifiedFiles} / {source.shelterTotalFiles} files matched</small>}{source.shelterBackups?.length > 0 && <div className="stats-shelter-backups" aria-label={`Verified backup destinations for ${source.label}`}>{source.shelterBackups.map((backup) => {
-                    const freshness = getShelterFreshness(backup.lastVerifiedAt, shelterClock);
-                    const driveName = backup.destination.split(/[\\/]/).filter(Boolean).pop() || backup.destination;
-                    const icon = backup.lastResult === "verified" ? <FiShield /> : <FiAlertCircle />;
-                    const resultLabel = backup.lastResult === "verified" ? formatShelterAge(backup.lastVerifiedAt, shelterClock) : `${backup.lastResult} · ${formatShelterAge(backup.lastVerifiedAt, shelterClock).toLowerCase()}`;
-                    return <div className={`stats-shelter-backup stats-freshness-${backup.lastResult === "verified" ? freshness : "red"}`} key={backup.destination} title={`${backup.destination}${backup.clonePath ? ` · ${backup.clonePath}` : ""}`} aria-label={`${driveName}: ${resultLabel}; ${freshness} freshness`}>
-                      {icon}<span><strong>{driveName}</strong><small>{resultLabel}</small></span>
-                    </div>;
-                  })}</div>}{source.cloneDestination && <small className="stats-destination-path" title={source.cloneDestination}>At {source.cloneDestination}</small>}{source.shelterAuditMessage && <small className="stats-source-error">{source.shelterAuditMessage}</small>}{source.shelterState === "changed" && <small className="stats-source-error">Select this source and choose Refresh Fallout Shelter to create and verify an updated copy.</small>}</td>
+
                 </tr>;
               })}
-              {(snapshot?.sources.length ?? 0) === 0 && <tr><td colSpan={4} className="stats-empty-row">{snapshot ? "No sources have been added yet." : "Waiting for the desktop source registry…"}</td></tr>}
+              {(snapshot?.sources.length ?? 0) === 0 && <tr><td colSpan={3} className="stats-empty-row">{snapshot ? "No sources have been added yet." : "Waiting for the desktop source registry…"}</td></tr>}
             </tbody>
           </table>
         </div>
         <div className="stats-source-foot"><span>{snapshot?.sources.length ?? 0} registered sources</span><span>Inventory as of {formatDate(snapshot?.totals.lastInventoryAt)}</span><button className="stats-text-button" onClick={() => void startInventory()} disabled={busy || Boolean(snapshot?.running)}>Refresh source measurements</button></div>
       </section>
+      </div>
 
       <section className="stats-indexing-section">
         <div className="stats-section-intro"><span className="stats-kicker">INDEX HEALTH</span><h2>Running &amp; queued work</h2><p>Each stage reports its own units; no misleading blended percentage.</p></div>
@@ -556,29 +592,6 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
 
       <footer className="stats-page-footnote"><FiActivity /> Inventory is measured on first use, when older than 15 minutes on dashboard open, and on demand. Offline sources retain last-known totals and verification matches but are marked stale; overlapping source rows remain separate while headline totals deduplicate nested local roots.</footer>
 
-      {showClone && snapshot?.shelter.destination && (
-        <SourceClonePanel
-          electronAPI={api}
-          sources={selectedSources.map(({ id, label, kind }) => ({ id, label, kind }))}
-          initialDestinations={[snapshot.shelter.destination]}
-          onClose={() => {
-            setShowClone(false);
-            setSelectedIds(new Set());
-            void startInventory();
-          }}
-        />
-      )}
-      {showShelterReplica && snapshot?.shelter.snapshotAvailable && (
-        <SourceClonePanel
-          electronAPI={api}
-          mode="shelter-replica"
-          sources={[{ id: "fallout-shelter", label: "Fallout Shelter", kind: "verified snapshot" }]}
-          onClose={() => {
-            setShowShelterReplica(false);
-            void loadSnapshot();
-          }}
-        />
-      )}
     </main>
   );
 }

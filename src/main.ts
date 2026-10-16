@@ -2260,6 +2260,7 @@ let memoryExportCancelRequested = false;
 let memoryExportScratch: string | null = null;
 let memoryPreviewQueue: Promise<void> = Promise.resolve();
 const memoryPreviewStatus = new Map<string, MemoryPreviewStatus>();
+const memoryPreviewCards = new Map<string, MemorySuggestion>();
 let memoryRenderQueue: Promise<void> = Promise.resolve();
 const memoryFrameVectors = new Map<string, Float32Array>();
 // Session-only: clips whose first frame classified unsafe; rechecked for saved suggestions.
@@ -3189,8 +3190,11 @@ function prepareMemoryPreviews(suggestions: MemorySuggestion[]): Promise<void> {
     return status !== "queued" && status !== "rendering";
   });
   if (!fresh.length) return memoryPreviewQueue;
-  for (const suggestion of fresh)
-    if (memoryPreviewStatus.get(suggestion.id)?.status !== "ready") setMemoryPreviewStatus(suggestion.id, { status: "queued" });
+  for (const suggestion of fresh) {
+    memoryPreviewCards.set(suggestion.id, suggestion);
+    if (memoryPreviewStatus.get(suggestion.id)?.status !== "ready")
+      setMemoryPreviewStatus(suggestion.id, { status: "queued" });
+  }
   const task = memoryPreviewQueue.catch(() => undefined)
     .then(() => prepareMemoryPreviewsNow(fresh));
   memoryPreviewQueue = task.then(() => undefined, () => undefined);
@@ -3246,6 +3250,8 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
       const destination = path.join(cacheDirectory, memoryPreviewFileName(suggestion));
       if (await fsPromises.stat(destination).then((result) => result.isFile(), () => false)) {
         setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
+        memoryPreviewCards.delete(suggestion.id);
+        await cleanupMemoryImageCache().catch((error) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(error)));
         continue;
       }
       // Reuse a movie rendered before the folder changed instead of re-rendering it.
@@ -3253,6 +3259,8 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
       if (existing && existing !== destination) {
         if (await fsPromises.copyFile(existing, destination).then(() => true, () => false)) {
           setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
+          memoryPreviewCards.delete(suggestion.id);
+          await cleanupMemoryImageCache().catch((error) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(error)));
           continue;
         }
       }
@@ -3300,9 +3308,13 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
         }
         setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
         await rememberMemoryMovieTitles([suggestion]).catch(() => undefined);
+        memoryPreviewCards.delete(suggestion.id);
+        await cleanupMemoryImageCache().catch((error) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(error)));
       } catch (error) {
         setMemoryPreviewStatus(suggestion.id, { status: "failed" });
         runtimeLog("memory-preview-skipped", memoryErrorDetails(error));
+        memoryPreviewCards.delete(suggestion.id);
+        await cleanupMemoryImageCache().catch((cleanupError) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(cleanupError)));
       }
     }
     // Keep movies of every visible and reserve story; delete only Silo-named leftovers.
@@ -5101,9 +5113,11 @@ async function buildSourceList(): Promise<BrowseSource[]> {
   const localSources = await Promise.all(appState.indexSources.map(async (source) => {
     const available = await fsPromises.access(source.path, fs.constants.R_OK).then(() => true, () => false);
     const includesSiloData = await sourceIncludesSiloAppData(source.path);
-    return { source, available, includesSiloData };
+    const internalRoot = await isSiloInternalRoot(source.path);
+    return { source, available, includesSiloData, internalRoot };
   }));
-  for (const { source, available, includesSiloData } of localSources) {
+  for (const { source, available, includesSiloData, internalRoot } of localSources) {
+    if (internalRoot) continue;
     const cloned = cloneStatus[source.path];
     const machine = source.kind === "machine";
     sources.push({
@@ -8621,6 +8635,43 @@ let autoMemoryTimer: NodeJS.Timeout | null = null;
 /** Stories retired by Generate before their movie finished; listed in the Memory Book until it does. */
 const memoryBookPending = new Map<string, MemorySuggestion>();
 
+/** Remove converted photo copies once their stories no longer need them for rendering. */
+async function cleanupMemoryImageCache(): Promise<void> {
+  await runMemoryRender(async () => {
+    const directory = indexStoragePath("memory-image-cache");
+    const state = await memoryManager.getState().catch(() => null);
+    const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
+    const cards = new Map<string, MemorySuggestion>();
+    for (const card of [...(state?.suggestions ?? []), ...reserve, ...memoryPreviewCards.values()])
+      cards.set(card.id, card);
+    for (const card of memoryBookPending.values())
+      if (!await findMemoryMovie(card).catch(() => null)) cards.set(card.id, card);
+
+    const retained = new Set<string>();
+    const paths = new Set<string>();
+    for (const card of cards.values())
+      for (const media of card.media)
+        if (media.type === "image") paths.add(media.path);
+    for (const mediaPath of paths) {
+      try {
+        const localPath = await resolveLocalPath(mediaPath);
+        const stats = await fsPromises.stat(localPath);
+        const key = createHash("sha1")
+          .update(`${localPath}:${stats.size}:${stats.mtimeMs}:2048:90`)
+          .digest("hex");
+        retained.add(`${key}.jpg`);
+      } catch {
+        // An unavailable source has no converted copy in active use.
+      }
+    }
+
+    const names = await fsPromises.readdir(directory).catch(() => [] as string[]);
+    await Promise.all(names
+      .filter((name) => /^[a-f0-9]{40}\.jpg$/i.test(name) && !retained.has(name))
+      .map((name) => fsPromises.unlink(path.join(directory, name)).catch(() => undefined)));
+  });
+}
+
 /** Prompted memories are saved to the Memory Book as soon as they are created. */
 const isCustomMemory = (card: MemorySuggestion) => card.storyKey?.startsWith("custom:") === true;
 
@@ -8633,6 +8684,7 @@ async function retireMemoriesToBook(before: MemorySuggestion[], after: MemorySug
   for (const card of retired) if (!await findMemoryMovie(card).catch(() => null)) unfinished.push(card);
   for (const card of unfinished) memoryBookPending.set(card.id, card);
   if (unfinished.length) void prepareMemoryPreviews(unfinished).catch((error) => runtimeLog("memory-book-preview-error", memoryErrorDetails(error)));
+  void cleanupMemoryImageCache().catch((error) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(error)));
 }
 
 async function runMemoryGenerator(reason: string, replace = false) {
@@ -10196,16 +10248,92 @@ ipcMain.handle("add-machine-source", async () => {
 });
 
 ipcMain.handle("remove-index-source", async (_event, sourcePath: string) => {
-  await stateStore.removeIndexSource(sourcePath);
-  sourceListCacheAt = 0;
-  // Update watchers to remove this source (but keep index for potential future re-add)
-  await getEnabledIndexSources();
-  const sources = await getAllIndexSources();
-  if (sources.length > 0) {
-    await semanticIndexer.startWatching(sources);
-  } else {
-    semanticIndexer.stopWatching();
+  if (typeof sourcePath !== "string" || !sourcePath.trim())
+    throw new Error("Choose a valid source to remove.");
+  const existing = (await listSources()).find((source) => source.rootPath === sourcePath);
+  if (!existing || (existing.kind !== "local" && existing.kind !== "machine"))
+    throw new Error("Only a registered folder or Mac source can be removed here.");
+  const before = stateStore.getState();
+  const sourceRecord = before.indexSources.find((source) => source.path === sourcePath);
+  if (!sourceRecord)
+    throw new Error("That source is no longer registered. Refresh the source list and try again.");
+  const retainedRoots = Array.from(new Set(
+    (await listSources())
+      .filter((source) => source.rootPath.trim() && source.rootPath !== sourcePath && !source.demoLocked)
+      .map((source) => source.rootPath),
+  ));
+  const safeRetainedRoots: string[] = [];
+  for (const root of retainedRoots)
+    if (!(await isSiloInternalRoot(root))) safeRetainedRoots.push(root);
+
+  if (indexRecovery) await indexRecovery.pauseStage("search");
+  else await semanticIndexer.pause();
+  semanticIndexer.stopWatching();
+
+  let rollbackIndex: (() => Promise<void>) | undefined;
+  let rollbackMemories: (() => Promise<void>) | undefined;
+  let removedPaths: string[] = [];
+  try {
+    // Commit index and Memory changes first. The source stays registered until both
+    // durable stores succeed, and StateStore rolls its own failed write back.
+    const indexRemoval = await semanticIndexer.removeSourceIndex(
+      sourcePath,
+      safeRetainedRoots,
+    );
+    rollbackIndex = indexRemoval.rollback;
+    removedPaths = indexRemoval.removedPaths;
+    const memoryRemoval = await memoryManager?.removeSource(sourcePath, safeRetainedRoots);
+    rollbackMemories = memoryRemoval?.rollback;
+    await stateStore.removeIndexSource(sourcePath);
+    sourceListCacheAt = 0;
+  } catch (error) {
+    const rollbackErrors: string[] = [];
+    for (const rollback of [rollbackMemories, rollbackIndex]) {
+      if (!rollback) continue;
+      try {
+        await rollback();
+      } catch (cause) {
+        rollbackErrors.push(cause instanceof Error ? cause.message : String(cause));
+      }
+    }
+    sourceListCacheAt = 0;
+    const restoredRoots = await getAllIndexSources().catch(() => [] as string[]);
+    if (restoredRoots.length) await semanticIndexer.startWatching(restoredRoots).catch(() => undefined);
+    else semanticIndexer.stopWatching();
+    indexRecovery?.clearUserPause("search");
+    if (restoredRoots.length && indexRecovery)
+      await indexRecovery.retry("search").catch(() => undefined);
+    if (rollbackErrors.length)
+      throw new Error(
+        `Source removal failed: ${error instanceof Error ? error.message : String(error)}. Rollback also reported: ${rollbackErrors.join("; ")}`,
+      );
+    throw error;
   }
+
+  await faceIndexer.markMissingPhotos(
+    removedPaths.filter((filePath) =>
+      MEMORY_NAMED_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase()),
+    ),
+  ).catch(() => undefined);
+  await cleanupMemoryImageCache().catch((error) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(error)));
+
+  sourceListCacheAt = 0;
+  if (retainedRoots.length)
+    await semanticIndexer.startWatching(retainedRoots).catch((error) =>
+      runtimeLog("source-removal-watch-restart-error", {
+        sourcePath,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+  else semanticIndexer.stopWatching();
+  indexRecovery?.clearUserPause("search");
+  if (retainedRoots.length && indexRecovery)
+    await indexRecovery.retry("search").catch((error) =>
+      runtimeLog("source-removal-index-resume-error", {
+        sourcePath,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
   return stateStore.getState();
 });
 
@@ -10732,9 +10860,31 @@ ipcMain.handle("get-face-state", async () => {
 });
 
 ipcMain.handle("retry-indexing-stage", async (_event, id: unknown) => {
-  if (typeof id !== "string" || !indexRecovery)
+  if (typeof id !== "string")
+    throw new Error("Choose an indexing stage to retry.");
+  if (id.startsWith("phone-backup:")) {
+    let deviceKey = "";
+    try {
+      deviceKey = decodeURIComponent(id.slice("phone-backup:".length));
+    } catch {
+      throw new Error("This phone backup request is invalid.");
+    }
+    const separator = deviceKey.indexOf(":");
+    const platform = deviceKey.slice(0, separator);
+    const deviceId = deviceKey.slice(separator + 1);
+    const device = await readyPhoneForBackup(deviceId, platform);
+    void phoneManager.backupDevice(device).catch((error) =>
+      runtimeLog("phone-backup-retry-error", {
+        platform,
+        deviceId,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return { ok: true };
+  }
+  if (!indexRecovery)
     throw new Error("Index recovery is not ready.");
-  await indexRecovery.retry(id);
+  await indexRecovery.restart(id);
   return { ok: true };
 });
 ipcMain.handle("pause-indexing-stage", async (_event, id: unknown) => {
@@ -11252,6 +11402,70 @@ ipcMain.handle("get-indexing-overview", async () => {
         Boolean(audio.sourceScannedAt?.[id]) &&
         !audio.failedSources?.includes(id),
     ).length ?? 0;
+  const formatBackupBytes = (bytes: number) => {
+    if (!Number.isFinite(bytes) || bytes < 0) return "unknown size";
+    if (bytes < 1024) return `${bytes.toLocaleString()} B`;
+    const units = ["KB", "MB", "GB", "TB"];
+    let value = bytes / 1024;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
+  };
+  const phoneBackupStates = new Map(
+    (phoneManager?.getBackupStates() ?? []).map((backup) => [
+      `${backup.platform}:${backup.deviceId}`,
+      backup,
+    ]),
+  );
+  const phoneStageDevices = new Map(
+    scannedPhoneDevices.map((device) => [
+      `${device.platform}:${device.id}`,
+      device,
+    ]),
+  );
+  const phoneBackupStages = Array.from(new Set([
+    ...phoneBackupStates.keys(),
+    ...phoneStageDevices.keys(),
+  ])).map((deviceKey) => {
+    const backup = phoneBackupStates.get(deviceKey);
+    const device = phoneStageDevices.get(deviceKey);
+    const [platform, deviceId] = deviceKey.split(":", 2);
+    const waitingForTrust = Boolean(device && device.status !== "ready");
+    const status = waitingForTrust
+      ? "error"
+      : backup
+        ? backup.status === "scanning" || backup.status === "backing-up"
+          ? "indexing"
+          : backup.status === "error"
+            ? "error"
+            : backup.status === "complete"
+              ? "complete"
+              : "idle"
+        : device
+          ? "waiting"
+          : "idle";
+    const processed = backup?.completedFiles ?? 0;
+    const total = backup?.totalFiles ?? 0;
+    const completedBytes = backup?.completedBytes ?? 0;
+    const totalBytes = backup?.totalBytes ?? 0;
+    const message = waitingForTrust
+      ? device?.message || "Unlock and trust the phone, then retry its backup."
+      : backup?.message ?? (device ? "Phone connected · backup is ready to start." : "Waiting for the phone to connect.");
+    return {
+      id: `phone-backup:${encodeURIComponent(deviceKey)}`,
+      label: `${device?.name ?? backup?.deviceName ?? "Phone"} backup`,
+      status,
+      processed,
+      total,
+      unit: "files",
+      errors: waitingForTrust ? Math.max(1, backup?.failedFiles ?? 0) : backup?.failedFiles ?? 0,
+      message,
+      detail: `${processed.toLocaleString()} of ${total.toLocaleString()} files · ${formatBackupBytes(completedBytes)} of ${formatBackupBytes(totalBytes)}${device?.rootPath ? " · connected" : ""}`,
+    };
+  });
   return [
     {
       id: "semantic-runtime",
@@ -11373,9 +11587,11 @@ ipcMain.handle("get-indexing-overview", async () => {
       errors: thumbnails?.failed ?? 0,
       message: thumbnails?.message ?? "Waiting to start",
     },
-  ].map((stage) => ({
+  ].concat(phoneBackupStages).map((stage) => ({
     ...stage,
-    canRetry: stage.id !== "discovery",
+    canRetry: stage.id.startsWith("phone-backup:")
+      ? stage.status === "error"
+      : stage.id !== "discovery",
     ...(indexRecovery?.details(stage.id) ?? {}),
   }));
 });

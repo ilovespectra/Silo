@@ -461,6 +461,10 @@ export class SemanticIndexer {
       completedAt:
         status === "completed" ? Date.now() : (previous?.completedAt ?? 0),
     });
+    await this.persistSourceCoverage();
+  }
+
+  private async persistSourceCoverage() {
     const snapshot = JSON.stringify({
       version: 1,
       sources: Array.from(this.sourceCoverage.entries()),
@@ -477,7 +481,7 @@ export class SemanticIndexer {
         message: String(error),
       });
     });
-    await this.coverageWriteQueue;
+    await write;
   }
 
   // File watching and reconciliation
@@ -931,6 +935,176 @@ export class SemanticIndexer {
     };
   }
 
+  /** Forget one configured source's durable search records without touching its files. */
+  async removeSourceIndex(
+    sourcePath: string,
+    retainedSourcePaths: string[] = [],
+  ): Promise<{ removedPaths: string[]; rollback: () => Promise<void> }> {
+    await this.loaded;
+    await this.writeChain;
+    if (this.activeSourcePaths.includes(sourcePath))
+      throw new Error("The source index is still active. Retry removal after indexing pauses.");
+    const replacementRoots = Array.from(new Set(retainedSourcePaths))
+      .filter((root) => root !== sourcePath)
+      .sort((first, second) => second.length - first.length);
+    const removedPaths: string[] = [];
+    const rehomedRecords: IndexRecord[] = [];
+    const queuedRehomes = new Map<string, string>();
+    const previousRecords = new Map<string, IndexRecord>();
+    for (const [filePath, record] of this.latestRecords) {
+      if (record.sourcePath !== sourcePath) continue;
+      previousRecords.set(filePath, record);
+      const replacementRoot = replacementRoots.find((root) =>
+        isPathWithin(filePath, root),
+      );
+      if (replacementRoot) {
+        const relativePath = path
+          .relative(replacementRoot, filePath)
+          .split(path.sep)
+          .join("/");
+        rehomedRecords.push({ ...record, sourcePath: replacementRoot, relativePath });
+      } else {
+        removedPaths.push(filePath);
+      }
+    }
+
+    for (const [filePath, queuedSource] of this.filesToIndex ?? []) {
+      if (queuedSource !== sourcePath) continue;
+      const replacementRoot = replacementRoots.find((root) =>
+        isPathWithin(filePath, root),
+      );
+      if (replacementRoot) queuedRehomes.set(filePath, replacementRoot);
+    }
+
+    const previousFilesToIndex = this.filesToIndex ? new Map(this.filesToIndex) : null;
+    const previousWorkerFailures = new Map(this.workerFailures);
+    const previousDiscoveredTotals = new Map(this.discoveredTotalsBySource);
+    const previousSourceCoverage = new Map(this.sourceCoverage);
+    const previousExcludedRecords = new Set(this.sourcesWithExcludedRecords);
+    const previousCanonicalSources = new Map(this.canonicalSourcePaths);
+    const previousDirtySources = new Set(this.dirtyWatchSources);
+    const previousWatchedSources = new Set(this.watchedSources);
+    const previousRestoredSources = [...this.restoredSourcePaths];
+    const previousQueuedSources = this.queuedSourcePaths ? [...this.queuedSourcePaths] : null;
+    const journalSize = await fsPromises.stat(this.recordsPath)
+      .then((stat) => stat.size, () => 0);
+    let journalChanged = false;
+    let rolledBack = false;
+
+    const rollback = async () => {
+      if (rolledBack) return;
+      rolledBack = true;
+      const errors: string[] = [];
+      if (journalChanged) {
+        try {
+          await this.appendLines(Array.from(previousRecords, ([filePath, record]) =>
+            JSON.stringify(record ?? { path: filePath, deleted: true }),
+          ));
+        } catch (error) {
+          errors.push(`journal: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      for (const filePath of previousRecords.keys()) this.deleteLatestRecord(filePath);
+      for (const record of previousRecords.values()) this.setLatestRecord(record);
+      this.filesToIndex = previousFilesToIndex ? new Map(previousFilesToIndex) : null;
+      this.workerFailures.clear();
+      for (const [filePath, failure] of previousWorkerFailures)
+        this.workerFailures.set(filePath, failure);
+      this.discoveredTotalsBySource.clear();
+      for (const [root, count] of previousDiscoveredTotals)
+        this.discoveredTotalsBySource.set(root, count);
+      this.sourceCoverage.clear();
+      for (const [root, coverage] of previousSourceCoverage)
+        this.sourceCoverage.set(root, coverage);
+      this.sourcesWithExcludedRecords.clear();
+      for (const root of previousExcludedRecords) this.sourcesWithExcludedRecords.add(root);
+      this.canonicalSourcePaths.clear();
+      for (const [root, canonical] of previousCanonicalSources)
+        this.canonicalSourcePaths.set(root, canonical);
+      this.dirtyWatchSources = new Set(previousDirtySources);
+      this.watchedSources = new Set(previousWatchedSources);
+      this.restoredSourcePaths = [...previousRestoredSources];
+      this.queuedSourcePaths = previousQueuedSources ? [...previousQueuedSources] : null;
+      try {
+        await Promise.all([
+          this.persistDiscoveredTotals(),
+          this.persistSourceCoverage(),
+          this.persistWorkerFailures(),
+          this.writeRecoveryFile("pending-work.json", {
+            version: 1,
+            entries: Array.from(this.filesToIndex ?? []),
+            sources: this.restoredSourcePaths,
+          }),
+        ]);
+      } catch (error) {
+        errors.push(`sidecars: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.reconcileCompletedCounts(Array.from(this.watchedSources));
+      if (errors.length) throw new Error(`Index rollback was incomplete (${errors.join("; ")}).`);
+    };
+
+    try {
+      // Write replacement records and tombstones before changing the live maps.
+      if (removedPaths.length || rehomedRecords.length) {
+        try {
+          await this.appendLines([
+            ...rehomedRecords.map((record) => JSON.stringify(record)),
+            ...removedPaths.map((filePath) =>
+              JSON.stringify({ path: filePath, deleted: true }),
+            ),
+          ]);
+          journalChanged = true;
+        } catch (error) {
+          await fsPromises.truncate(this.recordsPath, journalSize).catch(() => undefined);
+          throw error;
+        }
+      }
+
+      for (const replacement of rehomedRecords) this.setLatestRecord(replacement);
+      for (const filePath of removedPaths) {
+        this.workerFailures.delete(filePath);
+        this.filesToIndex?.delete(filePath);
+        this.deleteLatestRecord(filePath);
+      }
+      for (const [filePath, queuedSource] of this.filesToIndex ?? []) {
+        if (queuedSource !== sourcePath) continue;
+        const replacementRoot = queuedRehomes.get(filePath);
+        if (replacementRoot) this.filesToIndex?.set(filePath, replacementRoot);
+        else this.filesToIndex?.delete(filePath);
+      }
+      this.discoveredTotalsBySource.delete(sourcePath);
+      this.sourceCoverage.delete(sourcePath);
+      this.sourcesWithExcludedRecords.delete(sourcePath);
+      this.canonicalSourcePaths.delete(sourcePath);
+      this.dirtyWatchSources.delete(sourcePath);
+      this.watchedSources.delete(sourcePath);
+      this.restoredSourcePaths = this.restoredSourcePaths.filter((root) => root !== sourcePath);
+      if (this.queuedSourcePaths)
+        this.queuedSourcePaths = this.queuedSourcePaths.filter((root) => root !== sourcePath);
+      await Promise.all([
+        this.persistDiscoveredTotals(),
+        this.persistSourceCoverage(),
+        this.persistWorkerFailures(),
+        this.writeRecoveryFile("pending-work.json", {
+          version: 1,
+          entries: Array.from(this.filesToIndex ?? []),
+          sources: this.restoredSourcePaths,
+        }),
+      ]);
+      this.reconcileCompletedCounts(Array.from(this.watchedSources));
+      return { removedPaths, rollback };
+    } catch (error) {
+      try {
+        await rollback();
+      } catch (rollbackError) {
+        throw new Error(
+          `Source index removal failed: ${error instanceof Error ? error.message : String(error)}. ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+      throw error;
+    }
+  }
+
   getRetryableFiles(sourcePaths: string[]) {
     const roots = new Set(sourcePaths);
     const demoPaths = this.demoFilePaths(sourcePaths);
@@ -1169,7 +1343,7 @@ export class SemanticIndexer {
         message: String(error),
       });
     });
-    await this.summaryWriteQueue;
+    await write;
   }
 
   getIndexedImages(sourcePaths: string[]): IndexableFile[] {
