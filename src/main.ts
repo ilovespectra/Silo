@@ -95,7 +95,15 @@ import {
   isDeviceBindingId,
   verifyPaidLicenseToken,
 } from "./paidLicense";
-import { readOwnerAuthorizationToken } from "./ownerLicense";
+import {
+  isBuildBlockedByReleaseCutoff,
+  isVersionAtLeast,
+  resolveMinimumLicenseBuildVersion,
+} from "./licensePolicy";
+import {
+  isSignedEntitlementAllowed,
+  type SignedEntitlement,
+} from "./relayEntitlement";
 import {
   getDocumentPreview,
   isDocumentPreviewFile,
@@ -672,6 +680,28 @@ interface StoredLifetimeLicense {
   version: 3;
   deviceId: string;
   licenseToken: string;
+  appVersion?: string;
+  minimumRequiredVersion?: string;
+}
+
+function shouldRejectLicenseForCurrentBuild(
+  storedLicense?: Partial<StoredLifetimeLicense>,
+): boolean {
+  const minimumVersion = resolveMinimumLicenseBuildVersion(app.getVersion());
+  const currentVersion = app.getVersion();
+  if (isBuildBlockedByReleaseCutoff(currentVersion, minimumVersion)) {
+    return true;
+  }
+  if (!storedLicense) return false;
+  if (typeof storedLicense.appVersion === "string" &&
+      !isVersionAtLeast(storedLicense.appVersion, minimumVersion)) {
+    return true;
+  }
+  if (typeof storedLicense.minimumRequiredVersion === "string" &&
+      !isVersionAtLeast(currentVersion, storedLicense.minimumRequiredVersion)) {
+    return true;
+  }
+  return false;
 }
 
 async function getBetaInstallationId(): Promise<string> {
@@ -753,18 +783,65 @@ async function writeBetaLicense(activationCode: string): Promise<void> {
 }
 
 async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
-  try {
-    const deviceId = await getDeviceBindingId();
-    const ownerAuthorization = readOwnerAuthorizationToken(deviceId);
-    if (ownerAuthorization)
-      return {
-        isLicensed: true,
-        licenseType: "owner",
-        signature: "owner-authorization",
-        verifiedAt: ownerAuthorization.issuedAt,
-      };
-  } catch {}
+  const minimumRequiredVersion = resolveMinimumLicenseBuildVersion(app.getVersion());
+  if (isBuildBlockedByReleaseCutoff(app.getVersion(), minimumRequiredVersion)) {
+    runtimeLog("app-version-below-license-cutoff", {
+      currentVersion: app.getVersion(),
+      minimumRequiredVersion,
+    });
+    return { isLicensed: false };
+  }
 
+  const relayEntitlementUrl = process.env.SILO_ENTITLEMENT_URL?.trim();
+  const relayPublicKeyPem = process.env.SILO_RELAY_PUBLIC_KEY_PEM?.trim();
+  if (relayEntitlementUrl && relayPublicKeyPem) {
+    try {
+      const installationId = await getDeviceBindingId();
+      const endpoint = new URL(relayEntitlementUrl);
+      const response = await requestRelayJson(endpoint, {
+        method: "GET",
+        headers: {
+          "x-silo-installation-id": installationId,
+          "x-silo-app-version": app.getVersion(),
+          "x-silo-platform": process.platform,
+          "x-silo-arch": process.arch,
+        },
+        timeoutMs: 15000,
+        timeoutMessage: "The entitlement check timed out.",
+      });
+      const payload = (response.payload ?? null) as Partial<SignedEntitlement> | null;
+      if (
+        response.ok &&
+        isSignedEntitlementAllowed(
+          payload,
+          relayPublicKeyPem,
+          installationId,
+          app.getVersion(),
+          minimumRequiredVersion,
+        )
+      ) {
+        return {
+          isLicensed: true,
+          licenseType: "purchase",
+          signature: payload?.nonce ?? "relay-entitlement",
+          verifiedAt: Date.now(),
+        };
+      }
+      runtimeLog("relay-entitlement-denied-or-invalid", {
+        statusCode: response.statusCode,
+        ok: response.ok,
+      });
+      return { isLicensed: false };
+    } catch (error) {
+      runtimeLog("relay-entitlement-unavailable", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return { isLicensed: false };
+    }
+  }
+
+  // Local owner/unlock tokens are intentionally rejected so a cloned or locally-run
+  // app cannot bypass the paid gate by supplying a self-signed token.
   try {
     const stored = JSON.parse(
       await fsPromises.readFile(lifetimeLicensePath, "utf8"),
@@ -774,6 +851,13 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
       isDeviceBindingId(stored.deviceId) &&
       typeof stored.licenseToken === "string"
     ) {
+      if (shouldRejectLicenseForCurrentBuild(stored)) {
+        runtimeLog("stored-lifetime-license-rejected-by-build-gate", {
+          appVersion: typeof stored.appVersion === "string" ? stored.appVersion : "unknown",
+          minimumRequiredVersion,
+        });
+        return { isLicensed: false };
+      }
       const deviceId = await getDeviceBindingId();
       const payload = verifyPaidLicenseToken(
         stored.licenseToken,
@@ -798,6 +882,12 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
       typeof stored.verifiedAt === "number" &&
       Number.isFinite(stored.verifiedAt)
     ) {
+      if (shouldRejectLicenseForCurrentBuild(stored)) {
+        runtimeLog("legacy-lifetime-license-rejected-by-build-gate", {
+          minimumRequiredVersion,
+        });
+        return { isLicensed: false };
+      }
       const installationMatches =
         stored.version === 1 ||
         (typeof stored.installationId === "string" &&
@@ -829,6 +919,12 @@ async function readLifetimeLicense(): Promise<LifetimeLicenseState> {
     const stored = JSON.parse(await fsPromises.readFile(betaLicensePath, "utf8"));
     if (typeof stored?.activationCode !== "string")
       return { isLicensed: false };
+    if (shouldRejectLicenseForCurrentBuild(stored)) {
+      runtimeLog("beta-license-rejected-by-build-gate", {
+        minimumRequiredVersion,
+      });
+      return { isLicensed: false };
+    }
     const installationId = await getBetaInstallationId();
     const payload = verifyBetaActivationCode(
       stored.activationCode,
@@ -860,6 +956,8 @@ async function writeLifetimeLicense(
     version: 3,
     deviceId,
     licenseToken,
+    appVersion: app.getVersion(),
+    minimumRequiredVersion: resolveMinimumLicenseBuildVersion(app.getVersion()),
   };
   await fsPromises.mkdir(path.dirname(lifetimeLicensePath), {
     recursive: true,

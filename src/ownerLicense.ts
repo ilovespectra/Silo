@@ -170,43 +170,11 @@ export function verifyOwnerAuthorizationToken(
 }
 
 export function readOwnerAuthorizationToken(
-  expectedDeviceId: string,
-  publicKeyPem?: string,
+  _expectedDeviceId: string,
+  _publicKeyPem?: string,
 ): OwnerAuthorizationPayload | null {
-  const candidateTokens = [
-    process.env.SILO_OWNER_AUTH_TOKEN,
-    process.env.SILO_OWNER_LICENSE_TOKEN,
-    process.env.SILO_LICENSE_TOKEN,
-  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
-
-  for (const token of candidateTokens) {
-    const verificationKey = publicKeyPem ?? readOwnerAuthorizationKeyPem();
-    if (!verificationKey) continue;
-    const verified = verifyOwnerAuthorizationToken(token, expectedDeviceId, verificationKey);
-    if (verified) return verified;
-  }
-
-  const tokenFiles = [
-    process.env.SILO_OWNER_AUTH_TOKEN_PATH,
-    process.env.SILO_OWNER_LICENSE_TOKEN_PATH,
-    process.env.SILO_LICENSE_TOKEN_PATH,
-    path.join(os.homedir(), ".config", "silo", "owner-license-token.txt"),
-    path.join(os.homedir(), ".config", "silo", "owner-auth-token.txt"),
-    path.join(os.homedir(), ".config", "signingkey.token"),
-  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
-
-  for (const tokenFile of tokenFiles) {
-    try {
-      const raw = fs.readFileSync(tokenFile, "utf8").trim();
-      if (!raw) continue;
-      const verificationKey = publicKeyPem ?? readOwnerAuthorizationKeyPem();
-      if (!verificationKey) continue;
-      const verified = verifyOwnerAuthorizationToken(raw, expectedDeviceId, verificationKey);
-      if (verified) return verified;
-    } catch {
-      // Ignore missing token files and continue checking the next possible path.
-    }
-  }
-
+  // Cloned or locally-run builds must not be able to grant themselves full access by
+  // providing a local owner token via environment variables or config files.
+  // Full access remains gated to a valid paid/device-bound license only.
   return null;
 }
