@@ -10,10 +10,12 @@ const COMBINE_CLUSTER_DISTANCE = 0.4;
 // Stricter than auto-clustering: a suggestion must sit close to an actual confirmed face.
 const TRAINED_MATCH_DISTANCE = 0.42;
 const MAX_EXEMPLARS = 64;
+const USE_STRICT_X64_FACE_CLUSTERING = process.arch === "x64";
 const FACE_WASM_THREAD_LIMIT = 1;
 const FACE_STATE_CHECKPOINT_INTERVAL = 1000;
 
 export type PersonStatus = "unconfirmed" | "confirmed" | "banned";
+export type PersonNameSource = "automatic" | "user";
 
 export interface FaceIndexProgress {
   status:
@@ -62,6 +64,7 @@ interface FaceEdit {
 export interface PersonCluster {
   id: string;
   name: string;
+  nameSource?: PersonNameSource;
   faceIds: string[];
   manualPhotoPaths: string[];
   confirmedPhotoPaths: string[];
@@ -78,6 +81,7 @@ export interface PersonCluster {
 export interface PersonSummary {
   id: string;
   name: string;
+  nameSource: PersonNameSource;
   faceCount: number;
   photoCount: number;
   coverCropUrl: string | null;
@@ -268,7 +272,15 @@ export class FaceIndexer {
     }
     const recoveredJournal = this.recoveryJournal.length > 0;
     this.reconcilePeople();
-    if (!hasJournalVersion || recoveredJournal)
+    let migratedNameSources = false;
+    for (const person of this.state.people) {
+      if (person.nameSource) continue;
+      person.nameSource = /^Person \d+$/.test(person.name)
+        ? "automatic"
+        : "user";
+      migratedNameSources = true;
+    }
+    if (!hasJournalVersion || recoveredJournal || migratedNameSources)
       await this.persistState();
     this.bannedPhotoPaths = new Set(this.state.bannedPhotoPaths ?? []);
     this.missingPhotos = new Set(this.state.missingPhotoPaths ?? []);
@@ -725,6 +737,7 @@ export class FaceIndexer {
     const person: PersonCluster = {
       id: this.newId("person"),
       name: cleanName,
+      nameSource: "user",
       faceIds: [],
       manualPhotoPaths: [],
       confirmedPhotoPaths: [],
@@ -743,6 +756,7 @@ export class FaceIndexer {
     const cleanName = name.trim();
     if (!cleanName) throw new Error("Enter a person name.");
     person.name = cleanName;
+    person.nameSource = "user";
     await this.persistState();
     return this.getPeople();
   }
@@ -817,6 +831,7 @@ export class FaceIndexer {
     const person: PersonCluster = {
       id: this.newId("person"),
       name: cleanName,
+      nameSource: "user",
       faceIds: [],
       manualPhotoPaths: [],
       confirmedPhotoPaths: [],
@@ -857,7 +872,7 @@ export class FaceIndexer {
             other.id === person.id ||
             other.manual ||
             other.status ||
-            !/^Person \d+$/.test(other.name)
+            other.nameSource !== "automatic"
           )
             continue;
           if (!other.faceIds.includes(face.id)) continue;
@@ -1427,17 +1442,23 @@ export class FaceIndexer {
         .jpeg({ quality: 78 })
         .toFile(cropPath);
       const descriptor = Array.from(detection.descriptor as Float32Array);
-      const person = this.findOrCreateCluster(descriptor, createdPeople);
+      const normalizedBox = {
+        x: box.x / info.width,
+        y: box.y / info.height,
+        width: box.width / info.width,
+        height: box.height / info.height,
+      };
+      const person = this.findOrCreateCluster(
+        descriptor,
+        image.path,
+        normalizedBox,
+        createdPeople,
+      );
       const record: FaceRecord = {
         id: faceId,
         imagePath: image.path,
         signature: this.signature(image),
-        box: {
-          x: box.x / info.width,
-          y: box.y / info.height,
-          width: box.width / info.width,
-          height: box.height / info.height,
-        },
+        box: normalizedBox,
         score: detection.detection.score,
         descriptor,
         cropPath,
@@ -1451,46 +1472,100 @@ export class FaceIndexer {
     await this.appendProcessed(image, records, true, createdPeople);
   }
 
+  private clusterExemplars(person: PersonCluster): FaceRecord[] {
+    const faceIds = person.faceIds;
+    if (faceIds.length <= MAX_EXEMPLARS)
+      return faceIds
+        .map((faceId) => this.faces.get(faceId))
+        .filter((face): face is FaceRecord =>
+          Boolean(face && face.descriptor.length > 0 && !this.isFaceDeleted(face)),
+        );
+
+    const stride = faceIds.length / MAX_EXEMPLARS;
+    return Array.from({ length: MAX_EXEMPLARS }, (_, index) =>
+      this.faces.get(faceIds[Math.floor(index * stride)]),
+    ).filter((face): face is FaceRecord =>
+      Boolean(face && face.descriptor.length > 0 && !this.isFaceDeleted(face)),
+    );
+  }
+
   private findOrCreateCluster(
     descriptor: number[],
+    imagePath: string,
+    box: FaceRecord["box"],
     createdPeople: PersonCluster[] = [],
   ) {
     let best: PersonCluster | null = null;
-    let bestDistance = Infinity;
-    for (const person of this.state.people) {
-      if (!person.centroid.length || person.manual) continue;
-      // The current best match (or the acceptance threshold) bounds how far
-      // each exact Euclidean comparison needs to proceed. Most unrelated faces
-      // are rejected after only a few dimensions instead of all 128.
-      const maximumDistance = best
-        ? bestDistance
-        : AUTO_CLUSTER_DISTANCE;
-      const maximumSquared = maximumDistance * maximumDistance;
-      let sum = 0;
-      let rejected = false;
-      for (let index = 0; index < descriptor.length; index += 1) {
-        const difference = descriptor[index] - person.centroid[index];
-        sum += difference * difference;
-        if (sum > maximumSquared + 1e-12) {
-          rejected = true;
-          break;
+    if (!USE_STRICT_X64_FACE_CLUSTERING) {
+      let bestDistance = Infinity;
+      for (const person of this.state.people) {
+        if (!person.centroid.length || person.manual) continue;
+        // Keep the original bounded centroid comparison on non-x64 builds.
+        const maximumDistance = best ? bestDistance : AUTO_CLUSTER_DISTANCE;
+        const maximumSquared = maximumDistance * maximumDistance;
+        let sum = 0;
+        let rejected = false;
+        for (let index = 0; index < descriptor.length; index += 1) {
+          const difference = descriptor[index] - person.centroid[index];
+          sum += difference * difference;
+          if (sum > maximumSquared + 1e-12) {
+            rejected = true;
+            break;
+          }
+        }
+        if (!rejected) {
+          const distance = Math.sqrt(sum);
+          if (
+            distance <= AUTO_CLUSTER_DISTANCE &&
+            (!best || distance < bestDistance)
+          ) {
+            bestDistance = distance;
+            best = person;
+          }
         }
       }
-      if (!rejected) {
-        const distance = Math.sqrt(sum);
+      if (best && bestDistance <= AUTO_CLUSTER_DISTANCE) return best;
+    } else {
+      let bestWorstDistance = Infinity;
+      for (const person of this.state.people) {
+        if (!person.centroid.length || person.manual || person.status) continue;
+        const exemplars = this.clusterExemplars(person);
+        if (exemplars.length === 0) continue;
+
+        const facesInImage = this.facesByImage.get(imagePath) ?? [];
         if (
-          distance <= AUTO_CLUSTER_DISTANCE &&
-          (!best || distance < bestDistance)
-        ) {
-          bestDistance = distance;
+          person.faceIds.some((faceId) => {
+            const existing = facesInImage.find((face) => face.id === faceId);
+            return existing && this.boxOverlap(existing.box, box) < 0.5;
+          })
+        )
+          continue;
+
+        let worstDistance = 0;
+        let rejected = false;
+        for (const exemplar of exemplars) {
+          if (exemplar.descriptor.length !== descriptor.length) {
+            rejected = true;
+            break;
+          }
+          const distance = this.distance(descriptor, exemplar.descriptor);
+          if (distance > AUTO_CLUSTER_DISTANCE) {
+            rejected = true;
+            break;
+          }
+          worstDistance = Math.max(worstDistance, distance);
+        }
+        if (!rejected && worstDistance < bestWorstDistance) {
+          bestWorstDistance = worstDistance;
           best = person;
         }
       }
     }
-    if (best && bestDistance <= AUTO_CLUSTER_DISTANCE) return best;
+    if (best) return best;
     const person: PersonCluster = {
       id: this.newId("person"),
       name: `Person ${this.state.people.length + 1}`,
+      nameSource: "automatic",
       faceIds: [],
       manualPhotoPaths: [],
       confirmedPhotoPaths: [],
@@ -1630,6 +1705,7 @@ export class FaceIndexer {
           person = {
             id: personId,
             name: `Person ${this.state.people.length + 1}`,
+            nameSource: "automatic",
             faceIds: [],
             manualPhotoPaths: [],
             confirmedPhotoPaths: [],
@@ -1664,8 +1740,181 @@ export class FaceIndexer {
     this.recoveryJournal = [];
   }
 
+  private splitInconsistentAutomaticClusters(): number {
+    let splitCount = 0;
+    let nextPersonNumber = this.state.people.reduce((maximum, person) => {
+      const match = /^Person (\d+)$/.exec(person.name);
+      return match ? Math.max(maximum, Number(match[1])) : maximum;
+    }, 0) + 1;
+    const candidates = [...this.state.people];
+
+    const sampleSlot = (id: string, count: number) => {
+      let hash = 2166136261;
+      for (let index = 0; index < id.length; index += 1)
+        hash = Math.imul(hash ^ id.charCodeAt(index), 16777619);
+      return (hash >>> 0) % count;
+    };
+
+    for (const person of candidates) {
+      if (
+        person.manual ||
+        person.status ||
+        person.trainedAt ||
+        person.nameSource !== "automatic" ||
+        person.manualPhotoPaths.length > 0 ||
+        person.confirmedPhotoPaths.length > 0 ||
+        person.rejectedPhotoPaths.length > 0
+      )
+        continue;
+
+      const clusterFaces = person.faceIds.map((faceId) =>
+        this.faces.get(faceId),
+      );
+      // Leave an entire group untouched if any face has been edited, deleted,
+      // manually added, or is unavailable. Rebuilding faceIds from a filtered
+      // list would otherwise silently discard user data.
+      if (
+        clusterFaces.some(
+          (face) =>
+            !face ||
+            face.manual ||
+            Boolean(this.state.faceEdits?.[face.id]) ||
+            !face.descriptor.length ||
+            this.isFaceDeleted(face),
+        )
+      )
+        continue;
+      const faces = clusterFaces as FaceRecord[];
+      if (faces.length < 2) continue;
+      faces
+        .sort((first, second) =>
+          second.score - first.score || first.id.localeCompare(second.id),
+        );
+
+      const partitions: Array<{
+        faces: FaceRecord[];
+        exemplars: FaceRecord[];
+        byImage: Map<string, FaceRecord[]>;
+      }> = [];
+      for (const face of faces) {
+        let bestPartition: (typeof partitions)[number] | null = null;
+        let bestWorstDistance = Infinity;
+        for (const partition of partitions) {
+          const sameImageFaces = partition.byImage.get(face.imagePath) ?? [];
+          if (
+            sameImageFaces.some(
+              (other) => this.boxOverlap(other.box, face.box) < 0.5,
+            )
+          )
+            continue;
+
+          let worstDistance = 0;
+          let rejected = false;
+          for (const exemplar of partition.exemplars) {
+            if (exemplar.descriptor.length !== face.descriptor.length) {
+              rejected = true;
+              break;
+            }
+            const distance = this.distance(
+              face.descriptor,
+              exemplar.descriptor,
+            );
+            if (distance > AUTO_CLUSTER_DISTANCE) {
+              rejected = true;
+              break;
+            }
+            worstDistance = Math.max(worstDistance, distance);
+          }
+          if (!rejected && worstDistance < bestWorstDistance) {
+            bestWorstDistance = worstDistance;
+            bestPartition = partition;
+          }
+        }
+
+        if (!bestPartition) {
+          bestPartition = { faces: [], exemplars: [], byImage: new Map() };
+          partitions.push(bestPartition);
+        }
+        const priorCount = bestPartition.faces.length;
+        bestPartition.faces.push(face);
+        if (bestPartition.exemplars.length < MAX_EXEMPLARS) {
+          bestPartition.exemplars.push(face);
+        } else {
+          const slot = sampleSlot(face.id, priorCount + 1);
+          if (slot < MAX_EXEMPLARS)
+            bestPartition.exemplars[slot] = face;
+        }
+        const sameImage = bestPartition.byImage.get(face.imagePath) ?? [];
+        sameImage.push(face);
+        bestPartition.byImage.set(face.imagePath, sameImage);
+      }
+      if (partitions.length < 2) continue;
+
+      let primaryIndex = person.selectedCoverPhotoPath
+        ? partitions.findIndex((partition) =>
+            partition.faces.some(
+              (face) => face.imagePath === person.selectedCoverPhotoPath,
+            ),
+          )
+        : -1;
+      if (primaryIndex < 0) {
+        primaryIndex = partitions.reduce(
+          (bestIndex, partition, index) =>
+            partition.faces.length > partitions[bestIndex].faces.length
+              ? index
+              : bestIndex,
+          0,
+        );
+      }
+      const orderedPartitions = [
+        partitions[primaryIndex],
+        ...partitions.filter((_, index) => index !== primaryIndex),
+      ];
+      const assignedPeople: PersonCluster[] = [person];
+      person.faceIds = orderedPartitions[0].faces.map((face) => face.id);
+      person.suggestedFaceIds = undefined;
+      this.updateCentroid(person);
+
+      for (const partition of orderedPartitions.slice(1)) {
+        const created: PersonCluster = {
+          ...person,
+          id: this.newId("person"),
+          name: `Person ${nextPersonNumber++}`,
+          nameSource: "automatic",
+          faceIds: partition.faces.map((face) => face.id),
+          manualPhotoPaths: [],
+          confirmedPhotoPaths: [],
+          rejectedPhotoPaths: [],
+          centroid: [],
+          createdAt: Date.now(),
+          manual: false,
+          selectedCoverPhotoPath: null,
+          suggestedFaceIds: undefined,
+        };
+        this.state.people.push(created);
+        this.updateCentroid(created);
+        assignedPeople.push(created);
+      }
+
+      orderedPartitions.forEach((partition, index) => {
+        const targetId = assignedPeople[index].id;
+        for (const face of partition.faces)
+          face.personIds = Array.from(
+            new Set([
+              ...face.personIds.filter((personId) => personId !== person.id),
+              targetId,
+            ]),
+          );
+      });
+      splitCount += partitions.length - 1;
+    }
+    return splitCount;
+  }
+
   private async combineSimilarClusters(): Promise<number> {
-    let combined = 0;
+    let combined = USE_STRICT_X64_FACE_CLUSTERING
+      ? this.splitInconsistentAutomaticClusters()
+      : 0;
     let mergedThisRound = true;
 
     while (mergedThisRound) {
@@ -1674,7 +1923,7 @@ export class FaceIndexer {
         (person) =>
           !person.manual &&
           !person.status &&
-          /^Person \d+$/.test(person.name) &&
+          person.nameSource === "automatic" &&
           person.faceIds.length > 0 &&
           person.centroid.length > 0,
       );
@@ -1736,6 +1985,21 @@ export class FaceIndexer {
     first: PersonCluster,
     second: PersonCluster,
   ): boolean {
+    if (USE_STRICT_X64_FACE_CLUSTERING) {
+      const firstExemplars = this.clusterExemplars(first);
+      const secondExemplars = this.clusterExemplars(second);
+      if (firstExemplars.length === 0 || secondExemplars.length === 0)
+        return false;
+      for (const firstFace of firstExemplars)
+        for (const secondFace of secondExemplars)
+          if (
+            firstFace.descriptor.length !== secondFace.descriptor.length ||
+            this.distance(firstFace.descriptor, secondFace.descriptor) >
+              AUTO_CLUSTER_DISTANCE
+          )
+            return false;
+    }
+
     const firstByImage = new Map<string, FaceRecord[]>();
     for (const faceId of first.faceIds) {
       const face = this.faces.get(faceId);
@@ -1850,6 +2114,9 @@ export class FaceIndexer {
     return {
       id: person.id,
       name: person.name,
+      nameSource:
+        person.nameSource ??
+        (/^Person \d+$/.test(person.name) ? "automatic" : "user"),
       faceCount: faces.length,
       photoCount: photos.length,
       coverCropUrl:

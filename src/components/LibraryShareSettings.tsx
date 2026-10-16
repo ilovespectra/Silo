@@ -1,8 +1,17 @@
 import React, { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { FiCopy, FiShare2, FiStopCircle } from "react-icons/fi";
+import { FiChevronDown, FiCopy, FiFolder, FiHardDrive, FiShare2, FiStopCircle, FiUser, FiX } from "react-icons/fi";
 import type { LibraryShareSelection } from "../libraryShareServer";
 import "../styles/LibraryShareSettings.css";
+
+type ShareTargetType = LibraryShareSelection["type"];
+
+type ShareTargetOption = {
+  selection: LibraryShareSelection;
+  label: string;
+  detail: string;
+  icon: React.ReactNode;
+};
 
 type ShareStatus = {
   active: boolean;
@@ -14,11 +23,17 @@ export default function LibraryShareSettings() {
   const electronAPI = window.electron;
   const [sources, setSources] = useState<BrowseSource[]>([]);
   const [folders, setFolders] = useState<DigitalFolder[]>([]);
+  const [people, setPeople] = useState<PersonSummary[]>([]);
   const [selections, setSelections] = useState<LibraryShareSelection[]>([]);
   const [share, setShare] = useState<ShareStatus>({ active: false, sources: [] });
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [expandedGroups, setExpandedGroups] = useState<Record<ShareTargetType, boolean>>({
+    person: true,
+    folder: false,
+    source: false,
+  });
 
   useEffect(() => {
     let disposed = false;
@@ -26,11 +41,17 @@ export default function LibraryShareSettings() {
       setBusy(false);
       return;
     }
-    void Promise.all([electronAPI.listSources(), electronAPI.getAppState(), electronAPI.getLibraryShareStatus()])
-      .then(([availableSources, appState, currentShare]) => {
+    void Promise.all([
+      electronAPI.listSources(),
+      electronAPI.getAppState(),
+      electronAPI.getLibraryShareStatus(),
+      electronAPI.getFaceState(),
+    ])
+      .then(([availableSources, appState, currentShare, faceState]) => {
         if (disposed) return;
         setSources(availableSources);
         setFolders(appState.digitalFolders ?? []);
+        setPeople(faceState.people ?? []);
         setShare(currentShare);
       })
       .catch((cause) => {
@@ -48,6 +69,46 @@ export default function LibraryShareSettings() {
     (source) => source.kind === "local" && source.available,
   );
   const availableFolders = folders.filter((folder) => !folder.hidden && folder.filePaths.length > 0);
+  const availablePeople = people
+    .filter((person) => person.photoCount > 0 && person.nameSource === "user")
+    .sort((first, second) => first.name.localeCompare(second.name));
+
+  const selectionGroups: Array<{
+    type: ShareTargetType;
+    title: string;
+    options: ShareTargetOption[];
+  }> = [
+    {
+      type: "person",
+      title: "People",
+      options: availablePeople.map((person) => ({
+        selection: { type: "person", id: person.id },
+        label: person.name,
+        detail: `Person · ${person.photoCount.toLocaleString()} photos`,
+        icon: <FiUser aria-hidden="true" />,
+      })),
+    },
+    {
+      type: "folder",
+      title: "Folders",
+      options: availableFolders.map((folder) => ({
+        selection: { type: "folder", id: folder.id },
+        label: folder.name,
+        detail: `Virtual folder · ${folder.filePaths.length.toLocaleString()} members`,
+        icon: <FiFolder aria-hidden="true" />,
+      })),
+    },
+    {
+      type: "source",
+      title: "Sources",
+      options: availableSources.map((source) => ({
+        selection: { type: "source", id: source.id },
+        label: source.label,
+        detail: source.detail,
+        icon: <FiHardDrive aria-hidden="true" />,
+      })),
+    },
+  ];
 
   const isSelected = (selection: LibraryShareSelection) =>
     selections.some((item) => item.type === selection.type && item.id === selection.id);
@@ -58,6 +119,23 @@ export default function LibraryShareSettings() {
         ? current.filter((item) => item.type !== selection.type || item.id !== selection.id)
         : [...current, selection],
     );
+  };
+
+  const toggleAllInGroup = (type: ShareTargetType, options: ShareTargetOption[]) => {
+    const allSelected = options.length > 0 && options.every((option) => isSelected(option.selection));
+    setSelections((current) => {
+      if (allSelected)
+        return current.filter((selection) => selection.type !== type);
+      const selectedKeys = new Set(
+        current.filter((selection) => selection.type === type).map((selection) => selection.id),
+      );
+      return [
+        ...current,
+        ...options
+          .filter((option) => !selectedKeys.has(option.selection.id))
+          .map((option) => option.selection),
+      ];
+    });
   };
 
   const startSharing = async () => {
@@ -149,25 +227,60 @@ export default function LibraryShareSettings() {
         </>
       ) : (
         <>
-          <p className="library-share-description">Choose a local library or a virtual folder. Folder shares include only that folder’s current members. Only indexed photos and videos are included.</p>
-          {busy ? <p className="library-share-muted">Loading libraries and virtual folders…</p> : null}
-          {!busy && availableSources.length === 0 && availableFolders.length === 0 ? (
-            <p className="library-share-muted">Add a local library or create a virtual folder with local photos or videos before sharing.</p>
+          <p className="library-share-description">Choose a local library, virtual folder, or named person. Folder and People shares include only their current members. Only indexed photos and videos are included.</p>
+          {busy ? <p className="library-share-muted">Loading libraries, virtual folders, and People…</p> : null}
+          {!busy && selectionGroups.every((group) => group.options.length === 0) ? (
+            <p className="library-share-muted">Add a local library, create a virtual folder, or identify a person with local photos or videos before sharing.</p>
           ) : (
-            <div className="library-share-sources">
-              {availableSources.map((source) => {
-                const selection = { type: "source", id: source.id } as const;
-                return <label className="library-share-source" key={`source:${source.id}`}>
-                  <input type="checkbox" checked={isSelected(selection)} disabled={busy} onChange={() => toggleSelection(selection)} />
-                  <span><strong>{source.label}</strong><small>{source.detail}</small></span>
-                </label>;
-              })}
-              {availableFolders.map((folder) => {
-                const selection = { type: "folder", id: folder.id } as const;
-                return <label className="library-share-source" key={`folder:${folder.id}`}>
-                  <input type="checkbox" checked={isSelected(selection)} disabled={busy} onChange={() => toggleSelection(selection)} />
-                  <span><strong>{folder.name}</strong><small>Virtual folder · {folder.filePaths.length.toLocaleString()} members</small></span>
-                </label>;
+            <div className="library-share-groups">
+              {selectionGroups.map((group) => {
+                const selectedOptions = group.options.filter((option) => isSelected(option.selection));
+                const allSelected = group.options.length > 0 && selectedOptions.length === group.options.length;
+                const expanded = expandedGroups[group.type];
+                const listId = `library-share-${group.type}-options`;
+                return <section className="library-share-group" key={group.type}>
+                  <div className="library-share-group-heading">
+                    <button
+                      type="button"
+                      className="library-share-group-toggle"
+                      aria-expanded={expanded}
+                      aria-controls={listId}
+                      onClick={() => setExpandedGroups((current) => ({ ...current, [group.type]: !current[group.type] }))}
+                    >
+                      <FiChevronDown aria-hidden="true" className={expanded ? "is-expanded" : ""} />
+                      <strong>{group.title}</strong>
+                      <span>{selectedOptions.length} selected · {group.options.length} available</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="library-share-select-all"
+                      disabled={busy || group.options.length === 0}
+                      onClick={() => toggleAllInGroup(group.type, group.options)}
+                    >
+                      {allSelected ? "Clear all" : "Select all"}
+                    </button>
+                  </div>
+                  {selectedOptions.length > 0 && <div className="library-share-selected" aria-label={`Selected ${group.title.toLowerCase()}`}>
+                    {selectedOptions.map((option) => <button
+                      type="button"
+                      className="library-share-selected-chip"
+                      key={`${option.selection.type}:${option.selection.id}`}
+                      title={`Remove ${option.label}`}
+                      aria-label={`Remove ${option.label} from sharing`}
+                      disabled={busy}
+                      onClick={() => toggleSelection(option.selection)}
+                    >
+                      {option.icon}
+                      <span>{option.label}</span><FiX aria-hidden="true" />
+                    </button>)}
+                  </div>}
+                  <div id={listId} className="library-share-options" role="group" aria-label={`${group.title} available to share`} hidden={!expanded}>
+                    {group.options.map((option) => <label className="library-share-source" key={`${option.selection.type}:${option.selection.id}`}>
+                      <input type="checkbox" checked={isSelected(option.selection)} disabled={busy} onChange={() => toggleSelection(option.selection)} />
+                      <span><strong className="library-share-target-name">{option.icon}{option.label}</strong><small>{option.detail}</small></span>
+                    </label>)}
+                  </div>
+                </section>;
               })}
             </div>
           )}

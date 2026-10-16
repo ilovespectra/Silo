@@ -20,12 +20,12 @@ const mime = require("mime") as { getType(filePath: string): string | null };
 const MAX_PAGE_SIZE = 72;
 const MAX_DOWNLOAD_ITEMS = 10_000;
 const MAX_REQUEST_BODY = 1_000_000;
-const MAX_SHARED_SOURCES = 20;
 const imageSvgExtension = ".svg";
 
 export type LibraryShareSelection =
   | { type: "source"; id: string }
-  | { type: "folder"; id: string };
+  | { type: "folder"; id: string }
+  | { type: "person"; id: string };
 
 export interface LibraryShareSource {
   id: string;
@@ -46,7 +46,14 @@ interface ShareSourceSnapshot extends LibraryShareSource {
   rootIdentity: IndexedShareRootIdentity;
   selectionKey: string;
   folderId?: string;
+  personId?: string;
   allowedPaths?: Set<string>;
+}
+
+interface SharePerson {
+  id: string;
+  name: string;
+  filePaths: string[];
 }
 
 interface ShareDigitalFolder {
@@ -68,6 +75,7 @@ interface ShareContext {
 export interface LibraryShareServerOptions {
   getSources(): Promise<LibraryShareSource[]>;
   getDigitalFolders(): Promise<ShareDigitalFolder[]>;
+  getPeople(): Promise<SharePerson[]>;
   getIndexedFiles(sourceRoots: string[]): IndexedShareFile[];
   search(query: string, sourceRoots: string[]): Promise<IndexedShareFile[]>;
   getThumbnail(filePath: string): Promise<Buffer | null>;
@@ -248,24 +256,22 @@ export class LibraryShareServer {
   async start(selections: LibraryShareSelection[]): Promise<LibraryShareStatus> {
     if (this.context) await this.stop();
     if (!Array.isArray(selections) || selections.length === 0)
-      throw new Error("Choose at least one local library or virtual folder to share.");
-    if (selections.length > MAX_SHARED_SOURCES)
-      throw new Error(`Choose no more than ${MAX_SHARED_SOURCES} libraries or folders.`);
-
-    const [allSources, allFolders] = await Promise.all([
+      throw new Error("Choose at least one local library, virtual folder, or person to share.");
+    const [allSources, allFolders, allPeople] = await Promise.all([
       this.options.getSources(),
       this.options.getDigitalFolders(),
+      this.options.getPeople(),
     ]);
     const validSelections = selections.filter((selection): selection is LibraryShareSelection =>
       selection && typeof selection === "object" &&
-      (selection.type === "source" || selection.type === "folder") &&
+      (selection.type === "source" || selection.type === "folder" || selection.type === "person") &&
       typeof selection.id === "string" && selection.id.length > 0,
     );
     if (validSelections.length !== selections.length)
-      throw new Error("A selected library or virtual folder is invalid.");
+      throw new Error("A selected library, virtual folder, or person is invalid.");
     const selectionKeys = validSelections.map(({ type, id }) => `${type}:${id}`);
     if (new Set(selectionKeys).size !== selectionKeys.length)
-      throw new Error("A library or virtual folder was selected more than once.");
+      throw new Error("A library, virtual folder, or person was selected more than once.");
 
     const localSources = allSources.filter((source) =>
       source.kind === "local" && source.available,
@@ -276,6 +282,7 @@ export class LibraryShareServer {
       selectionKey: string,
       label: string,
       folderId?: string,
+      personId?: string,
       allowedPaths?: Set<string>,
     ) => {
       if (source.kind !== "local" || !source.available)
@@ -292,6 +299,7 @@ export class LibraryShareServer {
         rootIdentity: { device: rootStat.dev, inode: rootStat.ino },
         selectionKey,
         ...(folderId ? { folderId } : {}),
+        ...(personId ? { personId } : {}),
         ...(allowedPaths ? { allowedPaths } : {}),
       });
     };
@@ -305,10 +313,23 @@ export class LibraryShareServer {
         continue;
       }
 
-      const folder = allFolders.find((candidate) => candidate.id === selection.id && !candidate.hidden);
-      if (!folder) throw new Error("That virtual folder is no longer available to share.");
+      const folder = selection.type === "folder"
+        ? allFolders.find((candidate) => candidate.id === selection.id && !candidate.hidden)
+        : undefined;
+      const person = selection.type === "person"
+        ? allPeople.find((candidate) => candidate.id === selection.id)
+        : undefined;
+      if (selection.type === "folder" && !folder)
+        throw new Error("That virtual folder is no longer available to share.");
+      if (selection.type === "person" && !person)
+        throw new Error("That person is no longer available to share.");
+      const memberPaths = folder?.filePaths ?? person?.filePaths ?? [];
+      const memberName = folder?.name ?? person?.name ?? "";
+      const memberLabel = folder
+        ? `Virtual folder · ${folder.name}`
+        : `Person · ${person?.name ?? ""}`;
       const pathsBySource = new Map<string, Set<string>>();
-      for (const rawPath of folder.filePaths) {
+      for (const rawPath of memberPaths) {
         if (typeof rawPath !== "string" || !path.isAbsolute(rawPath)) continue;
         const memberPath = path.resolve(rawPath);
         const source = localSources
@@ -323,24 +344,22 @@ export class LibraryShareServer {
         pathsBySource.set(source.id, paths);
       }
       if (!pathsBySource.size)
-        throw new Error(`“${folder.name}” has no indexed files inside available local libraries.`);
+        throw new Error(`“${memberName}” has no indexed files inside available local libraries.`);
       for (const [sourceId, allowedPaths] of pathsBySource) {
         const source = localSources.find((candidate) => candidate.id === sourceId)!;
         await addSourceSnapshot(
           source,
           selectionKey,
-          `${folder.name} · ${source.label}`,
-          folder.id,
+          `${memberLabel} · ${source.label}`,
+          folder?.id,
+          person?.id,
           allowedPaths,
         );
       }
     }
 
     if (!sources.length)
-      throw new Error("No available local libraries or virtual folders were found.");
-    if (sources.length > MAX_SHARED_SOURCES)
-      throw new Error(`The selection spans more than ${MAX_SHARED_SOURCES} local libraries.`);
-
+      throw new Error("No available local libraries, virtual folders, or people were found.");
     const sourceLabelCounts = new Map<string, number>();
     for (const source of sources) {
       const baseLabel = comparableName(source.label);
@@ -399,9 +418,10 @@ export class LibraryShareServer {
   }
 
   private async currentSources(context: ShareContext): Promise<ShareSourceSnapshot[]> {
-    const [registered, folders] = await Promise.all([
+    const [registered, folders, people] = await Promise.all([
       this.options.getSources(),
       this.options.getDigitalFolders(),
+      this.options.getPeople(),
     ]);
     return context.sources.flatMap((shared) => {
       const sourceStillAvailable = registered.some((source) =>
@@ -411,14 +431,18 @@ export class LibraryShareServer {
         path.resolve(source.rootPath) === path.resolve(shared.rootPath),
       );
       if (!sourceStillAvailable) return [];
-      if (!shared.folderId) return [shared];
+      if (!shared.folderId && !shared.personId) return [shared];
 
-      const folder = folders.find((candidate) =>
-        candidate.id === shared.folderId && !candidate.hidden,
-      );
-      if (!folder) return [];
+      const folder = shared.folderId
+        ? folders.find((candidate) => candidate.id === shared.folderId && !candidate.hidden)
+        : undefined;
+      const person = shared.personId
+        ? people.find((candidate) => candidate.id === shared.personId)
+        : undefined;
+      const memberPaths = folder?.filePaths ?? person?.filePaths;
+      if (!memberPaths) return [];
       const root = path.resolve(shared.rootPath);
-      const allowedPaths = new Set(folder.filePaths.flatMap((memberPath) => {
+      const allowedPaths = new Set(memberPaths.flatMap((memberPath) => {
         if (typeof memberPath !== "string" || !path.isAbsolute(memberPath)) return [];
         const resolved = path.resolve(memberPath);
         const relative = path.relative(root, resolved);
@@ -438,10 +462,21 @@ export class LibraryShareServer {
       type: "image" | "video";
       id: string;
     }> = [];
-    for (const source of sources)
-      for (const file of this.options.getIndexedFiles([source.rootPath])) {
-        if (source.allowedPaths && !source.allowedPaths.has(path.resolve(file.path)))
-          continue;
+    const indexedFilesByRoot = new Map<string, Map<string, IndexedShareFile>>();
+    for (const source of sources) {
+      let indexedByPath = indexedFilesByRoot.get(source.rootPath);
+      if (!indexedByPath) {
+        indexedByPath = new Map(
+          this.options.getIndexedFiles([source.rootPath])
+            .map((file): [string, IndexedShareFile] => [path.resolve(file.path), file]),
+        );
+        indexedFilesByRoot.set(source.rootPath, indexedByPath);
+      }
+      const files = source.allowedPaths
+        ? Array.from(source.allowedPaths, (filePath) => indexedByPath!.get(filePath))
+            .filter((file): file is IndexedShareFile => Boolean(file))
+        : Array.from(indexedByPath.values());
+      for (const file of files) {
         const type = mediaType(file);
         if (!type || file.relativePath.includes("\0")) continue;
         results.push({
@@ -451,6 +486,7 @@ export class LibraryShareServer {
           id: itemId(context.token, source.publicId, source.rootPath, file.relativePath),
         });
       }
+    }
     return results;
   }
 
@@ -529,27 +565,33 @@ export class LibraryShareServer {
     if (query) {
       const roots = [source.rootPath];
       const recordByPath = new Map(entries.map((entry) => [path.resolve(entry.file.path), entry]));
-      let searchResults: IndexedShareFile[] = [];
-      try {
-        searchResults = await this.options.search(query, roots);
-      } catch {
-        searchResults = [];
-      }
-      const ranked: typeof entries = [];
-      const seen = new Set<string>();
-      for (const result of searchResults) {
-        const match = recordByPath.get(path.resolve(result.path));
-        if (match && !seen.has(match.id)) {
-          seen.add(match.id);
-          ranked.push(match);
-        }
-      }
       const lowered = query.toLocaleLowerCase();
-      for (const entry of entries) {
+      const queryTerms = lowered.match(/[\p{L}\p{N}]+/gu) ?? [];
+      const lexicalMatches = entries.filter((entry) => {
         const haystack = `${entry.file.name} ${entry.file.relativePath}`.toLocaleLowerCase();
-        if (haystack.includes(lowered) && !seen.has(entry.id)) {
-          seen.add(entry.id);
-          ranked.push(entry);
+        return haystack.includes(lowered) || (
+          queryTerms.length > 0 && queryTerms.every((term) => haystack.includes(term))
+        );
+      });
+
+      // Filename and path matches come directly from the shared index. Return
+      // them without waiting for CLIP/model startup so literal searches remain
+      // responsive even if semantic search is still preparing or unavailable.
+      const ranked: typeof entries = [...lexicalMatches];
+      if (ranked.length === 0) {
+        let searchResults: IndexedShareFile[] = [];
+        try {
+          searchResults = await this.options.search(query, roots);
+        } catch {
+          // Keep the share page usable when semantic search is unavailable.
+        }
+        const seen = new Set<string>();
+        for (const result of searchResults) {
+          const match = recordByPath.get(path.resolve(result.path));
+          if (match && !seen.has(match.id)) {
+            seen.add(match.id);
+            ranked.push(match);
+          }
         }
       }
       items = ranked.map((entry) => this.publicItem(context, entry));

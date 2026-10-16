@@ -331,7 +331,8 @@ interface DigitalFolder {
 
 type LibraryShareSelection =
   | { type: "source"; id: string }
-  | { type: "folder"; id: string };
+  | { type: "folder"; id: string }
+  | { type: "person"; id: string };
 
 interface FileMetadata {
   displayName?: string;
@@ -728,6 +729,7 @@ interface FaceIndexProgress {
 interface PersonSummary {
   id: string;
   name: string;
+  nameSource: "automatic" | "user";
   faceCount: number;
   photoCount: number;
   coverCropUrl: string | null;
@@ -1037,12 +1039,12 @@ interface Window {
     verifyShelterSources(sourceIds: string[]): Promise<LibraryDashboardSnapshot>;
     selectShelterDestination(): Promise<string | null>;
     getRuntimeDiagnostics(cursor: number): Promise<RuntimeDiagnosticRead>;
-    exportRuntimeDiagnostics(): Promise<{
+    exportRuntimeDiagnostics(format: "txt" | "json"): Promise<{
       ok: boolean;
       canceled?: boolean;
       error?: string;
-      textPath?: string;
-      jsonPath?: string;
+      filePath?: string;
+      format?: "txt" | "json";
       entries?: number;
       truncated?: boolean;
     }>;

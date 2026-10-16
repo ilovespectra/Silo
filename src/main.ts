@@ -7693,6 +7693,19 @@ app.whenReady().then(async () => {
         available,
       })),
     getDigitalFolders: async () => stateStore.getState().digitalFolders,
+    getPeople: async () => {
+      const sourceRoots = new Set(await getEnabledIndexSources());
+      return getDemoPeople().flatMap((summary) => {
+        const detail = faceIndexer.getPerson(summary.id);
+        if (!detail) return [];
+        const filePaths = detail.photoPaths.filter((photoPath) =>
+          fileIsInEnabledSource(photoPath, sourceRoots),
+        );
+        return filePaths.length > 0
+          ? [{ id: summary.id, name: summary.name, filePaths }]
+          : [];
+      });
+    },
     getIndexedFiles: (sourceRoots) => semanticIndexer.getIndexedFiles(sourceRoots),
     search: (query, sourceRoots) =>
       trackInteractiveSearch(() => semanticIndexer.search(query, 0, sourceRoots)),
@@ -8626,6 +8639,9 @@ app.whenReady().then(async () => {
       faceStatus: faceProgress.status,
       faceProcessed: faceProgress.processed,
       faceRemaining: faceProgress.remaining,
+      faceCount: faceProgress.faces,
+      facePeople: faceProgress.people,
+      faceErrors: faceProgress.errors,
       geoStatus: geoState.status,
       geoScanned: geoState.scanned,
       geoTotal: geoState.total,
@@ -11367,9 +11383,12 @@ async function readMemoryDiagnostics(maxEntries = 400): Promise<Record<string, u
 }
 
 ipcMain.handle("get-runtime-diagnostics", (_event, cursor: unknown) => readRuntimeDiagnostics(cursor));
-ipcMain.handle("export-runtime-diagnostics", async (event) => {
+ipcMain.handle("export-runtime-diagnostics", async (event, formatValue: unknown) => {
   if (!mainWindow || event.sender !== mainWindow.webContents)
     return { ok: false, error: "The Silo window is not available to export diagnostics." };
+  if (formatValue !== "txt" && formatValue !== "json")
+    return { ok: false, error: "Choose TXT or JSON before exporting diagnostics." };
+  const format = formatValue;
   const choice = await dialog.showOpenDialog(mainWindow, {
     title: "Choose a folder for Silo diagnostics",
     defaultPath: app.getPath("documents"),
@@ -11389,21 +11408,17 @@ ipcMain.handle("export-runtime-diagnostics", async (event) => {
     memoryEntries: await readMemoryDiagnostics(),
   };
   const timestamp = report.exportedAt.replace(/[:.]/g, "-");
-  let textPath = "";
-  let jsonPath = "";
+  let filePath = "";
   for (let suffix = 0; suffix < 1000; suffix += 1) {
     const stem = `Silo-Diagnostics-${timestamp}${suffix ? `-${suffix + 1}` : ""}`;
-    textPath = path.join(choice.filePaths[0], `${stem}.txt`);
-    jsonPath = path.join(choice.filePaths[0], `${stem}.json`);
-    const [textExists, jsonExists] = await Promise.all([
-      fsPromises.access(textPath).then(() => true, () => false),
-      fsPromises.access(jsonPath).then(() => true, () => false),
-    ]);
-    if (!textExists && !jsonExists) break;
-    textPath = "";
-    jsonPath = "";
+    const candidate = path.join(choice.filePaths[0], `${stem}.${format}`);
+    const exists = await fsPromises.access(candidate).then(() => true, () => false);
+    if (!exists) {
+      filePath = candidate;
+      break;
+    }
   }
-  if (!textPath || !jsonPath)
+  if (!filePath)
     return { ok: false, error: "Silo could not find an unused diagnostics filename." };
 
   const text = [
@@ -11421,24 +11436,18 @@ ipcMain.handle("export-runtime-diagnostics", async (event) => {
     ...report.memoryEntries.map((entry) => JSON.stringify(entry)),
     "",
   ].join("\n");
+  const contents = format === "json"
+    ? `${JSON.stringify(report, null, 2)}\n`
+    : text;
   try {
-    await fsPromises.writeFile(textPath, text, { flag: "wx" });
+    await fsPromises.writeFile(filePath, contents, { flag: "wx" });
   } catch {
-    return { ok: false, error: "Silo could not write the TXT diagnostics file." };
-  }
-  try {
-    await fsPromises.writeFile(jsonPath, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
-  } catch {
-    return {
-      ok: false,
-      error: "The TXT diagnostics file was saved, but Silo could not write its JSON companion.",
-      textPath,
-    };
+    return { ok: false, error: `Silo could not write the ${format.toUpperCase()} diagnostics file.` };
   }
   return {
     ok: true,
-    textPath,
-    jsonPath,
+    filePath,
+    format,
     entries: report.entries.length,
     truncated: report.truncated,
   };

@@ -8994,7 +8994,10 @@ input[type="range"]::-moz-range-progress {
 .stats-log-line strong { overflow: hidden; color: #ffa45f; text-overflow: ellipsis; white-space: nowrap; }
 .stats-log-line span { overflow-wrap: anywhere; color: #bbb8b2; }
 .stats-console-empty { padding: 20px; color: #8f8a83; }
-.stats-console-footer { justify-content: space-between; margin-top: 7px; color: var(--muted); font-size: 9px; }
+.stats-console-footer { justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 7px; color: var(--muted); font-size: 9px; }
+.stats-export-format { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+.stats-export-format select { min-height: 25px; padding: 2px 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; font-size: 10px; }
+.stats-export-format select:disabled { opacity: 0.5; }
 .stats-inline-error { display: flex; align-items: center; gap: 7px; max-width: 1500px; margin: 0 auto 12px; padding: 10px 12px; border: 1px solid rgba(241, 140, 120, 0.35); border-radius: 9px; background: rgba(145, 53, 44, 0.12); color: #f1a090; font-size: 11px; }
 .stats-page-footnote { display: flex; align-items: center; gap: 7px; max-width: 1500px; margin: 18px auto 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .stats-page-footnote svg { flex: 0 0 auto; color: var(--orange-bright); }

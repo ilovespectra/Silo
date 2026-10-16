@@ -95,6 +95,7 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
   const [truncated, setTruncated] = useState(false);
   const [isFollowing, setIsFollowing] = useState(true);
   const [exporting, setExporting] = useState(false);
+  const [exportFormat, setExportFormat] = useState<"txt" | "json">("txt");
   const [exportMessage, setExportMessage] = useState("");
   const cursor = useRef(0);
   const feedRef = useRef<HTMLDivElement | null>(null);
@@ -139,14 +140,14 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
     setExporting(true);
     setExportMessage("");
     try {
-      const result = await api.exportRuntimeDiagnostics();
+      const result = await api.exportRuntimeDiagnostics(exportFormat);
       if (result.canceled) return;
       if (!result.ok) {
         setExportMessage(result.error || "Silo could not export diagnostics.");
         return;
       }
       setExportMessage(
-        `Saved ${result.entries ?? 0} recent events as TXT and JSON${result.truncated ? " (older log entries were omitted)" : ""}.`,
+        `Saved ${result.entries ?? 0} recent events as ${exportFormat.toUpperCase()}${result.truncated ? " (older log entries were omitted)" : ""}.`,
       );
     } catch (cause) {
       setExportMessage(cause instanceof Error ? cause.message : "Silo could not export diagnostics.");
@@ -189,8 +190,20 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
       <footer className="stats-console-footer">
         <span>{entries.length.toLocaleString()} recent events</span>
         <span>{isFollowing ? "Following newest" : "Scroll to bottom to resume follow"}</span>
+        <label className="stats-export-format">
+          <span>Format</span>
+          <select
+            aria-label="Diagnostics export format"
+            value={exportFormat}
+            onChange={(event) => setExportFormat(event.currentTarget.value as "txt" | "json")}
+            disabled={exporting}
+          >
+            <option value="txt">TXT</option>
+            <option value="json">JSON</option>
+          </select>
+        </label>
         <button className="stats-text-button" onClick={() => void exportDiagnostics()} disabled={exporting}>
-          <FiDownload /> {exporting ? "Exporting…" : "Export TXT + JSON"}
+          <FiDownload /> {exporting ? "Exporting…" : `Export ${exportFormat.toUpperCase()}`}
         </button>
       </footer>
       {exportMessage && <p className="stats-console-note" role="status">{exportMessage}</p>}

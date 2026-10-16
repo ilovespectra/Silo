@@ -141,7 +141,7 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("select-shelter-destination"),
   getRuntimeDiagnostics: (cursor) =>
     ipcRenderer.invoke("get-runtime-diagnostics", cursor),
-  exportRuntimeDiagnostics: () => ipcRenderer.invoke("export-runtime-diagnostics"),
+  exportRuntimeDiagnostics: (format) => ipcRenderer.invoke("export-runtime-diagnostics", format),
   retryIndexingStage: (id) => ipcRenderer.invoke("retry-indexing-stage", id),
   pauseIndexingStage: (id) => ipcRenderer.invoke("pause-indexing-stage", id),
   onThumbnailPregenProgress: (callback) => {
