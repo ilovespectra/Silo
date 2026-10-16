@@ -8,6 +8,9 @@ import React, {
 } from "react";
 import {
   FiFastForward,
+  FiExternalLink,
+  FiPlus,
+  FiTrash2,
   FiHeart,
   FiPause,
   FiPlay,
@@ -46,8 +49,13 @@ interface AudioLibraryProps {
   yearFilter: string;
   sort: AudioSort;
   favoritePaths: Set<string>;
+  playlists: MediaPlaylist[];
   onAudioYearsChange: (years: string[]) => void;
   onToggleFavorite: (filePath: string) => void;
+  onCreatePlaylist: (name: string, kind: "audio") => Promise<string | null>;
+  onAddToPlaylist: (playlistId: string, filePath: string) => Promise<void>;
+  onRemoveFromPlaylist: (playlistId: string, filePath: string) => Promise<void>;
+  onDeletePlaylist: (playlistId: string) => Promise<void>;
 }
 
 interface AudioScanProgress {
@@ -178,6 +186,8 @@ const AudioTrackRow = React.memo(function AudioTrackRow({
   favorite,
   onPlay,
   onFavorite,
+  onPlaylist,
+  inPlaylist,
 }: {
   file: AudioFile;
   active: boolean;
@@ -185,6 +195,8 @@ const AudioTrackRow = React.memo(function AudioTrackRow({
   favorite: boolean;
   onPlay: (file: AudioFile) => void;
   onFavorite: (path: string) => void;
+  onPlaylist: (path: string) => void;
+  inPlaylist: boolean;
 }) {
   return (
     <div className={`audio-track ${active ? "active" : ""}`}>
@@ -205,6 +217,14 @@ const AudioTrackRow = React.memo(function AudioTrackRow({
         onClick={() => onFavorite(file.path)}
       >
         <FiHeart />
+      </button>
+      <button
+        className="audio-track-favorite audio-track-playlist"
+        title={inPlaylist ? "Remove from playlist" : "Add to selected playlist"}
+        aria-label={inPlaylist ? "Remove from playlist" : "Add to selected playlist"}
+        onClick={() => onPlaylist(file.path)}
+      >
+        {inPlaylist ? <FiTrash2 /> : <FiPlus />}
       </button>
     </div>
   );
@@ -263,8 +283,13 @@ export default function AudioLibrary({
   yearFilter,
   sort,
   favoritePaths,
+  playlists,
   onAudioYearsChange,
   onToggleFavorite,
+  onCreatePlaylist,
+  onAddToPlaylist,
+  onRemoveFromPlaylist,
+  onDeletePlaylist,
 }: AudioLibraryProps) {
   const [files, setFiles] = useState<AudioFile[]>([]);
   const [loading, setLoading] = useState(false);
@@ -285,8 +310,18 @@ export default function AudioLibrary({
   const [selectedExtensions, setSelectedExtensions] =
     useState<Set<string> | null>(null);
   const [activePath, setActivePath] = useState<string | null>(null);
+  const [playlistId, setPlaylistId] = useState("all");
+  const [targetPlaylistId, setTargetPlaylistId] = useState("");
+  const [playlistName, setPlaylistName] = useState("");
+  const [playlistBusy, setPlaylistBusy] = useState(false);
+  const audioPlaylists = playlists.filter((playlist) => playlist.kind === "audio");
+  const selectedPlaylist = audioPlaylists.find((playlist) => playlist.id === playlistId);
+  const targetPlaylist = audioPlaylists.find((playlist) => playlist.id === targetPlaylistId);
   const [preview, setPreview] = useState<AudioPreview | null>(null);
   const [playing, setPlaying] = useState(false);
+  const [playbackPhase, setPlaybackPhase] = useState<
+    "opening" | "buffering" | null
+  >(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false);
@@ -311,6 +346,7 @@ export default function AudioLibrary({
   const seekingRef = useRef(false);
   const visualFrameRef = useRef<number | null>(null);
   const requestRef = useRef(0);
+  const playbackRequestRef = useRef(0);
 
   useEffect(() => {
     if (!visible || !navigator.mediaDevices?.enumerateDevices) return;
@@ -378,13 +414,14 @@ export default function AudioLibrary({
         .filter(
           (file) =>
             (yearFilter === "all" || yearOf(file) === yearFilter) &&
+            (!selectedPlaylist || selectedPlaylist.filePaths.includes(file.path)) &&
             (selectedExtensions === null ||
               selectedExtensions.has(
                 audioExtension(file.name) || "(no extension)",
               )),
         )
         .sort((first, second) => compareAudioFiles(first, second, sort)),
-    [files, selectedExtensions, yearFilter, sort.field, sort.ascending],
+    [files, selectedExtensions, selectedPlaylist, yearFilter, sort.field, sort.ascending],
   );
   const byYear = useMemo(() => {
     const grouped = new Map<string, AudioFile[]>();
@@ -711,28 +748,42 @@ export default function AudioLibrary({
   };
 
   const playFile = async (file: AudioFile) => {
+    const requestId = ++playbackRequestRef.current;
     audioRef.current?.pause();
     setPreview(null);
     setActivePath(file.path);
     setPlaying(false);
+    setPlaybackPhase("opening");
     setCurrentTime(0);
     setDuration(0);
     setError("");
     // Resume audio in the click's user-activation window before awaiting IPC.
     void ensureAudioGraph();
-    const filePreview = await electronAPI.getFilePreview(file.path);
-    if (!filePreview?.mediaUrl) {
+    try {
+      const filePreview = await electronAPI.getFilePreview(file.path);
+      if (requestId !== playbackRequestRef.current) return;
+      if (!filePreview?.mediaUrl) {
+        setPlaybackPhase(null);
+        setError(
+          "Could not open this audio stream. Check the source connection and file format.",
+        );
+        return;
+      }
+      setPreview(filePreview);
+    } catch (cause) {
+      if (requestId !== playbackRequestRef.current) return;
+      setPlaybackPhase(null);
       setError(
-        "Could not open this audio stream. Check the source connection and file format.",
+        cause instanceof Error
+          ? cause.message
+          : "Could not open this audio stream. Check the source connection and file format.",
       );
-      return;
     }
-    setPreview(filePreview);
   };
 
   // Stable row callbacks, with current player/output settings rather than stale closures.
-  const rowActionsRef = useRef({ playFile, onToggleFavorite });
-  rowActionsRef.current = { playFile, onToggleFavorite };
+  const rowActionsRef = useRef({ playFile, onToggleFavorite, onAddToPlaylist, onRemoveFromPlaylist, targetPlaylistId, playlistId });
+  rowActionsRef.current = { playFile, onToggleFavorite, onAddToPlaylist, onRemoveFromPlaylist, targetPlaylistId, playlistId };
   const playRow = useCallback((file: AudioFile) => {
     void rowActionsRef.current.playFile(file);
   }, []);
@@ -740,6 +791,35 @@ export default function AudioLibrary({
     (path: string) => rowActionsRef.current.onToggleFavorite(path),
     [],
   );
+  const playlistRow = useCallback((filePath: string) => {
+    const current = rowActionsRef.current;
+    if (current.playlistId !== "all")
+      void current.onRemoveFromPlaylist(current.playlistId, filePath);
+    else if (current.targetPlaylistId)
+      void current.onAddToPlaylist(current.targetPlaylistId, filePath);
+  }, []);
+  const createPlaylist = async () => {
+    const name = playlistName.trim();
+    if (!name || playlistBusy) return;
+    setPlaylistBusy(true);
+    try {
+      const id = await onCreatePlaylist(name, "audio");
+      setPlaylistName("");
+      if (id) {
+        setPlaylistId(id);
+        setTargetPlaylistId(id);
+      }
+    } finally {
+      setPlaylistBusy(false);
+    }
+  };
+  const popOut = async () => {
+    if (!activeFile) return;
+    const audio = audioRef.current;
+    const result = await electronAPI.openMediaPopout(activeFile.path, audio?.currentTime ?? currentTime);
+    if (result.ok) audio?.pause();
+    else setError(result.error ?? "Could not open the pop-out player.");
+  };
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -750,7 +830,11 @@ export default function AudioLibrary({
     void audio
       .play()
       .then(() => setPlaying(true))
-      .catch(() => setPlaying(false));
+      .catch(() => {
+        setPlaying(false);
+        setPlaybackPhase(null);
+        setError("Audio playback could not start.");
+      });
   }, [preview]);
 
   useEffect(() => {
@@ -971,6 +1055,13 @@ export default function AudioLibrary({
           </strong>
         )}
       </header>
+      <div className="audio-playlist-tools">
+        <label><span>Playlist</span><select value={playlistId} onChange={(event) => setPlaylistId(event.target.value)} aria-label="Audio playlist"><option value="all">All audio</option>{audioPlaylists.map((playlist) => <option key={playlist.id} value={playlist.id}>{playlist.name} · {playlist.filePaths.length}</option>)}</select></label>
+        {selectedPlaylist && <button type="button" title="Delete this playlist" aria-label="Delete this playlist" onClick={() => { void onDeletePlaylist(selectedPlaylist.id); setPlaylistId("all"); }}> <FiTrash2 /> Delete playlist</button>}
+        <input value={playlistName} onChange={(event) => setPlaylistName(event.target.value)} placeholder="New audio playlist" aria-label="New audio playlist name" maxLength={100} />
+        <button type="button" disabled={!playlistName.trim() || playlistBusy} onClick={() => void createPlaylist()}><FiPlus /> Create playlist</button>
+        <label><span>Add tracks to</span><select value={targetPlaylistId} onChange={(event) => setTargetPlaylistId(event.target.value)} aria-label="Playlist destination"><option value="">Choose playlist</option>{audioPlaylists.map((playlist) => <option key={playlist.id} value={playlist.id}>{playlist.name}</option>)}</select></label>
+      </div>
       {loading && (
         <div className="audio-scan-progress" role="status" aria-live="polite">
           <div className="audio-scan-progress-label">
@@ -1018,6 +1109,8 @@ export default function AudioLibrary({
                     favorite={favoritePaths.has(row.file.path)}
                     onPlay={playRow}
                     onFavorite={favoriteRow}
+                    onPlaylist={playlistRow}
+                    inPlaylist={playlistId !== "all"}
                   />
                 ) : (
                   <button
@@ -1096,11 +1189,24 @@ export default function AudioLibrary({
             <span className="audio-disc">♫</span>
             <div>
               <strong>{activeFile?.name ?? "Nothing playing"}</strong>
-              <small>
-                {activeFile
+              <small
+                className={playbackPhase ? "audio-playback-status" : undefined}
+                role={playbackPhase ? "status" : undefined}
+                aria-live={playbackPhase ? "polite" : undefined}
+              >
+                {playbackPhase
+                  ? playbackPhase === "opening"
+                    ? "Opening audio stream…"
+                    : "Buffering audio…"
+                  : activeFile
                   ? `${activeFile.extension.replace(/^\./, "").toUpperCase() || "AUDIO"} · ${sizeOf(activeFile.size)} · ${new Date(activeFile.modified).toLocaleString()}`
                   : "Choose a track from your library"}
               </small>
+              {playbackPhase && activeFile && (
+                <small className="audio-track-details">
+                  {`${activeFile.extension.replace(/^\./, "").toUpperCase() || "AUDIO"} · ${sizeOf(activeFile.size)} · ${new Date(activeFile.modified).toLocaleString()}`}
+                </small>
+              )}
             </div>
           </div>
           <audio
@@ -1113,15 +1219,27 @@ export default function AudioLibrary({
             onLoadedMetadata={(event) =>
               setDuration(event.currentTarget.duration)
             }
+            onCanPlay={() => setPlaybackPhase(null)}
             onPlay={() => setPlaying(true)}
-            onPause={() => setPlaying(false)}
+            onPlaying={() => {
+              setPlaying(true);
+              setPlaybackPhase(null);
+            }}
+            onWaiting={() => setPlaybackPhase("buffering")}
+            onPause={() => {
+              setPlaying(false);
+              setPlaybackPhase((phase) =>
+                phase === "buffering" ? null : phase,
+              );
+            }}
             onEnded={() => stepTrack(1)}
-            onError={(event) =>
+            onError={(event) => {
+              setPlaybackPhase(null);
               setError(
                 preview?.playbackError ||
                   `Audio playback failed (media error ${event.currentTarget.error?.code ?? "unknown"}).`,
-              )
-            }
+              );
+            }}
           />
           <div className="audio-seek-row">
             <span>{timeOf(isSeeking ? seekDraft : currentTime)}</span>
@@ -1204,6 +1322,14 @@ export default function AudioLibrary({
               title="Next track"
             >
               <FiSkipForward />
+            </button>
+            <button
+              onClick={() => void popOut()}
+              disabled={!activeFile}
+              aria-label="Pop out audio player"
+              title="Open audio in a movable window"
+            >
+              <FiExternalLink />
             </button>
             <label className="audio-volume">
               {volume === 0 ? <FiVolumeX /> : <FiVolume2 />}

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Silo Media Player</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root { color-scheme: dark; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #080809; color: #f4f1ed; }
+    body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; background: radial-gradient(ellipse at 50% 0, #25160d, #080809 55%); }
+    header { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 8px 16px; border-bottom: 1px solid #30251e; color: #ffad60; }
+    header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .stage { flex: 1; min-height: 0; display: grid; place-items: center; padding: 12px; }
+    audio, video { display: block; max-width: 100%; max-height: calc(100vh - 76px); }
+    video { width: 100%; height: 100%; object-fit: contain; }
+    .status { color: #b7aaa0; text-align: center; }
+  </style>
+</head>
+<body>
+  <header><span>◉</span><strong id="title">Silo · Media Player</strong></header>
+  <main class="stage"><div class="status" id="status" role="status">Opening media…</div></main>
+  <script>
+    (async () => {
+      const stage = document.querySelector(".stage");
+      const status = document.getElementById("status");
+      try {
+        const item = await window.electron.getPopoutMedia();
+        if (!item) throw new Error("This player session has expired.");
+        const preview = await window.electron.getFilePreview(item.filePath);
+        if (!preview || !preview.mediaUrl) throw new Error("Could not open this media stream.");
+        const player = document.createElement(preview.playbackMimeType && preview.playbackMimeType.startsWith("video/") ? "video" : "audio");
+        player.controls = true;
+        player.autoplay = true;
+        player.playsInline = true;
+        player.src = preview.mediaUrl;
+        player.setAttribute("aria-label", item.filePath.split(/[\\/]/).pop() || "Media player");
+        document.getElementById("title").textContent = item.filePath.split(/[\\/]/).pop() || "Silo · Media Player";
+        player.addEventListener("loadedmetadata", () => {
+          if (Number.isFinite(item.startTime) && item.startTime > 0) {
+            try { player.currentTime = Math.min(item.startTime, player.duration || item.startTime); } catch (_) {}
+          }
+          status.remove();
+        }, { once: true });
+        player.addEventListener("error", () => { status.textContent = "This media could not be played."; }, { once: true });
+        stage.appendChild(player);
+        player.play().catch(() => { status.textContent = "Press Play to start."; });
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : "Could not open media.";
+      }
+    })();
+  </script>
+</body>
+</html>

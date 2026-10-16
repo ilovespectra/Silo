@@ -115,7 +115,13 @@ export interface PhoneBackupProgress {
   deviceId: string;
   platform: PhonePlatform;
   deviceName: string;
-  status: "idle" | "scanning" | "backing-up" | "complete" | "error";
+  status:
+    | "idle"
+    | "scanning"
+    | "checking"
+    | "backing-up"
+    | "complete"
+    | "error";
   totalFiles: number;
   completedFiles: number;
   totalBytes: number;
@@ -505,7 +511,11 @@ export class PhoneManager {
         for (const [key, manifest] of Object.entries(stored)) {
           manifest.progress.failedFiles =
             Number(manifest.progress.failedFiles) || 0;
-          if (["scanning", "backing-up"].includes(manifest.progress.status)) {
+          if (
+            ["scanning", "checking", "backing-up"].includes(
+              manifest.progress.status,
+            )
+          ) {
             manifest.progress.status = "idle";
             manifest.progress.message =
               "Backup was interrupted and will resume when the phone reconnects.";
@@ -1482,12 +1492,31 @@ export class PhoneManager {
         );
       const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
       this.updateBackup(manifest, {
+        status: "checking",
+        totalFiles: files.length,
+        completedFiles: 0,
+        totalBytes,
+        completedBytes: 0,
+        currentFile: null,
         message: `Checking ${files.length.toLocaleString()} files against your backup...`,
       });
       const alreadySaved = new Set<string>();
+      let lastCheckProgressAt = Date.now();
       for (let index = 0; index < files.length; index++) {
-        if (await this.isAlreadyBackedUp(manifest, files[index])) alreadySaved.add(files[index].path);
-        if (index % 500 === 499) await new Promise<void>((resolve) => setImmediate(resolve));
+        if (await this.isAlreadyBackedUp(manifest, files[index]))
+          alreadySaved.add(files[index].path);
+        manifest.progress.completedFiles = index + 1;
+        manifest.progress.completedBytes += files[index].size;
+        manifest.progress.currentFile =
+          files[index].relativePath || files[index].name;
+        const now = Date.now();
+        if (now - lastCheckProgressAt >= 400 || index === files.length - 1) {
+          lastCheckProgressAt = now;
+          manifest.progress.message = `${manifest.progress.completedFiles.toLocaleString()} of ${manifest.progress.totalFiles.toLocaleString()} files checked`;
+          this.onBackupProgress({ ...manifest.progress });
+        }
+        if (index % 500 === 499)
+          await new Promise<void>((resolve) => setImmediate(resolve));
       }
       const newFiles = files.length - alreadySaved.size;
       const remainingBytes = files.reduce(
@@ -1508,13 +1537,18 @@ export class PhoneManager {
       const reserveBytes = 5 * 1024 * 1024 * 1024;
 
       if (remainingBytes > Math.max(0, freeBytes - reserveBytes)) {
-        const location = this.backupDestinationPath
-          ? `external drive (${this.backupDestinationPath})`
-          : "this computer";
+        const selectedDestination = this.backupDestinationPath;
+        const destinationChanged =
+          selectedDestination !== null &&
+          path.resolve(backupDir) !== path.resolve(selectedDestination);
+        const location = destinationChanged
+          ? `the active phone backup folder (${backupDir}); the selected destination is ${selectedDestination}`
+          : `the active phone backup folder (${backupDir})`;
         throw new Error(
-          `Not enough free disk space on ${location} to back up ${device.name}. ` +
-            `${this.formatBytes(remainingBytes)} is needed while preserving a 5 GB safety reserve. ` +
-            `Available: ${this.formatBytes(Math.max(0, freeBytes - reserveBytes))}`,
+          `Not enough free disk space on ${location} to update ${device.name}. ` +
+            `Only ${this.formatBytes(remainingBytes)} of new or changed files are needed, ` +
+            `but Silo preserves a 5 GiB free-space reserve. This volume has ` +
+            `${this.formatBytes(freeBytes)} free; ${this.formatBytes(Math.max(0, freeBytes - reserveBytes))} is available above the reserve.`,
         );
       }
       this.updateBackup(manifest, {

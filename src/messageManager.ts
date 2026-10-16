@@ -960,7 +960,7 @@ export class MessageManager {
           continue;
         }
         const location = this.backupDestinationPath
-          ? `external drive (${this.backupDestinationPath})`
+          ? `selected phone backup location (${this.backupDestinationPath})`
           : "Mac storage";
         if (/not paired|pairing|InvalidHostID|lockdownd.*(pair|trust)/i.test(message))
           throw new Error(

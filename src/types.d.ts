@@ -139,7 +139,7 @@ interface PhoneBackupProgress {
   deviceId: string;
   platform: PhonePlatform;
   deviceName: string;
-  status: "idle" | "scanning" | "backing-up" | "complete" | "error";
+  status: "idle" | "scanning" | "checking" | "backing-up" | "complete" | "error";
   totalFiles: number;
   completedFiles: number;
   totalBytes: number;
@@ -338,6 +338,17 @@ interface FileMetadata {
   displayName?: string;
   year?: number;
   keywords: string[];
+  people?: string[];
+  places?: string[];
+  updatedAt: number;
+}
+
+interface MediaPlaylist {
+  id: string;
+  name: string;
+  kind: "audio" | "video";
+  filePaths: string[];
+  createdAt: number;
   updatedAt: number;
 }
 
@@ -595,6 +606,15 @@ interface DiagnosticReport {
 
 type IndexingDiagnosticReport = DiagnosticReport;
 
+interface FilterInventoryProgress {
+  requestId: number;
+  scanned: number;
+  total: number;
+  errors: number;
+  found: number;
+  done: boolean;
+}
+
 interface FileScanProgress {
   inventory?: { inventoryToken: string; total: number };
   requestId: number;
@@ -678,6 +698,7 @@ interface PersistedAppState {
   ui: PersistedUiState;
   indexSources: IndexSource[];
   digitalFolders: DigitalFolder[];
+  mediaPlaylists: MediaPlaylist[];
   fileMetadata: Record<string, FileMetadata>;
   searchFeedback: Record<string, "confirmed" | "removed">;
   messageFlags: Record<string, MessageDisplayFlags>;
@@ -925,6 +946,13 @@ interface Window {
       title?: string;
       defaultPath?: string | null;
     }): Promise<{ path: string; isTimeMachine: boolean } | null>;
+    getFilterInventory(requestId: number): Promise<{
+      inventory: FileInfo[] | { inventoryToken: string; total: number };
+      errors: number;
+    }>;
+    onFilterInventoryProgress(
+      callback: (progress: FilterInventoryProgress) => void,
+    ): () => void;
     getFiles(
       dirPath: string,
       exploded: boolean,
@@ -1209,8 +1237,16 @@ interface Window {
         keywords?: string[];
         mergeKeywords?: boolean;
         year?: number | null;
+        people?: string[];
+        places?: string[];
       },
     ): Promise<PersistedAppState>;
+    createMediaPlaylist(name: string, kind: "audio" | "video"): Promise<PersistedAppState>;
+    addMediaPlaylistFiles(playlistId: string, filePaths: string[]): Promise<PersistedAppState>;
+    removeMediaPlaylistFile(playlistId: string, filePath: string): Promise<PersistedAppState>;
+    deleteMediaPlaylist(playlistId: string): Promise<PersistedAppState>;
+    openMediaPopout(filePath: string, startTime?: number): Promise<{ ok: boolean; error?: string }>;
+    getPopoutMedia(): Promise<{ filePath: string; startTime: number } | null>;
     getDigitalFolderFiles(folderId: string): Promise<FileInfo[]>;
     downloadDigitalFolder(folderId: string): Promise<FileOperationResult>;
     getFaceState(): Promise<{

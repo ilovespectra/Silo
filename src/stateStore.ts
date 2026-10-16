@@ -1,5 +1,6 @@
 import * as path from "path";
 import * as fsPromises from "fs/promises";
+import { randomUUID } from "crypto";
 import type { GeocodedLocation } from "./geocoder";
 import { DEFAULT_SEMANTIC_SEARCH_CONFIDENCE } from "./searchSettings";
 
@@ -77,6 +78,17 @@ export interface FileMetadata {
   displayName?: string;
   year?: number;
   keywords: string[];
+  people?: string[];
+  places?: string[];
+  updatedAt: number;
+}
+
+export interface MediaPlaylist {
+  id: string;
+  name: string;
+  kind: "audio" | "video";
+  filePaths: string[];
+  createdAt: number;
   updatedAt: number;
 }
 
@@ -103,6 +115,7 @@ export interface PersistedAppState {
   ui: PersistedUiState;
   indexSources: IndexSource[];
   digitalFolders: DigitalFolder[];
+  mediaPlaylists: MediaPlaylist[];
   nameIndex: NameIndexEntry[];
   fileMetadata: Record<string, FileMetadata>;
   searchFeedback: Record<string, "confirmed" | "removed">;
@@ -130,6 +143,7 @@ const defaultState: PersistedAppState = {
   },
   indexSources: [],
   digitalFolders: [favoritesFolder(), refuseFolder()],
+  mediaPlaylists: [],
   nameIndex: [],
   fileMetadata: {},
   searchFeedback: {},
@@ -182,6 +196,27 @@ export class StateStore {
               : folder,
           ),
         ],
+        mediaPlaylists: Array.isArray(stored.mediaPlaylists)
+          ? stored.mediaPlaylists.flatMap((playlist) => {
+              if (
+                !playlist ||
+                typeof playlist !== "object" ||
+                typeof playlist.id !== "string" ||
+                typeof playlist.name !== "string" ||
+                (playlist.kind !== "audio" && playlist.kind !== "video") ||
+                !Array.isArray(playlist.filePaths)
+              )
+                return [];
+              return [{
+                id: playlist.id,
+                name: playlist.name.slice(0, 100),
+                kind: playlist.kind,
+                filePaths: Array.from(new Set(playlist.filePaths.filter((item) => typeof item === "string" && item.length <= 4096))),
+                createdAt: Number.isFinite(playlist.createdAt) ? playlist.createdAt : Date.now(),
+                updatedAt: Number.isFinite(playlist.updatedAt) ? playlist.updatedAt : Date.now(),
+              }];
+            })
+          : [],
         nameIndex: Array.isArray(stored.nameIndex) ? stored.nameIndex : [],
         fileMetadata:
           stored.fileMetadata && typeof stored.fileMetadata === "object"
@@ -515,6 +550,8 @@ export class StateStore {
       keywords?: string[];
       mergeKeywords?: boolean;
       year?: number | null;
+      people?: string[];
+      places?: string[];
     },
   ) {
     if (
@@ -542,7 +579,13 @@ export class StateStore {
                 ]),
               ),
         updatedAt: Date.now(),
+        ...(update.people === undefined ? {} : { people: current.people ?? [] }),
+        ...(update.places === undefined ? {} : { places: current.places ?? [] }),
       };
+      if (update.people !== undefined)
+        next.people = Array.from(new Set(update.people.map((value) => value.trim()).filter(Boolean)));
+      if (update.places !== undefined)
+        next.places = Array.from(new Set(update.places.map((value) => value.trim()).filter(Boolean)));
       if (update.displayName !== undefined) {
         const displayName = update.displayName?.trim();
         if (displayName) next.displayName = displayName;
@@ -555,11 +598,61 @@ export class StateStore {
       if (
         !next.displayName &&
         next.keywords.length === 0 &&
+        (next.people?.length ?? 0) === 0 &&
+        (next.places?.length ?? 0) === 0 &&
         next.year === undefined
       )
         delete this.state.fileMetadata[filePath];
       else this.state.fileMetadata[filePath] = next;
     }
+    await this.write();
+    return this.getState();
+  }
+
+  async createMediaPlaylist(name: string, kind: "audio" | "video") {
+    const cleanName = name.trim().slice(0, 100);
+    if (!cleanName) throw new Error("Enter a playlist name.");
+    if (kind !== "audio" && kind !== "video") throw new Error("Choose a valid playlist type.");
+    const playlist: MediaPlaylist = {
+      id: randomUUID(),
+      name: cleanName,
+      kind,
+      filePaths: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    this.state.mediaPlaylists.push(playlist);
+    await this.write();
+    return this.getState();
+  }
+
+  async addMediaPlaylistFiles(playlistId: string, filePaths: string[]) {
+    const playlist = this.state.mediaPlaylists.find((item) => item.id === playlistId);
+    if (!playlist) throw new Error("Playlist not found.");
+    const existing = new Set(playlist.filePaths);
+    for (const filePath of filePaths) {
+      if (typeof filePath !== "string" || !filePath.trim() || filePath.length > 4096) continue;
+      if (!existing.has(filePath)) {
+        existing.add(filePath);
+        playlist.filePaths.push(filePath);
+      }
+    }
+    playlist.updatedAt = Date.now();
+    await this.write();
+    return this.getState();
+  }
+
+  async removeMediaPlaylistFile(playlistId: string, filePath: string) {
+    const playlist = this.state.mediaPlaylists.find((item) => item.id === playlistId);
+    if (!playlist) throw new Error("Playlist not found.");
+    playlist.filePaths = playlist.filePaths.filter((item) => item !== filePath);
+    playlist.updatedAt = Date.now();
+    await this.write();
+    return this.getState();
+  }
+
+  async deleteMediaPlaylist(playlistId: string) {
+    this.state.mediaPlaylists = this.state.mediaPlaylists.filter((item) => item.id !== playlistId);
     await this.write();
     return this.getState();
   }

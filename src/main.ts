@@ -3848,7 +3848,6 @@ function registerMediaProtocols() {
 }
 let phoneDiscoveryTimer: NodeJS.Timeout | null = null;
 let phoneDiscoveryPromise: Promise<void> | null = null;
-const seenReadyPhoneKeys = new Set<string>();
 let derivedIndexTimer: NodeJS.Timeout | null = null;
 let derivedIndexPromise: Promise<void> | null = null;
 let derivedIndexRerunRequested = false;
@@ -4117,7 +4116,7 @@ function runDerivedIndexes(): Promise<void> {
   */
 }
 
-function discoverAndBackupPhones(): Promise<void> {
+function discoverPhones(): Promise<void> {
   if (phoneDiscoveryPromise) return phoneDiscoveryPromise;
   phoneDiscoveryPromise = (async () => {
     try {
@@ -4163,60 +4162,9 @@ function discoverAndBackupPhones(): Promise<void> {
         mainWindow.webContents.send("phone-devices-changed", devices);
       }
 
-      const currentReadyKeys = new Set(
-        devices
-          .filter((device) => device.status === "ready" && device.rootPath)
-          .map((device) => `${device.platform}:${device.id}`),
-      );
-      console.log(
-        `[PHONE-DISCOVERY] Ready keys:`,
-        Array.from(currentReadyKeys),
-      );
-      const backupStates = new Map(
-        phoneManager
-          .getBackupStates()
-          .map((state) => [`${state.platform}:${state.deviceId}`, state]),
-      );
-      for (const device of devices) {
-        if (device.status !== "ready" || !device.rootPath) continue;
-        const key = `${device.platform}:${device.id}`;
-        const previous = backupStates.get(key);
-        // Every connection or reconnection starts a backup (an active job is reused).
-        // While a phone stays connected, retry failures and refresh every 10 minutes.
-        const newlyConnected = !seenReadyPhoneKeys.has(key);
-        const refreshDue =
-          previous?.status === "complete" &&
-          (!previous.lastBackupAt ||
-            Date.now() - previous.lastBackupAt >= 10 * 60 * 1000);
-        const shouldStart =
-          newlyConnected || !previous || previous.status === "error" || refreshDue;
-        console.log(
-          `[PHONE-DISCOVERY] Device ${key}: shouldStart=${shouldStart}, newlyConnected=${newlyConnected}, status=${previous?.status}, refreshDue=${refreshDue}`,
-        );
-        if (!shouldStart) continue;
-        console.log(`[PHONE-DISCOVERY] Triggering backup for ${key}`);
-        void phoneManager.backupDevice(device).then((progress) => {
-          console.log(
-            `[PHONE-DISCOVERY] Backup finished for ${key}:`,
-            progress.status,
-          );
-          runtimeLog("phone-backup-finished", {
-            deviceId: progress.deviceId,
-            platform: progress.platform,
-            status: progress.status,
-            completedFiles: progress.completedFiles,
-            totalFiles: progress.totalFiles,
-          });
-        }).catch((error) => {
-          runtimeLog("phone-backup-failed", {
-            platform: device.platform,
-            message: error instanceof Error ? error.message : String(error),
-          });
-        });
-      }
+      // Discovery only updates the device list. Backups start only after the
+      // user confirms a backup request in the phone manager.
       await getEnabledIndexSources();
-      seenReadyPhoneKeys.clear();
-      for (const key of currentReadyKeys) seenReadyPhoneKeys.add(key);
     } catch (error) {
       console.error("[PHONE-DISCOVERY] Caught error:", error);
       runtimeLog("phone-discovery-error", {
@@ -8249,8 +8197,8 @@ app.whenReady().then(async () => {
   reportStartup("Ready", true);
   kickMagicBackground(90000);
   console.log("[STARTUP] All managers initialized");
-  phoneDiscoveryTimer = setInterval(() => void discoverAndBackupPhones(), 5000);
-  void discoverAndBackupPhones();
+  phoneDiscoveryTimer = setInterval(() => void discoverPhones(), 5000);
+  void discoverPhones();
   schedulePeriodicCleanup();
   setTimeout(() => void cleanupOldCaches().catch(() => undefined), 60000);
 
@@ -9469,6 +9417,39 @@ ipcMain.handle("cancel-source-clone", (_event, operationId: unknown) => {
   return true;
 });
 
+ipcMain.handle("get-filter-inventory", async (event, requestId: unknown) => {
+  if (typeof requestId !== "number" || !Number.isSafeInteger(requestId))
+    throw new Error("Invalid filter inventory request.");
+  let errors = 0;
+  const files = filterForContentSafety(
+    await readAllSources(true, (fileDeltas, scanned, total, _audioFound, scanErrors) => {
+      errors = scanErrors;
+      if (!event.sender.isDestroyed())
+        event.sender.send("filter-inventory-progress", {
+          requestId,
+          scanned,
+          total,
+          errors,
+          found: fileDeltas.length,
+          done: false,
+        });
+    }),
+  );
+  if (!event.sender.isDestroyed())
+    event.sender.send("filter-inventory-progress", {
+      requestId,
+      scanned: files.length,
+      total: files.length,
+      errors,
+      found: 0,
+      done: true,
+    });
+  return {
+    inventory: inventoryTransfers.create(files, event.sender.id),
+    errors,
+  };
+});
+
 ipcMain.handle(
   "get-files",
   async (
@@ -9868,6 +9849,51 @@ ipcMain.handle(
     };
   },
 );
+
+const mediaPopoutEntries = new Map<number, { filePath: string; startTime: number }>();
+
+ipcMain.handle(
+  "open-media-popout",
+  async (_event, filePath: string, startTime = 0) => {
+    if (typeof filePath !== "string" || !filePath.trim() || filePath.length > 4096)
+      return { ok: false, error: "Choose a valid media file." };
+    const mediaType = mime.getType(filePath);
+    if (!mediaType?.startsWith("audio/") && !mediaType?.startsWith("video/"))
+      return { ok: false, error: "Only audio and video files can open in the pop-out player." };
+    const token = randomBytes(24).toString("hex");
+    const popup = new BrowserWindow({
+      width: mediaType.startsWith("video/") ? 1120 : 760,
+      height: mediaType.startsWith("video/") ? 720 : 360,
+      minWidth: 420,
+      minHeight: 240,
+      title: `Silo · ${path.basename(filePath)}`,
+      backgroundColor: "#080809",
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        preload: getPreloadPath(),
+        sandbox: true,
+        autoplayPolicy: "no-user-gesture-required",
+      },
+    });
+    mediaPopoutEntries.set(popup.webContents.id, {
+      filePath,
+      startTime: Number.isFinite(startTime) ? Math.max(0, startTime) : 0,
+    });
+    popup.on("closed", () => mediaPopoutEntries.delete(popup.webContents.id));
+    const popoutPath = path.join(
+      app.getAppPath(),
+      isDev ? "public/media-popout.html" : "build/media-popout.html",
+    );
+    await popup.loadFile(popoutPath, { query: { token } });
+    popup.show();
+    return { ok: true };
+  },
+);
+
+ipcMain.handle("get-popout-media", (event) => {
+  return mediaPopoutEntries.get(event.sender.id) ?? null;
+});
 
 ipcMain.handle("get-file-preview", async (_event, filePath: string) => {
   try {
@@ -10897,6 +10923,26 @@ ipcMain.handle(
   },
 );
 ipcMain.handle(
+  "create-media-playlist",
+  async (_event, name: string, kind: "audio" | "video") =>
+    stateStore.createMediaPlaylist(name, kind),
+);
+ipcMain.handle(
+  "add-media-playlist-files",
+  async (_event, playlistId: string, filePaths: string[]) =>
+    stateStore.addMediaPlaylistFiles(playlistId, filePaths),
+);
+ipcMain.handle(
+  "remove-media-playlist-file",
+  async (_event, playlistId: string, filePath: string) =>
+    stateStore.removeMediaPlaylistFile(playlistId, filePath),
+);
+ipcMain.handle(
+  "delete-media-playlist",
+  async (_event, playlistId: string) => stateStore.deleteMediaPlaylist(playlistId),
+);
+
+ipcMain.handle(
   "update-file-metadata",
   async (
     _event,
@@ -10906,6 +10952,8 @@ ipcMain.handle(
       keywords?: string[];
       mergeKeywords?: boolean;
       year?: number | null;
+      people?: string[];
+      places?: string[];
     },
   ) => stateStore.updateFileMetadata(filePaths, update),
 );
@@ -13342,7 +13390,7 @@ ipcMain.handle("list-phones", async () => {
   console.log("[IPC] list-phones handler called");
   try {
     // Set a timeout for device discovery to prevent UI from hanging
-    const discoveryPromise = discoverAndBackupPhones();
+    const discoveryPromise = discoverPhones();
     const timeoutPromise = new Promise<void>((_resolve, reject) => {
       setTimeout(
         () => reject(new Error("Phone discovery timed out after 30 seconds")),
@@ -13372,14 +13420,6 @@ ipcMain.handle(
     invalidateSourceList();
     sendToRenderer("phone-devices-changed", scannedPhoneDevices);
     if (connected.status === "ready" && connected.rootPath) {
-      void phoneManager
-        .backupDevice(connected)
-        .catch((error) =>
-          runtimeLog("phone-backup-failed", {
-            platform: connected.platform,
-            message: error instanceof Error ? error.message : String(error),
-          }),
-        );
       void indexNewSources([connected.rootPath], "phone-connected");
     }
     return connected;

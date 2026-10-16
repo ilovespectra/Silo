@@ -97,6 +97,7 @@ import { PhoneManagementPanel } from "./components/PhoneManagerPanel";
 import GoogleReclaimDialog from "./components/GoogleReclaimDialog";
 import { GOOGLE_FEATURES_ENABLED } from "./featureFlags";
 import AudioLibrary from "./components/AudioLibrary";
+import VideoTheatre from "./components/VideoTheatre";
 import IndexingPanel from "./components/IndexingPanel";
 import LocationPicker from "./components/LocationPicker";
 import DuplicatesPage from "./components/DuplicatesPage";
@@ -782,6 +783,10 @@ function App() {
   const lastThumbnailPregenStatusRef =
     useRef<ThumbnailPregenProgress["status"]>("idle");
   const [digitalFolders, setDigitalFolders] = useState<DigitalFolder[]>([]);
+  const [mediaPlaylists, setMediaPlaylists] = useState<MediaPlaylist[]>([]);
+  const [mediaHostBounds, setMediaHostBounds] = useState<{
+    top: number; left: number; width: number; height: number;
+  } | null>(null);
   const draggedFolder = useRef<string | null>(null);
   const [folderDropTarget, setFolderDropTarget] = useState<{
     id: string;
@@ -1273,6 +1278,7 @@ function App() {
     sizeMax: Infinity,
   });
   const audioOnlySelected = filters.includedType === "audio";
+  const videoOnlySelected = filters.includedType === "video";
   const [magicState, setMagicState] = useState<MagicState>(emptyMagicState);
   const magicPrefs = useMagicPreferences();
   const [sort, setSort] = useState<SortState>({
@@ -1290,6 +1296,19 @@ function App() {
     revision: number;
   } | null>(null);
   const [sortIndicatorError, setSortIndicatorError] = useState("");
+  const [filterInventory, setFilterInventory] = useState<{
+    sourceKey: string;
+    files: FileInfo[];
+    errors: number;
+  } | null>(null);
+  const [filterInventoryProgress, setFilterInventoryProgress] =
+    useState<FilterInventoryProgress | null>(null);
+  const [filterInventoryError, setFilterInventoryError] = useState("");
+  const [metadataIndicatorProgress, setMetadataIndicatorProgress] = useState<{
+    processed: number;
+    total: number;
+  } | null>(null);
+  const filterInventoryRequestRef = useRef(0);
   const [peopleFilter, setPeopleFilter] = useState<MetadataFilter>("all");
   const [locationFilter, setLocationFilter] = useState<MetadataFilter>("all");
   const needsPhotoMetadata =
@@ -1314,6 +1333,27 @@ function App() {
   const searchRequestRef = useRef(0);
   const fileGridRef = useRef<HTMLDivElement | null>(null);
   const fileBrowserRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (appSection !== "files" || (!audioOnlySelected && !videoOnlySelected)) return;
+    const browser = fileBrowserRef.current;
+    if (!browser) return;
+    const measure = () => {
+      const rect = browser.getBoundingClientRect();
+      setMediaHostBounds((current) => {
+        const next = { top: rect.top, left: rect.left, width: rect.width, height: rect.height };
+        return current && current.top === next.top && current.left === next.left &&
+          current.width === next.width && current.height === next.height ? current : next;
+      });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(browser);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [appSection, audioOnlySelected, videoOnlySelected, sidebarWidth]);
   const sidebarDragRef = useRef<{ startX: number; startWidth: number } | null>(
     null,
   );
@@ -1801,6 +1841,7 @@ function App() {
   const applyPersistedState = useCallback((state: PersistedAppState) => {
     setShowHiddenMessages(state.ui.showHiddenMessages ?? false);
     setDigitalFolders(state.digitalFolders);
+    setMediaPlaylists(state.mediaPlaylists ?? []);
     const hiddenPaths = new Set<string>();
     state.digitalFolders
       .filter((folder) => folder.hidden)
@@ -1829,6 +1870,33 @@ function App() {
     );
     if (state.indexProgress) setIndexProgress(state.indexProgress);
   }, []);
+
+  const createMediaPlaylist = useCallback(async (name: string, kind: "audio" | "video") => {
+    if (!electronAPI) return null;
+    try {
+      const state = await electronAPI.createMediaPlaylist(name, kind);
+      applyPersistedState(state);
+      return state.mediaPlaylists.at(-1)?.id ?? null;
+    } catch (cause) {
+      setSearchError(cause instanceof Error ? cause.message : "Could not create playlist.");
+      return null;
+    }
+  }, [applyPersistedState, electronAPI]);
+  const addToMediaPlaylist = useCallback(async (playlistId: string, filePath: string) => {
+    if (!electronAPI) return;
+    try { applyPersistedState(await electronAPI.addMediaPlaylistFiles(playlistId, [filePath])); }
+    catch (cause) { setSearchError(cause instanceof Error ? cause.message : "Could not update playlist."); }
+  }, [applyPersistedState, electronAPI]);
+  const removeFromMediaPlaylist = useCallback(async (playlistId: string, filePath: string) => {
+    if (!electronAPI) return;
+    try { applyPersistedState(await electronAPI.removeMediaPlaylistFile(playlistId, filePath)); }
+    catch (cause) { setSearchError(cause instanceof Error ? cause.message : "Could not update playlist."); }
+  }, [applyPersistedState, electronAPI]);
+  const deleteMediaPlaylist = useCallback(async (playlistId: string) => {
+    if (!electronAPI) return;
+    try { applyPersistedState(await electronAPI.deleteMediaPlaylist(playlistId)); }
+    catch (cause) { setSearchError(cause instanceof Error ? cause.message : "Could not delete playlist."); }
+  }, [applyPersistedState, electronAPI]);
 
   const updateHiddenMessageVisibility = useCallback(
     async (show: boolean) => {
@@ -2511,6 +2579,16 @@ function App() {
         );
         setPhoneNotice(connected.message);
         if (connected.status === "ready" && connected.rootPath) {
+          setPhoneNotice(`Backing up ${connected.name}…`);
+          const progress = await electronAPI.renewPhoneBackup(
+            connected.id,
+            connected.platform,
+          );
+          setPhoneNotice(
+            progress.status === "error"
+              ? progress.message
+              : `${connected.name}’s browseable backup is up to date.`,
+          );
           await browsePhone(connected);
         }
       } finally {
@@ -3924,6 +4002,30 @@ function App() {
     openDialog,
   ]);
 
+  const editVideoMetadata = useCallback((filePath: string, field: "keywords" | "people" | "places") => {
+    const metadata = fileMetadata[filePath];
+    const labels = { keywords: "keywords", people: "people", places: "places" };
+    const current = metadata?.[field] ?? [];
+    openDialog({
+      mode: "text",
+      title: `Edit video ${labels[field]}`,
+      message: `Separate ${labels[field]} with commas. These labels are stored in Silo and do not change the source file.`,
+      initialValue: current.join(", "),
+      confirmLabel: "Save labels",
+      onConfirm: async (value) => {
+        if (!electronAPI) return;
+        try {
+          applyPersistedState(await electronAPI.updateFileMetadata([filePath], {
+            [field]: value.split(",").map((item) => item.trim()).filter(Boolean),
+          }));
+          setSortIndicatorRevision((revision) => revision + 1);
+        } catch (cause) {
+          throw cause instanceof Error ? cause : new Error("Could not save video labels.");
+        }
+      },
+    });
+  }, [applyPersistedState, electronAPI, fileMetadata, openDialog]);
+
   const editYear = useCallback(
     (paths: string[] = metadataTargets) => {
       if (!electronAPI || paths.length === 0) return;
@@ -4855,15 +4957,116 @@ function App() {
     };
   }, [electronAPI]);
 
+  const filterInventoryNeeded =
+    appSection === "files" &&
+    !audioOnlySelected &&
+    !activeDigitalFolderId &&
+    !searchQuery.trim() &&
+    (peopleFilter !== "all" || locationFilter !== "all");
+  const useFullFilterInventoryForResults = filterInventoryNeeded;
+  const filterInventoryFiles = useMemo(() => {
+    if (filterInventory?.sourceKey !== enabledSourcePathsKey) return null;
+    return filterInventory.files.filter(
+      (file) =>
+        !file.isDirectory &&
+        pathIsVisibleForSelectedSources(
+          file.path,
+          enabledSourcePaths,
+          allSourcePaths,
+        ) &&
+        (!currentPath ||
+          currentPath === allSourcesPath ||
+          pathIsWithinSourceRoot(file.path, currentPath)),
+    );
+  }, [
+    allSourcePaths,
+    allSourcesPath,
+    currentPath,
+    enabledSourcePaths,
+    enabledSourcePathsKey,
+    filterInventory,
+  ]);
+  const metadataFiles = filterInventoryNeeded
+    ? filterInventoryFiles ?? []
+    : contentFiles;
+
+  useEffect(() => {
+    if (!electronAPI || !filterInventoryNeeded) {
+      setFilterInventoryProgress(null);
+      return;
+    }
+    if (filterInventory?.sourceKey === enabledSourcePathsKey) return;
+
+    let cancelled = false;
+    const requestId = ++filterInventoryRequestRef.current;
+    setFilterInventoryError("");
+    setFilterInventoryProgress({
+      requestId,
+      scanned: 0,
+      total: 0,
+      errors: 0,
+      found: 0,
+      done: false,
+    });
+    const removeProgress = electronAPI.onFilterInventoryProgress((progress) => {
+      if (!cancelled && progress.requestId === requestId)
+        setFilterInventoryProgress(progress);
+    });
+    void (async () => {
+      try {
+        const result = await electronAPI.getFilterInventory(requestId);
+        const inventory = await readInventory<FileInfo>(
+          electronAPI,
+          result.inventory,
+        );
+        if (cancelled) return;
+        setFilterInventory({
+          sourceKey: enabledSourcePathsKey,
+          files: inventory,
+          errors: result.errors,
+        });
+        setFilterInventoryError(
+          result.errors
+            ? `${result.errors} enabled source${result.errors === 1 ? "" : "s"} could not be fully scanned. Filter results may be incomplete.`
+            : "",
+        );
+        setFilterInventoryProgress(null);
+      } catch (cause) {
+        if (!cancelled) {
+          setFilterInventoryError(
+            cause instanceof Error
+              ? cause.message
+              : "Could not scan selected sources for filter options.",
+          );
+          setFilterInventoryProgress(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      removeProgress();
+    };
+  }, [
+    activeDigitalFolderId,
+    appSection,
+    audioOnlySelected,
+    electronAPI,
+    enabledSourcePathsKey,
+    filterInventory?.sourceKey,
+    searchQuery,
+    filterInventoryNeeded,
+  ]);
+
   useEffect(() => {
     if (!electronAPI || !needsPhotoMetadata) {
+      setMetadataIndicatorProgress(null);
       return;
     }
     let cancelled = false;
     let running = false;
     let loadedRevision = -1;
     setSortIndicatorError("");
-    const mediaPaths = contentFiles
+    const mediaPaths = metadataFiles
       .filter(
         (file) =>
           !file.isDirectory && (file.type === "image" || file.type === "video"),
@@ -4878,6 +5081,9 @@ function App() {
         return;
       running = true;
       const revision = metadataRevisionRef.current;
+      setMetadataIndicatorProgress(
+        mediaPaths.length ? { processed: 0, total: mediaPaths.length } : null,
+      );
       try {
         const next: Record<string, { people: boolean; mapped: boolean }> = {};
         const snapshot: Record<
@@ -4904,6 +5110,10 @@ function App() {
           }
           publishPhotoIndicators(snapshot);
           for (const filePath of batch) delete snapshot[filePath];
+          setMetadataIndicatorProgress({
+            processed: Math.min(offset + batch.length, mediaPaths.length),
+            total: mediaPaths.length,
+          });
           await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         }
         if (cancelled) return;
@@ -4920,15 +5130,18 @@ function App() {
         });
         loadedRevision = revision;
         setSortIndicatorError("");
-        setSortIndicatorSnapshot({ files: contentFiles, revision });
+        setSortIndicatorSnapshot({ files: metadataFiles, revision });
+        setMetadataIndicatorProgress(null);
       } catch (cause) {
         loadedRevision = revision;
-        if (!cancelled)
+        if (!cancelled) {
           setSortIndicatorError(
             cause instanceof Error
               ? cause.message
               : "Could not load sorting metadata.",
           );
+          setMetadataIndicatorProgress(null);
+        }
       } finally {
         running = false;
       }
@@ -4940,11 +5153,13 @@ function App() {
       window.clearTimeout(timer);
       window.clearInterval(refreshTimer);
     };
-  }, [contentFiles, electronAPI, needsPhotoMetadata]);
+  }, [metadataFiles, electronAPI, needsPhotoMetadata]);
 
   const waitingForSortIndicators =
     needsPhotoMetadata &&
-    (sortIndicatorSnapshot?.files !== contentFiles ||
+    ((filterInventoryNeeded &&
+      filterInventory?.sourceKey !== enabledSourcePathsKey) ||
+      sortIndicatorSnapshot?.files !== metadataFiles ||
       sortIndicatorSnapshot?.revision !== sortIndicatorRevision);
   const showMetadataBusy = useStableBusy(waitingForSortIndicators);
 
@@ -4971,7 +5186,10 @@ function App() {
     exploded &&
     !searchQuery.trim();
   const filteredAndSortedFiles = useMemo(() => {
-    const filtered = contentFiles.filter((file) => {
+    const filterSourceFiles = useFullFilterInventoryForResults
+      ? filterInventoryFiles ?? []
+      : contentFiles;
+    const filtered = filterSourceFiles.filter((file) => {
       if (!pathIsVisibleForSelectedSources(file.path, enabledSourcePaths, allSourcePaths)) return false;
       if (file.isDirectory)
         return !exploded && peopleFilter === "all" && locationFilter === "all";
@@ -5051,6 +5269,8 @@ function App() {
     contentFiles,
     currentPath,
     deferBrowseSort,
+    filterInventoryFiles,
+    useFullFilterInventoryForResults,
     enabledSourcePaths,
     allSourcePaths,
     exploded,
@@ -5091,7 +5311,11 @@ function App() {
       if (!showFilters) return [];
       return Array.from(
         new Set([
-          ...contentFiles.filter((file) => !file.isDirectory).map(modifiedYear),
+          ...(filterInventoryNeeded && filterInventoryFiles
+            ? filterInventoryFiles
+            : contentFiles)
+            .filter((file) => !file.isDirectory)
+            .map(modifiedYear),
           ...(audioOnlySelected ? audioYearOptions : []),
         ]),
       ).sort((first, second) => {
@@ -5105,6 +5329,8 @@ function App() {
       audioOnlySelected,
       audioYearOptions,
       contentFiles,
+      filterInventoryFiles,
+      filterInventoryNeeded,
       showFilters,
       sort.ascending,
       sort.field,
@@ -6518,6 +6744,16 @@ function App() {
               )}
             </div>
           </div>
+          {filterInventoryProgress && (
+            <div className="filter-inventory-status" role="status" aria-live="polite">
+              Scanning selected source trees · {filterInventoryProgress.scanned.toLocaleString()} files found
+            </div>
+          )}
+          {filterInventoryError && (
+            <div className="filter-inventory-status error" role="status">
+              {filterInventoryError}
+            </div>
+          )}
           <div className="filter-section">
             <h3>Year</h3>
             <select
@@ -6544,8 +6780,8 @@ function App() {
               }
             >
               <option value="all">Both</option>
-              <option value="yes">With people</option>
-              <option value="no">Without people</option>
+              <option value="yes">Photos with People</option>
+              <option value="no">Photos without People</option>
             </select>
           </div>}
           {!audioOnlySelected && <div className="filter-section">
@@ -7487,8 +7723,10 @@ function App() {
         <main className="mobile-page" data-retained-scroll="mobile" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
           <section className="mobile-messages-section" aria-label="Mobile manager">
         <MessageExportPanel
+            phoneDevices={phoneDevices}
+            connectedPhone={connectedPhone}
             showHiddenMessages={showHiddenMessages}
-            onScanPhones={() => void scanForPhones()}
+            onScanPhones={scanForPhones}
             scanningPhones={phoneScanning}
             devicePanel={
                 <PhoneManagementPanel
@@ -8059,7 +8297,7 @@ function App() {
             }}
           />
           <div
-            className={`file-browser ${audioOnlySelected ? "audio-only" : ""}`}
+            className={`file-browser ${audioOnlySelected ? "audio-only" : ""} ${videoOnlySelected ? "video-only" : ""}`}
             data-retained-scroll="files"
             ref={fileBrowserRef}
           >
@@ -8080,18 +8318,6 @@ function App() {
                   <FiRefreshCw /> Retry
                 </button>
               </div>
-            )}
-            {audioOnlySelected && (
-              <AudioLibrary
-                electronAPI={electronAPI}
-                visible={appSection === "files" && audioOnlySelected}
-                exploded={exploded}
-                yearFilter={yearFilter}
-                sort={audioSort}
-                favoritePaths={favoritePaths}
-                onAudioYearsChange={setAudioYearOptions}
-                onToggleFavorite={(filePath) => void toggleFavorite(filePath)}
-              />
             )}
             <div className="browser-view-options">
               <span>
@@ -8139,7 +8365,14 @@ function App() {
                         : "hidden",
                   }}
                 >
-                  {sortIndicatorError || "Updating people and location sort…"}
+                  {filterInventoryError ||
+                    sortIndicatorError ||
+                    (filterInventoryNeeded &&
+                    filterInventory?.sourceKey !== enabledSourcePathsKey
+                      ? `Scanning selected source trees · ${(filterInventoryProgress?.scanned ?? 0).toLocaleString()} files found`
+                      : metadataIndicatorProgress
+                        ? `Checking people and locations · ${metadataIndicatorProgress.processed.toLocaleString()} of ${metadataIndicatorProgress.total.toLocaleString()} photos`
+                        : "Updating people and location sort…")}
                 </div>
               </div>
             )}
@@ -9050,6 +9283,48 @@ function App() {
           }
         />
       )}
+
+      <div
+        className="media-library-host"
+        aria-hidden={appSection !== "files" || (!audioOnlySelected && !videoOnlySelected)}
+        style={{
+          top: mediaHostBounds?.top ?? 0,
+          left: mediaHostBounds?.left ?? 0,
+          width: mediaHostBounds?.width ?? 0,
+          height: mediaHostBounds?.height ?? 0,
+          visibility: appSection === "files" && (audioOnlySelected || videoOnlySelected) && mediaHostBounds ? "visible" : "hidden",
+        }}
+      >
+        {electronAPI && <AudioLibrary
+          electronAPI={electronAPI}
+          visible={appSection === "files" && audioOnlySelected}
+          exploded={exploded}
+          yearFilter={yearFilter}
+          sort={audioSort}
+          favoritePaths={favoritePaths}
+          playlists={mediaPlaylists}
+          onAudioYearsChange={setAudioYearOptions}
+          onToggleFavorite={(filePath) => void toggleFavorite(filePath)}
+          onCreatePlaylist={createMediaPlaylist}
+          onAddToPlaylist={addToMediaPlaylist}
+          onRemoveFromPlaylist={removeFromMediaPlaylist}
+          onDeletePlaylist={deleteMediaPlaylist}
+        />}
+        {electronAPI && <VideoTheatre
+          electronAPI={electronAPI}
+          visible={appSection === "files" && videoOnlySelected}
+          files={filteredAndSortedFiles.filter((file) => !file.isDirectory && file.type === "video")}
+          playlists={mediaPlaylists}
+          favoritePaths={favoritePaths}
+          fileMetadata={fileMetadata}
+          onToggleFavorite={(filePath) => void toggleFavorite(filePath)}
+          onCreatePlaylist={createMediaPlaylist}
+          onAddToPlaylist={addToMediaPlaylist}
+          onRemoveFromPlaylist={removeFromMediaPlaylist}
+          onDeletePlaylist={deleteMediaPlaylist}
+          onEditMetadata={editVideoMetadata}
+        />}
+      </div>
 
       {viewerOpen && selectedFile && (
         <div

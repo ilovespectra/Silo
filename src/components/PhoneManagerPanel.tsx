@@ -14,7 +14,7 @@ interface PhoneManagerPanelProps {
   onResetBackupDestination: () => void;
 }
 
-/** A device is busy for a manual action or while an automatic backup is scanning/copying. */
+/** A device is busy during a confirmed backup scan, check, or copy. */
 export function isPhoneDeviceBackingUp(
   device: Pick<PhoneDevice, "id" | "platform">,
   busyDeviceId: string | null,
@@ -22,7 +22,11 @@ export function isPhoneDeviceBackingUp(
 ): boolean {
   if (busyDeviceId === device.id) return true;
   const status = backups[`${device.platform}:${device.id}`]?.status;
-  return status === "scanning" || status === "backing-up";
+  return (
+    status === "scanning" ||
+    status === "checking" ||
+    status === "backing-up"
+  );
 }
 
 interface PhoneManagementPanelProps {
@@ -59,6 +63,7 @@ interface PhoneDeviceCardProps {
   active: boolean;
   busyDeviceId: string | null;
   backingUp: boolean;
+  backupStatus?: PhoneBackupProgress["status"];
   restoreArchives: PhoneRestoreArchive[];
   tooling: PhoneTooling | null;
   onBrowse: (device: PhoneDevice) => void;
@@ -82,6 +87,7 @@ function PhoneDeviceCard({
   active,
   busyDeviceId,
   backingUp,
+  backupStatus,
   restoreArchives,
   tooling,
   onBrowse,
@@ -100,6 +106,14 @@ function PhoneDeviceCard({
   const [restoreNotice, setRestoreNotice] = useState("");
   const [showArchives, setShowArchives] = useState(false);
   const busy = busyDeviceId === device.id || backingUp;
+  const activityLabel =
+    backupStatus === "scanning"
+      ? "Scanning…"
+      : backupStatus === "checking"
+        ? "Checking…"
+        : busyDeviceId === device.id && !backingUp
+          ? "Starting…"
+          : "Backing up…";
   const createRestoreArchive = async () => {
     if (backupPassword.length < 8 || backupPassword !== confirmPassword) {
       setRestoreNotice("Enter a matching password with at least 8 characters.");
@@ -152,10 +166,14 @@ function PhoneDeviceCard({
               className="phone-renew-backup-button"
               onClick={() => onRenewBackup(device)}
               disabled={busy}
-              title={busy ? "Backing up…" : "Start a fresh browseable backup of this phone."}
+              title={
+                busy
+                  ? activityLabel
+                  : "Start a fresh browseable backup of this phone."
+              }
               data-help="Copy this connected phone’s photos, messages, and readable files into a dated browseable snapshot in Silo. This does not change files on the phone."
             >
-              {busy ? "Backing up…" : "Back up now"}
+              {busy ? activityLabel : "Back up now"}
             </button>
             <button
               className="phone-icon-button"
@@ -172,8 +190,8 @@ function PhoneDeviceCard({
             className="phone-renew-backup-button"
             onClick={() => onConnect(device)}
             disabled={busy}
-            title="Connect and save a dated snapshot in Silo"
-            data-help="Connecting starts or updates a dated local snapshot of accessible files. It does not change files on the device."
+            title="Connect, then back up after you confirm"
+            data-help="Silo scans only to find devices. This confirmation starts a dated local snapshot; the scan itself does not copy phone files."
           >
             <FiLink /> {busy ? "Connecting…" : "Connect"}
           </button>
@@ -310,10 +328,7 @@ function PhoneBackupStatus({
     : backup.totalFiles
       ? Math.min(100, (backup.completedFiles / backup.totalFiles) * 100)
       : 0;
-  const indeterminate =
-    (backup.status === "scanning" || backup.status === "backing-up") &&
-    backup.totalFiles === 0 &&
-    backup.totalBytes === 0;
+  const indeterminate = backup.status === "scanning";
 
   return (
     <div className={`phone-backup-progress ${backup.status}`} role="group" aria-label={`${device.name} backup status`} aria-live="polite">
@@ -323,10 +338,12 @@ function PhoneBackupStatus({
         </span>
         <strong>
           {indeterminate
-            ? "Working…"
-            : backup.status === "complete"
-            ? "100%"
-            : `${Math.round(backupPercent)}%`}
+            ? "Scanning…"
+            : backup.status === "checking"
+              ? "Checking…"
+              : backup.status === "complete"
+                ? "100%"
+                : `${Math.round(backupPercent)}%`}
         </strong>
       </div>
       <progress
@@ -335,9 +352,9 @@ function PhoneBackupStatus({
         aria-label={`${device.name} phone backup progress`}
       />
       <small>
-        {backup.completedFiles.toLocaleString()} / {backup.totalFiles.toLocaleString()} files
-        {backup.totalBytes > 0 &&
-          ` · ${formatFileSize(backup.completedBytes)} / ${formatFileSize(backup.totalBytes)}`}
+        {backup.status === "scanning"
+          ? `${backup.totalFiles.toLocaleString()} files found · ${formatFileSize(backup.totalBytes)} scanned`
+          : `${backup.completedFiles.toLocaleString()} / ${backup.totalFiles.toLocaleString()} files${backup.totalBytes > 0 ? ` · ${formatFileSize(backup.completedBytes)} / ${formatFileSize(backup.totalBytes)}` : ""}`}
         {backup.failedFiles > 0 &&
           ` · ${backup.failedFiles.toLocaleString()} skipped`}
         {backup.lastBackupAt &&
@@ -624,6 +641,7 @@ export function PhoneManagementPanel({
                 active={activeDeviceKey === `${device.platform}:${device.id}`}
                 busyDeviceId={busyDeviceId}
                 backingUp={isPhoneDeviceBackingUp(device, busyDeviceId, backups)}
+                backupStatus={backups[`${device.platform}:${device.id}`]?.status}
                 restoreArchives={restoreArchives}
                 tooling={tooling}
                 onBrowse={onBrowse}
@@ -655,7 +673,7 @@ export function PhoneManagementPanel({
       ) : (
         <div className="phone-device-empty">
           <FiSmartphone aria-hidden="true" />
-          <span>Plug in a phone or tablet. It is backed up automatically when it connects.</span>
+          <span>Plug in a phone or tablet, then scan for devices. Scanning only finds devices; choose Back up now to save a snapshot.</span>
         </div>
       )}
       {backupRequest && (

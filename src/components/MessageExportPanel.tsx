@@ -229,12 +229,21 @@ function messagePreferenceKey(
 
 export const MessageExportPanel: React.FC<{
   devicePanel?: React.ReactNode;
+  phoneDevices: PhoneDevice[];
+  connectedPhone: PhoneDevice | null;
   onScanPhones: () => void;
   scanningPhones: boolean;
   showHiddenMessages: boolean;
-}> = ({ devicePanel, onScanPhones, scanningPhones, showHiddenMessages }) => {
+}> = ({
+  devicePanel,
+  phoneDevices,
+  connectedPhone,
+  onScanPhones,
+  scanningPhones,
+  showHiddenMessages,
+}) => {
   const electronAPI = window.electron;
-  const [devices, setDevices] = useState<PhoneDevice[]>([]);
+  const devices = phoneDevices;
   const [historyEntries, setHistoryEntries] = useState<MessageHistoryEntry[]>(
     [],
   );
@@ -419,50 +428,22 @@ export const MessageExportPanel: React.FC<{
   ]);
 
   React.useEffect(() => {
-    // Load the persistent phone backup destination when component mounts
+    // Scan through the parent so the Messages pane and phone controls share one device state.
     if (!electronAPI) return;
-    void electronAPI
-      .scanPhones()
-      .then(setDevices)
-      .catch(() => undefined);
+    onScanPhones();
     void electronAPI.getPhoneBackupDestination().then((dest) => {
       console.log(`[MessageExportPanel] Loaded backup destination: ${dest}`);
       if (dest) setOutputDir(dest);
     });
-    return electronAPI.onPhoneDevicesChanged(setDevices);
-  }, [electronAPI]);
+  }, [electronAPI, onScanPhones]);
 
   React.useEffect(() => {
     if (!electronAPI) return;
     let active = true;
     void electronAPI
       .listMessageHistory()
-      .then(async (entries) => {
-        if (!active) return;
-        setHistoryEntries(entries);
-        if (entries.length === 0) return;
-        const entry = entries[0];
-        const key = `${entry.platform}:${entry.deviceId}`;
-        setSelectedDeviceKey(key);
-        setLoadingMessages(true);
-        try {
-          const result = await electronAPI.getMessageThreads(
-            entry.deviceId,
-            entry.platform,
-            false,
-          );
-          if (!active) return;
-          if (result.ok) {
-            setThreads(result.threads);
-            setSelectedThreadId(result.threads[0]?.threadId ?? "");
-            setNotice(
-              `${result.threads.length.toLocaleString()} saved conversations · ${entry.deviceName}`,
-            );
-          } else
-            setError(result.error || "Could not load saved message history.");
-        } finally {
-          if (active) setLoadingMessages(false);
-        }
+      .then((entries) => {
+        if (active) setHistoryEntries(entries);
       })
       .catch((cause) => {
         if (active)
@@ -479,6 +460,7 @@ export const MessageExportPanel: React.FC<{
 
   const loadMessagesRef = React.useRef<(refresh?: boolean, identity?: typeof selectedIdentity) => Promise<void>>();
   const selectedKeyRef = React.useRef(selectedDeviceKey);
+  const manuallySelectedDeviceRef = React.useRef(false);
   selectedKeyRef.current = selectedDeviceKey;
 
   React.useEffect(() => {
@@ -501,13 +483,37 @@ export const MessageExportPanel: React.FC<{
     });
   }, [electronAPI]);
 
+  React.useEffect(() => {
+    if (manuallySelectedDeviceRef.current) return;
+    const device =
+      (connectedPhone?.status === "ready" ? connectedPhone : null) ??
+      devices.find((candidate) => candidate.platform === "ios" && candidate.status === "ready") ??
+      devices.find((candidate) => candidate.status === "ready");
+    const history = historyEntries[0];
+    const identity = device
+      ? { deviceId: device.id, platform: device.platform, deviceName: device.name }
+      : selectedDeviceKey
+        ? null
+        : history;
+    if (!identity) return;
+    const key = `${identity.platform}:${identity.deviceId}`;
+    if (selectedDeviceKey === key) return;
+    setSelectedDeviceKey(key);
+    void loadMessagesRef.current?.(false, identity);
+  }, [connectedPhone, devices, historyEntries, selectedDeviceKey]);
+
   const loadMessages = async (refresh = false, identity = selectedIdentity) => {
     if (!electronAPI || !identity) return;
-    const connected = devices.find(
-      (device) =>
-        device.platform === identity.platform &&
-        device.id === identity.deviceId,
-    );
+    const connected =
+      (connectedPhone?.platform === identity.platform &&
+      connectedPhone.id === identity.deviceId
+        ? connectedPhone
+        : null) ??
+      devices.find(
+        (device) =>
+          device.platform === identity.platform &&
+          device.id === identity.deviceId,
+      );
     if (refresh && (!connected || connected.status !== "ready")) {
       setError("Connect and trust this phone to update its message backup.");
       return;
@@ -655,6 +661,7 @@ export const MessageExportPanel: React.FC<{
             aria-label="Phone message history"
             value={selectedDeviceKey}
             onChange={(event) => {
+              manuallySelectedDeviceRef.current = true;
               setSelectedDeviceKey(event.target.value);
               setThreads([]);
               setSelectedThreadId("");
@@ -756,7 +763,7 @@ export const MessageExportPanel: React.FC<{
         >
           {phoneMessageBackup?.included
             ? `Messages database included in phone snapshot · ${(phoneMessageBackup.size! / (1024 * 1024)).toFixed(1)} MB · Files: Messages/sms.db`
-            : "Messages database will appear in Files after a successful phone backup."}
+            : "Messages are not in this phone snapshot yet. Choose Update Messages from phone to create the backup."}
         </div>
       )}
 
@@ -881,15 +888,19 @@ export const MessageExportPanel: React.FC<{
                 </div>
               );
             })}
-            {!loadingMessages && filteredThreads.length === 0 && (
+            {filteredThreads.length === 0 && (
               <div className="messages-empty">
                 <FiMessageSquare />
                 <span>
-                  {historyEntries.length
-                    ? "Load saved message history."
-                    : devices.length
-                      ? "Load a phone to view conversations."
-                      : "Connect a phone to create message history."}
+                  {loadingMessages
+                    ? "Loading conversations…"
+                    : selectedIdentity
+                      ? "No conversations loaded. Update Messages from phone to create or refresh the backup."
+                      : historyEntries.length
+                        ? "Choose a saved message history."
+                        : devices.length
+                          ? "Select a phone to load message history."
+                          : "Connect a phone to create message history."}
                 </span>
               </div>
             )}

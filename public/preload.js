@@ -81,6 +81,14 @@ contextBridge.exposeInMainWorld("electron", {
   releaseInventory: (token) => ipcRenderer.invoke("release-inventory", token),
   getFiles: (dirPath, exploded, requestId, scanOptions) =>
     ipcRenderer.invoke("get-files", dirPath, exploded, requestId, scanOptions),
+  getFilterInventory: (requestId) =>
+    ipcRenderer.invoke("get-filter-inventory", requestId),
+  onFilterInventoryProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("filter-inventory-progress", listener);
+    return () =>
+      ipcRenderer.removeListener("filter-inventory-progress", listener);
+  },
   getAudioLibraryCache: () => ipcRenderer.invoke("get-audio-library-cache"),
   refreshAudioLibraryCache: (requestId, force) =>
     ipcRenderer.invoke(
@@ -120,6 +128,9 @@ contextBridge.exposeInMainWorld("electron", {
   },
   getFilePreview: (filePath) =>
     ipcRenderer.invoke("get-file-preview", filePath),
+  openMediaPopout: (filePath, startTime) =>
+    ipcRenderer.invoke("open-media-popout", filePath, startTime),
+  getPopoutMedia: () => ipcRenderer.invoke("get-popout-media"),
   getThumbnail: (filePath, urgent, force, size) =>
     ipcRenderer.invoke(
       "get-thumbnail",
@@ -319,6 +330,14 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("remove-digital-folder-reference", folderId, filePath),
   updateFileMetadata: (filePaths, update) =>
     ipcRenderer.invoke("update-file-metadata", filePaths, update),
+  createMediaPlaylist: (name, kind) =>
+    ipcRenderer.invoke("create-media-playlist", name, kind),
+  addMediaPlaylistFiles: (playlistId, filePaths) =>
+    ipcRenderer.invoke("add-media-playlist-files", playlistId, filePaths),
+  removeMediaPlaylistFile: (playlistId, filePath) =>
+    ipcRenderer.invoke("remove-media-playlist-file", playlistId, filePath),
+  deleteMediaPlaylist: (playlistId) =>
+    ipcRenderer.invoke("delete-media-playlist", playlistId),
   getDigitalFolderFiles: (folderId) =>
     ipcRenderer.invoke("get-digital-folder-files", folderId),
   downloadDigitalFolder: (folderId) =>
