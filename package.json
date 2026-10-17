@@ -52,7 +52,6 @@
     "@huggingface/transformers": "^4.2.0",
     "@tensorflow/tfjs": "^4.22.0",
     "@tensorflow/tfjs-backend-wasm": "^4.22.0",
-    "@types/three": "^0.180.0",
     "@vladmandic/face-api": "^1.7.15",
     "archiver": "^7.0.1",
     "electron-is-dev": "^2.0.0",
@@ -69,9 +68,6 @@
     "pdf-parse": "^2.4.5",
     "pdfkit": "^0.13.0",
     "qrcode.react": "^4.2.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "react-icons": "^5.0.1",
     "react-markdown": "^8.0.7",
     "remark-gfm": "^3.0.1",
     "sharp": "^0.34.5",
@@ -86,11 +82,15 @@
     "@types/pdfkit": "^0.12.12",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
+    "@types/three": "^0.180.0",
     "@types/yauzl": "^3.4.0",
     "concurrently": "^8.2.0",
     "electron": "37.10.3",
     "electron-builder": "^24.6.0",
     "js-yaml": "^4.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-icons": "^5.0.1",
     "react-scripts": "5.0.1",
     "typescript": "^4.9.5",
     "wait-on": "^7.0.0"
@@ -131,7 +131,12 @@
       "build/**/*",
       "electron-dist/**/*",
       "public/preload.js",
-      "package.json"
+      "package.json",
+      "!**/*.map",
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm",
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs",
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jspi.*",
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.*"
     ],
     "protocols": [
       {

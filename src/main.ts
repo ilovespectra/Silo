@@ -2549,6 +2549,8 @@ let indexStorageMessageText: string | null = null;
 let indexStorageFreeBytes: number | null = null;
 let indexStorageTransfer: MainIndexStorageStatus["transfer"] = null;
 let indexStorageMonitorTimer: NodeJS.Timeout | null = null;
+let startupCacheCleanupTimer: NodeJS.Timeout | null = null;
+let periodicCacheCleanupTimer: NodeJS.Timeout | null = null;
 let indexStorageMonitorRunning = false;
 let indexStorageTransferRunning = false;
 let indexStorageRelaunchPending = false;
@@ -8235,8 +8237,10 @@ async function cleanupOldCaches() {
 
 // Schedule periodic cache cleanup (every 6 hours while app is running)
 function schedulePeriodicCleanup() {
-  setInterval(
+  if (periodicCacheCleanupTimer || shuttingDown) return;
+  periodicCacheCleanupTimer = setInterval(
     async () => {
+      if (shuttingDown) return;
       try {
         await cleanupOldCaches();
       } catch (error) {
@@ -8508,7 +8512,7 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
 }
 
 async function monitorIndexStorageAvailability() {
-  if (indexStorageMonitorRunning || indexStorageTransferRunning || indexStorageRelaunchPending)
+  if (shuttingDown || indexStorageMonitorRunning || indexStorageTransferRunning || indexStorageRelaunchPending)
     return;
   indexStorageMonitorRunning = true;
   try {
@@ -8588,6 +8592,7 @@ async function monitorIndexStorageAvailability() {
 }
 
 function startIndexStorageAvailabilityMonitor() {
+  if (shuttingDown) return;
   if (indexStorageMonitorTimer) clearInterval(indexStorageMonitorTimer);
   indexStorageMonitorTimer = setInterval(
     () => void monitorIndexStorageAvailability(),
@@ -9430,7 +9435,10 @@ app.whenReady().then(async () => {
   phoneDiscoveryTimer = setInterval(() => void discoverPhones(), 5000);
   void discoverPhones();
   schedulePeriodicCleanup();
-  setTimeout(() => void cleanupOldCaches().catch(() => undefined), 60000);
+  startupCacheCleanupTimer = setTimeout(() => {
+    startupCacheCleanupTimer = null;
+    if (!shuttingDown) void cleanupOldCaches().catch(() => undefined);
+  }, 60000);
 
   await getEnabledIndexSources(); // Initialize visibility independently of coverage.
   await semanticLoad.catch(() => undefined);
@@ -9911,6 +9919,13 @@ app.on("before-quit", (event) => {
   void libraryShareServer?.stop();
   shuttingDown = true;
   if (rendererRecoveryTimer) clearTimeout(rendererRecoveryTimer);
+  if (indexStorageMonitorTimer) clearInterval(indexStorageMonitorTimer);
+  indexStorageMonitorTimer = null;
+  clearInterval(inventoryExpiryTimer);
+  if (periodicCacheCleanupTimer) clearInterval(periodicCacheCleanupTimer);
+  periodicCacheCleanupTimer = null;
+  if (startupCacheCleanupTimer) clearTimeout(startupCacheCleanupTimer);
+  startupCacheCleanupTimer = null;
   indexRecovery?.stop();
   if (indexRecoveryTimer) clearInterval(indexRecoveryTimer);
   if (audioInventoryRetryTimer) clearInterval(audioInventoryRetryTimer);
@@ -9918,6 +9933,10 @@ app.on("before-quit", (event) => {
   if (diagnosticsTimer) clearInterval(diagnosticsTimer);
   if (heapGuardTimer) clearInterval(heapGuardTimer);
   if (phoneDiscoveryTimer) clearInterval(phoneDiscoveryTimer);
+  if (autoMemoryTimer) clearInterval(autoMemoryTimer);
+  autoMemoryTimer = null;
+  if (autoMemoryStartupTimer) clearTimeout(autoMemoryStartupTimer);
+  autoMemoryStartupTimer = null;
   if (quitFlushed) return;
   runtimeLog("before-quit");
   for (const window of BrowserWindow.getAllWindows()) window.hide();
@@ -9998,6 +10017,7 @@ const AUTO_MEMORY_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const AUTO_MEMORY_POLL_MS = 60 * 1000;
 let lastAutoMemoryRunAt = 0;
 let autoMemoryTimer: NodeJS.Timeout | null = null;
+let autoMemoryStartupTimer: NodeJS.Timeout | null = null;
 
 /** Tops up the editable memories (never retires them) and pushes the new state to the page. */
 /** Stories retired by Generate before their movie finished; listed in the Memory Book until it does. */
@@ -10069,9 +10089,9 @@ async function runMemoryGenerator(reason: string, replace = false) {
 
 /** Generates once after startup indexing settles, then every 24 hours while running. */
 function scheduleAutomaticMemories() {
-  if (autoMemoryTimer) return;
+  if (autoMemoryTimer || shuttingDown) return;
   const tick = () => {
-    if (!memoryManager) return;
+    if (shuttingDown || !memoryManager) return;
     const due = lastAutoMemoryRunAt === 0 || Date.now() - lastAutoMemoryRunAt >= AUTO_MEMORY_INTERVAL_MS;
     if (!due || getThumbnailIndexingWaitMessage() !== null) return;
     const reason = lastAutoMemoryRunAt === 0 ? "startup" : "scheduled";
@@ -10080,7 +10100,10 @@ function scheduleAutomaticMemories() {
       .catch((error) => runtimeLog("memory-auto-generate-error", memoryErrorDetails(error)));
   };
   autoMemoryTimer = setInterval(tick, AUTO_MEMORY_POLL_MS);
-  setTimeout(tick, 15000);
+  autoMemoryStartupTimer = setTimeout(() => {
+    autoMemoryStartupTimer = null;
+    tick();
+  }, 15000);
 }
 
 // IPC Handlers
