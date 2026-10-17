@@ -4536,10 +4536,37 @@ type SourceClonePhase =
   | "error"
   | "cancelled";
 
+type SourceCloneExcludedKind = "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "unsupported";
+
 interface SourceCloneExcludedPath {
+  kind: SourceCloneExcludedKind;
   sourceLabel: string;
   path: string;
   reason: string;
+}
+
+interface SourceCloneExcludedEntry {
+  kind: SourceCloneExcludedKind;
+  path: string;
+  reason: string;
+}
+
+function sourceCloneOmissionNotice(excludedPaths: SourceCloneExcludedPath[]) {
+  if (!excludedPaths.length) return "";
+  const counts = new Map<SourceCloneExcludedKind, number>();
+  for (const excluded of excludedPaths)
+    counts.set(excluded.kind, (counts.get(excluded.kind) ?? 0) + 1);
+  const labels: Record<SourceCloneExcludedKind, string> = {
+    "macos-trash": "macOS Trash",
+    "symbolic-link": "symbolic links",
+    socket: "sockets",
+    fifo: "named pipes",
+    device: "device nodes",
+    unsupported: "other unsupported filesystem objects",
+  };
+  const summary = [...counts.entries()].map(([kind, count]) => `${count.toLocaleString()} ${labels[kind]}`).join(", ");
+  const itemLabel = excludedPaths.length === 1 ? "source item was" : "source items were";
+  return ` ${excludedPaths.length.toLocaleString()} ${itemLabel} omitted (${summary}); this is a verified copy of supported items, not a complete source mirror.`;
 }
 
 interface SourceCloneErrorDetails {
@@ -4564,7 +4591,6 @@ interface SourceCloneProgress {
   failedFiles: number;
   currentFile: string;
   message: string;
-  excludedPaths?: SourceCloneExcludedPath[];
   errorDetails?: SourceCloneErrorDetails;
 }
 
@@ -4593,6 +4619,7 @@ interface SourceClonePlan {
   duplicateFiles: number;
   sourceLabels: string[];
   sourceIds: string[];
+  excludedPaths: SourceCloneExcludedPath[];
   configDirectory: string;
   replicaOf?: string;
   sourceManifest?: Record<string, unknown>;
@@ -5528,7 +5555,7 @@ async function listLocalCloneEntries(
   options: {
     allowMarkedRoot?: boolean;
     skipRootManifest?: boolean;
-    onExcludedPath?: (excludedPath: string) => void;
+    onExcludedPath?: (excluded: SourceCloneExcludedEntry) => void;
   } = {},
 ) {
   const appDataPath = path.resolve(app.getPath("userData"));
@@ -5552,12 +5579,42 @@ async function listLocalCloneEntries(
     throw new Error("Could not verify the internal data-volume boundary; this machine source was not cloned.");
   if (isSiloAppData(root)) return;
   if (!options.allowMarkedRoot && await isSiloCloneDirectory(root)) return;
+  const rootStats = await originalFs.promises.lstat(root);
+  if (rootStats.isSymbolicLink()) {
+    options.onExcludedPath?.({
+      kind: "symbolic-link",
+      path: root,
+      reason: "The selected source root is a symbolic link. Fallout Shelter does not follow or recreate symbolic links, so this source was not traversed.",
+    });
+    return;
+  }
+  if (!rootStats.isDirectory() && !rootStats.isFile()) {
+    const kind: SourceCloneExcludedKind = rootStats.isSocket()
+      ? "socket"
+      : rootStats.isFIFO()
+        ? "fifo"
+        : rootStats.isBlockDevice() || rootStats.isCharacterDevice()
+          ? "device"
+          : "unsupported";
+    options.onExcludedPath?.({
+      kind,
+      path: root,
+      reason: "The selected source root is a special filesystem object and has no copyable regular-file contents.",
+    });
+    return;
+  }
+  if (rootStats.isFile())
+    throw new Error(`The selected source is a file rather than a folder: ${root}`);
   const stack = [{ directory: root, relativePath: "" }];
   while (stack.length > 0) {
     ensureCloneActive(operationId);
     const current = stack.pop()!;
     if (isMacTrashPath(current.directory, root)) {
-      options.onExcludedPath?.(current.directory);
+      options.onExcludedPath?.({
+        kind: "macos-trash",
+        path: current.directory,
+        reason: "macOS Trash is intentionally excluded; deleted items are not included in this backup.",
+      });
       continue;
     }
     if (isMacDataVolumePathExcluded(current.directory, root)) continue;
@@ -5571,20 +5628,29 @@ async function listLocalCloneEntries(
     const dir = await originalFs.promises.opendir(current.directory);
     for await (const entry of dir) {
       ensureCloneActive(operationId);
-      if (entry.isSymbolicLink()) continue;
       const absolutePath = path.join(current.directory, entry.name);
       if (options.skipRootManifest && current.directory === root && entry.name === "silo-clone-manifest.json") continue;
       if (isMacTrashPath(absolutePath, root)) {
-        options.onExcludedPath?.(absolutePath);
+        options.onExcludedPath?.({
+          kind: "macos-trash",
+          path: absolutePath,
+          reason: "macOS Trash is intentionally excluded; deleted items are not included in this backup.",
+        });
         continue;
       }
       if (isMacDataVolumePathExcluded(absolutePath, root)) continue;
       if (isSiloAppData(absolutePath)) continue;
       if (entry.isDirectory() && await isSiloCloneDirectory(absolutePath)) continue;
       const relativePath = path.join(current.relativePath, entry.name);
-      const stats = await originalFs.promises.stat(absolutePath);
+      const stats = await originalFs.promises.lstat(absolutePath);
       if (machineDevice !== null && stats.dev !== machineDevice) continue;
-      if (stats.isDirectory()) {
+      if (stats.isSymbolicLink()) {
+        options.onExcludedPath?.({
+          kind: "symbolic-link",
+          path: absolutePath,
+          reason: "Symbolic links are not followed or recreated by this backup, so their targets are not included through this path.",
+        });
+      } else if (stats.isDirectory()) {
         onEntry({
           sourcePath: absolutePath,
           destinationRelativePath: relativePath,
@@ -5601,6 +5667,23 @@ async function listLocalCloneEntries(
           size: stats.size,
           modified: stats.mtimeMs,
           isDirectory: false,
+        });
+      } else {
+        const kind: SourceCloneExcludedKind = stats.isSocket()
+          ? "socket"
+          : stats.isFIFO()
+            ? "fifo"
+            : stats.isBlockDevice() || stats.isCharacterDevice()
+              ? "device"
+              : "unsupported";
+        const typeLabel = kind === "socket" ? "Socket"
+          : kind === "fifo" ? "Named pipe"
+            : kind === "device" ? "Device node"
+              : "Unsupported filesystem object";
+        options.onExcludedPath?.({
+          kind,
+          path: absolutePath,
+          reason: `${typeLabel}s do not contain copyable regular-file data and are excluded from this backup.`,
         });
       }
     }
@@ -5666,6 +5749,20 @@ async function prepareSourceClone(
   const entries: SourceClonePlanEntry[] = [];
   const sourcePrefixes = new Map<string, string>();
   const excludedPaths: SourceCloneExcludedPath[] = [];
+  const inheritedExcludedPaths = prepareOptions.sourceManifest?.excludedPaths;
+  if (Array.isArray(inheritedExcludedPaths)) {
+    for (const value of inheritedExcludedPaths as unknown[]) {
+      if (!value || typeof value !== "object") continue;
+      const record = value as Record<string, unknown>;
+      if (typeof record.path !== "string" || typeof record.reason !== "string" ||
+          typeof record.sourceLabel !== "string") continue;
+      const kind: SourceCloneExcludedKind = record.kind === "macos-trash" || record.kind === "symbolic-link" ||
+        record.kind === "socket" || record.kind === "fifo" || record.kind === "device" || record.kind === "unsupported"
+        ? record.kind
+        : "unsupported";
+      excludedPaths.push({ kind, sourceLabel: record.sourceLabel, path: record.path, reason: record.reason });
+    }
+  }
   let scannedEntries = 0;
   const initial: SourceCloneProgress = {
     operationId, phase: "scanning", destination: destinationPlans[0].cloneRoot,
@@ -5709,16 +5806,17 @@ async function prepareSourceClone(
       }, {
         allowMarkedRoot: prepareOptions.allowMarkedRoot,
         skipRootManifest: prepareOptions.skipRootManifest,
-        onExcludedPath: (excludedPath) => {
-          const excluded = {
+        onExcludedPath: (excludedEntry) => {
+          const excluded: SourceCloneExcludedPath = {
+            kind: excludedEntry.kind,
             sourceLabel: source.label,
-            path: excludedPath,
-            reason: "macOS Trash contents are intentionally excluded from this backup.",
+            path: excludedEntry.path,
+            reason: excludedEntry.reason,
           };
           excludedPaths.push(excluded);
-          sendSourceCloneProgress({ ...initial, currentFile: excludedPath,
-            excludedPaths: [...excludedPaths],
-            message: `Skipping protected Trash folder in ${source.label}; deleted items are not included.` });
+          if (excludedPaths.length === 1 || excludedPaths.length % 100 === 0)
+            sendSourceCloneProgress({ ...initial, currentFile: excluded.path,
+              message: `Found ${excludedPaths.length.toLocaleString()} source item(s) that this backup will omit.` });
         },
       });
       continue;
@@ -5880,7 +5978,8 @@ async function prepareSourceClone(
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const plan: SourceClonePlan = { id, operationId, destinations: destinationPlans,
       entries, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles,
-      sourceLabels: selected.map((source) => source.label), sourceIds: selected.map((source) => source.id), configDirectory,
+      sourceLabels: selected.map((source) => source.label), sourceIds: selected.map((source) => source.id),
+      excludedPaths, configDirectory,
       replicaOf: prepareOptions.replicaOf,
       sourceManifest: prepareOptions.sourceManifest, reuseByDestination };
     sourceClonePlans.set(id, plan);
@@ -6125,6 +6224,8 @@ async function runSourceClone(
               sourceIds: sourceManifest && Array.isArray(sourceManifest.sourceIds) ? sourceManifest.sourceIds : plan.sourceIds,
               sourceLabels: sourceManifest && Array.isArray(sourceManifest.sourceLabels) ? sourceManifest.sourceLabels : plan.sourceLabels,
               ...(plan.replicaOf ? { replicaOf: plan.replicaOf } : {}),
+              sourceCoverage: plan.excludedPaths.length ? "partial" : "complete",
+              excludedPaths: plan.excludedPaths,
               totalFiles: plan.totalFiles, totalBytes: plan.totalBytes, duplicatePaths: manifestAliases.length,
               verifiedFiles: plan.totalFiles, failedFiles: 0, files: manifestFiles, aliases: manifestAliases,
             }),
@@ -6148,7 +6249,7 @@ async function runSourceClone(
             totalBytes: plan.totalBytes, copiedBytes, verifiedFiles, failedFiles, currentFile: "",
             message: `Destination ${destinationIndex + 1} of ${plan.destinations.length}: Compressed clone complete. ` +
               `${verifiedFiles.toLocaleString()} files verified inside ${path.basename(archivePath)} ` +
-              `(${(result.archiveBytes / 1024 ** 3).toFixed(2)} GB).` });
+              `(${(result.archiveBytes / 1024 ** 3).toFixed(2)} GB).${sourceCloneOmissionNotice(plan.excludedPaths)}` });
           successfulDestinations.push(archivePath);
         } catch (error) {
           const cancelled = operation.cancelled;
@@ -6332,6 +6433,8 @@ async function runSourceClone(
           sourceIds: sourceManifest && Array.isArray(sourceManifest.sourceIds) ? sourceManifest.sourceIds : plan.sourceIds,
           sourceLabels: sourceManifest && Array.isArray(sourceManifest.sourceLabels) ? sourceManifest.sourceLabels : plan.sourceLabels,
           ...(plan.replicaOf ? { replicaOf: plan.replicaOf } : {}),
+          sourceCoverage: plan.excludedPaths.length ? "partial" : "complete",
+          excludedPaths: plan.excludedPaths,
           totalFiles: plan.totalFiles, totalBytes: plan.totalBytes, duplicatePaths: manifestAliases.length,
           verifiedFiles, failedFiles, files: manifestFiles, aliases: manifestAliases,
         }, null, 2));
@@ -6339,7 +6442,8 @@ async function runSourceClone(
         await fsPromises.rm(inProgressMarker, { force: true });
         emit(complete ? "complete" : "error", "", complete
           ? `Clone complete. Verified ${verifiedFiles.toLocaleString()} files with SHA-256, including Silo config/indexes.` +
-            (reusedFiles ? ` ${reusedFiles.toLocaleString()} were already in the shelter and were linked, not copied.` : "")
+            (reusedFiles ? ` ${reusedFiles.toLocaleString()} were already in the shelter and were linked, not copied.` : "") +
+            sourceCloneOmissionNotice(plan.excludedPaths)
           : `Clone finished with ${failedFiles.toLocaleString()} file error(s). Originals were not changed.`, true);
         if (!complete) throw new Error(`Verification failed for destination ${destinationPlan.destination}.`);
         successfulDestinations.push(destinationPlan.cloneRoot);

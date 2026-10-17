@@ -676,11 +676,11 @@ interface SourceCloneProgress {
   failedFiles: number;
   currentFile: string;
   message: string;
-  excludedPaths?: SourceCloneExcludedPath[];
   errorDetails?: SourceCloneErrorDetails;
 }
 
 interface SourceCloneExcludedPath {
+  kind: "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "unsupported";
   sourceLabel: string;
   path: string;
   reason: string;

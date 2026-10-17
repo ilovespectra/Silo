@@ -58,6 +58,24 @@ function formatBytes(value: number) {
   return `${size.toFixed(2)} ${units[unit]}`;
 }
 
+function countExcludedByKind(excludedPaths: SourceCloneExcludedPath[]) {
+  const counts: Partial<Record<SourceCloneExcludedPath["kind"], number>> = {};
+  for (const excluded of excludedPaths)
+    counts[excluded.kind] = (counts[excluded.kind] ?? 0) + 1;
+  return counts;
+}
+
+function excludedKindLabel(kind: SourceCloneExcludedPath["kind"]) {
+  return ({
+    "macos-trash": "macOS Trash",
+    "symbolic-link": "symbolic links",
+    socket: "sockets",
+    fifo: "named pipes",
+    device: "device nodes",
+    unsupported: "other unsupported filesystem objects",
+  } satisfies Record<SourceCloneExcludedPath["kind"], string>)[kind];
+}
+
 export default function SourceClonePanel({ electronAPI, sources, initialDestinations = [], mode = "sources", onClose }: SourceClonePanelProps) {
   const [preparing, setPreparing] = useState(false);
   const [running, setRunning] = useState(false);
@@ -178,12 +196,17 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
       const report = diagnosticRef.current;
       if (report?.operationId === operationId) {
         report.outcome = "preflight-ready";
+        const excludedPaths = result.plan.excludedPaths ?? [];
         addDiagnosticEvent(report, "preflight-ready", {
           totalSources: result.plan.totalSources,
           totalFiles: result.plan.totalFiles,
           totalBytes: result.plan.totalBytes,
           duplicateFiles: result.plan.duplicateFiles,
-          excludedPaths: result.plan.excludedPaths ?? [],
+          sourceCoverage: excludedPaths.length ? "partial" : "complete",
+          excludedItemCount: excludedPaths.length,
+          excludedByKind: countExcludedByKind(excludedPaths),
+          excludedPaths: excludedPaths.slice(0, 100),
+          excludedPathsOmittedFromLog: Math.max(0, excludedPaths.length - 100),
         });
       }
       setProgress({
@@ -237,8 +260,11 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
         throw new Error(result.error || "Clone did not complete.");
       }
       if (report) {
-        report.outcome = "complete";
-        addDiagnosticEvent(report, "copy-complete");
+        report.outcome = plan.excludedPaths?.length ? "complete-with-exclusions" : "complete";
+        addDiagnosticEvent(report, "copy-complete", {
+          sourceCoverage: plan.excludedPaths?.length ? "partial" : "complete",
+          excludedItemCount: plan.excludedPaths?.length ?? 0,
+        });
       }
       if (result.timeMachineStarted)
         setTimeMachineMessage("macOS accepted the Time Machine backup request. Check Time Machine for progress and completion.");
@@ -354,6 +380,11 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
   };
 
   const hasShortfall = Boolean(plan?.destinations.some((destination) => destination.shortfallBytes > 0));
+  const excludedPaths = plan?.excludedPaths ?? [];
+  const excludedByKind = countExcludedByKind(excludedPaths);
+  const exclusionSummary = Object.entries(excludedByKind)
+    .map(([kind, count]) => `${count} ${excludedKindLabel(kind as SourceCloneExcludedPath["kind"])}`)
+    .join(", ");
   const progressValue = progress?.phase === "copying"
     ? progress.copiedBytes
     : progress?.phase === "verifying"
@@ -496,11 +527,22 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               <div><span>Destinations</span><strong>{plan.destinations.length}</strong></div>
             </div>
             <small className="source-clone-preflight-note">{plan.duplicateFiles.toLocaleString()} duplicate paths will reuse canonical content; no duplicate file bytes are copied.</small>
-            {plan.excludedPaths?.map((excluded) => (
-              <div className="source-clone-warning" key={`${excluded.sourceLabel}-${excluded.path}`}>
-                {excluded.reason} Source: {excluded.sourceLabel} · <code>{excluded.path}</code>
+            {excludedPaths.length > 0 && (
+              <div className="source-clone-warning">
+                <strong>{excludedPaths.length.toLocaleString()} source {excludedPaths.length === 1 ? "item will" : "items will"} be omitted from this backup.</strong>
+                <p>Fallout Shelter backs up regular files and folders. It does not follow symbolic links or copy sockets, named pipes, or device nodes; macOS Trash is also intentionally excluded.</p>
+                <small>{exclusionSummary}</small>
+                <details>
+                  <summary>Review omitted paths (first 100)</summary>
+                  {excludedPaths.slice(0, 100).map((excluded) => (
+                    <div key={`${excluded.sourceLabel}-${excluded.kind}-${excluded.path}`}>
+                      {excluded.reason} Source: {excluded.sourceLabel} · <code>{excluded.path}</code>
+                    </div>
+                  ))}
+                  {excludedPaths.length > 100 && <small>The downloadable diagnostic log includes the first 100 paths; the backup manifest records the complete omission list.</small>}
+                </details>
               </div>
-            ))}
+            )}
             {plan.destinations.map((destination) => <div className={`source-clone-warning ${destination.shortfallBytes > 0 ? "insufficient" : ""}`} key={`${destination.destination}-space`}>
               {destination.destination}: {destination.shortfallBytes > 0 ? <>short by <strong>{formatBytes(destination.shortfallBytes)}</strong></> : <>free space {formatBytes(destination.freeBytes)} is sufficient</>}
             </div>)}
@@ -520,7 +562,9 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 {createAppleCompatibleBackup && timeMachineMode === "as-well"
                   ? "I understand this makes a separate readable Silo copy in the selected folder and also requests a separate Time Machine backup at macOS’s configured destination; originals and settings are not changed."
                   : "I understand this makes a separate copy and does not alter the originals."}
-                {plan.excludedPaths?.length ? " The listed macOS Trash folders, including deleted items, are excluded." : ""}
+                {excludedPaths.length
+                  ? ` I understand ${excludedPaths.length.toLocaleString()} source ${excludedPaths.length === 1 ? "item" : "items"} identified by preflight will be omitted. The resulting clone contains a verified copy of supported items, not a complete source mirror.`
+                  : ""}
               </span>
             </label>
             {running && progress && (
@@ -536,7 +580,9 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               </div>
             )}
             {!running && progress?.phase === "complete" && (
-              <div className="source-clone-success"><FiCheckCircle /> {progress.message}</div>
+              <div className={excludedPaths.length ? "source-clone-warning" : "source-clone-success"}>
+                {!excludedPaths.length && <FiCheckCircle />} {progress.message}
+              </div>
             )}
             {timeMachineMessage && <div className="source-clone-success">{timeMachineMessage}</div>}
             {timeMachineError && <div className="source-clone-warning insufficient">{timeMachineError}</div>}
