@@ -774,6 +774,30 @@ function App() {
       reserveBytes: 10 * 1024 * 1024 * 1024,
       transfer: null,
     });
+  const [indexStorageNoticeDontShowAgain, setIndexStorageNoticeDontShowAgain] = useState(false);
+  const [indexStorageNoticeDismissed, setIndexStorageNoticeDismissed] = useState(false);
+  const [hideIndexStorageNoticePermanently, setHideIndexStorageNoticePermanently] = useState(() => {
+    try {
+      return localStorage.getItem("silo.hideIndexStorageFallbackNotice") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const indexStorageNoticeMessage = (indexStorageStatus.message ?? "").replace(/[’‘]/g, "'");
+  const isIndexStorageFallbackNotice = indexStorageStatus.usingLocalFallback && (
+    /selected destination.*unavailable/i.test(indexStorageNoticeMessage) ||
+    /can't locate your selected destination/i.test(indexStorageNoticeMessage)
+  );
+  const showIndexStorageFallbackNotice = isIndexStorageFallbackNotice &&
+    !indexStorageNoticeDismissed && !hideIndexStorageNoticePermanently;
+  const showIndexStorageMessage = Boolean(indexStorageStatus.message &&
+    (!isIndexStorageFallbackNotice || showIndexStorageFallbackNotice));
+  const hasVisibleIndexStorageTransfer = indexStorageStatus.transfer?.state === "moving" ||
+    indexStorageStatus.transfer?.state === "complete" || indexStorageStatus.transfer?.state === "error";
+  const showIndexStorageFallbackDetails = indexStorageStatus.usingLocalFallback &&
+    Boolean(indexStorageStatus.message || hasVisibleIndexStorageTransfer) &&
+    (!isIndexStorageFallbackNotice || showIndexStorageFallbackNotice);
+  const showIndexStorageBanner = showIndexStorageMessage || showIndexStorageFallbackDetails || hasVisibleIndexStorageTransfer;
   const [indexProgress, setIndexProgress] =
     useState<IndexProgress>(emptyIndexProgress);
   const [thumbnailPregen, setThumbnailPregen] =
@@ -5741,6 +5765,24 @@ function App() {
     if (intensiveJobs.length === 0) setPerformanceNoticeHidden(false);
   }, [intensiveJobs.length]);
 
+  useEffect(() => {
+    if (indexStorageStatus.destinationAvailable && !indexStorageStatus.usingLocalFallback) {
+      setIndexStorageNoticeDismissed(false);
+      setIndexStorageNoticeDontShowAgain(false);
+    }
+  }, [indexStorageStatus.destinationAvailable, indexStorageStatus.usingLocalFallback]);
+
+  const dismissIndexStorageFallbackNotice = (permanently: boolean) => {
+    setIndexStorageNoticeDismissed(true);
+    if (!permanently) return;
+    setHideIndexStorageNoticePermanently(true);
+    try {
+      localStorage.setItem("silo.hideIndexStorageFallbackNotice", "true");
+    } catch {
+      // Keep the notice dismissed for this session if storage is unavailable.
+    }
+  };
+
   const dismissPerformanceNotice = (permanently: boolean) => {
     setPerformanceNoticeHidden(true);
     if (!permanently) return;
@@ -5887,30 +5929,47 @@ function App() {
           </div>
         </div>
       )}
-      {((indexStorageStatus.message ||
-        indexStorageStatus.transfer?.state === "moving" ||
-        indexStorageStatus.transfer?.state === "complete" ||
-        indexStorageStatus.transfer?.state === "error") ||
+      {(showIndexStorageBanner ||
         intensiveJobs.length > 0 ||
         searchError) && (
         <div className="app-notice-stack" aria-live="polite">
-          {(indexStorageStatus.message ||
-            indexStorageStatus.transfer?.state === "moving" ||
-            indexStorageStatus.transfer?.state === "complete" ||
-            indexStorageStatus.transfer?.state === "error") && (
+          {showIndexStorageBanner && (
             <div className="index-storage-banner" role="status">
-              {indexStorageStatus.message && (
-                <strong>{indexStorageStatus.message}</strong>
-              )}
-              {indexStorageStatus.usingLocalFallback && (
-                <span>
-                  {indexStorageStatus.localFallbackEnabled
-                    ? `Local cache fallback is enabled with a ${Math.round(indexStorageStatus.reserveBytes / 1024 / 1024 / 1024)} GB free-space reserve. Silo will verify and move the cache back when the destination reconnects.`
-                    : "Local cache fallback is off. Indexing is paused until the selected destination reconnects."}
-                </span>
-              )}
-              {indexStorageStatus.transfer && (
-                <span>{indexStorageStatus.transfer.message}</span>
+              <div className="index-storage-banner-content">
+                {showIndexStorageMessage && indexStorageStatus.message && (
+                  <strong>{indexStorageStatus.message}</strong>
+                )}
+                {showIndexStorageFallbackDetails && (
+                  <span>
+                    {indexStorageStatus.localFallbackEnabled
+                      ? `Local cache fallback is enabled with a ${Math.round(indexStorageStatus.reserveBytes / 1024 / 1024 / 1024)} GB free-space reserve. Silo will verify and move the cache back when the destination reconnects.`
+                      : "Local cache fallback is off. Indexing is paused until the selected destination reconnects."}
+                  </span>
+                )}
+                {indexStorageStatus.transfer && (
+                  <span>{indexStorageStatus.transfer.message}</span>
+                )}
+              </div>
+              {showIndexStorageFallbackNotice && (
+                <div className="index-storage-banner-actions">
+                  <label className="index-storage-dismiss-choice">
+                    <input
+                      type="checkbox"
+                      checked={indexStorageNoticeDontShowAgain}
+                      onChange={(event) => setIndexStorageNoticeDontShowAgain(event.target.checked)}
+                    />
+                    Don’t show again
+                  </label>
+                  <button
+                    className="index-storage-dismiss"
+                    type="button"
+                    aria-label="Dismiss unavailable cache destination notice"
+                    title={indexStorageNoticeDontShowAgain ? "Dismiss and don’t show again" : "Dismiss until the destination reconnects"}
+                    onClick={() => dismissIndexStorageFallbackNotice(indexStorageNoticeDontShowAgain)}
+                  >
+                    <FiX aria-hidden="true" />
+                  </button>
+                </div>
               )}
             </div>
           )}

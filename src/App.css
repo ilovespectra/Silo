@@ -3833,10 +3833,50 @@ input[type="range"]::-moz-range-progress {
   line-height: 1.45;
   text-align: left;
 }
+.index-storage-banner-content {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
 .index-storage-banner strong {
   font-weight: 700;
 }
 .index-storage-banner span {
+  color: var(--text);
+}
+.index-storage-banner-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 2px;
+}
+.index-storage-dismiss-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.index-storage-dismiss-choice input {
+  accent-color: var(--orange);
+}
+.index-storage-dismiss {
+  display: inline-grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.index-storage-dismiss:hover {
+  background: var(--surface-hover);
   color: var(--text);
 }
 
