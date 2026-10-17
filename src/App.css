@@ -2328,6 +2328,50 @@ label.settings-row {
   font-size: 10px;
   overflow-wrap: anywhere;
 }
+.source-clone-diagnostics {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+.source-clone-diagnostics > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+.source-clone-diagnostics strong {
+  color: var(--text);
+  font-size: 10px;
+}
+.source-clone-diagnostics small {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.source-clone-diagnostic-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.source-clone-diagnostic-actions > button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--raised);
+  color: var(--text);
+  font-size: 10px;
+  cursor: pointer;
+}
+.source-clone-diagnostic-actions > button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.source-clone-diagnostics code {
+  overflow-wrap: anywhere;
+}
 .source-clone-preflight-note {
   color: var(--muted);
   font-size: 10px;

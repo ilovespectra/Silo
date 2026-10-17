@@ -185,6 +185,7 @@ import {
   getMacDataVolumeDeviceId,
   invalidateSiloCloneDirectoryCache,
   isMacDataVolumePathExcluded,
+  isMacTrashPath,
   isMacDataVolumeSourceRoot,
   isNonLibraryPath,
   isPathWithin,
@@ -4535,6 +4536,21 @@ type SourceClonePhase =
   | "error"
   | "cancelled";
 
+interface SourceCloneExcludedPath {
+  sourceLabel: string;
+  path: string;
+  reason: string;
+}
+
+interface SourceCloneErrorDetails {
+  name: string;
+  message: string;
+  code?: string;
+  errno?: number | string;
+  syscall?: string;
+  path?: string;
+}
+
 interface SourceCloneProgress {
   operationId: string;
   phase: SourceClonePhase;
@@ -4548,6 +4564,8 @@ interface SourceCloneProgress {
   failedFiles: number;
   currentFile: string;
   message: string;
+  excludedPaths?: SourceCloneExcludedPath[];
+  errorDetails?: SourceCloneErrorDetails;
 }
 
 interface SourceClonePlanEntry {
@@ -5477,6 +5495,21 @@ function sendSourceCloneProgress(progress: SourceCloneProgress) {
   sendToRenderer("source-clone-progress", progress);
 }
 
+function sourceCloneErrorDetails(error: unknown): SourceCloneErrorDetails {
+  const value = error && typeof error === "object"
+    ? error as Record<string, unknown>
+    : {};
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    name: typeof value.name === "string" ? value.name : "Error",
+    message,
+    ...(typeof value.code === "string" ? { code: value.code } : {}),
+    ...((typeof value.errno === "number" || typeof value.errno === "string") ? { errno: value.errno } : {}),
+    ...(typeof value.syscall === "string" ? { syscall: value.syscall } : {}),
+    ...(typeof value.path === "string" ? { path: value.path } : {}),
+  };
+}
+
 function ensureCloneActive(operationId: string) {
   if (sourceCloneOperations.get(operationId)?.cancelled)
     throw new Error("Source clone cancelled.");
@@ -5492,7 +5525,11 @@ async function listLocalCloneEntries(
   root: string,
   operationId: string,
   onEntry: (entry: SourceClonePlanEntry) => void,
-  options: { allowMarkedRoot?: boolean; skipRootManifest?: boolean } = {},
+  options: {
+    allowMarkedRoot?: boolean;
+    skipRootManifest?: boolean;
+    onExcludedPath?: (excludedPath: string) => void;
+  } = {},
 ) {
   const appDataPath = path.resolve(app.getPath("userData"));
   const canonicalAppDataPath = await originalFs.promises
@@ -5519,6 +5556,10 @@ async function listLocalCloneEntries(
   while (stack.length > 0) {
     ensureCloneActive(operationId);
     const current = stack.pop()!;
+    if (isMacTrashPath(current.directory, root)) {
+      options.onExcludedPath?.(current.directory);
+      continue;
+    }
     if (isMacDataVolumePathExcluded(current.directory, root)) continue;
     if (machineDevice !== null) {
       const directoryStats = await originalFs.promises.stat(current.directory).catch(() => null);
@@ -5533,6 +5574,10 @@ async function listLocalCloneEntries(
       if (entry.isSymbolicLink()) continue;
       const absolutePath = path.join(current.directory, entry.name);
       if (options.skipRootManifest && current.directory === root && entry.name === "silo-clone-manifest.json") continue;
+      if (isMacTrashPath(absolutePath, root)) {
+        options.onExcludedPath?.(absolutePath);
+        continue;
+      }
       if (isMacDataVolumePathExcluded(absolutePath, root)) continue;
       if (isSiloAppData(absolutePath)) continue;
       if (entry.isDirectory() && await isSiloCloneDirectory(absolutePath)) continue;
@@ -5620,6 +5665,7 @@ async function prepareSourceClone(
 
   const entries: SourceClonePlanEntry[] = [];
   const sourcePrefixes = new Map<string, string>();
+  const excludedPaths: SourceCloneExcludedPath[] = [];
   let scannedEntries = 0;
   const initial: SourceCloneProgress = {
     operationId, phase: "scanning", destination: destinationPlans[0].cloneRoot,
@@ -5663,6 +5709,17 @@ async function prepareSourceClone(
       }, {
         allowMarkedRoot: prepareOptions.allowMarkedRoot,
         skipRootManifest: prepareOptions.skipRootManifest,
+        onExcludedPath: (excludedPath) => {
+          const excluded = {
+            sourceLabel: source.label,
+            path: excludedPath,
+            reason: "macOS Trash contents are intentionally excluded from this backup.",
+          };
+          excludedPaths.push(excluded);
+          sendSourceCloneProgress({ ...initial, currentFile: excludedPath,
+            excludedPaths: [...excludedPaths],
+            message: `Skipping protected Trash folder in ${source.label}; deleted items are not included.` });
+        },
       });
       continue;
     }
@@ -5828,7 +5885,8 @@ async function prepareSourceClone(
       sourceManifest: prepareOptions.sourceManifest, reuseByDestination };
     sourceClonePlans.set(id, plan);
     return { planId: id, destinations: destinationPlans, totalSources: selected.length,
-      sourceLabels: plan.sourceLabels, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles };
+      sourceLabels: plan.sourceLabels, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles,
+      excludedPaths };
   } catch (error) {
     await fsPromises.rm(configDirectory, { recursive: true, force: true }).catch(() => undefined);
     throw error;
@@ -9241,6 +9299,50 @@ ipcMain.handle("select-source-clone-destination", async () => {
   return !result.canceled ? result.filePaths : [];
 });
 
+ipcMain.handle("save-source-clone-diagnostic-log", async (_event, contents: unknown) => {
+  if (typeof contents !== "string" || Buffer.byteLength(contents, "utf8") > 2 * 1024 * 1024)
+    return { ok: false, error: "The diagnostic log is invalid or exceeds the 2 MB limit." };
+  let report: unknown;
+  try {
+    report = JSON.parse(contents);
+  } catch {
+    return { ok: false, error: "The diagnostic log could not be read." };
+  }
+  if (!report || typeof report !== "object" || Array.isArray(report))
+    return { ok: false, error: "The diagnostic log has an invalid format." };
+  if (!mainWindow) return { ok: false, error: "Silo's window is not available." };
+
+  const now = new Date();
+  const fileName = `Silo-Fallout-Shelter-Diagnostics-${now.toISOString().replace(/[:.]/g, "-")}.json`;
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "Save Fallout Shelter diagnostic log",
+    defaultPath: path.join(app.getPath("downloads"), fileName),
+    buttonLabel: "Save diagnostic log",
+    filters: [{ name: "JSON diagnostic log", extensions: ["json"] }],
+  });
+  if (result.canceled || !result.filePath) return { ok: false, cancelled: true };
+
+  try {
+    const payload = {
+      ...(report as Record<string, unknown>),
+      system: {
+        appVersion: app.getVersion(),
+        platform: process.platform,
+        architecture: process.arch,
+        osRelease: os.release(),
+      },
+      exportedAt: now.toISOString(),
+    };
+    await fsPromises.writeFile(result.filePath, JSON.stringify(payload, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    return { ok: true, fileName: path.basename(result.filePath) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
 ipcMain.handle(
   "prepare-source-clone",
   async (
@@ -9263,6 +9365,7 @@ ipcMain.handle(
       return { ok: true, plan };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const errorDetails = sourceCloneErrorDetails(error);
       sourceCloneOperations.delete(operationId);
       sendSourceCloneProgress({
         operationId,
@@ -9277,8 +9380,9 @@ ipcMain.handle(
         failedFiles: 0,
         currentFile: "",
         message,
+        errorDetails,
       });
-      return { ok: false, error: message };
+      return { ok: false, error: message, errorDetails };
     }
   },
 );
@@ -9294,6 +9398,7 @@ ipcMain.handle("prepare-shelter-replica", async (_event, destinations: unknown, 
     return { ok: true, plan };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const errorDetails = sourceCloneErrorDetails(error);
     sourceCloneOperations.delete(operationId);
     sendSourceCloneProgress({
       operationId,
@@ -9308,8 +9413,9 @@ ipcMain.handle("prepare-shelter-replica", async (_event, destinations: unknown, 
       failedFiles: 0,
       currentFile: "",
       message,
+      errorDetails,
     });
-    return { ok: false, error: message };
+    return { ok: false, error: message, errorDetails };
   }
 });
 
@@ -9338,12 +9444,14 @@ ipcMain.handle("start-source-clone", async (_event, planId: unknown, options: un
       return {
         ok: true,
         timeMachineError: error instanceof Error ? error.message : String(error),
+        timeMachineErrorDetails: sourceCloneErrorDetails(error),
       };
     }
   } catch (error) {
     return {
       ok: false,
       error: error instanceof Error ? error.message : String(error),
+      errorDetails: sourceCloneErrorDetails(error),
     };
   }
 });
@@ -9357,7 +9465,11 @@ ipcMain.handle("start-machine-time-machine-backup", async (_event, sourceId: unk
     await startConfiguredTimeMachineBackup(sourceId, sourceRegistered);
     return { ok: true, timeMachineStarted: true };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      errorDetails: sourceCloneErrorDetails(error),
+    };
   }
 });
 
@@ -9414,8 +9526,10 @@ ipcMain.handle("extract-source-clone-archive", async (_event, operationId: unkno
       ? "Extraction cancelled; the partially extracted folder was removed."
       : error instanceof Error ? error.message : String(error);
     sendSourceCloneProgress({ ...base, phase: operation.cancelled ? "cancelled" : "error",
-      destination: destinationParent, message });
-    return { ok: false, error: message, cancelled: operation.cancelled };
+      destination: destinationParent, message,
+      ...(!operation.cancelled ? { errorDetails: sourceCloneErrorDetails(error) } : {}) });
+    return { ok: false, error: message, cancelled: operation.cancelled,
+      ...(!operation.cancelled ? { errorDetails: sourceCloneErrorDetails(error) } : {}) };
   } finally {
     sourceCloneOperations.delete(operationId);
   }

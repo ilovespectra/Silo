@@ -676,6 +676,23 @@ interface SourceCloneProgress {
   failedFiles: number;
   currentFile: string;
   message: string;
+  excludedPaths?: SourceCloneExcludedPath[];
+  errorDetails?: SourceCloneErrorDetails;
+}
+
+interface SourceCloneExcludedPath {
+  sourceLabel: string;
+  path: string;
+  reason: string;
+}
+
+interface SourceCloneErrorDetails {
+  name: string;
+  message: string;
+  code?: string;
+  errno?: number | string;
+  syscall?: string;
+  path?: string;
 }
 
 interface SourceClonePreflight {
@@ -691,6 +708,7 @@ interface SourceClonePreflight {
   totalFiles: number;
   totalBytes: number;
   duplicateFiles: number;
+  excludedPaths?: SourceCloneExcludedPath[];
 }
 
 interface PersistedAppState {
@@ -989,19 +1007,37 @@ interface Window {
       sourceIds: string[],
       destinations: string[],
       operationId: string,
-    ): Promise<{ ok: boolean; plan?: SourceClonePreflight; error?: string }>;
+    ): Promise<{
+      ok: boolean;
+      plan?: SourceClonePreflight;
+      error?: string;
+      errorDetails?: SourceCloneErrorDetails;
+    }>;
     prepareShelterReplica(
       destinations: string[],
       operationId: string,
-    ): Promise<{ ok: boolean; plan?: SourceClonePreflight; error?: string }>;
+    ): Promise<{
+      ok: boolean;
+      plan?: SourceClonePreflight;
+      error?: string;
+      errorDetails?: SourceCloneErrorDetails;
+    }>;
     startSourceClone(
       planId: string,
       options?: { compress?: boolean; createAppleCompatibleBackup?: boolean },
-    ): Promise<{ ok: boolean; timeMachineStarted?: boolean; timeMachineError?: string; error?: string }>;
+    ): Promise<{
+      ok: boolean;
+      timeMachineStarted?: boolean;
+      timeMachineError?: string;
+      timeMachineErrorDetails?: SourceCloneErrorDetails;
+      error?: string;
+      errorDetails?: SourceCloneErrorDetails;
+    }>;
     startMachineTimeMachineBackup(sourceId: string): Promise<{
       ok: boolean;
       timeMachineStarted?: boolean;
       error?: string;
+      errorDetails?: SourceCloneErrorDetails;
     }>;
     extractSourceCloneArchive(operationId: string): Promise<{
       ok: boolean;
@@ -1009,25 +1045,54 @@ interface Window {
       destinationRoot?: string;
       extractedFiles?: number;
       error?: string;
+      errorDetails?: SourceCloneErrorDetails;
     }>;
     cancelSourceClone(operationId: string): Promise<boolean>;
     onSourceCloneProgress(
       callback: (progress: SourceCloneProgress) => void,
     ): () => void;
+    saveSourceCloneDiagnosticLog(contents: string): Promise<{
+      ok: boolean;
+      cancelled?: boolean;
+      fileName?: string;
+      error?: string;
+    }>;
     selectSourceCloneDestination(): Promise<string[]>;
     prepareSourceClone(
       sourceIds: string[],
       destinations: string[],
       operationId: string,
-    ): Promise<{ ok: boolean; plan?: SourceClonePreflight; error?: string }>;
+    ): Promise<{
+      ok: boolean;
+      plan?: SourceClonePreflight;
+      error?: string;
+      errorDetails?: SourceCloneErrorDetails;
+    }>;
+    prepareShelterReplica(
+      destinations: string[],
+      operationId: string,
+    ): Promise<{
+      ok: boolean;
+      plan?: SourceClonePreflight;
+      error?: string;
+      errorDetails?: SourceCloneErrorDetails;
+    }>;
     startSourceClone(
       planId: string,
       options?: { compress?: boolean; createAppleCompatibleBackup?: boolean },
-    ): Promise<{ ok: boolean; timeMachineStarted?: boolean; timeMachineError?: string; error?: string }>;
+    ): Promise<{
+      ok: boolean;
+      timeMachineStarted?: boolean;
+      timeMachineError?: string;
+      timeMachineErrorDetails?: SourceCloneErrorDetails;
+      error?: string;
+      errorDetails?: SourceCloneErrorDetails;
+    }>;
     startMachineTimeMachineBackup(sourceId: string): Promise<{
       ok: boolean;
       timeMachineStarted?: boolean;
       error?: string;
+      errorDetails?: SourceCloneErrorDetails;
     }>;
     extractSourceCloneArchive(operationId: string): Promise<{
       ok: boolean;
@@ -1035,6 +1100,7 @@ interface Window {
       destinationRoot?: string;
       extractedFiles?: number;
       error?: string;
+      errorDetails?: SourceCloneErrorDetails;
     }>;
     cancelSourceClone(operationId: string): Promise<boolean>;
     onSourceCloneProgress(

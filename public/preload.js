@@ -126,6 +126,8 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.on("source-clone-progress", listener);
     return () => ipcRenderer.removeListener("source-clone-progress", listener);
   },
+  saveSourceCloneDiagnosticLog: (contents) =>
+    ipcRenderer.invoke("save-source-clone-diagnostic-log", contents),
   getFilePreview: (filePath) =>
     ipcRenderer.invoke("get-file-preview", filePath),
   openMediaPopout: (filePath, startTime) =>

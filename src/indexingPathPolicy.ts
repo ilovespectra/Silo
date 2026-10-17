@@ -58,6 +58,16 @@ export function isMacDataVolumePathExcluded(candidatePath: string, sourceRoot: s
   );
 }
 
+/** Trash contents may be protected by macOS even when the enclosing folder is readable. */
+export function isMacTrashPath(candidatePath: string, sourceRoot: string): boolean {
+  if (process.platform !== "darwin") return false;
+  const resolvedRoot = path.resolve(sourceRoot);
+  const relative = path.relative(resolvedRoot, path.resolve(candidatePath));
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+    return false;
+  return relative.split(path.sep).some((segment) => segment === ".Trash" || segment === ".Trashes");
+}
+
 // Software trees (dependencies, app bundles, VCS internals) hold thousands of files and no memories.
 const NON_LIBRARY_SEGMENT = /(^|[\\/])(node_modules|bower_components|\.git|\.svn|\.hg|__pycache__|\.Trashes|\.cache|\.silo-phone-restores|\.silo-phone-snapshots|[^\\/]+\.(app|asar|framework|bundle|plugin|kext|xpc|appex|xcodeproj|xcassets))([\\/]|$)/i;
 

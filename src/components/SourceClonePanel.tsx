@@ -15,6 +15,36 @@ interface SourceClonePanelProps {
   onClose: () => void;
 }
 
+interface SourceCloneDiagnosticReport {
+  format: "silo-fallout-shelter-diagnostic";
+  version: 1;
+  operationId: string;
+  mode: "sources" | "shelter-replica";
+  startedAt: string;
+  updatedAt: string;
+  outcome: string;
+  sources: CloneSource[];
+  destinations: string[];
+  omittedEvents: number;
+  events: Array<{ at: string; type: string; details?: unknown }>;
+}
+
+function addDiagnosticEvent(report: SourceCloneDiagnosticReport, type: string, details?: unknown) {
+  report.updatedAt = new Date().toISOString();
+  report.events.push({ at: report.updatedAt, type, ...(details === undefined ? {} : { details }) });
+  if (report.events.length > 2000) {
+    const removeCount = report.events.length - 1500;
+    report.events.splice(0, removeCount);
+    report.omittedEvents += removeCount;
+  }
+}
+
+function describeError(error: unknown) {
+  return error instanceof Error
+    ? { name: error.name, message: error.message }
+    : { name: "Error", message: String(error) };
+}
+
 function formatBytes(value: number) {
   if (!Number.isFinite(value) || value < 0) return "0 B";
   if (value < 1024) return `${value} B`;
@@ -43,15 +73,66 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
   const [timeMachineError, setTimeMachineError] = useState("");
   const [extracting, setExtracting] = useState(false);
   const operationIdRef = useRef("");
+  const diagnosticRef = useRef<SourceCloneDiagnosticReport | null>(null);
+  const [diagnosticsAvailable, setDiagnosticsAvailable] = useState(false);
+  const [diagnosticStatus, setDiagnosticStatus] = useState("");
   const busy = preparing || running || extracting;
   const supportsTimeMachine = mode === "sources" && sources.length === 1 && sources[0].kind === "machine";
   const timeMachineOnly = supportsTimeMachine && createAppleCompatibleBackup && timeMachineMode === "instead";
 
   useEffect(() => {
     return electronAPI.onSourceCloneProgress((state) => {
-      if (state.operationId === operationIdRef.current) setProgress(state);
+      if (state.operationId === operationIdRef.current) {
+        setProgress(state);
+        const report = diagnosticRef.current;
+        if (report?.operationId === state.operationId)
+          addDiagnosticEvent(report, "progress", state);
+      }
     });
   }, [electronAPI]);
+
+  const beginDiagnostics = (operationId: string, selectedDestinations: string[]) => {
+    const now = new Date().toISOString();
+    const report: SourceCloneDiagnosticReport = {
+      format: "silo-fallout-shelter-diagnostic",
+      version: 1,
+      operationId,
+      mode,
+      startedAt: now,
+      updatedAt: now,
+      outcome: "in-progress",
+      sources: sources.map((source) => ({ ...source })),
+      destinations: [...selectedDestinations],
+      omittedEvents: 0,
+      events: [],
+    };
+    addDiagnosticEvent(report, "operation-started", {
+      sources: report.sources,
+      destinations: report.destinations,
+    });
+    diagnosticRef.current = report;
+    setDiagnosticsAvailable(true);
+    setDiagnosticStatus("");
+  };
+
+  const downloadDiagnostics = async () => {
+    const report = diagnosticRef.current;
+    if (!report) return;
+    addDiagnosticEvent(report, "diagnostic-export-requested");
+    setDiagnosticStatus("");
+    try {
+      const result = await electronAPI.saveSourceCloneDiagnosticLog(JSON.stringify(report));
+      if (result.ok) setDiagnosticStatus(`Saved ${result.fileName || "diagnostic log"}.`);
+      else if (result.cancelled) addDiagnosticEvent(report, "diagnostic-export-cancelled");
+      else {
+        addDiagnosticEvent(report, "diagnostic-export-failed", { message: result.error || "Could not save the diagnostic log." });
+        setDiagnosticStatus(result.error || "Could not save the diagnostic log.");
+      }
+    } catch (cause) {
+      addDiagnosticEvent(report, "diagnostic-export-failed", describeError(cause));
+      setDiagnosticStatus(cause instanceof Error ? cause.message : "Could not save the diagnostic log.");
+    }
+  };
 
   const addDestination = async () => {
     setError("");
@@ -71,6 +152,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
     setError(""); setPlan(null); setProgress(null); setAcknowledged(false); setPreparing(true);
     const operationId = `clone-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     operationIdRef.current = operationId;
+    beginDiagnostics(operationId, destinations);
     try {
       const result = mode === "shelter-replica"
         ? await electronAPI.prepareShelterReplica(destinations, operationId)
@@ -79,9 +161,31 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             destinations,
             operationId,
           );
-      if (!result.ok || !result.plan)
-        throw new Error(result.error || "Could not prepare this clone.");
+      if (!result.ok || !result.plan) {
+        const message = result.error || "Could not prepare this clone.";
+        const cancelled = message.toLowerCase().includes("cancel");
+        const report = diagnosticRef.current;
+        if (report?.operationId === operationId) {
+          report.outcome = cancelled ? "cancelled" : "preflight-failed";
+          addDiagnosticEvent(report, cancelled ? "preflight-cancelled" : "preflight-failed", {
+            message,
+            ...(result.errorDetails ? { error: result.errorDetails } : {}),
+          });
+        }
+        throw new Error(message);
+      }
       setPlan(result.plan);
+      const report = diagnosticRef.current;
+      if (report?.operationId === operationId) {
+        report.outcome = "preflight-ready";
+        addDiagnosticEvent(report, "preflight-ready", {
+          totalSources: result.plan.totalSources,
+          totalFiles: result.plan.totalFiles,
+          totalBytes: result.plan.totalBytes,
+          duplicateFiles: result.plan.duplicateFiles,
+          excludedPaths: result.plan.excludedPaths ?? [],
+        });
+      }
       setProgress({
         operationId,
         phase: "checking-space",
@@ -97,6 +201,11 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
         message: "Preflight complete. Review the space estimate before copying.",
       });
     } catch (cause) {
+      const report = diagnosticRef.current;
+      if (report?.operationId === operationId && report.outcome === "in-progress") {
+        report.outcome = "preflight-failed";
+        addDiagnosticEvent(report, "preflight-failed", describeError(cause));
+      }
       setError(cause instanceof Error ? cause.message : "Could not prepare this clone.");
     } finally {
       setPreparing(false);
@@ -107,17 +216,47 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
     if (!plan || plan.destinations.some((destination) => destination.shortfallBytes > 0) || !acknowledged) return;
     setRunning(true);
     setError("");
+    const report = diagnosticRef.current;
+    if (report) {
+      report.outcome = "copy-in-progress";
+      addDiagnosticEvent(report, "copy-started", { compress });
+    }
     try {
       const result = await electronAPI.startSourceClone(plan.planId, {
         compress,
         createAppleCompatibleBackup: supportsTimeMachine && createAppleCompatibleBackup && timeMachineMode === "as-well",
       });
-      if (!result.ok) throw new Error(result.error || "Clone did not complete.");
+      if (!result.ok) {
+        if (report) {
+          report.outcome = "copy-failed";
+          addDiagnosticEvent(report, "copy-failed", {
+            message: result.error || "Clone did not complete.",
+            ...(result.errorDetails ? { error: result.errorDetails } : {}),
+          });
+        }
+        throw new Error(result.error || "Clone did not complete.");
+      }
+      if (report) {
+        report.outcome = "complete";
+        addDiagnosticEvent(report, "copy-complete");
+      }
       if (result.timeMachineStarted)
         setTimeMachineMessage("macOS accepted the Time Machine backup request. Check Time Machine for progress and completion.");
-      if (result.timeMachineError)
+      if (result.timeMachineError) {
+        if (report) report.outcome = "clone-complete-time-machine-failed";
         setTimeMachineError(`The Silo clone completed, but Time Machine could not be confirmed: ${result.timeMachineError}`);
+        if (report) addDiagnosticEvent(report, "time-machine-request-failed", {
+          message: result.timeMachineError,
+          ...(result.timeMachineErrorDetails ? { error: result.timeMachineErrorDetails } : {}),
+        });
+      } else if (result.timeMachineStarted && report) {
+        addDiagnosticEvent(report, "time-machine-request-accepted");
+      }
     } catch (cause) {
+      if (report && report.outcome === "copy-in-progress") {
+        report.outcome = "copy-failed";
+        addDiagnosticEvent(report, "copy-failed", describeError(cause));
+      }
       setError(cause instanceof Error ? cause.message : "Clone did not complete.");
     } finally {
       setRunning(false);
@@ -130,12 +269,37 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
     setError("");
     setTimeMachineMessage("");
     setTimeMachineError("");
+    const operationId = `timemachine-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    operationIdRef.current = operationId;
+    beginDiagnostics(operationId, destinations);
+    const report = diagnosticRef.current;
+    if (report) {
+      report.outcome = "time-machine-in-progress";
+      addDiagnosticEvent(report, "time-machine-request-started", { source: sources[0] });
+    }
     try {
       const result = await electronAPI.startMachineTimeMachineBackup(sources[0].id);
-      if (!result.ok) throw new Error(result.error || "Time Machine did not start.");
+      if (!result.ok) {
+        if (report) {
+          report.outcome = "time-machine-failed";
+          addDiagnosticEvent(report, "time-machine-request-failed", {
+            message: result.error || "Time Machine did not start.",
+            ...(result.errorDetails ? { error: result.errorDetails } : {}),
+          });
+        }
+        throw new Error(result.error || "Time Machine did not start.");
+      }
+      if (report) {
+        report.outcome = "time-machine-requested";
+        addDiagnosticEvent(report, "time-machine-request-accepted");
+      }
       if (result.timeMachineStarted)
         setTimeMachineMessage("macOS accepted the Time Machine backup request. Check Time Machine for progress and completion.");
     } catch (cause) {
+      if (report && report.outcome === "time-machine-in-progress") {
+        report.outcome = "time-machine-failed";
+        addDiagnosticEvent(report, "time-machine-request-failed", describeError(cause));
+      }
       setTimeMachineError(cause instanceof Error ? cause.message : "Time Machine could not be started or confirmed.");
     } finally {
       setRunning(false);
@@ -144,6 +308,11 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
 
   const cancel = async () => {
     const operationId = operationIdRef.current;
+    const report = diagnosticRef.current;
+    if (report?.operationId === operationId) {
+      report.outcome = "cancel-requested";
+      addDiagnosticEvent(report, "cancel-requested");
+    }
     if (operationId) await electronAPI.cancelSourceClone(operationId);
     setPreparing(false);
     setRunning(false);
@@ -153,10 +322,31 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
     setError(""); setProgress(null); setExtracting(true);
     const operationId = `extract-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     operationIdRef.current = operationId;
+    beginDiagnostics(operationId, destinations);
+    addDiagnosticEvent(diagnosticRef.current!, "archive-extraction-started");
     try {
       const result = await electronAPI.extractSourceCloneArchive(operationId);
-      if (!result.ok && !result.cancelled) throw new Error(result.error || "The archive could not be extracted.");
+      if (!result.ok && !result.cancelled) {
+        const report = diagnosticRef.current;
+        if (report) {
+          report.outcome = "extraction-failed";
+          addDiagnosticEvent(report, "archive-extraction-failed", {
+            message: result.error || "The archive could not be extracted.",
+            ...(result.errorDetails ? { error: result.errorDetails } : {}),
+          });
+        }
+        throw new Error(result.error || "The archive could not be extracted.");
+      }
+      if (diagnosticRef.current) {
+        diagnosticRef.current.outcome = result.cancelled ? "extraction-cancelled" : "complete";
+        addDiagnosticEvent(diagnosticRef.current, result.cancelled ? "archive-extraction-cancelled" : "archive-extraction-complete");
+      }
     } catch (cause) {
+      const report = diagnosticRef.current;
+      if (report && report.outcome === "in-progress") {
+        report.outcome = "extraction-failed";
+        addDiagnosticEvent(report, "archive-extraction-failed", describeError(cause));
+      }
       setError(cause instanceof Error ? cause.message : "The archive could not be extracted.");
     } finally {
       setExtracting(false);
@@ -306,6 +496,11 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               <div><span>Destinations</span><strong>{plan.destinations.length}</strong></div>
             </div>
             <small className="source-clone-preflight-note">{plan.duplicateFiles.toLocaleString()} duplicate paths will reuse canonical content; no duplicate file bytes are copied.</small>
+            {plan.excludedPaths?.map((excluded) => (
+              <div className="source-clone-warning" key={`${excluded.sourceLabel}-${excluded.path}`}>
+                {excluded.reason} Source: {excluded.sourceLabel} · <code>{excluded.path}</code>
+              </div>
+            ))}
             {plan.destinations.map((destination) => <div className={`source-clone-warning ${destination.shortfallBytes > 0 ? "insufficient" : ""}`} key={`${destination.destination}-space`}>
               {destination.destination}: {destination.shortfallBytes > 0 ? <>short by <strong>{formatBytes(destination.shortfallBytes)}</strong></> : <>free space {formatBytes(destination.freeBytes)} is sufficient</>}
             </div>)}
@@ -321,9 +516,12 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             )}
             <label className="source-clone-acknowledge">
               <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />
-              <span>{createAppleCompatibleBackup && timeMachineMode === "as-well"
-                ? "I understand this makes a separate readable Silo copy in the selected folder and also requests a separate Time Machine backup at macOS’s configured destination; originals and settings are not changed."
-                : "I understand this makes a separate copy and does not alter the originals."}</span>
+              <span>
+                {createAppleCompatibleBackup && timeMachineMode === "as-well"
+                  ? "I understand this makes a separate readable Silo copy in the selected folder and also requests a separate Time Machine backup at macOS’s configured destination; originals and settings are not changed."
+                  : "I understand this makes a separate copy and does not alter the originals."}
+                {plan.excludedPaths?.length ? " The listed macOS Trash folders, including deleted items, are excluded." : ""}
+              </span>
             </label>
             {running && progress && (
               <div className={`source-clone-progress ${progress.phase}`}>
@@ -364,6 +562,18 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
 
         {error && <div className="source-clone-error">{error}</div>}
         {preparing && !plan && progress && <small className="source-clone-preflight-note">{progress.message}</small>}
+        {diagnosticsAvailable && (
+          <div className="source-clone-diagnostics">
+            <div>
+              <strong>Diagnostic log</strong>
+              <small>Includes source and destination paths, filenames, progress, and operating-system errors. Review it before sharing.</small>
+            </div>
+            <div className="source-clone-diagnostic-actions">
+              <button onClick={() => void downloadDiagnostics()} disabled={busy}>Download diagnostic log</button>
+              {diagnosticStatus && <small role="status">{diagnosticStatus}</small>}
+            </div>
+          </div>
+        )}
       </section>
     </div>
   );
