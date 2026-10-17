@@ -8652,6 +8652,14 @@ async function pauseIndexingForStorage(message: string) {
 }
 
 async function resumeIndexingAfterStorage() {
+  if (indexStorageMissingRoots.length) {
+    const message =
+      "Silo still cannot verify cache data at a previously used location. Reconnect that drive or locate the cache folder; indexing remains paused to avoid splitting the index.";
+    indexStorageAvailable = false;
+    indexStorageUnavailableMessage = message;
+    publishIndexStorageStatus(message);
+    return;
+  }
   if (indexStorageInitializationDeferred) {
     indexStorageTransfer = {
       state: "complete",
@@ -8661,14 +8669,6 @@ async function resumeIndexingAfterStorage() {
     };
     publishIndexStorageStatus(indexStorageTransfer.message);
     scheduleIndexStorageRelaunch();
-    return;
-  }
-  if (indexStorageMissingRoots.length) {
-    const message =
-      "Silo still cannot verify cache data at a previously used location. Reconnect that drive or locate the cache folder; indexing remains paused to avoid splitting the index.";
-    indexStorageAvailable = false;
-    indexStorageUnavailableMessage = message;
-    publishIndexStorageStatus(message);
     return;
   }
   indexStorageUnavailableMessage = null;
