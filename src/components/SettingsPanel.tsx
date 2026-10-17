@@ -10,6 +10,7 @@ import {
   FiCheckCircle,
   FiChevronRight,
   FiCpu,
+  FiCopy,
   FiDownload,
   FiExternalLink,
   FiFilm,
@@ -377,6 +378,9 @@ export function BugReportDialog({
   const [capturingScreenshot, setCapturingScreenshot] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [diagnosticCopyState, setDiagnosticCopyState] = useState<
+    "idle" | "copied" | "error"
+  >("idle");
   const [sent, setSent] = useState(false);
   const [beetleCue, setBeetleCue] = useState<{
     left: number;
@@ -403,6 +407,7 @@ export function BugReportDialog({
     setDiagnosticConsent(false);
     setScreenshotDataUrl(null);
     setNotice("");
+    setDiagnosticCopyState("idle");
   }, [diagnosticReport?.id]);
 
   useEffect(() => {
@@ -547,6 +552,15 @@ export function BugReportDialog({
     onScreenshotSelectionChange(false);
   };
 
+  const copyDiagnosticText = async () => {
+    try {
+      await navigator.clipboard.writeText(message);
+      setDiagnosticCopyState("copied");
+    } catch {
+      setDiagnosticCopyState("error");
+    }
+  };
+
   const captureScreenshot = async () => {
     if (!electronAPI) return;
     setBusy(true);
@@ -675,19 +689,50 @@ export function BugReportDialog({
             </label>
           </div>
         )}
-        <label className="bug-report-field">
-          <span>What happened?</span>
+        <div className="bug-report-field">
+          <div className="bug-report-field-heading">
+            <label htmlFor="bug-report-message">What happened?</label>
+            {diagnosticReport && (
+              <div className="bug-report-copy-actions">
+                <button
+                  className="settings-secondary"
+                  type="button"
+                  onClick={() => void copyDiagnosticText()}
+                  disabled={!message}
+                  aria-label="Copy diagnostic report text"
+                >
+                  {diagnosticCopyState === "copied" ? <FiCheck /> : <FiCopy />}
+                  {diagnosticCopyState === "copied" ? "Copied" : "Copy report text"}
+                </button>
+                <span
+                  className={`bug-report-copy-status ${diagnosticCopyState}`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {diagnosticCopyState === "copied"
+                    ? "Copied to clipboard."
+                    : diagnosticCopyState === "error"
+                      ? "Could not copy to clipboard."
+                      : ""}
+                </span>
+              </div>
+            )}
+          </div>
           <textarea
+            id="bug-report-message"
             autoFocus
             maxLength={100000}
             rows={5}
             value={message}
-            onChange={(event) => setMessage(event.target.value)}
+            onChange={(event) => {
+              setMessage(event.target.value);
+              setDiagnosticCopyState("idle");
+            }}
             placeholder="Describe what you expected and what went wrong…"
             disabled={busy || sent}
           />
           <small>{message.length.toLocaleString()} / 100,000</small>
-        </label>
+        </div>
         <label className="bug-report-field">
           <span>Visible feature (optional)</span>
           <select

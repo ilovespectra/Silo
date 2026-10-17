@@ -9789,6 +9789,11 @@ input[type="range"]::-moz-range-progress {
   color: var(--text);
 }
 .bug-report-field { display: grid; gap: 6px; font-size: 11px; font-weight: 700; }
+.bug-report-field-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.bug-report-copy-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
+.bug-report-copy-actions .settings-secondary { min-height: 30px; padding: 0 9px; font-size: 10px; }
+.bug-report-copy-status { color: #efa08c; font-size: 10px; font-weight: 400; }
+.bug-report-copy-status.copied { color: #8dcf9a; }
 .bug-report-field textarea,
 .bug-report-field select {
   width: 100%;
