@@ -816,9 +816,13 @@ export default function AudioLibrary({
   const popOut = async () => {
     if (!activeFile) return;
     const audio = audioRef.current;
-    const result = await electronAPI.openMediaPopout(activeFile.path, audio?.currentTime ?? currentTime);
-    if (result.ok) audio?.pause();
-    else setError(result.error ?? "Could not open the pop-out player.");
+    try {
+      const result = await electronAPI.openMediaPopout(activeFile.path, audio?.currentTime ?? currentTime);
+      if (result.ok) audio?.pause();
+      else setError(result.error ?? "Could not open the pop-out player.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not open the pop-out player.");
+    }
   };
 
   useEffect(() => {
@@ -1055,12 +1059,43 @@ export default function AudioLibrary({
           </strong>
         )}
       </header>
-      <div className="audio-playlist-tools">
-        <label><span>Playlist</span><select value={playlistId} onChange={(event) => setPlaylistId(event.target.value)} aria-label="Audio playlist"><option value="all">All audio</option>{audioPlaylists.map((playlist) => <option key={playlist.id} value={playlist.id}>{playlist.name} · {playlist.filePaths.length}</option>)}</select></label>
-        {selectedPlaylist && <button type="button" title="Delete this playlist" aria-label="Delete this playlist" onClick={() => { void onDeletePlaylist(selectedPlaylist.id); setPlaylistId("all"); }}> <FiTrash2 /> Delete playlist</button>}
-        <input value={playlistName} onChange={(event) => setPlaylistName(event.target.value)} placeholder="New audio playlist" aria-label="New audio playlist name" maxLength={100} />
-        <button type="button" disabled={!playlistName.trim() || playlistBusy} onClick={() => void createPlaylist()}><FiPlus /> Create playlist</button>
-        <label><span>Add tracks to</span><select value={targetPlaylistId} onChange={(event) => setTargetPlaylistId(event.target.value)} aria-label="Playlist destination"><option value="">Choose playlist</option>{audioPlaylists.map((playlist) => <option key={playlist.id} value={playlist.id}>{playlist.name}</option>)}</select></label>
+      <div className="audio-playlist-tools" role="group" aria-label="Audio playlist controls">
+        <div className="audio-playlist-control-group">
+          <label>
+            <span>Playlist</span>
+            <select value={playlistId} onChange={(event) => setPlaylistId(event.target.value)} aria-label="Audio playlist">
+              <option value="all">All audio</option>
+              {audioPlaylists.map((playlist) => <option key={playlist.id} value={playlist.id}>{playlist.name} · {playlist.filePaths.length}</option>)}
+            </select>
+          </label>
+          {selectedPlaylist && (
+            <button
+              type="button"
+              className="audio-playlist-delete"
+              title="Delete this playlist"
+              aria-label="Delete this playlist"
+              onClick={() => { void onDeletePlaylist(selectedPlaylist.id); setPlaylistId("all"); }}
+            >
+              <FiTrash2 /> Delete
+            </button>
+          )}
+        </div>
+        <div className="audio-playlist-control-group audio-playlist-create-group">
+          <label className="audio-playlist-name">
+            <span>New playlist</span>
+            <input value={playlistName} onChange={(event) => setPlaylistName(event.target.value)} placeholder="Playlist name" aria-label="New audio playlist name" maxLength={100} />
+          </label>
+          <button type="button" className="audio-playlist-create" disabled={!playlistName.trim() || playlistBusy} onClick={() => void createPlaylist()}>
+            <FiPlus /> Create playlist
+          </button>
+        </div>
+        <label className="audio-playlist-destination">
+          <span>Add tracks to</span>
+          <select value={targetPlaylistId} onChange={(event) => setTargetPlaylistId(event.target.value)} aria-label="Playlist destination">
+            <option value="">Choose playlist</option>
+            {audioPlaylists.map((playlist) => <option key={playlist.id} value={playlist.id}>{playlist.name}</option>)}
+          </select>
+        </label>
       </div>
       {loading && (
         <div className="audio-scan-progress" role="status" aria-live="polite">

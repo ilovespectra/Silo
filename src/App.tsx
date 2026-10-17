@@ -9295,35 +9295,45 @@ function App() {
           visibility: appSection === "files" && (audioOnlySelected || videoOnlySelected) && mediaHostBounds ? "visible" : "hidden",
         }}
       >
-        {electronAPI && <AudioLibrary
-          electronAPI={electronAPI}
-          visible={appSection === "files" && audioOnlySelected}
-          exploded={exploded}
-          yearFilter={yearFilter}
-          sort={audioSort}
-          favoritePaths={favoritePaths}
-          playlists={mediaPlaylists}
-          onAudioYearsChange={setAudioYearOptions}
-          onToggleFavorite={(filePath) => void toggleFavorite(filePath)}
-          onCreatePlaylist={createMediaPlaylist}
-          onAddToPlaylist={addToMediaPlaylist}
-          onRemoveFromPlaylist={removeFromMediaPlaylist}
-          onDeletePlaylist={deleteMediaPlaylist}
-        />}
-        {electronAPI && <VideoTheatre
-          electronAPI={electronAPI}
-          visible={appSection === "files" && videoOnlySelected}
-          files={filteredAndSortedFiles.filter((file) => !file.isDirectory && file.type === "video")}
-          playlists={mediaPlaylists}
-          favoritePaths={favoritePaths}
-          fileMetadata={fileMetadata}
-          onToggleFavorite={(filePath) => void toggleFavorite(filePath)}
-          onCreatePlaylist={createMediaPlaylist}
-          onAddToPlaylist={addToMediaPlaylist}
-          onRemoveFromPlaylist={removeFromMediaPlaylist}
-          onDeletePlaylist={deleteMediaPlaylist}
-          onEditMetadata={editVideoMetadata}
-        />}
+        {electronAPI && <div
+          className="media-player-slot"
+          hidden={!(appSection === "files" && audioOnlySelected)}
+        >
+          <AudioLibrary
+            electronAPI={electronAPI}
+            visible={appSection === "files" && audioOnlySelected}
+            exploded={exploded}
+            yearFilter={yearFilter}
+            sort={audioSort}
+            favoritePaths={favoritePaths}
+            playlists={mediaPlaylists}
+            onAudioYearsChange={setAudioYearOptions}
+            onToggleFavorite={(filePath) => void toggleFavorite(filePath)}
+            onCreatePlaylist={createMediaPlaylist}
+            onAddToPlaylist={addToMediaPlaylist}
+            onRemoveFromPlaylist={removeFromMediaPlaylist}
+            onDeletePlaylist={deleteMediaPlaylist}
+          />
+        </div>}
+        {electronAPI && <div
+          className="media-player-slot"
+          hidden={!(appSection === "files" && videoOnlySelected)}
+        >
+          <VideoTheatre
+            electronAPI={electronAPI}
+            visible={appSection === "files" && videoOnlySelected}
+            files={filteredAndSortedFiles.filter((file) => !file.isDirectory && file.type === "video")}
+            playlists={mediaPlaylists}
+            favoritePaths={favoritePaths}
+            fileMetadata={fileMetadata}
+            onToggleFavorite={(filePath) => void toggleFavorite(filePath)}
+            onCreatePlaylist={createMediaPlaylist}
+            onAddToPlaylist={addToMediaPlaylist}
+            onRemoveFromPlaylist={removeFromMediaPlaylist}
+            onDeletePlaylist={deleteMediaPlaylist}
+            onEditMetadata={editVideoMetadata}
+          />
+        </div>}
       </div>
 
       {viewerOpen && selectedFile && (

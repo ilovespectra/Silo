@@ -9876,18 +9876,63 @@ ipcMain.handle(
         autoplayPolicy: "no-user-gesture-required",
       },
     });
-    mediaPopoutEntries.set(popup.webContents.id, {
+    const popupContents = popup.webContents;
+    const popupContentsId = popupContents.id;
+    const popupWindowId = popup.id;
+    let popupClosed = false;
+    mediaPopoutEntries.set(popupContentsId, {
       filePath,
       startTime: Number.isFinite(startTime) ? Math.max(0, startTime) : 0,
     });
-    popup.on("closed", () => mediaPopoutEntries.delete(popup.webContents.id));
+    popup.once("closed", () => {
+      popupClosed = true;
+      mediaPopoutEntries.delete(popupContentsId);
+      runtimeLog("media-popout-closed", {
+        windowId: popupWindowId,
+        webContentsId: popupContentsId,
+      });
+    });
+    popupContents.on("render-process-gone", (_event, details) => {
+      runtimeLog("media-popout-render-process-gone", {
+        windowId: popupWindowId,
+        webContentsId: popupContentsId,
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+    });
     const popoutPath = path.join(
       app.getAppPath(),
       isDev ? "public/media-popout.html" : "build/media-popout.html",
     );
-    await popup.loadFile(popoutPath, { query: { token } });
-    popup.show();
-    return { ok: true };
+    try {
+      await popup.loadFile(popoutPath, { query: { token } });
+      if (popupClosed) {
+        mediaPopoutEntries.delete(popupContentsId);
+        return { ok: false, error: "The pop-out player closed before it finished opening." };
+      }
+      popup.show();
+      runtimeLog("media-popout-opened", {
+        windowId: popupWindowId,
+        webContentsId: popupContentsId,
+        mediaType: mediaType.startsWith("video/") ? "video" : "audio",
+      });
+      return { ok: true };
+    } catch (error) {
+      mediaPopoutEntries.delete(popupContentsId);
+      runtimeLog("media-popout-open-failed", {
+        windowId: popupWindowId,
+        webContentsId: popupContentsId,
+        message: safeRuntimeDiagnosticText(
+          error instanceof Error ? error.message : String(error),
+        ),
+      });
+      try {
+        if (!popupClosed && !popup.isDestroyed()) popup.close();
+      } catch {
+        // A close during load can destroy the window before this cleanup runs.
+      }
+      return { ok: false, error: "Silo could not open the pop-out player." };
+    }
   },
 );
 

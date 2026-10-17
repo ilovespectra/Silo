@@ -120,9 +120,13 @@ export default function VideoTheatre({
   const popOut = async () => {
     if (!activeFile) return;
     const player = videoRef.current;
-    const result = await electronAPI.openMediaPopout(activeFile.path, player?.currentTime ?? 0);
-    if (result.ok) player?.pause();
-    else setError(result.error ?? "Could not open the pop-out player.");
+    try {
+      const result = await electronAPI.openMediaPopout(activeFile.path, player?.currentTime ?? 0);
+      if (result.ok) player?.pause();
+      else setError(result.error ?? "Could not open the pop-out player.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not open the pop-out player.");
+    }
   };
   const metadata = activeFile ? fileMetadata[activeFile.path] : undefined;
 
