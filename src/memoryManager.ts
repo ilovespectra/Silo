@@ -114,6 +114,7 @@ const MAX_RECENT_KEYS = 80;
 const MAX_MEDIA = 24;
 const MAX_CACHE_MEDIA = 30;
 const MAX_STATE_BYTES = 4 * 1024 * 1024;
+const MAX_CUSTOM_PROMPT_STEPS = 26;
 const RIGHTS = "Song from your music library. Memory movies are for personal viewing only: don't share or upload them, the music is copyrighted.";
 const MUSIC_EXTENSION = /\.(mp3|m4a|aac|flac|alac|wav|aiff?|ogg|opus)$/i;
 const NOT_MUSIC = /(voice ?memos?|recordings?|ringtones?|podcasts?|audiobooks?|sound ?effects?|\bsfx\b|samples?|whatsapp|telegram|attachments|voicemail|notifications?|alarms?|system sounds|garageband|phone backups?)/i;
@@ -635,18 +636,9 @@ export class MemoryManager {
       };
       let searchFailed = false;
       let customPlan: MemoryPromptPlan | null = null;
-      if (customTopic && this.deps.planPromptedMemory) {
-        this.updateGenerationProgress("scanning", 0, 1, "Understanding your Memory request...", startedAt);
-        try {
-          customPlan = await this.deps.planPromptedMemory(customTopic);
-        } catch (error) {
-          this.deps.onSearchError?.("custom-topic-plan", error);
-        }
-      }
-      promptedTopicTitle = customTopic ? customTopicTitle(customTopic, customPlan) : undefined;
-      const broadQueries = customTopic ? customTopicQueries(customTopic, customPlan) : [];
+      let broadQueries = customTopic ? customTopicQueries(customTopic) : [];
       const totalSteps = customTopic
-        ? Math.max(2, broadQueries.length + 1)
+        ? MAX_CUSTOM_PROMPT_STEPS
         : Math.max(2, Math.min(MAX_IDEA_ATTEMPTS, want ? 8 : 1) + 5);
       let completedSteps = 0;
       const advance = (phase: MemoryGenerationProgress["phase"], label: string, amount = 1) => {
@@ -654,14 +646,90 @@ export class MemoryManager {
         this.updateGenerationProgress(phase, completedSteps, totalSteps, label, startedAt);
       };
       if (customTopic) {
-        let searchErrors = 0;
         const mergedByPath = new Map<string, {
           media: MemoryMedia;
           score: number;
           queryRanks: Map<string, number>;
         }>();
         const queryPaths: string[][] = [];
-        for (let index = 0; index < broadQueries.length; index++) {
+        let searchErrors = 0;
+        const addQueryHits = (query: string, hits: MemoryMedia[], index: number, of: number) => {
+          let added = 0;
+          const queryKey = query.toLocaleLowerCase().replace(/\s+/g, " ").trim();
+          const thisQueryPaths: string[] = [];
+          for (let rank = 0; rank < hits.length; rank++) {
+            const candidate = hits[rank];
+            const media = mediaValue(candidate);
+            if (!media) continue;
+            thisQueryPaths.push(media.path);
+            const score = (candidate as MemoryMedia & { score?: number }).score;
+            const candidateScore = typeof score === "number" && Number.isFinite(score) ? score : 0;
+            const existing = mergedByPath.get(media.path);
+            if (!existing) {
+              mergedByPath.set(media.path, { media, score: candidateScore, queryRanks: new Map([[queryKey, rank]]) });
+              added++;
+            } else {
+              if (candidateScore > existing.score) {
+                existing.media = media;
+                existing.score = candidateScore;
+              }
+              existing.queryRanks.set(queryKey, rank);
+            }
+          }
+          queryPaths.push(thisQueryPaths);
+          this.trace("memory-custom-query", { index, of, words: query.split(/\s+/).length,
+            hits: hits.length, added, merged: mergedByPath.size });
+        };
+
+        // Start with the user's words, before asking Ollama to reinterpret them.
+        // Simple named people, folders, and places can then generate immediately.
+        const directQuery = customTopic;
+        try {
+          advance("scanning", `Searching “${promptedTopicTitle ?? customTopicTitle(customTopic)}”`, 1);
+          const hits = this.deps.searchPrompted
+            ? await this.deps.searchPrompted(directQuery, customTopic)
+            : await this.deps.search(directQuery);
+          if (Array.isArray(hits)) {
+            addQueryHits(directQuery, hits, 0, 1);
+            const directTitle = customTopicTitle(customTopic);
+            const directCard = await this.buildCard({
+              key: `custom:${createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16)}`,
+              title: directTitle,
+              description: `A story shaped by “${customTopic}” from your library.`,
+              query: customTopic,
+              mood: customTopicMood(customTopic),
+            }, hits, signatures, usedPaths, existingStories);
+            if (directCard) {
+              take(directCard);
+              if (produced.length)
+                advance("matching", `Found a memory for “${directTitle}”`, 1);
+            }
+          } else {
+            this.trace("memory-custom-query", { index: 0, of: 1, words: directQuery.split(/\s+/).length, hits: -1 });
+          }
+        } catch (error) {
+          searchErrors++;
+          this.deps.onSearchError?.("custom-topic", error);
+        }
+
+        if (!produced.length && this.deps.planPromptedMemory) {
+          this.updateGenerationProgress("scanning", completedSteps, totalSteps, "Expanding your Memory search…", startedAt);
+          try {
+            customPlan = await this.deps.planPromptedMemory(customTopic);
+          } catch (error) {
+            this.deps.onSearchError?.("custom-topic-plan", error);
+          }
+        }
+        promptedTopicTitle = customTopicTitle(customTopic, customPlan);
+        if (!produced.length) {
+          const directKey = directQuery.toLocaleLowerCase().replace(/\s+/g, " ").trim();
+          broadQueries = customTopicQueries(customTopic, customPlan)
+            .filter((query) => query.toLocaleLowerCase().replace(/\s+/g, " ").trim() !== directKey);
+        } else {
+          broadQueries = [];
+        }
+
+        for (let index = 0; !produced.length && index < broadQueries.length; index++) {
           const query = broadQueries[index];
           try {
             const topicTitle = promptedTopicTitle ?? customTopicTitle(customTopic);
@@ -673,31 +741,7 @@ export class MemoryManager {
               this.trace("memory-custom-query", { index, of: broadQueries.length, words: query.split(/\s+/).length, hits: -1 });
               continue;
             }
-            let added = 0;
-            const queryKey = query.toLocaleLowerCase().replace(/\s+/g, " ").trim();
-            const thisQueryPaths: string[] = [];
-            for (let rank = 0; rank < hits.length; rank++) {
-              const candidate = hits[rank];
-              const media = mediaValue(candidate);
-              if (!media) continue;
-              thisQueryPaths.push(media.path);
-              const score = (candidate as MemoryMedia & { score?: number }).score;
-              const candidateScore = typeof score === "number" && Number.isFinite(score) ? score : 0;
-              const existing = mergedByPath.get(media.path);
-              if (!existing) {
-                mergedByPath.set(media.path, { media, score: candidateScore, queryRanks: new Map([[queryKey, rank]]) });
-                added++;
-              } else {
-                if (candidateScore > existing.score) {
-                  existing.media = media;
-                  existing.score = candidateScore;
-                }
-                existing.queryRanks.set(queryKey, rank);
-              }
-            }
-            queryPaths.push(thisQueryPaths);
-            this.trace("memory-custom-query", { index, of: broadQueries.length, words: query.split(/\s+/).length,
-              hits: hits.length, added, merged: mergedByPath.size });
+            addQueryHits(query, hits, index + 1, broadQueries.length);
           } catch (error) {
             searchErrors += 1;
             this.deps.onSearchError?.("custom-topic", error);
@@ -705,7 +749,7 @@ export class MemoryManager {
           }
         }
         // Only report search as unavailable when every query actually failed.
-        if (!produced.length && searchErrors > 0 && searchErrors === broadQueries.length) searchFailed = true;
+        if (!produced.length && searchErrors > 0 && searchErrors === broadQueries.length + 1) searchFailed = true;
         // Interleave result lists before the card's bounded candidate pass, so the first
         // phrase cannot crowd every later person, place, or folder out of the 200-photo pool.
         const orderedPaths: string[] = [];
@@ -737,15 +781,17 @@ export class MemoryManager {
           }];
         });
         const topicTitle = promptedTopicTitle ?? customTopicTitle(customTopic);
-        const card = await this.buildCard({
-          key: `custom:${createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16)}`,
-          title: topicTitle,
-          description: `A story shaped by “${customTopic}” from your library.`,
-          query: customTopic,
-          mood: customTopicMood(customTopic),
-        }, mergedHits, signatures, usedPaths, existingStories);
-        take(card);
-        advance("matching", card ? `Found a memory for “${topicTitle}”` : "Matching the best photos...", 1);
+        if (!produced.length && mergedHits.length) {
+          const card = await this.buildCard({
+            key: `custom:${createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16)}`,
+            title: topicTitle,
+            description: `A story shaped by “${customTopic}” from your library.`,
+            query: customTopic,
+            mood: customTopicMood(customTopic),
+          }, mergedHits, signatures, usedPaths, existingStories);
+          take(card);
+          advance("matching", card ? `Found a memory for “${topicTitle}”` : "Matching the best photos...", 1);
+        }
       } else if (want > 0 && this.deps.discover) {
         let ideas: MemoryStoryCandidate[] = [];
         try { ideas = await this.deps.discover(); } catch (error) { searchFailed = true; this.deps.onSearchError?.("discover", error); }

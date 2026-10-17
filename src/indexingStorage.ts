@@ -1055,8 +1055,15 @@ export async function prepareConfiguredIndexStorage(
     settings.pendingPath &&
     path.resolve(settings.path) !== path.resolve(userDataPath) &&
     !(await exists(settings.path))
-  )
-    rememberedRoots.push(path.resolve(settings.path));
+  ) {
+    // A staged destination change explicitly selects a new cache root. Retire
+    // only the unavailable root being replaced; its files remain untouched,
+    // while the new destination can rebuild derived indexes from originals.
+    const unavailablePriorRoot = path.resolve(settings.path);
+    for (let index = rememberedRoots.length - 1; index >= 0; index -= 1)
+      if (rememberedRoots[index] === unavailablePriorRoot)
+        rememberedRoots.splice(index, 1);
+  }
   const missingRoots: string[] = [];
   for (const root of rememberedRoots) {
     if (root === path.resolve(storageRoot)) continue;

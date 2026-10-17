@@ -702,6 +702,59 @@ async function run() {
     assert(!media.includes("crowd.mov") && !media.includes("dull.mp4"));
   });
 
+  await test("custom prompts try the exact phrase before optional Ollama planning", async () => {
+    const hits = Array.from({ length: 16 }, (_, i) => ({
+      path: path.join(library, `direct-prompt-${i}.jpg`), name: `direct-prompt-${i}.jpg`,
+      type: "image", modified: 2000 + i, score: 100 - i,
+    }));
+    const calls = [];
+    const manager = new MemoryManager(path.join(root, "manager-direct-prompt"), {
+      search: async () => [],
+      searchPrompted: async (query, contextQuery) => {
+        calls.push(["search", query, contextQuery]);
+        return hits;
+      },
+      planPromptedMemory: async () => {
+        calls.push(["plan"]);
+        return { title: "Planned title", queries: ["Maja birthday"], entities: ["Maja"] };
+      },
+      thumb: async () => null, listAudio: () => [], isAllowed: async () => true,
+    });
+    const result = await manager.generate(false, "Maja birthday");
+    assert.equal(result.suggestions.length, 1, result.message);
+    assert.deepEqual(calls, [["search", "Maja birthday", "Maja birthday"]]);
+    assert.equal(result.suggestions[0].title, "Maja Birthday");
+  });
+
+  await test("custom prompt planning expands failed exact searches across saved entities", async () => {
+    const hits = Array.from({ length: 16 }, (_, i) => ({
+      path: path.join(library, `planned-prompt-${i}.jpg`), name: `planned-prompt-${i}.jpg`,
+      type: "image", modified: 3000 + i, score: 100 - i,
+    }));
+    const calls = [];
+    const manager = new MemoryManager(path.join(root, "manager-planned-prompt"), {
+      search: async () => [],
+      searchPrompted: async (query, contextQuery) => {
+        calls.push(["search", query, contextQuery]);
+        return query === "Maja birthday at Lake Bled" ? [] : hits;
+      },
+      planPromptedMemory: async (topic) => {
+        calls.push(["plan", topic]);
+        return { title: "Birthday by the Lake", queries: ["Maja birthday Lake Bled"], entities: ["Maja", "Lake Bled"] };
+      },
+      thumb: async () => null, listAudio: () => [], isAllowed: async () => true,
+    });
+    const result = await manager.generate(false, "Maja birthday at Lake Bled");
+    assert.equal(result.suggestions.length, 1, result.message);
+    assert.deepEqual(calls.slice(0, 2), [
+      ["search", "Maja birthday at Lake Bled", "Maja birthday at Lake Bled"],
+      ["plan", "Maja birthday at Lake Bled"],
+    ]);
+    assert(calls.some(([kind, query, contextQuery]) => kind === "search" && query === "Lake Bled"
+      && contextQuery === "Maja birthday at Lake Bled"), "planned place entity is searched with full prompt context");
+    assert.equal(result.suggestions[0].title, "Birthday by the Lake");
+  });
+
   await test("similar prompted videos reject a mostly repeated photo set", async () => {
     const shared = Array.from({ length: 8 }, (_, i) => ({
       path: path.join(library, `overlap-${i}.jpg`), name: `overlap-${i}.jpg`, type: "image",
