@@ -166,6 +166,8 @@ import {
   LOCAL_INDEX_STORAGE_RESERVE_BYTES,
   setLocalIndexStorageFallback,
   setActiveIndexStorageRoot,
+  describeIndexStorageMigrationProgress,
+  type IndexStorageMigrationProgress,
 } from "./indexingStorage";
 import {
   CLONE_ARCHIVE_EXTENSION,
@@ -265,23 +267,72 @@ function recommendedIndexStorageRoot(): string {
   return path.join(app.getPath("home"), "SiloCache");
 }
 
-/** Lets the user pick (or create) a storage folder and saves it. Returns false if they cancel. */
-async function chooseIndexStorageFolder(userDataPath: string, message: string): Promise<boolean> {
+function nearestExistingFolder(target: string) {
+  let candidate = path.resolve(target);
+  while (!fs.existsSync(candidate) && path.dirname(candidate) !== candidate)
+    candidate = path.dirname(candidate);
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
+function folderHoldsSiloIndex(folder: string) {
+  return ["semantic-index", "face-index", "thumbnail-cache"].some((entry) =>
+    fs.existsSync(path.join(folder, entry)),
+  );
+}
+
+/**
+ * Lets the user pick (or create) a storage folder and saves it. Returns false
+ * if they cancel. When `previousRoot` is given, the picker opens on it and the
+ * user is warned before switching away from an existing Silo cache.
+ */
+async function chooseIndexStorageFolder(
+  userDataPath: string,
+  message: string,
+  previousRoot?: string,
+): Promise<boolean> {
+  const previous =
+    previousRoot && path.resolve(previousRoot) !== path.resolve(userDataPath)
+      ? path.resolve(previousRoot)
+      : null;
   for (;;) {
     const chosen = await dialog.showOpenDialog({
       title: "Choose Silo storage destination",
-      message,
-      defaultPath: recommendedIndexStorageRoot(),
+      message: previous ? `${message}\nPreviously used: ${previous}` : message,
+      defaultPath:
+        (previous && nearestExistingFolder(previous)) || recommendedIndexStorageRoot(),
       properties: ["openDirectory", "createDirectory", "promptToCreate"],
       buttonLabel: "Use this destination",
     });
     if (chosen.canceled || !chosen.filePaths[0]) return false;
-    const storageRoot = path.resolve(chosen.filePaths[0]);
+    let storageRoot = path.resolve(chosen.filePaths[0]);
     const resolvedUserData = path.resolve(userDataPath);
     const isInside = (child: string, parent: string) => {
       const relative = path.relative(parent, child);
       return !relative || (!relative.startsWith("..") && !path.isAbsolute(relative));
     };
+    if (previous && storageRoot !== previous && fs.existsSync(previous)) {
+      const nested = isInside(storageRoot, previous);
+      const previousHasIndex = folderHoldsSiloIndex(previous);
+      if (nested || previousHasIndex) {
+        const { response } = await dialog.showMessageBox({
+          type: "warning",
+          message: nested
+            ? "That folder is inside your existing Silo cache"
+            : "Your existing Silo cache is in a different folder",
+          detail: nested
+            ? `You chose:\n${storageRoot}\n\nSilo's cache lives one level up, in:\n${previous}\n\nUse the existing cache folder so your indexes open normally.`
+            : `Existing cache (indexes, faces, thumbnails):\n${previous}\n\nYou chose:\n${storageRoot}\n\nUsing the new folder starts with an empty cache, and Silo will need to re-index your library.`,
+          buttons: nested
+            ? ["Use existing cache folder", "Choose again"]
+            : ["Use existing cache folder", "Use the new folder", "Choose again"],
+          defaultId: 0,
+          cancelId: nested ? 1 : 2,
+          noLink: true,
+        });
+        if (response === 0) storageRoot = previous;
+        else if (nested || response === 2) continue;
+      }
+    }
     try {
       if (isInside(storageRoot, resolvedUserData) || isInside(resolvedUserData, storageRoot))
         throw new Error("Choose a folder outside Silo's app data folder.");
@@ -302,6 +353,208 @@ async function chooseIndexStorageFolder(userDataPath: string, message: string): 
       });
     }
   }
+}
+
+type IndexStorageProbeResult = "ok" | "missing" | "unresponsive";
+
+/**
+ * Checks the destination from a disposable child process. A wedged external
+ * drive can block any file call indefinitely; doing the check out of process
+ * means Silo's main thread never waits on it.
+ */
+function probeIndexStorageDestination(
+  storageRoot: string,
+  timeoutMs = 8000,
+): Promise<IndexStorageProbeResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: IndexStorageProbeResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("/bin/test", ["-d", storageRoot, "-a", "-w", storageRoot], {
+        stdio: "ignore",
+        detached: true,
+      });
+    } catch {
+      resolve("unresponsive");
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      child.unref();
+      finish("unresponsive");
+    }, timeoutMs);
+    child.once("error", () => finish("unresponsive"));
+    child.once("exit", (code) => finish(code === 0 ? "ok" : "missing"));
+  });
+}
+
+function volumeRootFor(storageRoot: string) {
+  const parts = path.resolve(storageRoot).split(path.sep).filter(Boolean);
+  if (process.platform === "darwin" && parts[0] === "Volumes" && parts[1])
+    return path.join("/Volumes", parts[1]);
+  return null;
+}
+
+function runDiskutil(args: string[], timeoutMs: number) {
+  return new Promise<{ ok: boolean; output: string }>((resolve) => {
+    const child = execFile("/usr/sbin/diskutil", args, { timeout: timeoutMs }, (error, stdout, stderr) =>
+      resolve({ ok: !error, output: `${stdout}${stderr}`.trim() || (error ? error.message : "") }),
+    );
+    child.unref?.();
+  });
+}
+
+let indexStorageRecoveryPromptOpen = false;
+
+/**
+ * Walks the user through un-sticking an unresponsive drive: eject, then force
+ * eject if macOS refuses. Returns "retry" after the drive was released (or the
+ * user asked to retry), "local" to continue on the local cache, "quit" to quit.
+ */
+async function recoverUnresponsiveIndexStorage(
+  storageRoot: string,
+  parent?: BrowserWindow | null,
+): Promise<"retry" | "local" | "quit"> {
+  const volume = volumeRootFor(storageRoot);
+  const label = volume ? path.basename(volume) : path.basename(storageRoot);
+  const show = (options: Electron.MessageBoxOptions) =>
+    parent && !parent.isDestroyed()
+      ? dialog.showMessageBox(parent, options)
+      : dialog.showMessageBox(options);
+  indexStorageRecoveryPromptOpen = true;
+  try {
+    for (;;) {
+      runtimeLog("index-storage-unresponsive", { volume: label });
+      const { response } = await show({
+        type: "warning",
+        message: `${label} isn't responding`,
+        detail: `Silo's cache folder is on ${label}, but the drive stopped answering file requests:\n${storageRoot}\n\nEjecting the drive releases it. Afterwards, unplug it, plug it back in, and choose Retry. Your cache files are left untouched.`,
+        buttons: volume
+          ? [`Eject ${label}…`, "Retry", "Use local cache for now", "Quit"]
+          : ["Retry", "Use local cache for now", "Quit"],
+        defaultId: 0,
+        cancelId: volume ? 3 : 2,
+        noLink: true,
+      });
+      const choice = volume
+        ? (["eject", "retry", "local", "quit"] as const)[response]
+        : (["retry", "local", "quit"] as const)[response];
+      if (choice !== "eject") return choice;
+
+      const eject = await runDiskutil(["eject", volume!], 30_000);
+      runtimeLog("index-storage-eject", { volume: label, ok: eject.ok });
+      if (!eject.ok) {
+        const force = await show({
+          type: "warning",
+          message: `${label} could not be ejected normally`,
+          detail: `${eject.output || "macOS reported the drive as busy."}\n\nForce eject releases the drive even though files are open. Silo hasn't committed anything partial: interrupted cache moves are discarded and the originals are kept. Other apps writing to ${label} may lose unsaved changes.`,
+          buttons: [`Force eject ${label}`, "Back"],
+          defaultId: 0,
+          cancelId: 1,
+          noLink: true,
+        });
+        if (force.response !== 0) continue;
+        const forced = await runDiskutil(["unmount", "force", volume!], 30_000);
+        if (forced.ok) await runDiskutil(["eject", volume!], 15_000);
+        runtimeLog("index-storage-force-eject", { volume: label, ok: forced.ok });
+        if (!forced.ok) {
+          await show({
+            type: "error",
+            message: `${label} could not be force ejected`,
+            detail: `${forced.output}\n\nUnplug the drive (or restart the Mac if it still won't release), then choose Retry.`,
+            buttons: ["OK"],
+            noLink: true,
+          });
+          continue;
+        }
+      }
+      const ejected = await show({
+        type: "info",
+        message: `${label} was ejected`,
+        detail: `Unplug ${label}, plug it back in, wait for it to appear in Finder, then choose Retry. Choose "Use local cache for now" to keep working without it.`,
+        buttons: ["Retry", "Use local cache for now"],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true,
+      });
+      return ejected.response === 1 ? "local" : "retry";
+    }
+  } finally {
+    indexStorageRecoveryPromptOpen = false;
+  }
+}
+
+/** Small pre-window progress display for storage work that runs before Silo's main window exists. */
+function createStartupStorageProgress() {
+  let window: BrowserWindow | null = null;
+  let pending: { title: string; detail: string; fraction: number | null } | null = null;
+  let rendering = false;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><style>
+body{margin:0;padding:22px 24px;font:13px -apple-system,BlinkMacSystemFont,sans-serif;background:#1c1c1e;color:#f2f2f7;-webkit-user-select:none}
+h1{font-size:15px;margin:0 0 6px}p{margin:0 0 14px;color:#c7c7cc;line-height:1.4;min-height:36px}
+.bar{height:6px;border-radius:3px;background:#3a3a3c;overflow:hidden}.fill{height:100%;width:0;background:#0a84ff;transition:width .3s}
+.indeterminate .fill{width:30%;animation:slide 1.2s infinite ease-in-out}@keyframes slide{0%{margin-left:-30%}100%{margin-left:100%}}
+small{display:block;margin-top:12px;color:#8e8e93}</style></head><body>
+<h1 id="t">Preparing Silo's cache…</h1><p id="d"></p><div class="bar indeterminate" id="b"><div class="fill" id="f"></div></div>
+<small>Your original files stay in place until every copy is verified. Please keep the drive connected.</small>
+<script>window.update=(t,d,f)=>{document.getElementById('t').textContent=t;document.getElementById('d').textContent=d;const b=document.getElementById('b');if(f===null){b.className='bar indeterminate';document.getElementById('f').style.width='';}else{b.className='bar';document.getElementById('f').style.width=Math.round(f*100)+'%';}}</script>
+</body></html>`;
+  const flush = async () => {
+    if (rendering || !pending || !window || window.isDestroyed()) return;
+    rendering = true;
+    const next = pending;
+    pending = null;
+    await window.webContents
+      .executeJavaScript(
+        `window.update(${JSON.stringify(next.title)},${JSON.stringify(next.detail)},${JSON.stringify(next.fraction)})`,
+      )
+      .catch(() => {});
+    rendering = false;
+    if (pending) void flush();
+  };
+  return {
+    update(title: string, detail: string, fraction: number | null) {
+      pending = { title, detail, fraction };
+      if (!window) {
+        window = new BrowserWindow({
+          width: 460,
+          height: 190,
+          resizable: false,
+          minimizable: false,
+          maximizable: false,
+          fullscreenable: false,
+          title: "Silo",
+          backgroundColor: "#1c1c1e",
+          show: false,
+          webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
+        });
+        window.once("ready-to-show", () => window?.show());
+        void window
+          .loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+          .then(flush)
+          .catch(() => {});
+        return;
+      }
+      void flush();
+    },
+    close() {
+      if (window && !window.isDestroyed()) window.destroy();
+      window = null;
+      pending = null;
+    },
+  };
+}
+
+function migrationProgressFraction(detail?: IndexStorageMigrationProgress) {
+  if (!detail || !["copying", "verifying"].includes(detail.phase) || detail.totalBytes <= 0)
+    return null;
+  return Math.min(1, detail.bytesVerified / detail.totalBytes);
 }
 
 async function requireIndexStorageSelection(userDataPath: string): Promise<boolean> {
@@ -706,8 +959,13 @@ function shouldRejectLicenseForCurrentBuild(
     return true;
   }
   if (!storedLicense) return false;
-  if (typeof storedLicense.appVersion === "string" &&
-      !isVersionAtLeast(storedLicense.appVersion, minimumVersion)) {
+  // Only an explicitly configured release cutoff may retire licenses saved by
+  // older builds. Falling back to the running version would revoke every
+  // license on each app update.
+  const configuredCutoff = resolveMinimumLicenseBuildVersion("");
+  if (configuredCutoff &&
+      typeof storedLicense.appVersion === "string" &&
+      !isVersionAtLeast(storedLicense.appVersion, configuredCutoff)) {
     return true;
   }
   if (typeof storedLicense.minimumRequiredVersion === "string" &&
@@ -2295,6 +2553,8 @@ let indexStorageMonitorRunning = false;
 let indexStorageTransferRunning = false;
 let indexStorageRelaunchPending = false;
 let indexStorageTransferRetryAt = 0;
+let indexStorageUnresponsivePrompted = false;
+let mainStartupWindowAllowed = false;
 let heapPressureMessage: string | null = null;
 let rendererReady = false;
 let shuttingDown = false;
@@ -3505,7 +3765,24 @@ const ALL_INDEX_RECOVERY_STAGES = [
 ];
 let geocoder: Geocoder;
 let duplicateManager: DuplicateManager;
-let contentSettingsStore: ContentSettingsStore;
+let contentSettingsStore!: ContentSettingsStore;
+
+function getDefaultContentSettings(): ContentPreferences & { parentalPasswordSet: boolean } {
+  return {
+    showNsfw: false,
+    safeSearch: true,
+    theme: "system",
+    autoplayGlobe: false,
+    preloadMapTextures: false,
+    showBannedPeople: false,
+    parentalPasswordSet: false,
+  };
+}
+
+function getPublicContentSettings(): ContentPreferences & { parentalPasswordSet: boolean } {
+  return contentSettingsStore?.getPublicSettings() ?? getDefaultContentSettings();
+}
+
 let semanticUnsafePaths = new Set<string>();
 let safetyScanPromise: Promise<void> | null = null;
 let scannedPhoneDevices: PhoneDevice[] = [];
@@ -8005,15 +8282,16 @@ function unavailableIndexStorageMessage() {
 async function checkSelectedIndexStorageAvailable() {
   const userDataPath = path.resolve(app.getPath("userData"));
   if (path.resolve(selectedIndexStorageRoot) === userDataPath) return true;
-  try {
-    await fsPromises.access(
-      selectedIndexStorageRoot,
-      fs.constants.R_OK | fs.constants.W_OK,
-    );
-    return true;
-  } catch {
-    return false;
+  const probe = await probeIndexStorageDestination(selectedIndexStorageRoot);
+  if (probe === "unresponsive" && !indexStorageRecoveryPromptOpen && !indexStorageUnresponsivePrompted) {
+    indexStorageUnresponsivePrompted = true;
+    void recoverUnresponsiveIndexStorage(selectedIndexStorageRoot, mainWindow).then((choice) => {
+      if (choice === "quit") app.quit();
+      else if (choice === "retry") indexStorageUnresponsivePrompted = false;
+    });
   }
+  if (probe === "ok") indexStorageUnresponsivePrompted = false;
+  return probe === "ok";
 }
 
 async function withIndexStorageCacheWrite<T>(operation: () => Promise<T>): Promise<T> {
@@ -8154,10 +8432,12 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
     const userDataPath = app.getPath("userData");
     const storage = await prepareConfiguredIndexStorage(
       userDataPath,
-      (filesVerified, bytesVerified) => {
+      (filesVerified, bytesVerified, detail) => {
         indexStorageTransfer = {
           state: "moving",
-          message: `Verifying cache transfer: ${filesVerified.toLocaleString()} files and ${(bytesVerified / 1024 / 1024 / 1024).toFixed(2)} GiB checked.`,
+          message: detail
+            ? describeIndexStorageMigrationProgress(detail)
+            : `Verifying cache transfer: ${filesVerified.toLocaleString()} files and ${(bytesVerified / 1024 / 1024 / 1024).toFixed(2)} GiB checked.`,
           filesVerified,
           bytesVerified,
         };
@@ -8202,11 +8482,15 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
     const message = error instanceof Error ? error.message : String(error);
     indexStorageTransfer = {
       state: "error",
-      message: `Cache transfer paused. Silo preserved the existing cache. ${message}`,
+      message: `Cache transfer paused. Silo preserved the existing cache. ${message}${reason === "destination" ? " Silo will try again when the drive is reconnected or Silo restarts." : ""}`,
       filesVerified: indexStorageTransfer.filesVerified,
       bytesVerified: indexStorageTransfer.bytesVerified,
     };
-    indexStorageTransferRetryAt = Date.now() + 15_000;
+    // Retrying immediately repeats the same failing multi-GB verification.
+    // Wait until the destination disconnects/reconnects or the user retries.
+    indexStorageTransferRetryAt = reason === "destination"
+      ? Number.POSITIVE_INFINITY
+      : Date.now() + 15_000;
     const fallbackCanResume =
       indexStorageUsingLocalFallback &&
       indexStorageFallbackEnabled &&
@@ -8245,6 +8529,9 @@ async function monitorIndexStorageAvailability() {
       await prepareStorageTransition("destination");
       return;
     }
+
+    if (!destinationAvailable && indexStorageTransferRetryAt === Number.POSITIVE_INFINITY)
+      indexStorageTransferRetryAt = 0;
 
     if (!destinationAvailable && !indexStorageUsingLocalFallback) {
       const message = unavailableIndexStorageMessage();
@@ -8380,37 +8667,103 @@ app.whenReady().then(async () => {
   const userDataPath = app.getPath("userData");
   if (!(await requireIndexStorageSelection(userDataPath))) return;
   let storage: Awaited<ReturnType<typeof prepareConfiguredIndexStorage>>;
+  const startupStorageProgress = createStartupStorageProgress();
+  let useLocalCacheThisSession = false;
   for (;;) {
+    let watchdog: NodeJS.Timeout | null = null;
     try {
+      const savedSettings = await getIndexStorageSettings(userDataPath).catch(() => null);
+      const savedRoot = savedSettings ? path.resolve(savedSettings.path) : null;
+      const external = Boolean(savedRoot && savedRoot !== path.resolve(userDataPath));
+      if (external && !useLocalCacheThisSession) {
+        const probe = await probeIndexStorageDestination(savedRoot!);
+        runtimeLog("index-storage-probe", { result: probe });
+        if (probe === "unresponsive") {
+          const choice = await recoverUnresponsiveIndexStorage(savedRoot!);
+          if (choice === "quit") {
+            app.quit();
+            return;
+          }
+          if (choice === "retry") continue;
+          useLocalCacheThisSession = true;
+        }
+      }
+      let lastProgressAt = Date.now();
+      let stallCheckRunning = false;
+      if (external && !useLocalCacheThisSession)
+        watchdog = setInterval(() => {
+          if (stallCheckRunning || indexStorageRecoveryPromptOpen || Date.now() - lastProgressAt < 45_000)
+            return;
+          stallCheckRunning = true;
+          void probeIndexStorageDestination(savedRoot!).then(async (probe) => {
+            if (probe !== "unresponsive") {
+              lastProgressAt = Date.now();
+              return;
+            }
+            startupStorageProgress.update(
+              "The drive stopped responding",
+              "Waiting for your choice…",
+              null,
+            );
+            // Ejecting makes the stuck file calls fail, which ends this attempt
+            // and returns to the retry dialog below.
+            await recoverUnresponsiveIndexStorage(savedRoot!);
+            lastProgressAt = Date.now();
+          }).finally(() => {
+            stallCheckRunning = false;
+          });
+        }, 10_000);
       storage = await prepareConfiguredIndexStorage(
         userDataPath,
-        (filesVerified, bytesVerified) =>
+        (filesVerified, bytesVerified, detail) => {
+          lastProgressAt = Date.now();
           runtimeLog("index-storage-migration-progress", {
             filesVerified,
             bytesVerified,
-          }),
+            phase: detail?.phase,
+            totalFiles: detail?.totalFiles,
+            totalBytes: detail?.totalBytes,
+          });
+          if (detail)
+            startupStorageProgress.update(
+              "Moving Silo's cache back to your drive",
+              describeIndexStorageMigrationProgress(detail),
+              migrationProgressFraction(detail),
+            );
+        },
+        { destinationUnavailable: useLocalCacheThisSession },
       );
+      if (watchdog) clearInterval(watchdog);
+      startupStorageProgress.close();
       break;
     } catch (error) {
+      if (watchdog) clearInterval(watchdog);
+      startupStorageProgress.close();
       const message = error instanceof Error ? error.message : String(error);
       runtimeLog("index-storage-initialization-failed", { message });
-      // Recover in place: pick a usable folder and retry without relaunching.
+      const savedRoot = await getIndexStorageSettings(userDataPath)
+        .then((settings) => settings.path)
+        .catch(() => undefined);
+      const savedLabel = savedRoot ? path.basename(savedRoot) : "saved folder";
+      // Recover in place: retry the saved folder or pick another without relaunching.
       const { response } = await dialog.showMessageBox({
         type: "warning",
         message: "Silo couldn't prepare its storage folder",
-        detail: `${message}\n\nChoose or create another folder to continue. Existing index files were preserved.`,
-        buttons: ["Choose folder…", "Try again", "Quit"],
+        detail: `${message}\n\n${savedRoot ? `Saved cache folder:\n${savedRoot}\n\n` : ""}Existing index files were preserved. Retry the saved folder, or choose where your Silo cache lives.`,
+        buttons: [`Retry ${savedLabel}`, "Choose folder…", "Quit"],
         defaultId: 0,
         cancelId: 2,
+        noLink: true,
       });
       if (response === 2) {
         app.quit();
         return;
       }
-      if (response === 0)
+      if (response === 1)
         await chooseIndexStorageFolder(
           userDataPath,
-          "Choose or create a folder for Silo's indexes, caches, and settings.",
+          "Choose the folder that holds Silo's indexes and caches.",
+          savedRoot,
         );
     }
   }
@@ -8508,6 +8861,7 @@ app.whenReady().then(async () => {
   contentSettingsStore = new ContentSettingsStore(app.getPath("userData"));
   await contentSettingsStore.initialize();
   registerMediaProtocols();
+  mainStartupWindowAllowed = true;
   await createWindow();
 
   if (app.isPackaged && !isDev) void checkForAppUpdates();
@@ -9633,7 +9987,9 @@ for (const signal of ["SIGTERM", "SIGINT"] as const)
   process.on(signal, () => app.quit());
 
 app.on("activate", () => {
-  if (mainWindow === null) {
+  // Before startup finishes opening storage and licenses, a Dock click must not
+  // open a half-initialized window (it would show Demo mode and never load).
+  if (mainWindow === null && mainStartupWindowAllowed) {
     void createWindow();
   }
 });
@@ -11302,15 +11658,30 @@ ipcMain.handle("get-app-state", () => ({
 
 ipcMain.handle("get-search-index-readiness", () => searchIndexReadiness);
 
-ipcMain.handle("get-content-settings", () =>
-  contentSettingsStore.getPublicSettings(),
-);
+ipcMain.handle("get-content-settings", () => getPublicContentSettings());
 ipcMain.handle("get-search-performance-settings", () =>
-  contentSettingsStore.getSearchPerformanceSnapshot(),
+  contentSettingsStore?.getSearchPerformanceSnapshot() ?? {
+    settings: {
+      searchThreads: 1,
+      indexThreads: 1,
+      backgroundWorkPercent: 5,
+    },
+    machine: {
+      processor: "Processor information unavailable",
+      logicalProcessors: 1,
+      availableProcessors: 1,
+      totalMemoryBytes: 0,
+      freeMemoryBytes: 0,
+      platform: process.platform,
+      architecture: process.arch,
+    },
+  },
 );
 ipcMain.handle(
   "update-search-performance-settings",
   async (_event, update: unknown) => {
+    if (!contentSettingsStore)
+      throw new Error("Content settings are still initializing.");
     const snapshot = await contentSettingsStore.updateSearchPerformanceSettings(update);
     semanticIndexer?.setPerformanceSettings(snapshot.settings);
     faceIndexer?.setBackgroundWorkPercent(snapshot.settings.backgroundWorkPercent);
@@ -11319,12 +11690,17 @@ ipcMain.handle(
 );
 ipcMain.handle(
   "set-parental-password",
-  (_event, currentPassword: string, newPassword: string) =>
-    contentSettingsStore.setParentalPassword(currentPassword, newPassword),
+  (_event, currentPassword: string, newPassword: string) => {
+    if (!contentSettingsStore)
+      throw new Error("Content settings are still initializing.");
+    return contentSettingsStore.setParentalPassword(currentPassword, newPassword);
+  },
 );
 ipcMain.handle(
   "update-content-settings",
   async (_event, update: Partial<ContentPreferences>, password?: string) => {
+    if (!contentSettingsStore)
+      throw new Error("Content settings are still initializing.");
     const settings = await contentSettingsStore.updatePreferences(
       update,
       password,

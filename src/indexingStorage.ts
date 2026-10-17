@@ -1,3 +1,4 @@
+import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import { createReadStream, realpathSync } from "fs";
 import * as fsPromises from "fs/promises";
@@ -286,7 +287,95 @@ interface StorageTreeSummary {
   bytes: number;
 }
 
-type ProgressListener = (filesVerified: number, bytesVerified: number) => void;
+export type IndexStorageMigrationPhase =
+  | "scanning"
+  | "reconciling"
+  | "copying"
+  | "committing"
+  | "verifying"
+  | "cleaning";
+
+export interface IndexStorageMigrationProgress {
+  phase: IndexStorageMigrationPhase;
+  filesVerified: number;
+  bytesVerified: number;
+  totalFiles: number;
+  totalBytes: number;
+}
+
+type ProgressListener = (
+  filesVerified: number,
+  bytesVerified: number,
+  detail?: IndexStorageMigrationProgress,
+) => void;
+
+// Content-addressed caches: the same file name always describes the same
+// item, so a temporary fallback copy can be merged into the destination.
+// Every other entry is a self-consistent store that must never be mixed.
+const MERGEABLE_INDEX_STORAGE_ENTRIES = new Set([
+  "thumbnail-cache",
+  "preview-cache",
+  "media-cache",
+  "memory-image-cache",
+  "cloud-cache",
+]);
+
+const MIGRATION_STAGING_PATTERN = /^\.silo-index-migration-(\d+)(?:-[0-9a-f]+)?$/;
+
+/**
+ * Deletes bulky folders from a detached `rm` process. Large cache trees on
+ * slow external drives can take minutes to delete; doing it out of process
+ * keeps Silo's file worker threads free.
+ */
+function deleteInBackground(targets: readonly string[]) {
+  if (!targets.length) return;
+  try {
+    const child = spawn("/bin/rm", ["-rf", "--", ...targets], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    void Promise.all(
+      targets.map((target) => fsPromises.rm(target, { recursive: true, force: true }).catch(() => {})),
+    );
+  }
+}
+
+function processIsAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Moves staging folders left behind by interrupted migrations out of the way
+ * (a cheap rename) and deletes them in the background so a large cleanup never
+ * holds up startup or competes with a migration for the drive.
+ */
+async function removeStaleMigrationStaging(destinationRoot: string) {
+  const names = await fsPromises.readdir(destinationRoot).catch(() => [] as string[]);
+  const trash: string[] = [];
+  for (const name of names) {
+    const match = MIGRATION_STAGING_PATTERN.exec(name);
+    if (!match) {
+      if (name.startsWith(".silo-index-trash-")) trash.push(path.join(destinationRoot, name));
+      continue;
+    }
+    const pid = Number(match[1]);
+    if (pid === process.pid || processIsAlive(pid)) continue;
+    const trashPath = path.join(destinationRoot, `.silo-index-trash-${name.slice(1)}`);
+    await fsPromises
+      .rename(path.join(destinationRoot, name), trashPath)
+      .then(() => trash.push(trashPath))
+      .catch(() => {});
+  }
+  return () => deleteInBackground(trash);
+}
 
 async function exists(target: string) {
   return fsPromises.lstat(target).then(
@@ -474,13 +563,58 @@ async function assertTargetMatches(node: MigrationNode): Promise<boolean> {
   return true;
 }
 
+export interface IndexStorageMigrationOptions {
+  /**
+   * "strict" fails when the destination already holds different data (used
+   * for user-initiated moves). "keep-destination" is used when a previously
+   * selected destination reconnects: its existing index stores win, and the
+   * temporary local copies are archived beside their source instead of being
+   * merged into (and corrupting) the destination's stores.
+   */
+  conflictPolicy?: "strict" | "keep-destination";
+}
+
+function formatGiB(bytes: number) {
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+export function describeIndexStorageMigrationProgress(
+  detail: IndexStorageMigrationProgress,
+) {
+  const files = `${detail.filesVerified.toLocaleString()} of ${detail.totalFiles.toLocaleString()} files`;
+  const bytes = `${formatGiB(detail.bytesVerified)} of ${formatGiB(detail.totalBytes)}`;
+  switch (detail.phase) {
+    case "scanning":
+      return "Checking which cache files need to move…";
+    case "reconciling":
+      return "Comparing the local cache with the reconnected destination…";
+    case "copying":
+      return `Copying and verifying cache files: ${files} (${bytes}).`;
+    case "committing":
+      return "Placing verified cache files in the destination…";
+    case "verifying":
+      return `Confirming the local originals did not change: ${files} (${bytes}).`;
+    case "cleaning":
+      return "Cleaning up the temporary local cache…";
+  }
+}
+
+function supersededArchiveRoot(sourceRoot: string, stamp: string) {
+  return path.join(
+    path.dirname(sourceRoot),
+    `${path.basename(sourceRoot)}-superseded-${stamp}`,
+  );
+}
+
 export async function migrateIndexStorageRoots(
   sourceRoots: readonly string[],
   storageRoot: string,
   entries: readonly string[] = INDEX_STORAGE_ENTRIES,
   onProgress?: ProgressListener,
   beforeSourceRemoval?: () => Promise<void>,
+  options: IndexStorageMigrationOptions = {},
 ): Promise<IndexStorageMigrationResult> {
+  const keepDestination = options.conflictPolicy === "keep-destination";
   const destinationRoot = path.resolve(storageRoot);
   const sources = Array.from(new Set(sourceRoots.map((source) => path.resolve(source))))
     .filter((source) => source !== destinationRoot);
@@ -489,26 +623,107 @@ export async function migrateIndexStorageRoots(
       throw new Error("Index storage migration source and destination must be separate.");
   }
 
+  const totals = { totalFiles: 0, totalBytes: 0 };
+  const report = (
+    phase: IndexStorageMigrationPhase,
+    filesVerified: number,
+    bytesVerified: number,
+  ) =>
+    onProgress?.(filesVerified, bytesVerified, {
+      phase,
+      filesVerified,
+      bytesVerified,
+      ...totals,
+    });
+  report("scanning", 0, 0);
   await fsPromises.mkdir(destinationRoot, { recursive: true });
+  const deleteStaleStaging = await removeStaleMigrationStaging(destinationRoot);
+  try {
+    return await runIndexStorageMigration();
+  } finally {
+    deleteStaleStaging();
+  }
+
+  async function runIndexStorageMigration(): Promise<IndexStorageMigrationResult> {
+  const archiveStamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const superseded: { source: string; archive: string }[] = [];
+  // Regenerable caches built while the destination was offline are dropped
+  // rather than copied back file by file (often 100k+ thumbnails).
+  const discarded: string[] = [];
   const sourceEntries: string[] = [];
+  const sourceSnapshotKeys = new Set<string>();
   const nodes: MigrationNode[] = [];
+  const claimedTargets = new Set<string>();
   let requiredBytes = 0;
   for (let rootIndex = 0; rootIndex < sources.length; rootIndex += 1) {
     const sourceRoot = sources[rootIndex];
     for (const name of entries) {
       const source = path.join(sourceRoot, name);
       if (!(await exists(source))) continue;
+      const target = path.join(destinationRoot, name);
+      const mergeable = MERGEABLE_INDEX_STORAGE_ENTRIES.has(name);
+      if (keepDestination && mergeable) {
+        discarded.push(source);
+        continue;
+      }
+      if (
+        keepDestination &&
+        !mergeable &&
+        ((await exists(target)) || claimedTargets.has(path.resolve(target)))
+      ) {
+        superseded.push({
+          source,
+          archive: path.join(supersededArchiveRoot(sourceRoot, archiveStamp), name),
+        });
+        continue;
+      }
       const staged = path.join(destinationRoot, `.silo-index-migration-${process.pid}`, String(rootIndex), name);
-      const before = nodes.length;
-      await collectMigrationNodes(source, path.join(destinationRoot, name), staged, nodes);
+      const collected: MigrationNode[] = [];
+      await collectMigrationNodes(source, target, staged, collected);
       sourceEntries.push(source);
-      for (const node of nodes.slice(before))
-        if (node.kind === "file") requiredBytes += node.size;
+      for (const node of collected) {
+        sourceSnapshotKeys.add(migrationNodeKey(node));
+        const targetKey = path.resolve(node.target);
+        if (
+          keepDestination &&
+          node.kind === "file" &&
+          (claimedTargets.has(targetKey) || (await exists(node.target)))
+        )
+          continue; // The destination already has this cache file.
+        claimedTargets.add(targetKey);
+        nodes.push(node);
+        if (node.kind === "file") {
+          requiredBytes += node.size;
+          totals.totalFiles += 1;
+        }
+      }
     }
   }
+  totals.totalBytes = requiredBytes;
   await assertEnoughSpace(destinationRoot, requiredBytes);
+
+  const archiveSuperseded = async () => {
+    for (const { source, archive } of superseded) {
+      await fsPromises.mkdir(path.dirname(archive), { recursive: true });
+      await fsPromises.rename(source, archive);
+    }
+    const trash: string[] = [];
+    for (const source of discarded) {
+      const trashPath = `${source}.silo-discarded-${archiveStamp}`;
+      await fsPromises.rename(source, trashPath).then(
+        () => trash.push(trashPath),
+        () => {},
+      );
+    }
+    deleteInBackground(trash);
+  };
+
   if (nodes.length === 0) {
     await beforeSourceRemoval?.();
+    report("cleaning", 0, 0);
+    await archiveSuperseded();
+    for (const source of sourceEntries)
+      await fsPromises.rm(source, { recursive: true, force: true });
     return { filesVerified: 0, bytesVerified: 0 };
   }
 
@@ -521,7 +736,19 @@ export async function migrateIndexStorageRoots(
     ),
   }));
   const progress = { filesVerified: 0, bytesVerified: 0 };
+  let lastReportAt = 0;
+  const reportThrottled = (
+    phase: IndexStorageMigrationPhase,
+    filesVerified: number,
+    bytesVerified: number,
+  ) => {
+    const now = Date.now();
+    if (now - lastReportAt < 400 && filesVerified < totals.totalFiles) return;
+    lastReportAt = now;
+    report(phase, filesVerified, bytesVerified);
+  };
   try {
+    report("copying", 0, 0);
     for (const node of stagedNodes) {
       if (node.kind === "directory") {
         await fsPromises.mkdir(node.staged, { recursive: true });
@@ -539,10 +766,10 @@ export async function migrateIndexStorageRoots(
       node.hash = sourceHash;
       progress.filesVerified += 1;
       progress.bytesVerified += node.size;
-      if (progress.filesVerified % 500 === 0)
-        onProgress?.(progress.filesVerified, progress.bytesVerified);
+      reportThrottled("copying", progress.filesVerified, progress.bytesVerified);
     }
 
+    report("committing", progress.filesVerified, progress.bytesVerified);
     const byTarget = new Map<string, MigrationNode>();
     for (const node of stagedNodes) {
       const key = path.resolve(node.target);
@@ -573,7 +800,6 @@ export async function migrateIndexStorageRoots(
       if (node.kind === "file" && !(await assertTargetMatches(node)))
         throw new Error(`Index storage commit verification failed for ${node.target}; all originals were preserved.`);
 
-    const originalKeys = new Set(nodes.map(migrationNodeKey));
     const currentNodes: MigrationNode[] = [];
     for (const source of sourceEntries) {
       const sourceRoot = sources.find((candidate) => isPathWithin(source, candidate))!;
@@ -585,23 +811,31 @@ export async function migrateIndexStorageRoots(
         currentNodes,
       );
     }
-    if (currentNodes.length !== nodes.length ||
-        currentNodes.some((node) => !originalKeys.has(migrationNodeKey(node))))
+    if (currentNodes.length !== sourceSnapshotKeys.size ||
+        currentNodes.some((node) => !sourceSnapshotKeys.has(migrationNodeKey(node))))
       throw new Error("Index storage sources changed during migration; all originals were preserved.");
+    const verified = { files: 0, bytes: 0 };
+    lastReportAt = 0;
+    report("verifying", 0, 0);
     for (const node of stagedNodes) {
       if (node.kind !== "file") continue;
       const stats = await fsPromises.stat(node.source);
       if (stats.size !== node.size || await hashFile(node.source) !== node.hash)
         throw new Error(`Index storage source changed during migration: ${node.source}; all originals were preserved.`);
+      verified.files += 1;
+      verified.bytes += node.size;
+      reportThrottled("verifying", verified.files, verified.bytes);
     }
 
     await beforeSourceRemoval?.();
+    report("cleaning", progress.filesVerified, progress.bytesVerified);
+    await archiveSuperseded();
     for (const source of sourceEntries)
       await fsPromises.rm(source, { recursive: true, force: true });
-    onProgress?.(progress.filesVerified, progress.bytesVerified);
     return progress;
   } finally {
     await fsPromises.rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
+  }
   }
 }
 
@@ -632,6 +866,7 @@ export async function prepareExternalIndexStorage(
 export async function prepareConfiguredIndexStorage(
   userDataPath: string,
   onProgress?: ProgressListener,
+  options: { destinationUnavailable?: boolean } = {},
 ) {
   const settings = await readIndexStorageSettings(userDataPath);
   const storageRoot = settings.pendingPath ?? settings.path;
@@ -651,6 +886,10 @@ export async function prepareConfiguredIndexStorage(
   const localFallbackRoot = getLocalFallbackIndexStorageRoot(userDataPath);
   const legacyFallbackRoot = getLegacyLocalFallbackIndexStorageRoot(userDataPath);
   try {
+    // A drive that stopped responding is treated like a disconnected one so
+    // Silo can open on its local cache instead of waiting on the drive.
+    if (options.destinationUnavailable)
+      throw new ExternalIndexStorageUnavailableError(storageRoot);
     await validateExternalVolume(userDataPath, storageRoot);
   } catch (error) {
     if (!(error instanceof ExternalIndexStorageUnavailableError)) throw error;
@@ -748,6 +987,9 @@ export async function prepareConfiguredIndexStorage(
     settings.pendingPath
       ? () => writeIndexStorageRoot(userDataPath, storageRoot)
       : undefined,
+    // A reconnecting destination already owns its indexes; only a
+    // user-requested move must refuse to overwrite existing data.
+    { conflictPolicy: settings.pendingPath ? "strict" : "keep-destination" },
   );
   return {
     storageRoot,
