@@ -33,6 +33,8 @@ export class IndexingRecovery {
   private requested = new Set<string>();
   private persistenceError = "";
   private externalBlockReason = "";
+  private readonly externalBlockReasons = new Map<string, string>();
+  private nextExternalBlockId = 0;
   private interactiveSearchActive = false;
   private searchPausedStages = new Set<string>();
   private priorityPausedStages = new Set<string>();
@@ -159,13 +161,43 @@ export class IndexingRecovery {
   }
 
   async setBlocked(reason: string | null) {
-    this.externalBlockReason = reason ?? "";
+    if (reason) this.externalBlockReasons.set("index-storage", reason);
+    else this.externalBlockReasons.delete("index-storage");
+    await this.refreshExternalBlock();
+  }
+
+  /** Add a temporary independent hold without clearing storage or other holds. */
+  async acquireBlock(reason: string): Promise<() => Promise<void>> {
+    const id = `temporary-${++this.nextExternalBlockId}`;
+    this.externalBlockReasons.set(id, reason);
+    try {
+      await this.refreshExternalBlock(true);
+    } catch (error) {
+      this.externalBlockReasons.delete(id);
+      await this.refreshExternalBlock().catch((refreshError) => {
+        console.error("[IndexingRecovery] Could not restore processing after a failed temporary hold", refreshError);
+      });
+      throw error;
+    }
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      this.externalBlockReasons.delete(id);
+      await this.refreshExternalBlock();
+    };
+  }
+
+  private async refreshExternalBlock(requireSuccessfulPause = false) {
+    const wasBlocked = Boolean(this.externalBlockReason);
+    this.externalBlockReason = Array.from(this.externalBlockReasons.values()).join(" · ");
     if (this.externalBlockReason) {
-      await this.pauseActiveStages();
+      if (!wasBlocked || requireSuccessfulPause)
+        await this.pauseActiveStages(new Set(), false, requireSuccessfulPause);
       this.persist();
       return;
     }
-    await this.tick();
+    if (wasBlocked) await this.tick();
   }
 
   setSearchActive(active: boolean): Promise<void> {
@@ -201,6 +233,7 @@ export class IndexingRecovery {
   private async pauseActiveStages(
     excludedIds = new Set<string>(),
     rememberForSearch = false,
+    requireSuccessfulPause = false,
   ) {
     const busyStatuses = new Set([
       "scanning",
@@ -213,9 +246,11 @@ export class IndexingRecovery {
       (stage) =>
         !excludedIds.has(stage.id) &&
         (!rememberForSearch || Boolean(stage.pause)) &&
-        busyStatuses.has(stage.progress().status),
+        (busyStatuses.has(stage.progress().status) ||
+          this.records.get(stage.id)?.running === true),
     );
     const pauses: Promise<void>[] = [];
+    const failures: string[] = [];
     for (const stage of activeStages) {
       const record = this.records.get(stage.id) ?? {
         attempts: 0,
@@ -241,10 +276,13 @@ export class IndexingRecovery {
           .then(() => undefined)
           .catch((error) => {
             console.error(`[IndexingRecovery] Could not pause ${stage.id}`, error);
+            failures.push(stage.id);
           }),
       );
     }
     await Promise.all(pauses);
+    if (requireSuccessfulPause && failures.length)
+      throw new Error(`Could not safely pause these background tasks: ${failures.join(", ")}.`);
   }
 
   pause(id: string) {

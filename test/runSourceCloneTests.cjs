@@ -22,6 +22,7 @@ const {
   isAppDataPath,
   isMacDataVolumePathExcluded,
   isMacDataVolumeSourceRoot,
+  isMacTrashPath,
   isNonLibraryPath,
   isSiloCloneDirectory,
   invalidateSiloCloneDirectoryCache,
@@ -133,8 +134,34 @@ const fsPromises = new Proxy(fsp, {
     return typeof value === "function" ? value.bind(target) : value;
   },
 });
+const originalFsForTests = new Proxy(fs, {
+  get(target, property) {
+    if (property === "promises") {
+      return new Proxy(fsp, {
+        get(promiseTarget, promiseProperty) {
+          if (promiseProperty === "stat") return fsPromises.stat;
+          if (promiseProperty === "lstat") return async (filePath, ...args) => {
+            const stats = await promiseTarget.lstat(filePath, ...args);
+            const canonicalFilePath = fs.realpathSync(path.resolve(String(filePath)));
+            const simulatedDevice = [...simulatedDeviceRoots]
+              .map(([deviceRoot, deviceId]) => ({ root: fs.realpathSync(deviceRoot), deviceId }))
+              .filter(({ root }) => canonicalFilePath === root || canonicalFilePath.startsWith(`${root}${path.sep}`))
+              .sort((left, right) => right.root.length - left.root.length)[0];
+            return simulatedDevice
+              ? new Proxy(stats, { get(value, key) { return key === "dev" ? simulatedDevice.deviceId : Reflect.get(value, key, value); } })
+              : stats;
+          };
+          const value = Reflect.get(promiseTarget, promiseProperty, promiseTarget);
+          return typeof value === "function" ? value.bind(promiseTarget) : value;
+        },
+      });
+    }
+    const value = Reflect.get(target, property, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  },
+});
 const context = vm.createContext({
-  console, path, os, fs, fsPromises, originalFs: fs, Buffer, Date, Math, Number, String, Array, Set, Map, Object, Error, Promise,
+  console, path, os, fs, fsPromises, originalFs: originalFsForTests, Buffer, Date, Math, Number, String, Array, Set, Map, Object, Error, Promise,
   Transform, pipeline, createHash: crypto.createHash,
   InventoryFingerprint,
   CLONE_ARCHIVE_EXTENSION,
@@ -143,6 +170,7 @@ const context = vm.createContext({
   isAppDataPath,
   isMacDataVolumePathExcluded,
   isMacDataVolumeSourceRoot,
+  isMacTrashPath,
   isNonLibraryPath,
   isSiloCloneDirectory,
   invalidateSiloCloneDirectoryCache,
@@ -165,9 +193,10 @@ const context = vm.createContext({
   getShelterDestination: async () => destinations[0],
   sourceCloneOperations: new Map(),
   sourceClonePlans: new Map(),
+  recordSourceCloneSessionProgress: () => {},
   sendToRenderer: (channel, value) => { if (channel === "source-clone-progress") progress.push(value); },
 });
-for (const name of ["cloneSafeSegment", "cloneSafeRelativePath", "sendSourceCloneProgress", "ensureCloneActive", "hashFile", "readFiles", "appendSiloOnlyCloneAliases", "buildShelterReuseIndex", "listLocalCloneEntries", "getSourceCloneStatus", "persistSourceCloneStatus", "prepareSourceClone", "findLatestShelterSnapshot", "prepareShelterReplica", "runSourceClone"]) {
+for (const name of ["cloneSafeSegment", "cloneSafeRelativePath", "sourceCloneOmissionNotice", "sendSourceCloneProgress", "ensureCloneActive", "hashFile", "readFiles", "appendSiloOnlyCloneAliases", "buildShelterReuseIndex", "listLocalCloneEntries", "getSourceCloneStatus", "persistSourceCloneStatus", "prepareSourceClone", "findLatestShelterSnapshot", "prepareShelterReplica", "runSourceClone"]) {
   assert(functions.has(name), `Missing source clone function ${name}`);
   const compiled = ts.transpileModule(functions.get(name).getText(ast), {
     compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },

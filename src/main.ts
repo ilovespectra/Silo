@@ -4640,6 +4640,16 @@ interface ShelterReusableFile {
 
 const sourceClonePlans = new Map<string, SourceClonePlan>();
 const sourceCloneOperations = new Map<string, { cancelled: boolean }>();
+function reserveSourceCloneOperation(operationId: string) {
+  if (ejectingWholeDevices.size)
+    throw new Error("Silo is safely ejecting a drive. Wait until it is ready before starting Fallout Shelter work.");
+  if (sourceCloneOperations.has(operationId))
+    throw new Error("That Fallout Shelter operation is already active.");
+  const operation = { cancelled: false };
+  sourceCloneOperations.set(operationId, operation);
+  return operation;
+}
+
 const sourceCloneStatusPath = path.join(app.getPath("userData"), "source-clone-status.json");
 type SourceCloneStatusRecord = {
   lastClonedAt: number;
@@ -4733,6 +4743,7 @@ interface ActiveSourceCloneSessionLog {
   lastPersistScheduledAt: number;
   lastEventAt: number;
   lastEventPhase: SourceClonePhase | null;
+  lastPersistSucceeded: boolean;
   persistPromise: Promise<void>;
 }
 
@@ -4788,25 +4799,30 @@ async function writeSourceCloneSessionLogFile(filePath: string, serialized: stri
   if (process.platform !== "win32")
     await fsPromises.chmod(sourceCloneSessionLogsDirectory, 0o700);
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
-  const handle = await fsPromises.open(temporaryPath, "w", 0o600);
   try {
-    if (process.platform !== "win32") await handle.chmod(0o600);
-    await handle.writeFile(serialized, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await fsPromises.rename(temporaryPath, filePath);
-  if (process.platform !== "win32") {
+    const handle = await fsPromises.open(temporaryPath, "w", 0o600);
     try {
-      const directoryHandle = await fsPromises.open(sourceCloneSessionLogsDirectory, "r");
-      try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR") throw error;
+      if (process.platform !== "win32") await handle.chmod(0o600);
+      await handle.writeFile(serialized, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
     }
+    await fsPromises.rename(temporaryPath, filePath);
+    if (process.platform !== "win32") {
+      try {
+        const directoryHandle = await fsPromises.open(sourceCloneSessionLogsDirectory, "r");
+        try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR") throw error;
+      }
+    }
+    sourceCloneSessionStorageWarning = null;
+  } catch (error) {
+    await fsPromises.rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw error;
   }
-  sourceCloneSessionStorageWarning = null;
 }
 
 function persistSourceCloneSessionLog(active: ActiveSourceCloneSessionLog, force = false) {
@@ -4817,8 +4833,12 @@ function persistSourceCloneSessionLog(active: ActiveSourceCloneSessionLog, force
   const snapshot = JSON.stringify(active.log, null, 2);
   active.persistPromise = active.persistPromise
     .catch(() => undefined)
-    .then(() => writeSourceCloneSessionLogFile(active.filePath, snapshot))
+    .then(async () => {
+      await writeSourceCloneSessionLogFile(active.filePath, snapshot);
+      active.lastPersistSucceeded = true;
+    })
     .catch((error) => {
+      active.lastPersistSucceeded = false;
       const details = sourceCloneErrorDetails(error);
       sourceCloneSessionStorageWarning = "Automatic session logs could not be saved locally. Check available disk space and Silo's file access.";
       runtimeLog("source-clone-session-log-write-failed", {
@@ -4866,11 +4886,16 @@ async function beginSourceCloneSessionLog(
     lastPersistScheduledAt: 0,
     lastEventAt: Date.now(),
     lastEventPhase: null,
+    lastPersistSucceeded: false,
     persistPromise: Promise.resolve(),
   };
   appendSourceCloneSessionEvent(active, "operation-started");
   sourceCloneSessionsByOperation.set(operationId, active);
   await persistSourceCloneSessionLog(active, true);
+  if (!active.lastPersistSucceeded) {
+    sourceCloneSessionsByOperation.delete(operationId);
+    throw new Error("Silo could not save the Fallout Shelter session log, so the operation did not start. Check available disk space and Silo's file access, then try again.");
+  }
   await pruneSourceCloneSessionLogs();
 }
 
@@ -5037,6 +5062,7 @@ async function finishSourceCloneSessionLog(operationId: string) {
   if (!active) return;
   await persistSourceCloneSessionLog(active, true);
   await active.persistPromise;
+  if (!active.lastPersistSucceeded) return;
   sourceCloneSessionsByOperation.delete(operationId);
   await pruneSourceCloneSessionLogs();
 }
@@ -5476,6 +5502,24 @@ const ALL_SOURCES_PATH = "/__sources__/all";
 
 type SourceKind = "local" | "machine" | "ios" | "android" | "gdrive" | "gphotos";
 
+interface MountedMacVolume {
+  mountPath: string;
+  label: string;
+  deviceIdentifier: string;
+  wholeDeviceIdentifier: string;
+  volumeUUID?: string;
+  external: boolean;
+  ejectable: boolean;
+}
+
+interface EjectableVolumeSourceInfo {
+  label: string;
+  mountPath: string;
+  wholeDeviceIdentifier: string;
+  volumeUUID?: string;
+  ejecting?: boolean;
+}
+
 interface BrowseSource {
   id: string;
   kind: SourceKind;
@@ -5488,6 +5532,7 @@ interface BrowseSource {
   demoLocked?: boolean;
   lastClonedAt?: number;
   lastCloneDestination?: string;
+  ejectableVolume?: EjectableVolumeSourceInfo;
   offlineBackup?: boolean;
   snapshotAt?: number;
 }
@@ -5497,6 +5542,118 @@ let sourceListCache: BrowseSource[] | null = null;
 let sourceListCacheAt = 0;
 let sourceListPromise: Promise<BrowseSource[]> | null = null;
 let sourceListGeneration = 0;
+let mountedMacVolumesCache: MountedMacVolume[] = [];
+let mountedMacVolumesCacheAt = 0;
+let mountedMacVolumesPromise: Promise<MountedMacVolume[]> | null = null;
+const ejectingWholeDevices = new Set<string>();
+const sourcesReturnedFromEjectedVolumes = new Set<string>();
+
+function plistString(xml: string, key: string): string | undefined {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`<key>${escapedKey}<\\/key>\\s*<string>([\\s\\S]*?)<\\/string>`).exec(xml);
+  if (!match) return undefined;
+  return match[1]
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function plistBoolean(xml: string, key: string): boolean {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`<key>${escapedKey}<\\/key>\\s*<true\\s*\\/?>`).test(xml);
+}
+
+function invalidateMountedMacVolumes(): void {
+  mountedMacVolumesCacheAt = 0;
+  mountedMacVolumesPromise = null;
+}
+
+async function getMountedMacVolumes(forceRefresh = false): Promise<MountedMacVolume[]> {
+  if (process.platform !== "darwin") return [];
+  if (!forceRefresh && Date.now() - mountedMacVolumesCacheAt < 1500)
+    return mountedMacVolumesCache.map((volume) => ({ ...volume }));
+  if (!forceRefresh && mountedMacVolumesPromise)
+    return (await mountedMacVolumesPromise).map((volume) => ({ ...volume }));
+
+  const pending = (async () => {
+    const mountDirectory = "/Volumes";
+    const entries = await fsPromises.readdir(mountDirectory, { withFileTypes: true }).catch(() => []);
+    const wholeDiskInfo = new Map<string, { physical: boolean; external: boolean; ejectable: boolean }>();
+    const volumes: MountedMacVolume[] = [];
+    await Promise.all(entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
+      const mountPath = path.join(mountDirectory, entry.name);
+      try {
+        const { stdout: info } = await execFileAsync("/usr/sbin/diskutil", ["info", "-plist", mountPath], {
+          timeout: 6000,
+          maxBuffer: 1024 * 1024,
+        });
+        if (path.resolve(plistString(info, "MountPoint") ?? "") !== path.resolve(mountPath)) return;
+        const deviceIdentifier = plistString(info, "DeviceIdentifier");
+        const wholeDeviceIdentifier = plistString(info, "ParentWholeDisk");
+        if (!deviceIdentifier || !/^disk\d+(?:s\d+)?$/.test(deviceIdentifier) ||
+            !wholeDeviceIdentifier || !/^disk\d+$/.test(wholeDeviceIdentifier)) return;
+        const external = plistBoolean(info, "RemovableMediaOrExternalDevice");
+        const volumeEjectable = plistBoolean(info, "Ejectable");
+        let whole = wholeDiskInfo.get(wholeDeviceIdentifier);
+        if (!whole) {
+          const { stdout: wholeInfo } = await execFileAsync(
+            "/usr/sbin/diskutil",
+            ["info", "-plist", `/dev/${wholeDeviceIdentifier}`],
+            { timeout: 6000, maxBuffer: 1024 * 1024 },
+          );
+          whole = {
+            physical: plistString(wholeInfo, "VirtualOrPhysical") === "Physical" &&
+              plistBoolean(wholeInfo, "WholeDisk"),
+            external: plistBoolean(wholeInfo, "RemovableMediaOrExternalDevice"),
+            ejectable: plistBoolean(wholeInfo, "Ejectable"),
+          };
+          wholeDiskInfo.set(wholeDeviceIdentifier, whole);
+        }
+        volumes.push({
+          mountPath,
+          label: plistString(info, "VolumeName") || entry.name,
+          deviceIdentifier,
+          wholeDeviceIdentifier,
+          ...(plistString(info, "VolumeUUID") ? { volumeUUID: plistString(info, "VolumeUUID") } : {}),
+          external,
+          ejectable: external && volumeEjectable && whole.physical && whole.external && whole.ejectable,
+        });
+      } catch {
+        // A folder in /Volumes is not offered as an eject target unless diskutil
+        // confirms both the mounted volume and its ejectable physical disk.
+      }
+    }));
+    return volumes.sort((first, second) => second.mountPath.length - first.mountPath.length);
+  })();
+  mountedMacVolumesPromise = pending;
+  try {
+    mountedMacVolumesCache = await pending;
+    mountedMacVolumesCacheAt = Date.now();
+    return mountedMacVolumesCache.map((volume) => ({ ...volume }));
+  } finally {
+    if (mountedMacVolumesPromise === pending) mountedMacVolumesPromise = null;
+  }
+}
+
+async function getMountedMacMountPoints(): Promise<Set<string>> {
+  const { stdout } = await execFileAsync("/sbin/mount", [], {
+    timeout: 8000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  return new Set(
+    Array.from(stdout.matchAll(/^\/dev\/\S+ on (.+) \([^)]*\)$/gm), (match) =>
+      match[1].replace(/\\([0-7]{3})/g, (_escape, octal: string) =>
+        String.fromCharCode(Number.parseInt(octal, 8)),
+      ),
+    ),
+  );
+}
+
+function mountedVolumeForPath(sourcePath: string, volumes = mountedMacVolumesCache): MountedMacVolume | undefined {
+  return volumes.find((volume) => isPathWithin(sourcePath, volume.mountPath));
+}
 
 /** Drops cached and in-flight source lists so the next request sees current devices. */
 function invalidateSourceList(): void {
@@ -5504,6 +5661,7 @@ function invalidateSourceList(): void {
   sourceListCache = null;
   sourceListCacheAt = 0;
   sourceListPromise = null;
+  invalidateMountedMacVolumes();
 }
 
 function accessDisplayName(): string {
@@ -5566,7 +5724,7 @@ function disableLifetimeFeatures(): void {
 async function listSources(): Promise<BrowseSource[]> {
   if (sourceListCache && Date.now() - sourceListCacheAt < 1000)
     return sourceListCache.map((source) => ({ ...source }));
-  if (sourceListPromise)
+    if (sourceListPromise)
     return (await sourceListPromise).map((source) => ({ ...source }));
   const generation = sourceListGeneration;
   const pending = buildSourceList().then((sources) =>
@@ -5578,6 +5736,17 @@ async function listSources(): Promise<BrowseSource[]> {
     if (generation !== sourceListGeneration) return listSources();
     sourceListCache = sources;
     sourceListCacheAt = Date.now();
+    if (sourcesReturnedFromEjectedVolumes.size) {
+      const returned = Array.from(sourcesReturnedFromEjectedVolumes);
+      sourcesReturnedFromEjectedVolumes.clear();
+      setImmediate(() => {
+        void indexNewSources(returned, "ejected-volume-returned").catch((error) =>
+          runtimeLog("returned-volume-indexing-start-failed", {
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      });
+    }
     return sourceListCache.map((source) => ({ ...source }));
   } finally {
     if (sourceListPromise === pending) sourceListPromise = null;
@@ -5585,6 +5754,19 @@ async function listSources(): Promise<BrowseSource[]> {
 }
 
 async function buildSourceList(): Promise<BrowseSource[]> {
+  const mountedVolumes = await getMountedMacVolumes();
+  const resumedPaths = await stateStore.resumeSourcesAfterVolumeReturn(
+    mountedVolumes
+      .filter((volume) => !ejectingWholeDevices.has(volume.wholeDeviceIdentifier))
+      .map((volume) => volume.volumeUUID)
+      .filter((uuid): uuid is string => Boolean(uuid)),
+  ).catch((error) => {
+    runtimeLog("returned-volume-source-state-restore-failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return [];
+  });
+  resumedPaths.forEach((sourcePath) => sourcesReturnedFromEjectedVolumes.add(sourcePath));
   const appState = stateStore.getState();
   const disabled = new Set(appState.disabledSourceIds);
   const explicitPhoneChoiceByDevice = new Map<string, string>();
@@ -5600,12 +5782,30 @@ async function buildSourceList(): Promise<BrowseSource[]> {
   const sources: BrowseSource[] = [];
 
   const localSources = await Promise.all(appState.indexSources.map(async (source) => {
-    const available = await fsPromises.access(source.path, fs.constants.R_OK).then(() => true, () => false);
+    const onMountedVolume = mountedVolumeForPath(source.path, mountedVolumes);
+    const underVolumesDirectory = process.platform === "darwin" &&
+      isPathWithin(source.path, "/Volumes") && path.resolve(source.path) !== "/Volumes";
+    const volumeMatches = !source.volumeUUID || source.volumeUUID === onMountedVolume?.volumeUUID;
+    const attachedToExpectedVolume = !underVolumesDirectory || Boolean(onMountedVolume && volumeMatches);
+    if (!source.volumeUUID && onMountedVolume?.volumeUUID && source.kind !== "machine")
+      await stateStore.addIndexSource(source.path, onMountedVolume.volumeUUID).catch((error) => {
+        console.warn("[Sources] Could not persist the mounted-volume identity:", error);
+      });
+    const accessible = await fsPromises.access(source.path, fs.constants.R_OK).then(() => true, () => false);
+    const available = attachedToExpectedVolume && accessible;
     const includesSiloData = await sourceIncludesSiloAppData(source.path);
     const internalRoot = await isSiloInternalRoot(source.path);
-    return { source, available, includesSiloData, internalRoot };
+    const ejectableVolume = attachedToExpectedVolume && onMountedVolume?.ejectable
+      ? {
+          label: onMountedVolume.label,
+          mountPath: onMountedVolume.mountPath,
+          wholeDeviceIdentifier: onMountedVolume.wholeDeviceIdentifier,
+          ...(onMountedVolume.volumeUUID ? { volumeUUID: onMountedVolume.volumeUUID } : {}),
+        }
+      : undefined;
+    return { source, available, includesSiloData, internalRoot, ejectableVolume, underVolumesDirectory, onMountedVolume, volumeMatches };
   }));
-  for (const { source, available, includesSiloData, internalRoot } of localSources) {
+  for (const { source, available, includesSiloData, internalRoot, ejectableVolume, underVolumesDirectory, onMountedVolume, volumeMatches } of localSources) {
     if (internalRoot) continue;
     const cloned = cloneStatus[source.path];
     const machine = source.kind === "machine";
@@ -5613,15 +5813,25 @@ async function buildSourceList(): Promise<BrowseSource[]> {
       id: source.path,
       kind: machine ? "machine" : "local",
       label: machine ? "This Mac" : source.path.split(path.sep).filter(Boolean).pop() || source.path,
-      detail: machine ? "Internal data volume; mounted external volumes are excluded." : source.path,
+      detail: machine ? "Internal data volume; mounted external volumes are excluded." : onMountedVolume?.mountPath ?? source.path,
       rootPath: source.path,
       enabled: !disabled.has(source.path),
       available,
+      ...(ejectableVolume ? {
+        ejectableVolume: {
+          ...ejectableVolume,
+          ejecting: ejectingWholeDevices.has(ejectableVolume.wholeDeviceIdentifier),
+        },
+      } : {}),
       message: includesSiloData
         ? "Silo's private app data is automatically excluded from indexing."
         : available
           ? ""
-          : "Source is disconnected or unreadable.",
+          : underVolumesDirectory && onMountedVolume && !volumeMatches
+            ? "A different drive is mounted here. This source is paused until its original drive returns."
+            : underVolumesDirectory && !onMountedVolume
+              ? "Drive is not mounted. Silo will resume processing when it returns."
+              : "Source is disconnected or unreadable.",
       ...(cloned ? { lastClonedAt: cloned.lastClonedAt, lastCloneDestination: cloned.destinations.at(-1) } : {}),
     });
   }
@@ -6142,7 +6352,7 @@ async function prepareSourceClone(
   if (!Array.isArray(destinations) || destinations.length === 0 || destinations.some((item) => typeof item !== "string" || !path.isAbsolute(item)))
     throw new Error("Choose at least one valid destination folder.");
   const uniqueDestinations = Array.from(new Set(destinations));
-  const operation = { cancelled: false };
+  const operation = sourceCloneOperations.get(operationId) ?? { cancelled: false };
   sourceCloneOperations.set(operationId, operation);
   const available = sourceOverrides ?? await listSources();
   const selected = available.filter((source) =>
@@ -7337,7 +7547,8 @@ async function getIndexableRootsFromSources(
     // Memories use every configured source, independent of result visibility.
     // A local root stays useful to the existing index while its drive is offline;
     // remote roots must be available before their virtual paths can be searched.
-    (source.available || !source.rootPath.startsWith("/__")),
+    (source.available || (!source.rootPath.startsWith("/__") &&
+      !(process.platform === "darwin" && isPathWithin(source.rootPath, "/Volumes") && path.resolve(source.rootPath) !== "/Volumes"))),
   );
   const enabledBackupDevices = new Set<string>();
   for (const source of candidates) {
@@ -9193,6 +9404,7 @@ app.whenReady().then(async () => {
         thumbnailPregenDirty = false;
         await thumbnailPregenerator?.start();
       },
+      pause: () => thumbnailPregenerator?.pause(),
     },
     {
       id: "audio",
@@ -9339,6 +9551,7 @@ app.on("window-all-closed", () => {
 });
 
 let quitFlushed = false;
+let shutdownFlushSucceeded = false;
 app.on("before-quit", (event) => {
   memoryExporter?.cancel();
   void libraryShareServer?.stop();
@@ -9353,24 +9566,60 @@ app.on("before-quit", (event) => {
   if (phoneDiscoveryTimer) clearInterval(phoneDiscoveryTimer);
   if (quitFlushed) return;
   runtimeLog("before-quit");
-  // An intentional quit is never a crash, even if the flush below is cut short.
-  clearActiveSessionMarker();
   for (const window of BrowserWindow.getAllWindows()) window.hide();
-  void semanticIndexer?.stopWatching();
-  void phoneManager?.unmountAll();
-  if (!semanticIndexer) return;
-  // Finish in-flight index writes so a restart never finds a torn record line.
+  semanticIndexer?.stopWatching();
+  if (!semanticIndexer) {
+    shutdownFlushSucceeded = true;
+    return;
+  }
+  // Drain readers and writers before the process exits. If shutdown itself is
+  // interrupted, leave the session marker so the next launch records it.
   event.preventDefault();
   quitFlushed = true;
-  const flush = Promise.all([
-    faceIndexer?.pause(),
-    semanticIndexer.flushWrites(),
-    semanticIndexer.flushVectorSearch(),
-  ]);
-  const deadline = new Promise((resolve) => setTimeout(resolve, 8000));
-  void Promise.race([flush, deadline]).finally(() => app.quit());
+  const flush = (async () => {
+    const drains = await Promise.allSettled([
+      semanticIndexer.pause(),
+      faceIndexer?.pause(),
+      geoIndexer?.pause(),
+      duplicateManager?.pause(),
+      thumbnailPregenerator?.pause(),
+      libraryStatsManager?.cancelAndWait(),
+      audioLibraryCache?.waitForIdle(),
+      phoneManager?.unmountAll(),
+      aestheticScorer?.setBackgroundPaused(true),
+    ]);
+    const failedDrain = drains.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failedDrain) throw failedDrain.reason;
+    await Promise.all([
+      semanticIndexer.flushWrites(),
+      semanticIndexer.flushVectorSearch(),
+    ]);
+  })();
+  let deadlineTimer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<false>((resolve) => {
+    deadlineTimer = setTimeout(() => resolve(false), 8000);
+  });
+  const drained = flush.then(
+    () => true as const,
+    (error) => {
+      runtimeLog("shutdown-drain-failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return false as const;
+    },
+  );
+  void Promise.race([drained, deadline]).then((succeeded) => {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    shutdownFlushSucceeded = succeeded;
+    if (!succeeded) runtimeLog("shutdown-drain-incomplete-session-marker-retained");
+    app.quit();
+  });
 });
 function clearActiveSessionMarker() {
+  if (!shutdownFlushSucceeded) {
+    runtimeLog("diagnostic-session-marker-retained-after-incomplete-shutdown");
+    return;
+  }
   try {
     fs.rmSync(activeSessionMarkerPath, { force: true });
   } catch (error) {
@@ -9999,8 +10248,13 @@ ipcMain.handle(
     const cleanDestinations = Array.isArray(destinations)
       ? destinations.filter((item): item is string => typeof item === "string")
       : [];
-    await beginSourceCloneSessionLog(operationId, "sources", cleanIds.length, cleanDestinations.length);
     try {
+      reserveSourceCloneOperation(operationId);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    try {
+      await beginSourceCloneSessionLog(operationId, "sources", cleanIds.length, cleanDestinations.length);
       const plan = await prepareSourceClone(
         cleanIds,
         cleanDestinations,
@@ -10039,8 +10293,13 @@ ipcMain.handle("prepare-shelter-replica", async (_event, destinations: unknown, 
     : [];
   if (typeof operationId !== "string" || !operationId)
     return { ok: false, error: "Invalid Fallout Shelter replica operation." };
-  await beginSourceCloneSessionLog(operationId, "shelter-replica", 1, cleanDestinations.length);
   try {
+    reserveSourceCloneOperation(operationId);
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  try {
+    await beginSourceCloneSessionLog(operationId, "shelter-replica", 1, cleanDestinations.length);
     const plan = await prepareShelterReplica(cleanDestinations, operationId);
     await markSourceCloneSessionLog(operationId, "awaiting-confirmation", "preflight-ready");
     return { ok: true, plan };
@@ -10082,6 +10341,8 @@ ipcMain.handle("start-source-clone", async (_event, planId: unknown, options: un
     return { ok: false, error: "Time Machine can only be added to a clone of the registered This Mac source." };
   const operationId = plan?.operationId;
   if (!operationId) return { ok: false, error: "Clone plan expired. Prepare the source clone again." };
+  if (ejectingWholeDevices.size)
+    return { ok: false, error: "Silo is safely ejecting a drive. Wait until it is ready before starting Fallout Shelter work." };
   await updateSourceCloneSessionOptions(operationId, {
     compress,
     timeMachineRequested: createAppleCompatibleBackup,
@@ -10133,9 +10394,14 @@ ipcMain.handle("start-machine-time-machine-backup", async (_event, sourceId: unk
   const sourceRegistered = process.platform === "darwin" &&
     stateStore.getState().indexSources.some((source) => source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine");
   const operationId = `time-machine-${randomBytes(16).toString("hex")}`;
-  await beginSourceCloneSessionLog(operationId, "time-machine-only", 1, 0, { timeMachineRequested: true });
-  await markSourceCloneSessionLog(operationId, "time-machine-requesting", "time-machine-request-started");
   try {
+    reserveSourceCloneOperation(operationId);
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  try {
+    await beginSourceCloneSessionLog(operationId, "time-machine-only", 1, 0, { timeMachineRequested: true });
+    await markSourceCloneSessionLog(operationId, "time-machine-requesting", "time-machine-request-started");
     await startConfiguredTimeMachineBackup(sourceId, sourceRegistered);
     await markSourceCloneSessionLog(operationId, "time-machine-requested", "time-machine-request-accepted");
     await finishSourceCloneSessionLog(operationId);
@@ -10148,6 +10414,8 @@ ipcMain.handle("start-machine-time-machine-backup", async (_event, sourceId: unk
       error: error instanceof Error ? error.message : String(error),
       errorDetails: sourceCloneErrorDetails(error),
     };
+  } finally {
+    sourceCloneOperations.delete(operationId);
   }
 });
 
@@ -10171,9 +10439,18 @@ ipcMain.handle("extract-source-clone-archive", async (_event, operationId: unkno
   });
   if (destinationChoice.canceled || !destinationChoice.filePaths[0]) return { ok: false, cancelled: true };
   const destinationParent = destinationChoice.filePaths[0];
-  await beginSourceCloneSessionLog(operationId, "archive-extraction", 1, 1);
-  const operation = { cancelled: false };
-  sourceCloneOperations.set(operationId, operation);
+  let operation: { cancelled: boolean };
+  try {
+    operation = reserveSourceCloneOperation(operationId);
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  try {
+    await beginSourceCloneSessionLog(operationId, "archive-extraction", 1, 1);
+  } catch (error) {
+    sourceCloneOperations.delete(operationId);
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
   const base = { operationId, totalSources: 1, completedFiles: 0, totalBytes: 0, copiedBytes: 0,
     verifiedFiles: 0, failedFiles: 0, totalFiles: 0, currentFile: "" };
   sendSourceCloneProgress({ ...base, phase: "scanning", destination: destinationParent,
@@ -11282,7 +11559,12 @@ ipcMain.handle("select-index-source", async () => {
     properties: ["openDirectory"],
   });
   if (result.canceled || !result.filePaths[0]) return null;
+  if (ejectingWholeDevices.size)
+    throw new Error("A drive is being safely ejected. Wait until it is ready before changing sources.");
   const newSourcePath = result.filePaths[0];
+  const mountedVolume = mountedVolumeForPath(newSourcePath, await getMountedMacVolumes());
+  if (mountedVolume && ejectingWholeDevices.has(mountedVolume.wholeDeviceIdentifier))
+    throw new Error("That drive is being safely ejected. Wait until it is ready before adding a source.");
   const alreadyRegistered = stateStore
     .getState()
     .indexSources.some((source) => source.path === newSourcePath);
@@ -11294,11 +11576,196 @@ ipcMain.handle("select-index-source", async () => {
     notifyDemoLimitReached("sources");
     return null;
   }
-  await stateStore.addIndexSource(newSourcePath);
+  if (ejectingWholeDevices.size)
+    throw new Error("A drive is being safely ejected. Wait until it is ready before changing sources.");
+  await stateStore.addIndexSource(newSourcePath, mountedVolume?.volumeUUID);
   sourceListCacheAt = 0;
   void indexNewSources([newSourcePath], "local-source-added");
 
   return stateStore.getState();
+});
+
+ipcMain.handle("eject-source-volume", async (_event, sourceId: unknown) => {
+  if (process.platform !== "darwin")
+    throw new Error("Secure drive ejection is available only on macOS.");
+  if (typeof sourceId !== "string" || !sourceId.trim())
+    throw new Error("Choose a saved source on the drive to eject.");
+  const sourceRecord = stateStore.getState().indexSources.find((source) => source.path === sourceId);
+  if (!sourceRecord)
+    throw new Error("That source is no longer saved. Refresh the source list and try again.");
+
+  const volumes = await getMountedMacVolumes(true);
+  const targetVolume = mountedVolumeForPath(sourceRecord.path, volumes);
+  if (!targetVolume || !targetVolume.ejectable || !targetVolume.volumeUUID ||
+      (sourceRecord.volumeUUID && sourceRecord.volumeUUID !== targetVolume.volumeUUID))
+    throw new Error("Silo cannot confirm the original ejectable drive for this source. The drive was left mounted.");
+  const wholeDevice = targetVolume.wholeDeviceIdentifier;
+  if (ejectingWholeDevices.has(wholeDevice))
+    throw new Error(`${targetVolume.label} is already being ejected.`);
+  if (ejectingWholeDevices.size)
+    throw new Error("Another drive is already being safely ejected. Wait until it is ready before starting another ejection.");
+
+  // Reserve synchronously before the next await. New Fallout Shelter and Time
+  // Machine operations check this gate before touching any source or destination.
+  ejectingWholeDevices.add(wholeDevice);
+  invalidateSourceList();
+  let diskVolumes: MountedMacVolume[] = [];
+  let affectedSourcePaths: string[] = [];
+  try {
+    if (sourceCloneOperations.size > 0 || [...sourceCloneSessionsByOperation.values()].some((active) =>
+      active.log.outcome === "in-progress" || active.log.outcome === "time-machine-requesting"))
+      throw new Error("A Fallout Shelter, verification, or Time Machine operation is active. Let it finish before ejecting a drive.");
+
+    diskVolumes = volumes.filter((volume) => volume.wholeDeviceIdentifier === wholeDevice);
+    const diskVolumeIds = new Set(diskVolumes.map((volume) => volume.volumeUUID).filter((uuid): uuid is string => Boolean(uuid)));
+    affectedSourcePaths = stateStore.getState().indexSources
+      .filter((source) => {
+        const mounted = mountedVolumeForPath(source.path, volumes);
+        return mounted?.wholeDeviceIdentifier === wholeDevice ||
+          Boolean(source.volumeUUID && diskVolumeIds.has(source.volumeUUID));
+      })
+      .map((source) => source.path);
+    if (!affectedSourcePaths.includes(sourceRecord.path))
+      throw new Error("Silo could not match the saved source to the selected drive. The drive was left mounted.");
+
+    const affectedSourceIds = new Set(
+      (await listSources())
+        .filter((source) => affectedSourcePaths.includes(source.rootPath))
+        .map((source) => source.id),
+    );
+    const share = libraryShareServer?.getStatus();
+    if (share?.active && share.sources.some((source) => affectedSourceIds.has(source.id)))
+      throw new Error("A Silo library share is using this drive. Stop the share, then safely eject the drive.");
+
+    // tmutil returns after accepting a request; the backup itself continues in macOS.
+    // Do not unmount any drive while Time Machine reports an active backup.
+    try {
+      const { stdout: timeMachineStatus } = await execFileAsync(
+        "/usr/bin/tmutil",
+        ["status", "-plist"],
+        { timeout: 8000, maxBuffer: 256 * 1024 },
+      );
+      if (!/<key>Running<\/key>\s*<(?:true|false)\s*\/>/.test(timeMachineStatus))
+        throw new Error("macOS did not return a readable Time Machine status.");
+      if (plistBoolean(timeMachineStatus, "Running"))
+        throw new Error("Time Machine is still running. Wait for its backup to finish before ejecting a drive.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("Time Machine is still running")) throw error;
+      throw new Error(`Silo could not confirm that Time Machine is idle, so it left the drive mounted. ${message}`);
+    }
+  } catch (error) {
+    ejectingWholeDevices.delete(wholeDevice);
+    invalidateSourceList();
+    throw error;
+  }
+
+  let releaseProcessingBlock: (() => Promise<void>) | undefined;
+  let preparedSourcePaths: string[] = [];
+  let ejected = false;
+  let ejectAttempted = false;
+  let volumeConfirmedMounted = false;
+  try {
+    if (!indexRecovery)
+      throw new Error("Silo's background processing is not ready to pause safely. The drive was left mounted.");
+    releaseProcessingBlock = await indexRecovery.acquireBlock(`Safely ejecting ${targetVolume.label}.`);
+    audioLibraryCache?.cancelScan();
+    await Promise.all([
+      libraryStatsManager?.cancelAndWait(),
+      audioLibraryCache?.waitForIdle(),
+    ]);
+    semanticIndexer.stopWatching();
+
+    for (const sourcePath of affectedSourcePaths) {
+      const volume = mountedVolumeForPath(sourcePath, volumes);
+      const existing = stateStore.getState().indexSources.find((source) => source.path === sourcePath);
+      if (volume?.volumeUUID && existing && !existing.volumeUUID)
+        await stateStore.addIndexSource(sourcePath, volume.volumeUUID);
+    }
+    preparedSourcePaths = await stateStore.prepareSourcesForEject(affectedSourcePaths);
+    if (!preparedSourcePaths.includes(sourceRecord.path))
+      throw new Error("Silo could not deselect the source before ejection. The drive was left mounted.");
+    enabledSourcePathCache = new Set();
+    enabledSourceCacheReady = true;
+    invalidateSourceList();
+    await getEnabledIndexSources();
+
+    ejectAttempted = true;
+    let ejectError: unknown;
+    try {
+      await execFileAsync("/usr/sbin/diskutil", ["eject", `/dev/${wholeDevice}`], {
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+      });
+    } catch (error) {
+      ejectError = error;
+    }
+    let mountedMacMountPoints: Set<string>;
+    try {
+      mountedMacMountPoints = await getMountedMacMountPoints();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Silo could not verify whether ${targetVolume.label} is mounted. Its sources remain deselected and will resume when the same drive is detected again. ${message}`);
+    }
+    volumeConfirmedMounted = diskVolumes.some((volume) => mountedMacMountPoints.has(volume.mountPath));
+    if (ejectError) {
+      const detail = ejectError && typeof ejectError === "object" && "stderr" in ejectError
+        ? String((ejectError as { stderr?: unknown }).stderr ?? "").trim()
+        : "";
+      const message = detail || (ejectError instanceof Error ? ejectError.message : "macOS did not confirm the eject request.");
+      if (volumeConfirmedMounted)
+        throw new Error(`macOS could not eject ${targetVolume.label}. The source selections were restored. ${message}`);
+      throw new Error(`macOS could not confirm ejection of ${targetVolume.label}. Its sources remain deselected and will resume when the same drive is detected again. ${message}`);
+    }
+    if (volumeConfirmedMounted)
+      throw new Error(`macOS accepted the eject request but a volume on ${targetVolume.label} is still mounted. The source selections were restored.`);
+    ejected = true;
+    invalidateSourceList();
+    try {
+      const roots = await getAllIndexSources();
+      await semanticIndexer.startWatching(roots);
+    } catch (watchError) {
+      runtimeLog("drive-eject-watcher-restart-failed", {
+        message: watchError instanceof Error ? watchError.message : String(watchError),
+      });
+    }
+  } catch (error) {
+    if (!ejected && preparedSourcePaths.length) {
+      let selectionsRestored = false;
+      if (!ejectAttempted || volumeConfirmedMounted) {
+        try {
+          await stateStore.restoreSourcesAfterEjectFailure(preparedSourcePaths);
+          selectionsRestored = true;
+        } catch (restoreError) {
+          runtimeLog("drive-eject-selection-restore-failed", {
+            message: restoreError instanceof Error ? restoreError.message : String(restoreError),
+          });
+        }
+      } else {
+        runtimeLog("drive-eject-status-uncertain-sources-remain-deselected");
+      }
+      invalidateSourceList();
+      if (selectionsRestored) await getEnabledIndexSources().catch(() => undefined);
+      if (semanticIndexer) {
+        const roots = await getAllIndexSources().catch(() => []);
+        await semanticIndexer.startWatching(roots).catch((watchError) =>
+          runtimeLog("drive-eject-watcher-restore-failed", {
+            message: watchError instanceof Error ? watchError.message : String(watchError),
+          }),
+        );
+      }
+    }
+    throw error;
+  } finally {
+    if (releaseProcessingBlock) await releaseProcessingBlock().catch((error) =>
+      runtimeLog("drive-eject-processing-resume-failed", {
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    ejectingWholeDevices.delete(wholeDevice);
+    invalidateSourceList();
+  }
+  return listSources();
 });
 
 ipcMain.handle("add-machine-source", async () => {
@@ -11323,6 +11790,8 @@ ipcMain.handle("remove-index-source", async (_event, sourcePath: string) => {
   if (typeof sourcePath !== "string" || !sourcePath.trim())
     throw new Error("Choose a valid source to remove.");
   const existing = (await listSources()).find((source) => source.rootPath === sourcePath);
+  if (ejectingWholeDevices.size)
+    throw new Error("A drive is being safely ejected. Wait until it is ready before changing sources.");
   if (!existing || (existing.kind !== "local" && existing.kind !== "machine"))
     throw new Error("Only a registered folder or Mac source can be removed here.");
   const before = stateStore.getState();
@@ -11337,6 +11806,9 @@ ipcMain.handle("remove-index-source", async (_event, sourcePath: string) => {
   const safeRetainedRoots: string[] = [];
   for (const root of retainedRoots)
     if (!(await isSiloInternalRoot(root))) safeRetainedRoots.push(root);
+
+  if (ejectingWholeDevices.size)
+    throw new Error("A drive is being safely ejected. Wait until it is ready before changing sources.");
 
   if (indexRecovery) await indexRecovery.pauseStage("search");
   else await semanticIndexer.pause();
@@ -12059,20 +12531,26 @@ async function findLatestCompleteShelterClone(
 }
 
 async function verifyShelterSources(sourceIds: string[]) {
-  const destinationState = await getShelterDestinationState();
-  if (!destinationState.destination)
-    throw new Error("Choose a Fallout Shelter destination before verifying backups.");
-  if (!destinationState.available)
-    throw new Error("The selected Fallout Shelter destination is not connected and readable.");
-  const destination = destinationState.destination;
-  const registeredSources = await listSources();
-  const selected = registeredSources.filter((source) => sourceIds.includes(source.id));
-  if (!sourceIds.length || selected.length !== new Set(sourceIds).size || selected.some((source) => !source.available))
-    throw new Error("Select only connected, available sources before verifying backups.");
-
   const operationId = `shelter-audit-${Date.now()}-${randomBytes(4).toString("hex")}`;
-  await beginSourceCloneSessionLog(operationId, "verification", selected.length, 1);
-  sourceCloneOperations.set(operationId, { cancelled: false });
+  reserveSourceCloneOperation(operationId);
+  let destination: string;
+  let selected: BrowseSource[];
+  try {
+    const destinationState = await getShelterDestinationState();
+    if (!destinationState.destination)
+      throw new Error("Choose a Fallout Shelter destination before verifying backups.");
+    if (!destinationState.available)
+      throw new Error("The selected Fallout Shelter destination is not connected and readable.");
+    destination = destinationState.destination;
+    const registeredSources = await listSources();
+    selected = registeredSources.filter((source) => sourceIds.includes(source.id));
+    if (!sourceIds.length || selected.length !== new Set(sourceIds).size || selected.some((source) => !source.available))
+      throw new Error("Select only connected, available sources before verifying backups.");
+    await beginSourceCloneSessionLog(operationId, "verification", selected.length, 1);
+  } catch (error) {
+    sourceCloneOperations.delete(operationId);
+    throw error;
+  }
   let failedSources = 0;
   let verifiedFiles = 0;
   let totalFiles = 0;
@@ -12291,6 +12769,8 @@ ipcMain.handle("verify-shelter-sources", async (_event, sourceIds: unknown) => {
   return verifyShelterSources(cleanIds);
 });
 ipcMain.handle("refresh-library-stats", async () => {
+  if (ejectingWholeDevices.size)
+    throw new Error("A drive is being safely ejected. Wait until it is ready before refreshing library inventory.");
   if (!libraryStatsManager) throw new Error("Library inventory is not ready.");
   const sources = (await listSources()).map(({ id, label, kind, rootPath, available, offlineBackup, snapshotAt, message }) => ({
     id, label, kind, rootPath, available, offlineBackup, snapshotAt, message,
@@ -14524,8 +15004,13 @@ ipcMain.handle(
   "set-source-enabled",
   async (_event, sourceId: string, enabled: boolean) => {
     if (typeof sourceId !== "string" || !sourceId) return listSources();
+    if (ejectingWholeDevices.size)
+      throw new Error("A drive is being safely ejected. Wait until it is ready before changing source selections.");
     const shouldEnable = Boolean(enabled);
     const target = (await listSources()).find((source) => source.id === sourceId);
+    if (ejectingWholeDevices.size || target?.ejectableVolume?.ejecting ||
+        (target?.ejectableVolume && ejectingWholeDevices.has(target.ejectableVolume.wholeDeviceIdentifier)))
+      throw new Error("That drive is being safely ejected. Wait until it is ready before changing its source selection.");
     const phoneTarget = target
       ? phoneManager.parsePhonePath(target.rootPath)
       : null;
@@ -14563,6 +15048,8 @@ ipcMain.handle(
         return listSources();
       }
     }
+    if (ejectingWholeDevices.size)
+      throw new Error("A drive is being safely ejected. Wait until it is ready before changing source selections.");
     for (const peer of phonePeers)
       await stateStore.setSourceEnabled(peer.id, false);
     await stateStore.setSourceEnabled(sourceId, shouldEnable);
@@ -14577,8 +15064,12 @@ ipcMain.handle(
 
 ipcMain.handle("set-all-sources-enabled", async (_event, enabled: boolean) => {
   const sources = await listSources();
+  if (ejectingWholeDevices.size || sources.some((source) => source.ejectableVolume?.ejecting))
+    throw new Error("A drive is being safely ejected. Wait until it is ready before changing source selections.");
   const allIds = sources.map((source) => source.id);
   if (!enabled) {
+    if (ejectingWholeDevices.size)
+      throw new Error("A drive is being safely ejected. Wait until it is ready before changing source selections.");
     await stateStore.setAllSourcesEnabled(allIds, false);
   } else {
     const selectedPhoneSources = new Map<string, BrowseSource>();
@@ -14627,6 +15118,8 @@ ipcMain.handle("set-all-sources-enabled", async (_event, enabled: boolean) => {
       for (const sourceId of allowedIds) chosenIds.add(sourceId);
       if (overLimit) notifyDemoLimitReached("sources");
     }
+    if (ejectingWholeDevices.size)
+      throw new Error("A drive is being safely ejected. Wait until it is ready before changing source selections.");
     await stateStore.setAllSourcesEnabled(allIds, false);
     for (const sourceId of chosenIds)
       await stateStore.setSourceEnabled(sourceId, true);

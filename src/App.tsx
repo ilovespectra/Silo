@@ -32,6 +32,7 @@ import {
   FiHeart,
   FiImage,
   FiList,
+  FiLogOut,
   FiMap,
   FiMapPin,
   FiMove,
@@ -1233,6 +1234,7 @@ function App() {
     }
   };
   const [sources, setSources] = useState<BrowseSource[]>([]);
+  const [ejectingDeviceIds, setEjectingDeviceIds] = useState<Set<string>>(() => new Set());
   const enabledSourcePaths = useMemo(
     () => new Set(sources
       .filter((source) => source.enabled && source.available && source.rootPath.trim())
@@ -2947,6 +2949,12 @@ function App() {
     sourcesRef.current = latest;
     setSources(latest);
   }, [electronAPI]);
+
+  useEffect(() => {
+    if (!electronAPI) return;
+    const timer = window.setInterval(() => void refreshSources(), 5000);
+    return () => window.clearInterval(timer);
+  }, [electronAPI, refreshSources]);
   useEffect(() => {
     if (!electronAPI?.onLifetimeAccessChanged) return;
     return electronAPI.onLifetimeAccessChanged((access) => {
@@ -3063,6 +3071,34 @@ function App() {
       loadDirectory,
     ],
   );
+
+  const ejectSourceVolume = useCallback(async (source: BrowseSource) => {
+    const volume = source.ejectableVolume;
+    if (!electronAPI || !volume?.volumeUUID || volume.ejecting) return;
+    const deviceId = volume.wholeDeviceIdentifier;
+    if (ejectingDeviceIds.has(deviceId)) return;
+    setEjectingDeviceIds((current) => new Set(current).add(deviceId));
+    setBrowseError("");
+    try {
+      const updated = await electronAPI.ejectSourceVolume(source.id);
+      sourcesRefreshRequestRef.current += 1;
+      sourcesRef.current = updated;
+      setSources(updated);
+    } catch (error) {
+      setBrowseError(
+        error instanceof Error
+          ? error.message
+          : `Could not safely eject ${volume.label}. The drive was left mounted.`,
+      );
+    } finally {
+      setEjectingDeviceIds((current) => {
+        const next = new Set(current);
+        next.delete(deviceId);
+        return next;
+      });
+      await refreshSources().catch(() => undefined);
+    }
+  }, [electronAPI, ejectingDeviceIds, refreshSources]);
 
   const removeSource = useCallback(async (source: BrowseSource) => {
     if (!electronAPI || (source.kind !== "local" && source.kind !== "machine")) return;
@@ -7917,10 +7953,16 @@ function App() {
               ) : (
                 <>
                   <div className="source-toggle-row">
-                    <button onClick={() => setEverySource(true)}>
+                    <button
+                      disabled={sources.some((source) => source.ejectableVolume?.ejecting)}
+                      onClick={() => setEverySource(true)}
+                    >
                       Select all
                     </button>
-                    <button onClick={() => setEverySource(false)}>
+                    <button
+                      disabled={sources.some((source) => source.ejectableVolume?.ejecting)}
+                      onClick={() => setEverySource(false)}
+                    >
                       Select none
                     </button>
                   </div>
@@ -7950,7 +7992,7 @@ function App() {
                     >
                       <button
                         className={`source-enable-toggle ${source.enabled && source.available ? "active" : ""}`}
-                        disabled={!source.available}
+                        disabled={!source.available || sources.some((item) => item.ejectableVolume?.ejecting)}
                         onClick={() => toggleSource(source.id, !source.enabled)}
                         title={
                           source.enabled ? "Exclude source" : "Include source"
@@ -7978,6 +8020,27 @@ function App() {
                           </small>
                         )}
                       </span>
+                      {source.ejectableVolume?.volumeUUID && (
+                        <button
+                          className="source-eject-button"
+                          type="button"
+                          disabled={sources.some((item) => item.ejectableVolume?.ejecting) ||
+                            source.ejectableVolume.ejecting ||
+                            ejectingDeviceIds.has(source.ejectableVolume.wholeDeviceIdentifier)}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void ejectSourceVolume(source);
+                          }}
+                          title={source.ejectableVolume.ejecting || ejectingDeviceIds.has(source.ejectableVolume.wholeDeviceIdentifier)
+                            ? `Safely preparing ${source.ejectableVolume.label} for ejection`
+                            : `Safely eject ${source.ejectableVolume.label} from macOS`}
+                          aria-label={`Safely eject ${source.ejectableVolume.label} from the computer`}
+                          data-help="Deselect every Silo source on this physical drive, pause Silo's background work, and ask macOS to eject it safely. Silo will resume its saved source selection when the same drive returns."
+                        >
+                          <FiLogOut aria-hidden="true" />
+                        </button>
+                      )}
                       {(source.kind === "local" || source.kind === "machine") && (
                         <button
                           className="source-unplug-button"

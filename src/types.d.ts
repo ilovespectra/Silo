@@ -266,6 +266,13 @@ interface BrowseSource {
   snapshotAt?: number;
   lastClonedAt?: number;
   lastCloneDestination?: string;
+  ejectableVolume?: {
+    label: string;
+    mountPath: string;
+    wholeDeviceIdentifier: string;
+    volumeUUID?: string;
+    ejecting?: boolean;
+  };
 }
 
 interface PhotoPickerSession {
@@ -319,6 +326,11 @@ interface IndexSource {
   path: string;
   addedAt: number;
   kind?: "machine";
+  volumeUUID?: string;
+  resumeAfterEject?: {
+    wasDisabled: boolean;
+    wasExplicitlyEnabled: boolean;
+  };
 }
 
 interface DigitalFolder {
@@ -1670,6 +1682,7 @@ interface Window {
     googleClearPickedPhotos(accountId?: string): Promise<GoogleAccountsState>;
     googleExportPhotos(accountId?: string): Promise<FileOperationResult>;
     listSources(): Promise<BrowseSource[]>;
+    ejectSourceVolume(sourceId: string): Promise<BrowseSource[]>;
     removeIndexSource(sourcePath: string): Promise<PersistedAppState>;
     getLibraryShareStatus(): Promise<{
       active: boolean;

@@ -769,6 +769,59 @@ test("a failed pause clears the false paused state and reports the failure", asy
   assert.match(recovery.details("locations").recoveryError, /Pause failed/);
 });
 
+test("temporary processing holds wait for a clean pause and reject pause failures", async (t) => {
+  const { IndexingRecovery } = loadSource("indexingRecovery.ts");
+  const stateDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "indexing-temporary-hold-test-"),
+  );
+  t.after(() => fs.rmSync(stateDirectory, { recursive: true, force: true }));
+  let progress = { status: "indexing", message: "Reading source" };
+  let pauseFinished = false;
+  const stage = {
+    id: "faces",
+    progress: () => progress,
+    ready: () => false,
+    pause: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      pauseFinished = true;
+      progress = { status: "paused", message: "Paused at checkpoint" };
+    },
+    start: async () => {},
+  };
+  const recovery = new IndexingRecovery(
+    [stage],
+    Date.now,
+    path.join(stateDirectory, "success.json"),
+  );
+  const release = await recovery.acquireBlock("Safely ejecting drive");
+  assert.equal(pauseFinished, true, "the temporary hold waits for the active stage to pause");
+  assert.match(recovery.details("faces").blockedReason, /Safely ejecting drive/);
+  await release();
+  assert.doesNotMatch(recovery.details("faces").blockedReason, /Safely ejecting drive/);
+
+  const failingStage = {
+    id: "locations",
+    progress: () => ({ status: "indexing", message: "Reading GPS" }),
+    ready: () => false,
+    pause: async () => { throw new Error("checkpoint write failed"); },
+    start: async () => {},
+  };
+  const failingRecovery = new IndexingRecovery(
+    [failingStage],
+    Date.now,
+    path.join(stateDirectory, "failure.json"),
+  );
+  await assert.rejects(
+    failingRecovery.acquireBlock("Safely ejecting drive"),
+    /Could not safely pause these background tasks: locations/,
+  );
+  assert.doesNotMatch(
+    failingRecovery.details("locations").blockedReason,
+    /Safely ejecting drive/,
+    "a failed temporary hold does not leave processing blocked",
+  );
+});
+
 test("worker labels constructor failures as infrastructure rather than file errors", async () => {
   const port = new EventEmitter();
   const responses = new EventEmitter();

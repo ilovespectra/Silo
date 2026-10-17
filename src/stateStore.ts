@@ -34,6 +34,11 @@ export interface IndexSource {
   path: string;
   addedAt: number;
   kind?: "machine";
+  volumeUUID?: string;
+  resumeAfterEject?: {
+    wasDisabled: boolean;
+    wasExplicitlyEnabled: boolean;
+  };
 }
 
 export interface DigitalFolder {
@@ -316,9 +321,26 @@ export class StateStore {
     return this.getState();
   }
 
-  async addIndexSource(sourcePath: string) {
-    if (!this.state.indexSources.some((source) => source.path === sourcePath)) {
-      this.state.indexSources.push({ path: sourcePath, addedAt: Date.now() });
+  async addIndexSource(sourcePath: string, volumeUUID?: string) {
+    const existing = this.state.indexSources.find((source) => source.path === sourcePath);
+    if (existing) {
+      if (!existing.volumeUUID && volumeUUID) {
+        const previous = this.state;
+        this.state = structuredClone(this.state);
+        this.state.indexSources.find((source) => source.path === sourcePath)!.volumeUUID = volumeUUID;
+        try {
+          await this.write();
+        } catch (error) {
+          this.state = previous;
+          throw error;
+        }
+      }
+    } else {
+      this.state.indexSources.push({
+        path: sourcePath,
+        addedAt: Date.now(),
+        ...(volumeUUID ? { volumeUUID } : {}),
+      });
       await this.write();
     }
     return this.getState();
@@ -360,6 +382,10 @@ export class StateStore {
   }
 
   async setSourceEnabled(sourceId: string, enabled: boolean) {
+    const previous = this.state;
+    this.state = structuredClone(this.state);
+    const source = this.state.indexSources.find((item) => item.path === sourceId);
+    if (source?.resumeAfterEject) delete source.resumeAfterEject;
     const disabled = new Set(this.state.disabledSourceIds);
     const explicitlyEnabled = new Set(this.state.enabledSourceIds);
     if (enabled) disabled.delete(sourceId);
@@ -368,11 +394,22 @@ export class StateStore {
     else explicitlyEnabled.delete(sourceId);
     this.state.disabledSourceIds = Array.from(disabled);
     this.state.enabledSourceIds = Array.from(explicitlyEnabled);
-    await this.write();
+    try {
+      await this.write();
+    } catch (error) {
+      this.state = previous;
+      throw error;
+    }
     return this.getState();
   }
 
   async setAllSourcesEnabled(sourceIds: string[], enabled: boolean) {
+    const previous = this.state;
+    this.state = structuredClone(this.state);
+    const selectedIds = new Set(sourceIds);
+    for (const source of this.state.indexSources)
+      if (selectedIds.has(source.path) && source.resumeAfterEject)
+        delete source.resumeAfterEject;
     const disabled = new Set(this.state.disabledSourceIds);
     const explicitlyEnabled = new Set(this.state.enabledSourceIds);
     for (const sourceId of sourceIds) {
@@ -386,8 +423,98 @@ export class StateStore {
     }
     this.state.disabledSourceIds = Array.from(disabled);
     this.state.enabledSourceIds = Array.from(explicitlyEnabled);
-    await this.write();
+    try {
+      await this.write();
+    } catch (error) {
+      this.state = previous;
+      throw error;
+    }
     return this.getState();
+  }
+
+  async prepareSourcesForEject(sourcePaths: string[]) {
+    const targets = new Set(sourcePaths);
+    const previous = this.state;
+    this.state = structuredClone(this.state);
+    const disabled = new Set(this.state.disabledSourceIds);
+    const explicitlyEnabled = new Set(this.state.enabledSourceIds);
+    const affected: string[] = [];
+    for (const source of this.state.indexSources) {
+      if (!targets.has(source.path)) continue;
+      source.resumeAfterEject = {
+        wasDisabled: disabled.has(source.path),
+        wasExplicitlyEnabled: explicitlyEnabled.has(source.path),
+      };
+      disabled.add(source.path);
+      explicitlyEnabled.delete(source.path);
+      affected.push(source.path);
+    }
+    this.state.disabledSourceIds = Array.from(disabled);
+    this.state.enabledSourceIds = Array.from(explicitlyEnabled);
+    try {
+      await this.write();
+    } catch (error) {
+      this.state = previous;
+      throw error;
+    }
+    return affected;
+  }
+
+  async restoreSourcesAfterEjectFailure(sourcePaths: string[]) {
+    const targets = new Set(sourcePaths);
+    const previous = this.state;
+    this.state = structuredClone(this.state);
+    const disabled = new Set(this.state.disabledSourceIds);
+    const explicitlyEnabled = new Set(this.state.enabledSourceIds);
+    for (const source of this.state.indexSources) {
+      if (!targets.has(source.path) || !source.resumeAfterEject) continue;
+      if (source.resumeAfterEject.wasDisabled) disabled.add(source.path);
+      else disabled.delete(source.path);
+      if (source.resumeAfterEject.wasExplicitlyEnabled) explicitlyEnabled.add(source.path);
+      else explicitlyEnabled.delete(source.path);
+      delete source.resumeAfterEject;
+    }
+    this.state.disabledSourceIds = Array.from(disabled);
+    this.state.enabledSourceIds = Array.from(explicitlyEnabled);
+    try {
+      await this.write();
+    } catch (error) {
+      this.state = previous;
+      throw error;
+    }
+  }
+
+  async resumeSourcesAfterVolumeReturn(volumeUUIDs: string[]) {
+    const returnedVolumes = new Set(volumeUUIDs);
+    if (!returnedVolumes.size) return [];
+    const previous = this.state;
+    this.state = structuredClone(this.state);
+    const disabled = new Set(this.state.disabledSourceIds);
+    const explicitlyEnabled = new Set(this.state.enabledSourceIds);
+    const resumed: string[] = [];
+    for (const source of this.state.indexSources) {
+      const resume = source.resumeAfterEject;
+      if (!resume || !source.volumeUUID || !returnedVolumes.has(source.volumeUUID)) continue;
+      if (resume.wasDisabled) disabled.add(source.path);
+      else disabled.delete(source.path);
+      if (resume.wasExplicitlyEnabled) explicitlyEnabled.add(source.path);
+      else explicitlyEnabled.delete(source.path);
+      delete source.resumeAfterEject;
+      resumed.push(source.path);
+    }
+    if (!resumed.length) {
+      this.state = previous;
+      return [];
+    }
+    this.state.disabledSourceIds = Array.from(disabled);
+    this.state.enabledSourceIds = Array.from(explicitlyEnabled);
+    try {
+      await this.write();
+    } catch (error) {
+      this.state = previous;
+      throw error;
+    }
+    return resumed;
   }
 
   async createDigitalFolder(name: string) {

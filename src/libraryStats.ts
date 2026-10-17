@@ -105,6 +105,7 @@ export class LibraryStatsManager {
   private currentSources: LibraryStatsSourceInput[] = [];
   private queuedSources: LibraryStatsSourceInput[] | null = null;
   private runPromise: Promise<void> | null = null;
+  private cancelRequested = false;
   private progress: LibraryStatsSnapshot["progress"] = {
     currentSourceId: null,
     currentSource: "",
@@ -153,9 +154,10 @@ export class LibraryStatsManager {
   requestRefresh(sources: LibraryStatsSourceInput[]) {
     this.currentSources = sources.map((source) => ({ ...source }));
     if (this.runPromise) {
-      this.queuedSources = this.currentSources;
+      if (!this.cancelRequested) this.queuedSources = this.currentSources;
       return this.getSnapshot();
     }
+    this.cancelRequested = false;
     const firstBatch = this.currentSources;
     this.progress = {
       currentSourceId: null,
@@ -177,6 +179,12 @@ export class LibraryStatsManager {
   }
 
   async waitForIdle() {
+    await this.runPromise;
+  }
+
+  async cancelAndWait() {
+    this.cancelRequested = true;
+    this.queuedSources = null;
     await this.runPromise;
   }
 
@@ -268,7 +276,7 @@ export class LibraryStatsManager {
 
   private async runBatches(initial: LibraryStatsSourceInput[]) {
     let batch: LibraryStatsSourceInput[] | null = initial;
-    while (batch) {
+    while (batch && !this.cancelRequested) {
       this.currentSources = batch;
       await this.scanBatch(batch);
       batch = this.queuedSources;
@@ -288,6 +296,7 @@ export class LibraryStatsManager {
     };
     this.publish();
     for (const [index, source] of available.entries()) {
+      if (this.cancelRequested) break;
       this.progress = {
         ...this.progress,
         currentSourceId: source.id,
@@ -325,7 +334,8 @@ export class LibraryStatsManager {
             this.progress.message = `Scanning ${source.label}: ${this.progress.scannedEntries.toLocaleString()} entries · ${fileCount.toLocaleString()} files.`;
             this.publish();
           }
-        }, () => false);
+        }, () => this.cancelRequested);
+        if (this.cancelRequested) break;
         const inventory: StoredInventory = {
           id: source.id,
           rootPath: source.rootPath,

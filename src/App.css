@@ -2915,6 +2915,30 @@ label.settings-row {
   background: color-mix(in srgb, var(--error, #c46e5d) 8%, transparent);
 }
 
+.source-eject-button {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.source-eject-button:hover:not(:disabled) {
+  border-color: var(--orange);
+  background: color-mix(in srgb, var(--orange) 10%, transparent);
+  color: var(--orange-bright);
+}
+
+.source-eject-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
 .google-account.stale {
   border-color: var(--border-warning);
 }

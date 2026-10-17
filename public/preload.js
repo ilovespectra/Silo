@@ -533,6 +533,7 @@ contextBridge.exposeInMainWorld("electron", {
   googleExportPhotos: (accountId) =>
     ipcRenderer.invoke("google-export-photos", accountId),
   listSources: () => ipcRenderer.invoke("list-sources"),
+  ejectSourceVolume: (sourceId) => ipcRenderer.invoke("eject-source-volume", sourceId),
   removeIndexSource: (sourcePath) => ipcRenderer.invoke("remove-index-source", sourcePath),
   getLibraryShareStatus: () => ipcRenderer.invoke("get-library-share-status"),
   startLibraryShare: (selections) =>

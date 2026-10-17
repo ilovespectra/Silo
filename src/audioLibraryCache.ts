@@ -105,6 +105,10 @@ export class AudioLibraryCache {
     this.cancelled = true;
   }
 
+  async waitForIdle() {
+    await this.scanPromise?.catch(() => undefined);
+  }
+
   async scan(
     sources: Array<{
       id: string;
