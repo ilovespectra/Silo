@@ -4659,6 +4659,388 @@ type SourceCloneStatusRecord = {
 };
 let sourceCloneStatusCache: Record<string, SourceCloneStatusRecord> | null = null;
 let sourceCloneStatusWrite: Promise<void> = Promise.resolve();
+
+type SourceCloneSessionMode = "sources" | "shelter-replica" | "archive-extraction" | "time-machine-only" | "verification";
+type SourceCloneSessionOutcome =
+  | "in-progress"
+  | "awaiting-confirmation"
+  | "complete"
+  | "complete-with-omissions"
+  | "complete-with-errors"
+  | "error"
+  | "cancelled"
+  | "interrupted"
+  | "time-machine-requesting"
+  | "time-machine-requested"
+  | "time-machine-failed";
+
+interface SourceCloneSessionProgressSnapshot {
+  phase: SourceClonePhase;
+  totalSources: number;
+  totalFiles: number;
+  discoveredFiles?: number;
+  omittedPaths?: number;
+  completedFiles: number;
+  totalBytes: number;
+  copiedBytes: number;
+  verifiedFiles: number;
+  failedFiles: number;
+}
+
+interface SourceCloneSessionLogEvent {
+  at: string;
+  event: string;
+  phase?: SourceClonePhase;
+  totalSources?: number;
+  totalFiles?: number;
+  discoveredFiles?: number;
+  omittedPaths?: number;
+  completedFiles?: number;
+  totalBytes?: number;
+  copiedBytes?: number;
+  verifiedFiles?: number;
+  failedFiles?: number;
+  errorName?: string;
+  code?: string;
+  syscall?: string;
+}
+
+interface SourceCloneSessionLog {
+  format: "silo-fallout-shelter-session-log";
+  version: 1;
+  id: string;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+  appVersion: string;
+  platform: string;
+  architecture: string;
+  osRelease: string;
+  mode: SourceCloneSessionMode;
+  outcome: SourceCloneSessionOutcome;
+  sourceCount: number;
+  destinationCount: number;
+  options: { compress: boolean; timeMachineRequested: boolean };
+  latestProgress?: SourceCloneSessionProgressSnapshot;
+  omittedEvents: number;
+  events: SourceCloneSessionLogEvent[];
+}
+
+interface ActiveSourceCloneSessionLog {
+  operationId: string;
+  log: SourceCloneSessionLog;
+  filePath: string;
+  lastPersistScheduledAt: number;
+  lastEventAt: number;
+  lastEventPhase: SourceClonePhase | null;
+  persistPromise: Promise<void>;
+}
+
+const SOURCE_CLONE_SESSION_LOG_LIMIT = 30;
+const SOURCE_CLONE_SESSION_EVENT_LIMIT = 400;
+const SOURCE_CLONE_SESSION_PERSIST_INTERVAL_MS = 1_000;
+const SOURCE_CLONE_SESSION_EVENT_INTERVAL_MS = 10_000;
+const sourceCloneSessionLogsDirectory = path.join(app.getPath("userData"), "fallout-shelter-session-logs");
+const sourceCloneSessionsByOperation = new Map<string, ActiveSourceCloneSessionLog>();
+let sourceCloneSessionStorageWarning: string | null = null;
+
+function sourceCloneSessionLogFilePath(id: string) {
+  return path.join(sourceCloneSessionLogsDirectory, `${id}.json`);
+}
+
+function appendSourceCloneSessionEvent(
+  active: ActiveSourceCloneSessionLog,
+  event: string,
+  progress?: SourceCloneProgress,
+  error?: SourceCloneErrorDetails,
+) {
+  const at = new Date().toISOString();
+  const entry: SourceCloneSessionLogEvent = {
+    at,
+    event,
+    ...(progress ? {
+      phase: progress.phase,
+      totalSources: progress.totalSources,
+      totalFiles: progress.totalFiles,
+      ...(progress.discoveredFiles === undefined ? {} : { discoveredFiles: progress.discoveredFiles }),
+      ...(progress.omittedPaths === undefined ? {} : { omittedPaths: progress.omittedPaths }),
+      completedFiles: progress.completedFiles,
+      totalBytes: progress.totalBytes,
+      copiedBytes: progress.copiedBytes,
+      verifiedFiles: progress.verifiedFiles,
+      failedFiles: progress.failedFiles,
+    } : {}),
+    ...(error?.name ? { errorName: error.name.slice(0, 80) } : {}),
+    ...(error?.code ? { code: error.code.slice(0, 40) } : {}),
+    ...(error?.syscall ? { syscall: error.syscall.slice(0, 80) } : {}),
+  };
+  active.log.events.push(entry);
+  if (active.log.events.length > SOURCE_CLONE_SESSION_EVENT_LIMIT) {
+    const removeCount = active.log.events.length - SOURCE_CLONE_SESSION_EVENT_LIMIT;
+    active.log.events.splice(0, removeCount);
+    active.log.omittedEvents += removeCount;
+  }
+  active.log.updatedAt = at;
+}
+
+async function writeSourceCloneSessionLogFile(filePath: string, serialized: string) {
+  await fsPromises.mkdir(sourceCloneSessionLogsDirectory, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32")
+    await fsPromises.chmod(sourceCloneSessionLogsDirectory, 0o700);
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  const handle = await fsPromises.open(temporaryPath, "w", 0o600);
+  try {
+    if (process.platform !== "win32") await handle.chmod(0o600);
+    await handle.writeFile(serialized, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fsPromises.rename(temporaryPath, filePath);
+  if (process.platform !== "win32") {
+    try {
+      const directoryHandle = await fsPromises.open(sourceCloneSessionLogsDirectory, "r");
+      try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR") throw error;
+    }
+  }
+  sourceCloneSessionStorageWarning = null;
+}
+
+function persistSourceCloneSessionLog(active: ActiveSourceCloneSessionLog, force = false) {
+  const now = Date.now();
+  if (!force && now - active.lastPersistScheduledAt < SOURCE_CLONE_SESSION_PERSIST_INTERVAL_MS)
+    return active.persistPromise;
+  active.lastPersistScheduledAt = now;
+  const snapshot = JSON.stringify(active.log, null, 2);
+  active.persistPromise = active.persistPromise
+    .catch(() => undefined)
+    .then(() => writeSourceCloneSessionLogFile(active.filePath, snapshot))
+    .catch((error) => {
+      const details = sourceCloneErrorDetails(error);
+      sourceCloneSessionStorageWarning = "Automatic session logs could not be saved locally. Check available disk space and Silo's file access.";
+      runtimeLog("source-clone-session-log-write-failed", {
+        ...(details.code ? { code: details.code } : {}),
+        ...(details.syscall ? { syscall: details.syscall } : {}),
+      });
+    });
+  return active.persistPromise;
+}
+
+async function beginSourceCloneSessionLog(
+  operationId: string,
+  mode: SourceCloneSessionMode,
+  sourceCount: number,
+  destinationCount: number,
+  options: { compress?: boolean; timeMachineRequested?: boolean } = {},
+) {
+  const id = randomBytes(16).toString("hex");
+  const now = new Date().toISOString();
+  const log: SourceCloneSessionLog = {
+    format: "silo-fallout-shelter-session-log",
+    version: 1,
+    id,
+    startedAt: now,
+    updatedAt: now,
+    appVersion: app.getVersion(),
+    platform: process.platform,
+    architecture: process.arch,
+    osRelease: os.release(),
+    mode,
+    outcome: "in-progress",
+    sourceCount: Math.max(0, sourceCount),
+    destinationCount: Math.max(0, destinationCount),
+    options: {
+      compress: options.compress === true,
+      timeMachineRequested: options.timeMachineRequested === true,
+    },
+    omittedEvents: 0,
+    events: [],
+  };
+  const active: ActiveSourceCloneSessionLog = {
+    operationId,
+    log,
+    filePath: sourceCloneSessionLogFilePath(id),
+    lastPersistScheduledAt: 0,
+    lastEventAt: Date.now(),
+    lastEventPhase: null,
+    persistPromise: Promise.resolve(),
+  };
+  appendSourceCloneSessionEvent(active, "operation-started");
+  sourceCloneSessionsByOperation.set(operationId, active);
+  await persistSourceCloneSessionLog(active, true);
+  await pruneSourceCloneSessionLogs();
+}
+
+async function markSourceCloneSessionLog(
+  operationId: string,
+  outcome: SourceCloneSessionOutcome,
+  event: string,
+  error?: SourceCloneErrorDetails,
+) {
+  const active = sourceCloneSessionsByOperation.get(operationId);
+  if (!active) return;
+  active.log.outcome = outcome;
+  if (outcome === "in-progress" || outcome === "time-machine-requesting") {
+    delete active.log.finishedAt;
+  } else {
+    active.log.finishedAt = new Date().toISOString();
+  }
+  appendSourceCloneSessionEvent(active, event, undefined, error);
+  active.lastEventAt = Date.now();
+  await persistSourceCloneSessionLog(active, true);
+}
+
+async function updateSourceCloneSessionOptions(
+  operationId: string,
+  options: { compress?: boolean; timeMachineRequested?: boolean },
+): Promise<void> {
+  const active = sourceCloneSessionsByOperation.get(operationId);
+  if (!active) return;
+  if (options.compress !== undefined) active.log.options.compress = options.compress;
+  if (options.timeMachineRequested !== undefined)
+    active.log.options.timeMachineRequested = options.timeMachineRequested;
+  active.log.updatedAt = new Date().toISOString();
+  await persistSourceCloneSessionLog(active, true);
+}
+
+function recordSourceCloneSessionProgress(progress: SourceCloneProgress) {
+  const active = sourceCloneSessionsByOperation.get(progress.operationId);
+  if (!active) return;
+  const now = Date.now();
+  const latest: SourceCloneSessionProgressSnapshot = {
+    phase: progress.phase,
+    totalSources: progress.totalSources,
+    totalFiles: progress.totalFiles,
+    ...(progress.discoveredFiles === undefined ? {} : { discoveredFiles: progress.discoveredFiles }),
+    ...(progress.omittedPaths === undefined ? {} : { omittedPaths: progress.omittedPaths }),
+    completedFiles: progress.completedFiles,
+    totalBytes: progress.totalBytes,
+    copiedBytes: progress.copiedBytes,
+    verifiedFiles: progress.verifiedFiles,
+    failedFiles: progress.failedFiles,
+  };
+  active.log.latestProgress = latest;
+  active.log.updatedAt = new Date(now).toISOString();
+
+  const terminal = progress.phase === "complete" || progress.phase === "error" || progress.phase === "cancelled";
+  const phaseChanged = progress.phase !== active.lastEventPhase;
+  if (terminal || phaseChanged || now - active.lastEventAt >= SOURCE_CLONE_SESSION_EVENT_INTERVAL_MS) {
+    const event = progress.phase === "complete" ? "operation-complete"
+      : progress.phase === "error" ? "operation-error"
+        : progress.phase === "cancelled" ? "operation-cancelled" : "progress-checkpoint";
+    appendSourceCloneSessionEvent(active, event, progress, progress.errorDetails);
+    active.lastEventAt = now;
+    active.lastEventPhase = progress.phase;
+  }
+
+  if (progress.phase === "complete") {
+    active.log.outcome = progress.omittedPaths
+      ? "complete-with-omissions"
+      : progress.failedFiles > 0 ? "complete-with-errors" : "complete";
+    active.log.finishedAt = active.log.updatedAt;
+  } else if (progress.phase === "error") {
+    active.log.outcome = "error";
+    active.log.finishedAt = active.log.updatedAt;
+  } else if (progress.phase === "cancelled") {
+    active.log.outcome = "cancelled";
+    active.log.finishedAt = active.log.updatedAt;
+  } else if (active.log.outcome === "awaiting-confirmation") {
+    active.log.outcome = "in-progress";
+    delete active.log.finishedAt;
+  }
+  void persistSourceCloneSessionLog(active, terminal || phaseChanged);
+}
+
+async function readSourceCloneSessionLogFiles(): Promise<SourceCloneSessionLog[]> {
+  let names: string[];
+  try {
+    names = await fsPromises.readdir(sourceCloneSessionLogsDirectory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    sourceCloneSessionStorageWarning = "Automatic session logs are not available. Check Silo's file access.";
+    return [];
+  }
+  const sessions: SourceCloneSessionLog[] = [];
+  for (const name of names) {
+    if (!/^[a-f0-9]{32}\.json$/.test(name)) continue;
+    try {
+      const value = JSON.parse(await fsPromises.readFile(path.join(sourceCloneSessionLogsDirectory, name), "utf8")) as SourceCloneSessionLog;
+      if (value?.format !== "silo-fallout-shelter-session-log" || value.version !== 1 ||
+          value.id !== name.slice(0, -5) || !Array.isArray(value.events)) continue;
+      sessions.push(value);
+    } catch {
+      // Ignore a damaged individual log and keep other session records available.
+    }
+  }
+  return sessions.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+}
+
+async function pruneSourceCloneSessionLogs() {
+  try {
+    const sessions = await readSourceCloneSessionLogFiles();
+    const keep = new Set(sessions.slice(0, SOURCE_CLONE_SESSION_LOG_LIMIT).map((session) => session.id));
+    for (const [operationId, active] of sourceCloneSessionsByOperation) {
+      void operationId;
+      keep.add(active.log.id);
+    }
+    for (const session of sessions) {
+      if (!keep.has(session.id))
+        await fsPromises.rm(sourceCloneSessionLogFilePath(session.id), { force: true });
+    }
+  } catch {
+    sourceCloneSessionStorageWarning = "Automatic session logs could not be retained locally.";
+  }
+}
+
+async function initializeSourceCloneSessionLogs(previousSessionWasUnclosed: boolean) {
+  const sessions = await readSourceCloneSessionLogFiles();
+  for (const session of sessions) {
+    if (session.outcome !== "in-progress" && session.outcome !== "awaiting-confirmation" &&
+        session.outcome !== "time-machine-requesting") continue;
+    const preflightClosedNormally = session.outcome === "awaiting-confirmation" && !previousSessionWasUnclosed;
+    session.outcome = preflightClosedNormally ? "cancelled" : "interrupted";
+    session.finishedAt = new Date().toISOString();
+    session.updatedAt = session.finishedAt;
+    session.events.push({
+      at: session.finishedAt,
+      event: preflightClosedNormally ? "preflight-closed-with-app" : "previous-session-interrupted",
+    });
+    if (session.events.length > SOURCE_CLONE_SESSION_EVENT_LIMIT) {
+      const removed = session.events.length - SOURCE_CLONE_SESSION_EVENT_LIMIT;
+      session.events.splice(0, removed);
+      session.omittedEvents += removed;
+    }
+    try {
+      await writeSourceCloneSessionLogFile(sourceCloneSessionLogFilePath(session.id), JSON.stringify(session, null, 2));
+    } catch {
+      sourceCloneSessionStorageWarning = "An interrupted Fallout Shelter session could not be updated on disk.";
+    }
+  }
+  await pruneSourceCloneSessionLogs();
+}
+
+async function getSourceCloneSessionLogs() {
+  const byId = new Map((await readSourceCloneSessionLogFiles()).map((session) => [session.id, session]));
+  for (const active of sourceCloneSessionsByOperation.values())
+    byId.set(active.log.id, active.log);
+  return {
+    sessions: [...byId.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, SOURCE_CLONE_SESSION_LOG_LIMIT),
+    warning: sourceCloneSessionStorageWarning,
+  };
+}
+
+async function finishSourceCloneSessionLog(operationId: string) {
+  const active = sourceCloneSessionsByOperation.get(operationId);
+  if (!active) return;
+  await persistSourceCloneSessionLog(active, true);
+  await active.persistPromise;
+  sourceCloneSessionsByOperation.delete(operationId);
+  await pruneSourceCloneSessionLogs();
+}
+
 const shelterDestinationPath = path.join(app.getPath("userData"), "shelter-destination.json");
 let shelterDestinationCache: string | null | undefined;
 
@@ -5524,6 +5906,7 @@ function cloneSafeRelativePath(value: string) {
 }
 
 function sendSourceCloneProgress(progress: SourceCloneProgress) {
+  recordSourceCloneSessionProgress(progress);
   sendToRenderer("source-clone-progress", progress);
 }
 
@@ -7758,13 +8141,14 @@ function installApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
+  await initializeSourceCloneSessionLogs(previousSessionWasUnclosed);
   if (app.isPackaged) app.setAsDefaultProtocolClient("silo");
   const startupBetaUrl = process.argv.find((argument) =>
     argument.toLowerCase().startsWith("silo://beta-activate"),
   );
   if (startupBetaUrl) queueBetaActivationUrl(startupBetaUrl);
   loadPendingDiagnosticReport();
-  const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
   if (previousSessionWasUnclosed)
     createAppCrashDiagnosticReport("The previous Silo session did not close normally.");
   try {
@@ -9554,6 +9938,51 @@ ipcMain.handle("save-source-clone-diagnostic-log", async (_event, contents: unkn
   }
 });
 
+ipcMain.handle("get-source-clone-session-logs", async () => getSourceCloneSessionLogs());
+
+ipcMain.handle("dismiss-source-clone-session", async (_event, operationId: unknown) => {
+  if (typeof operationId !== "string" || !operationId) return false;
+  const active = sourceCloneSessionsByOperation.get(operationId);
+  if (!active || active.log.outcome !== "awaiting-confirmation") return false;
+  await markSourceCloneSessionLog(operationId, "cancelled", "preflight-dismissed");
+  await finishSourceCloneSessionLog(operationId);
+  return true;
+});
+
+ipcMain.handle("download-source-clone-session-log", async (_event, id: unknown) => {
+  if (typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id))
+    return { ok: false, error: "Invalid Fallout Shelter session log." };
+  if (!mainWindow) return { ok: false, error: "Silo's window is not available." };
+  let session: SourceCloneSessionLog | undefined;
+  try {
+    const active = [...sourceCloneSessionsByOperation.values()].find((item) => item.log.id === id);
+    session = active
+      ? JSON.parse(JSON.stringify(active.log)) as SourceCloneSessionLog
+      : (await readSourceCloneSessionLogFiles()).find((item) => item.id === id);
+  } catch {
+    return { ok: false, error: "The saved Fallout Shelter session log could not be read." };
+  }
+  if (!session) return { ok: false, error: "That Fallout Shelter session log is no longer available." };
+
+  const datePart = session.startedAt.replace(/[:.]/g, "-");
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "Download Fallout Shelter session log",
+    defaultPath: path.join(app.getPath("downloads"), `Silo-Fallout-Shelter-Session-${datePart}.json`),
+    buttonLabel: "Save session log",
+    filters: [{ name: "JSON session log", extensions: ["json"] }],
+  });
+  if (result.canceled || !result.filePath) return { ok: false, cancelled: true };
+  try {
+    await fsPromises.writeFile(result.filePath, JSON.stringify(session, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    return { ok: true, fileName: path.basename(result.filePath) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Could not save the session log." };
+  }
+});
+
 ipcMain.handle(
   "prepare-source-clone",
   async (
@@ -9567,12 +9996,17 @@ ipcMain.handle(
       : [];
     if (typeof operationId !== "string" || !operationId)
       return { ok: false, error: "Invalid clone operation." };
+    const cleanDestinations = Array.isArray(destinations)
+      ? destinations.filter((item): item is string => typeof item === "string")
+      : [];
+    await beginSourceCloneSessionLog(operationId, "sources", cleanIds.length, cleanDestinations.length);
     try {
       const plan = await prepareSourceClone(
         cleanIds,
-        Array.isArray(destinations) ? destinations.filter((item): item is string => typeof item === "string") : [],
+        cleanDestinations,
         operationId,
       );
+      await markSourceCloneSessionLog(operationId, "awaiting-confirmation", "preflight-ready");
       return { ok: true, plan };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -9593,6 +10027,7 @@ ipcMain.handle(
         message,
         errorDetails,
       });
+      await finishSourceCloneSessionLog(operationId);
       return { ok: false, error: message, errorDetails };
     }
   },
@@ -9604,8 +10039,10 @@ ipcMain.handle("prepare-shelter-replica", async (_event, destinations: unknown, 
     : [];
   if (typeof operationId !== "string" || !operationId)
     return { ok: false, error: "Invalid Fallout Shelter replica operation." };
+  await beginSourceCloneSessionLog(operationId, "shelter-replica", 1, cleanDestinations.length);
   try {
     const plan = await prepareShelterReplica(cleanDestinations, operationId);
+    await markSourceCloneSessionLog(operationId, "awaiting-confirmation", "preflight-ready");
     return { ok: true, plan };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -9626,6 +10063,7 @@ ipcMain.handle("prepare-shelter-replica", async (_event, destinations: unknown, 
       message,
       errorDetails,
     });
+    await finishSourceCloneSessionLog(operationId);
     return { ok: false, error: message, errorDetails };
   }
 });
@@ -9642,23 +10080,45 @@ ipcMain.handle("start-source-clone", async (_event, planId: unknown, options: un
       (!plan || plan.sourceIds.length !== 1 || plan.sourceIds[0] !== MAC_DATA_VOLUME_ROOT ||
         !stateStore.getState().indexSources.some((source) => source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine")))
     return { ok: false, error: "Time Machine can only be added to a clone of the registered This Mac source." };
+  const operationId = plan?.operationId;
+  if (!operationId) return { ok: false, error: "Clone plan expired. Prepare the source clone again." };
+  await updateSourceCloneSessionOptions(operationId, {
+    compress,
+    timeMachineRequested: createAppleCompatibleBackup,
+  });
   try {
     await runSourceClone(planId, { compress });
-    if (!createAppleCompatibleBackup) return { ok: true };
+    if (sourceCloneSessionsByOperation.get(operationId)?.log.latestProgress?.phase === "cancelled") {
+      await markSourceCloneSessionLog(operationId, "cancelled", "clone-cancelled");
+      await finishSourceCloneSessionLog(operationId);
+      return { ok: false, cancelled: true };
+    }
+    if (!createAppleCompatibleBackup) {
+      await finishSourceCloneSessionLog(operationId);
+      return { ok: true };
+    }
+    await markSourceCloneSessionLog(operationId, "time-machine-requesting", "time-machine-request-started");
     try {
       await startConfiguredTimeMachineBackup(
         MAC_DATA_VOLUME_ROOT,
         stateStore.getState().indexSources.some((source) => source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine"),
       );
+      await markSourceCloneSessionLog(operationId, "time-machine-requested", "time-machine-request-accepted");
+      await finishSourceCloneSessionLog(operationId);
       return { ok: true, timeMachineStarted: true };
     } catch (error) {
+      const errorDetails = sourceCloneErrorDetails(error);
+      await markSourceCloneSessionLog(operationId, "time-machine-failed", "time-machine-request-failed", errorDetails);
+      await finishSourceCloneSessionLog(operationId);
       return {
         ok: true,
         timeMachineError: error instanceof Error ? error.message : String(error),
-        timeMachineErrorDetails: sourceCloneErrorDetails(error),
+        timeMachineErrorDetails: errorDetails,
       };
     }
   } catch (error) {
+    await markSourceCloneSessionLog(operationId, "error", "clone-failed", sourceCloneErrorDetails(error));
+    await finishSourceCloneSessionLog(operationId);
     return {
       ok: false,
       error: error instanceof Error ? error.message : String(error),
@@ -9672,10 +10132,17 @@ ipcMain.handle("start-machine-time-machine-backup", async (_event, sourceId: unk
     return { ok: false, error: "Time Machine can only be requested for This Mac." };
   const sourceRegistered = process.platform === "darwin" &&
     stateStore.getState().indexSources.some((source) => source.path === MAC_DATA_VOLUME_ROOT && source.kind === "machine");
+  const operationId = `time-machine-${randomBytes(16).toString("hex")}`;
+  await beginSourceCloneSessionLog(operationId, "time-machine-only", 1, 0, { timeMachineRequested: true });
+  await markSourceCloneSessionLog(operationId, "time-machine-requesting", "time-machine-request-started");
   try {
     await startConfiguredTimeMachineBackup(sourceId, sourceRegistered);
+    await markSourceCloneSessionLog(operationId, "time-machine-requested", "time-machine-request-accepted");
+    await finishSourceCloneSessionLog(operationId);
     return { ok: true, timeMachineStarted: true };
   } catch (error) {
+    await markSourceCloneSessionLog(operationId, "time-machine-failed", "time-machine-request-failed", sourceCloneErrorDetails(error));
+    await finishSourceCloneSessionLog(operationId);
     return {
       ok: false,
       error: error instanceof Error ? error.message : String(error),
@@ -9704,6 +10171,7 @@ ipcMain.handle("extract-source-clone-archive", async (_event, operationId: unkno
   });
   if (destinationChoice.canceled || !destinationChoice.filePaths[0]) return { ok: false, cancelled: true };
   const destinationParent = destinationChoice.filePaths[0];
+  await beginSourceCloneSessionLog(operationId, "archive-extraction", 1, 1);
   const operation = { cancelled: false };
   sourceCloneOperations.set(operationId, operation);
   const base = { operationId, totalSources: 1, completedFiles: 0, totalBytes: 0, copiedBytes: 0,
@@ -9743,6 +10211,7 @@ ipcMain.handle("extract-source-clone-archive", async (_event, operationId: unkno
       ...(!operation.cancelled ? { errorDetails: sourceCloneErrorDetails(error) } : {}) };
   } finally {
     sourceCloneOperations.delete(operationId);
+    await finishSourceCloneSessionLog(operationId);
   }
 });
 
@@ -11602,7 +12071,12 @@ async function verifyShelterSources(sourceIds: string[]) {
     throw new Error("Select only connected, available sources before verifying backups.");
 
   const operationId = `shelter-audit-${Date.now()}-${randomBytes(4).toString("hex")}`;
+  await beginSourceCloneSessionLog(operationId, "verification", selected.length, 1);
   sourceCloneOperations.set(operationId, { cancelled: false });
+  let failedSources = 0;
+  let verifiedFiles = 0;
+  let totalFiles = 0;
+  let failedFiles = 0;
   try {
     for (const source of selected) {
       ensureCloneActive(operationId);
@@ -11666,9 +12140,41 @@ async function verifyShelterSources(sourceIds: string[]) {
           },
         },
       });
+      totalFiles += audit.totalFiles;
+      verifiedFiles += audit.verifiedFiles;
+      failedFiles += Math.max(0, audit.totalFiles - audit.verifiedFiles);
+      recordSourceCloneSessionProgress({
+        operationId,
+        phase: "verifying",
+        destination: "",
+        totalSources: selected.length,
+        totalFiles,
+        completedFiles: verifiedFiles + failedFiles,
+        totalBytes: 0,
+        copiedBytes: 0,
+        verifiedFiles,
+        failedFiles,
+        currentFile: "",
+        message: "Verifying selected Fallout Shelter copies",
+      });
+      if (audit.lastResult === "verified") {
+        await markSourceCloneSessionLog(operationId, "in-progress", "verification-source-verified");
+      } else {
+        failedSources += 1;
+        await markSourceCloneSessionLog(operationId, "in-progress", `verification-source-${audit.lastResult}`);
+      }
     }
+    await markSourceCloneSessionLog(
+      operationId,
+      failedSources ? "complete-with-errors" : "complete",
+      failedSources ? "verification-completed-with-errors" : "verification-complete",
+    );
+  } catch (error) {
+    await markSourceCloneSessionLog(operationId, "error", "verification-failed", sourceCloneErrorDetails(error));
+    throw error;
   } finally {
     sourceCloneOperations.delete(operationId);
+    await finishSourceCloneSessionLog(operationId);
   }
   return getLibraryDashboardSnapshot();
 }

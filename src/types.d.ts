@@ -698,6 +698,72 @@ interface SourceCloneErrorDetails {
   path?: string;
 }
 
+type SourceCloneSessionMode = "sources" | "shelter-replica" | "archive-extraction" | "time-machine-only" | "verification";
+type SourceCloneSessionOutcome =
+  | "in-progress"
+  | "awaiting-confirmation"
+  | "complete"
+  | "complete-with-omissions"
+  | "complete-with-errors"
+  | "error"
+  | "cancelled"
+  | "interrupted"
+  | "time-machine-requesting"
+  | "time-machine-requested"
+  | "time-machine-failed";
+
+interface SourceCloneSessionProgressSnapshot {
+  phase: SourceCloneProgress["phase"];
+  totalSources: number;
+  totalFiles: number;
+  discoveredFiles?: number;
+  omittedPaths?: number;
+  completedFiles: number;
+  totalBytes: number;
+  copiedBytes: number;
+  verifiedFiles: number;
+  failedFiles: number;
+}
+
+interface SourceCloneSessionLogEvent {
+  at: string;
+  event: string;
+  phase?: SourceCloneProgress["phase"];
+  totalSources?: number;
+  totalFiles?: number;
+  discoveredFiles?: number;
+  omittedPaths?: number;
+  completedFiles?: number;
+  totalBytes?: number;
+  copiedBytes?: number;
+  verifiedFiles?: number;
+  failedFiles?: number;
+  errorName?: string;
+  code?: string;
+  syscall?: string;
+}
+
+interface SourceCloneSessionLog {
+  format: "silo-fallout-shelter-session-log";
+  version: 1;
+  id: string;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+  appVersion: string;
+  platform: string;
+  architecture: string;
+  osRelease: string;
+  mode: SourceCloneSessionMode;
+  outcome: SourceCloneSessionOutcome;
+  sourceCount: number;
+  destinationCount: number;
+  options: { compress: boolean; timeMachineRequested: boolean };
+  latestProgress?: SourceCloneSessionProgressSnapshot;
+  omittedEvents: number;
+  events: SourceCloneSessionLogEvent[];
+}
+
 interface SourceClonePreflight {
   planId: string;
   destinations: Array<{
@@ -1030,6 +1096,7 @@ interface Window {
       options?: { compress?: boolean; createAppleCompatibleBackup?: boolean },
     ): Promise<{
       ok: boolean;
+      cancelled?: boolean;
       timeMachineStarted?: boolean;
       timeMachineError?: string;
       timeMachineErrorDetails?: SourceCloneErrorDetails;
@@ -1060,6 +1127,14 @@ interface Window {
       fileName?: string;
       error?: string;
     }>;
+    getSourceCloneSessionLogs(): Promise<{ sessions: SourceCloneSessionLog[]; warning: string | null }>;
+    downloadSourceCloneSessionLog(id: string): Promise<{
+      ok: boolean;
+      cancelled?: boolean;
+      fileName?: string;
+      error?: string;
+    }>;
+    dismissSourceCloneSession(operationId: string): Promise<boolean>;
     selectSourceCloneDestination(): Promise<string[]>;
     prepareSourceClone(
       sourceIds: string[],

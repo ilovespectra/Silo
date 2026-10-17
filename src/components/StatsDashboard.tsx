@@ -5,6 +5,7 @@ import {
   FiCheckCircle,
   FiCloudOff,
   FiCopy,
+  FiClock,
   FiDownload,
   FiDatabase,
   FiHardDrive,
@@ -216,6 +217,7 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [showClone, setShowClone] = useState(false);
   const [showReplica, setShowReplica] = useState(false);
+  const [showSessionHistory, setShowSessionHistory] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -343,6 +345,7 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
           <button className="stats-button small" onClick={() => void refreshInventory()} disabled={busy || Boolean(snapshot?.running)}><FiRefreshCw className={busy ? "stats-spin" : ""} /> {busy || snapshot?.running ? "Measuring…" : "Refresh readiness"}</button>
         </div>
         <button className="stats-button small fallout-shelter-replica-button" disabled={!snapshot?.shelter.snapshotAvailable} title={snapshot?.shelter.snapshotAvailable ? "Verify the latest complete shelter on another physical volume" : "Create and verify the primary shelter first"} onClick={() => setShowReplica(true)} data-tour="shelter-replica"><FiCopy /> Replicate shelter to another volume</button>
+        <button className="stats-button small fallout-shelter-replica-button" onClick={() => setShowSessionHistory(true)}><FiClock /> View previous session logs</button>
         {(snapshot?.shelter.replicas ?? []).map((replica) => <div className="stats-shelter-replica" key={`${replica.path}:${replica.verifiedAt}`}><FiCheckCircle /><span><strong>Verified replica</strong><small title={replica.path}>{replica.path}</small></span><time>{formatDate(replica.verifiedAt)}</time></div>)}
       </section>
 
@@ -371,6 +374,7 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
       </section>
       {showClone && snapshot?.shelter.destination && <SourceClonePanel electronAPI={api} sources={selectedSources.map(({ id, label, kind }) => ({ id, label, kind }))} initialDestinations={[snapshot.shelter.destination]} onClose={() => { setShowClone(false); setSelectedIds(new Set()); void refreshInventory(); }} />}
       {showReplica && snapshot?.shelter.snapshotAvailable && <SourceClonePanel electronAPI={api} mode="shelter-replica" sources={[{ id: "fallout-shelter", label: "Fallout Shelter", kind: "verified snapshot" }]} onClose={() => { setShowReplica(false); void loadSnapshot(); }} />}
+      {showSessionHistory && <SourceClonePanel electronAPI={api} sources={[]} historyOnly onClose={() => setShowSessionHistory(false)} />}
     </div>
   );
 }

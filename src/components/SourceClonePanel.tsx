@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { FiArchive, FiCheckCircle, FiCopy, FiHardDrive, FiShield, FiX } from "react-icons/fi";
+import { FiArchive, FiCheckCircle, FiClock, FiCopy, FiDownload, FiHardDrive, FiRefreshCw, FiShield, FiX } from "react-icons/fi";
 
 interface CloneSource {
   id: string;
@@ -12,6 +12,7 @@ interface SourceClonePanelProps {
   sources: CloneSource[];
   initialDestinations?: string[];
   mode?: "sources" | "shelter-replica";
+  historyOnly?: boolean;
   onClose: () => void;
 }
 
@@ -58,6 +59,73 @@ function formatBytes(value: number) {
   return `${size.toFixed(2)} ${units[unit]}`;
 }
 
+function sourceCloneSessionOutcomeLabel(outcome: SourceCloneSessionOutcome) {
+  return ({
+    "in-progress": "In progress",
+    "awaiting-confirmation": "Preflight ready",
+    complete: "Complete",
+    "complete-with-omissions": "Complete with omissions",
+    "complete-with-errors": "Complete with errors",
+    error: "Failed",
+    cancelled: "Cancelled",
+    interrupted: "Interrupted",
+    "time-machine-requesting": "Requesting Time Machine",
+    "time-machine-requested": "Time Machine request accepted",
+    "time-machine-failed": "Time Machine request failed",
+  } satisfies Record<SourceCloneSessionOutcome, string>)[outcome];
+}
+
+function sourceCloneSessionModeLabel(mode: SourceCloneSessionMode) {
+  return ({
+    sources: "Source copy",
+    "shelter-replica": "Fallout Shelter replica",
+    "archive-extraction": "Archive extraction",
+    "time-machine-only": "Time Machine only",
+    verification: "Verify selected backups",
+  } satisfies Record<SourceCloneSessionMode, string>)[mode];
+}
+
+function sourceCloneSessionEventLabel(event: string) {
+  return ({
+    "operation-started": "Session started",
+    "preflight-ready": "Preflight completed; awaiting confirmation",
+    "progress-checkpoint": "Progress saved",
+    "operation-complete": "Copy and verification completed",
+    "operation-error": "Operation failed",
+    "operation-cancelled": "Operation cancelled",
+    "clone-complete": "Clone completed",
+    "clone-failed": "Clone failed",
+    "time-machine-request-started": "Time Machine request started",
+    "time-machine-request-accepted": "macOS accepted the Time Machine request",
+    "time-machine-request-failed": "Time Machine request failed",
+    "previous-session-interrupted": "Silo restarted before this session finished",
+    "verification-source-verified": "Selected source matched its shelter copy",
+    "verification-source-mismatch": "Selected source did not match its shelter copy",
+    "verification-source-missing": "No complete shelter copy was found",
+    "verification-source-error": "Selected source could not be verified",
+    "verification-complete": "Selected backups verified",
+    "verification-completed-with-errors": "Verification finished with issues",
+    "verification-failed": "Verification operation failed",
+    "preflight-dismissed": "Preflight closed before cloning",
+    "preflight-closed-with-app": "Silo closed before cloning began",
+  } as Record<string, string>)[event] ?? event.replace(/-/g, " ");
+}
+
+function sourceCloneSessionProgressLine(progress: SourceCloneSessionProgressSnapshot) {
+  const parts = [progress.phase.replace(/-/g, " ")];
+  if (progress.totalFiles > 0)
+    parts.push(`${progress.completedFiles.toLocaleString()} / ${progress.totalFiles.toLocaleString()} files`);
+  if (progress.totalBytes > 0)
+    parts.push(`${formatBytes(progress.copiedBytes)} / ${formatBytes(progress.totalBytes)}`);
+  if (progress.verifiedFiles > 0)
+    parts.push(`${progress.verifiedFiles.toLocaleString()} verified`);
+  if (progress.omittedPaths)
+    parts.push(`${progress.omittedPaths.toLocaleString()} omitted`);
+  if (progress.failedFiles > 0)
+    parts.push(`${progress.failedFiles.toLocaleString()} errors`);
+  return parts.join(" · ");
+}
+
 function countExcludedByKind(excludedPaths: SourceCloneExcludedPath[]) {
   const counts: Partial<Record<SourceCloneExcludedPath["kind"], number>> = {};
   for (const excluded of excludedPaths)
@@ -77,7 +145,7 @@ function excludedKindLabel(kind: SourceCloneExcludedPath["kind"]) {
   } satisfies Record<SourceCloneExcludedPath["kind"], string>)[kind];
 }
 
-export default function SourceClonePanel({ electronAPI, sources, initialDestinations = [], mode = "sources", onClose }: SourceClonePanelProps) {
+export default function SourceClonePanel({ electronAPI, sources, initialDestinations = [], mode = "sources", historyOnly = false, onClose }: SourceClonePanelProps) {
   const [preparing, setPreparing] = useState(false);
   const [running, setRunning] = useState(false);
   const [plan, setPlan] = useState<SourceClonePreflight | null>(null);
@@ -95,6 +163,13 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
   const diagnosticRef = useRef<SourceCloneDiagnosticReport | null>(null);
   const [diagnosticsAvailable, setDiagnosticsAvailable] = useState(false);
   const [diagnosticStatus, setDiagnosticStatus] = useState("");
+  const [sessionHistoryOpen, setSessionHistoryOpen] = useState(historyOnly);
+  const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
+  const [sessionLogs, setSessionLogs] = useState<SourceCloneSessionLog[]>([]);
+  const [sessionLogWarning, setSessionLogWarning] = useState("");
+  const [selectedSessionLogId, setSelectedSessionLogId] = useState("");
+  const [sessionLogStatus, setSessionLogStatus] = useState("");
+  const [downloadingSessionLog, setDownloadingSessionLog] = useState(false);
   const busy = preparing || running || extracting;
   const supportsTimeMachine = mode === "sources" && sources.length === 1 && sources[0].kind === "machine";
   const timeMachineOnly = supportsTimeMachine && createAppleCompatibleBackup && timeMachineMode === "instead";
@@ -152,6 +227,53 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
       setDiagnosticStatus(cause instanceof Error ? cause.message : "Could not save the diagnostic log.");
     }
   };
+
+  const loadPreviousSessionLogs = async () => {
+    setSessionHistoryLoading(true);
+    setSessionLogStatus("");
+    try {
+      const result = await electronAPI.getSourceCloneSessionLogs();
+      const sessions = Array.isArray(result.sessions) ? result.sessions : [];
+      setSessionLogs(sessions);
+      setSessionLogWarning(result.warning || "");
+      setSelectedSessionLogId((current) => sessions.some((session) => session.id === current)
+        ? current : sessions[0]?.id ?? "");
+    } catch (cause) {
+      setSessionLogWarning(cause instanceof Error ? cause.message : "Saved session logs could not be loaded.");
+    } finally {
+      setSessionHistoryLoading(false);
+    }
+  };
+
+  const toggleSessionHistory = () => {
+    const open = !sessionHistoryOpen;
+    setSessionHistoryOpen(open);
+    if (open) void loadPreviousSessionLogs();
+  };
+
+  const downloadSavedSessionLog = async (id: string) => {
+    setDownloadingSessionLog(true);
+    setSessionLogStatus("");
+    try {
+      const result = await electronAPI.downloadSourceCloneSessionLog(id);
+      if (result.ok) setSessionLogStatus(`Saved ${result.fileName || "session log"}.`);
+      else if (!result.cancelled) setSessionLogStatus(result.error || "Could not save the session log.");
+    } catch (cause) {
+      setSessionLogStatus(cause instanceof Error ? cause.message : "Could not save the session log.");
+    } finally {
+      setDownloadingSessionLog(false);
+    }
+  };
+
+  const closePanel = () => {
+    if (operationIdRef.current)
+      void electronAPI.dismissSourceCloneSession(operationIdRef.current);
+    onClose();
+  };
+
+  useEffect(() => {
+    if (historyOnly) void loadPreviousSessionLogs();
+  }, [historyOnly, electronAPI]);
 
   const addDestination = async () => {
     setError("");
@@ -251,6 +373,13 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
         compress,
         createAppleCompatibleBackup: supportsTimeMachine && createAppleCompatibleBackup && timeMachineMode === "as-well",
       });
+      if (result.cancelled) {
+        if (report) {
+          report.outcome = "copy-cancelled";
+          addDiagnosticEvent(report, "copy-cancelled");
+        }
+        return;
+      }
       if (!result.ok) {
         if (report) {
           report.outcome = "copy-failed";
@@ -403,16 +532,16 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
 
   return (
     <div className="source-clone-backdrop" role="presentation" onMouseDown={(event) => {
-      if (!busy && event.target === event.currentTarget) onClose();
+      if (!busy && event.target === event.currentTarget) closePanel();
     }}>
-      <section className="source-clone-panel" role="dialog" aria-modal="true" aria-labelledby="source-clone-title">
+      <section className={`source-clone-panel${historyOnly ? " history-only" : ""}`} role="dialog" aria-modal="true" aria-labelledby="source-clone-title">
         <header>
-          <div className="source-clone-icon"><FiCopy /></div>
+          <div className="source-clone-icon">{historyOnly ? <FiClock /> : <FiCopy />}</div>
           <div>
-            <span className="sidebar-kicker">{mode === "shelter-replica" ? "VERIFIED FALLOUT SHELTER REPLICA" : "FALLOUT SHELTER · SOURCE COPY"}</span>
-            <h2 id="source-clone-title">{mode === "shelter-replica" ? "Clone Fallout Shelter" : "Create Fallout Shelter"}</h2>
+            <span className="sidebar-kicker">{historyOnly ? "FALLOUT SHELTER · SESSION HISTORY" : mode === "shelter-replica" ? "VERIFIED FALLOUT SHELTER REPLICA" : "FALLOUT SHELTER · SOURCE COPY"}</span>
+            <h2 id="source-clone-title">{historyOnly ? "Previous session logs" : mode === "shelter-replica" ? "Clone Fallout Shelter" : "Create Fallout Shelter"}</h2>
           </div>
-          {!busy && <button className="source-clone-close" onClick={onClose} aria-label="Close"><FiX /></button>}
+          {!busy && <button className="source-clone-close" onClick={closePanel} aria-label="Close"><FiX /></button>}
         </header>
 
         <div className="source-clone-sources">
@@ -426,6 +555,57 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             ? "Silo copies the latest completed Fallout Shelter snapshot to a different physical volume and verifies each unique file by SHA-256."
             : "Fallout Shelter writes a separate destination copy, then verifies matching SHA-256 hashes. Original files are not modified or removed."}</p>
         </div>
+
+        <section className="source-clone-session-history">
+          <button className="source-clone-session-toggle" onClick={toggleSessionHistory} aria-expanded={sessionHistoryOpen}>
+            <FiClock /> {sessionHistoryOpen ? "Hide previous session logs" : "View previous session logs"}
+          </button>
+          {sessionHistoryOpen && (
+            <div className="source-clone-session-content">
+              <p className="source-clone-session-privacy">Saved automatically in Silo’s local app data. Progress is checkpointed about once a second, and unfinished sessions are marked interrupted after a restart. Open or refresh this panel to see any storage warning. Logs contain session times, system/app version, phases, counts and error codes. They exclude source names, file and folder paths, file contents and screenshots. Silo keeps up to 30 sessions.</p>
+              <button className="source-clone-session-refresh" onClick={() => void loadPreviousSessionLogs()} disabled={sessionHistoryLoading}>
+                <FiRefreshCw className={sessionHistoryLoading ? "stats-spin" : ""} /> Refresh logs
+              </button>
+              {sessionLogWarning && <div className="source-clone-warning insufficient">{sessionLogWarning}</div>}
+              {sessionHistoryLoading && <small>Loading saved sessions…</small>}
+              {!sessionHistoryLoading && !sessionLogs.length && !sessionLogWarning && <small>No saved Fallout Shelter sessions yet.</small>}
+              {sessionLogs.length > 0 && (
+                <div className="source-clone-session-list" aria-label="Saved Fallout Shelter sessions">
+                  {sessionLogs.map((session) => (
+                    <button className={`source-clone-session-item ${selectedSessionLogId === session.id ? "selected" : ""}`} key={session.id}
+                      onClick={() => { setSelectedSessionLogId(session.id); setSessionLogStatus(""); }}>
+                      <strong>{sourceCloneSessionOutcomeLabel(session.outcome)}</strong>
+                      <span>{new Date(session.startedAt).toLocaleString()} · {sourceCloneSessionModeLabel(session.mode)}</span>
+                      {session.latestProgress && <small>{sourceCloneSessionProgressLine(session.latestProgress)}</small>}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {sessionLogs.find((session) => session.id === selectedSessionLogId) && (() => {
+                const session = sessionLogs.find((item) => item.id === selectedSessionLogId)!;
+                return (
+                  <div className="source-clone-session-detail">
+                    <div className="source-clone-session-meta">Silo {session.appVersion} · {session.platform} {session.architecture} · OS {session.osRelease}<br />{session.sourceCount} source{session.sourceCount === 1 ? "" : "s"} · {session.destinationCount} destination{session.destinationCount === 1 ? "" : "s"}{session.options.compress ? " · compressed" : ""}{session.options.timeMachineRequested ? " · Time Machine selected" : ""}</div>
+                    <div className="source-clone-session-events">
+                      {session.events.map((event, index) => (
+                        <div className="source-clone-session-event" key={`${session.id}-${event.at}-${index}`}>
+                          <time>{new Date(event.at).toLocaleTimeString()}</time>
+                          <span><strong>{sourceCloneSessionEventLabel(event.event)}</strong>
+                            {(event.phase || event.totalFiles !== undefined || event.omittedPaths !== undefined) && <small>{event.phase ? event.phase.replace(/-/g, " ") : ""}{event.totalFiles !== undefined ? ` · ${event.completedFiles ?? 0} / ${event.totalFiles} files` : ""}{event.omittedPaths ? ` · ${event.omittedPaths} omitted` : ""}{event.failedFiles ? ` · ${event.failedFiles} errors` : ""}{event.code ? ` · ${event.code}` : ""}</small>}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="source-clone-diagnostic-actions">
+                      <button onClick={() => void downloadSavedSessionLog(session.id)} disabled={downloadingSessionLog}><FiDownload /> {downloadingSessionLog ? "Saving…" : "Download this log"}</button>
+                      {sessionLogStatus && <small role="status">{sessionLogStatus}</small>}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+        </section>
 
         {supportsTimeMachine && !plan && (
           <div className="source-clone-time-machine-choice">
@@ -513,7 +693,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 {timeMachineError && <div className="source-clone-warning insufficient">{timeMachineError}</div>}
                 <div className="source-clone-actions">
                   {timeMachineMessage
-                    ? <button className="source-clone-primary" onClick={onClose}>Done</button>
+                    ? <button className="source-clone-primary" onClick={closePanel}>Done</button>
                     : <button className="source-clone-primary" onClick={() => void startTimeMachineOnly()} disabled={!acknowledged || busy}>Start Time Machine backup</button>}
                 </div>
               </>
@@ -601,11 +781,11 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               <div className="source-clone-warning insufficient">{progress.message}</div>
             )}
             <div className="source-clone-actions">
-              <button onClick={() => { setPlan(null); setDestinations([]); }} disabled={busy}>Change destinations</button>
+              <button onClick={() => { if (operationIdRef.current) void electronAPI.dismissSourceCloneSession(operationIdRef.current); setPlan(null); setDestinations([]); }} disabled={busy}>Change destinations</button>
               {running ? (
                 <button className="source-clone-cancel" onClick={() => void cancel()}>Cancel copy</button>
               ) : progress?.phase === "complete" ? (
-                <button className="source-clone-primary" onClick={onClose}>Done</button>
+              <button className="source-clone-primary" onClick={closePanel}>Done</button>
               ) : (
                 <button className="source-clone-primary" onClick={() => void startClone()} disabled={!acknowledged || hasShortfall} title="Create and verify a separate copy; leave source unchanged">
                   {createAppleCompatibleBackup && timeMachineMode === "as-well"

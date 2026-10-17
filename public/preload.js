@@ -128,6 +128,12 @@ contextBridge.exposeInMainWorld("electron", {
   },
   saveSourceCloneDiagnosticLog: (contents) =>
     ipcRenderer.invoke("save-source-clone-diagnostic-log", contents),
+  getSourceCloneSessionLogs: () =>
+    ipcRenderer.invoke("get-source-clone-session-logs"),
+  downloadSourceCloneSessionLog: (id) =>
+    ipcRenderer.invoke("download-source-clone-session-log", id),
+  dismissSourceCloneSession: (operationId) =>
+    ipcRenderer.invoke("dismiss-source-clone-session", operationId),
   getFilePreview: (filePath) =>
     ipcRenderer.invoke("get-file-preview", filePath),
   openMediaPopout: (filePath, startTime) =>
