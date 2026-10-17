@@ -680,10 +680,11 @@ interface SourceCloneProgress {
 }
 
 interface SourceCloneExcludedPath {
-  kind: "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "unsupported";
+  kind: "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "permission-denied" | "unsupported";
   sourceLabel: string;
   path: string;
   reason: string;
+  errorCode?: string;
 }
 
 interface SourceCloneErrorDetails {

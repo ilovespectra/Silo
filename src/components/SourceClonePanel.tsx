@@ -72,6 +72,7 @@ function excludedKindLabel(kind: SourceCloneExcludedPath["kind"]) {
     socket: "sockets",
     fifo: "named pipes",
     device: "device nodes",
+    "permission-denied": "permission-restricted paths or folders",
     unsupported: "other unsupported filesystem objects",
   } satisfies Record<SourceCloneExcludedPath["kind"], string>)[kind];
 }
@@ -204,6 +205,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
           duplicateFiles: result.plan.duplicateFiles,
           sourceCoverage: excludedPaths.length ? "partial" : "complete",
           excludedItemCount: excludedPaths.length,
+          excludedPathCount: excludedPaths.length,
           excludedByKind: countExcludedByKind(excludedPaths),
           excludedPaths: excludedPaths.slice(0, 100),
           excludedPathsOmittedFromLog: Math.max(0, excludedPaths.length - 100),
@@ -264,6 +266,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
         addDiagnosticEvent(report, "copy-complete", {
           sourceCoverage: plan.excludedPaths?.length ? "partial" : "complete",
           excludedItemCount: plan.excludedPaths?.length ?? 0,
+          excludedPathCount: plan.excludedPaths?.length ?? 0,
         });
       }
       if (result.timeMachineStarted)
@@ -529,14 +532,14 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             <small className="source-clone-preflight-note">{plan.duplicateFiles.toLocaleString()} duplicate paths will reuse canonical content; no duplicate file bytes are copied.</small>
             {excludedPaths.length > 0 && (
               <div className="source-clone-warning">
-                <strong>{excludedPaths.length.toLocaleString()} source {excludedPaths.length === 1 ? "item will" : "items will"} be omitted from this backup.</strong>
-                <p>Fallout Shelter backs up regular files and folders. It does not follow symbolic links or copy sockets, named pipes, or device nodes; macOS Trash is also intentionally excluded.</p>
+                <strong>{excludedPaths.length.toLocaleString()} source {excludedPaths.length === 1 ? "path or subtree will" : "paths or subtrees will"} be omitted from this backup.</strong>
+                <p>Fallout Shelter copies readable regular files and folders. It skips symbolic links, sockets, named pipes, device nodes, macOS Trash, and paths the operating system denies Silo permission to inspect or read. A denied folder may contain additional files that cannot be inventoried, so this is a partial copy.</p>
                 <small>{exclusionSummary}</small>
                 <details>
                   <summary>Review omitted paths (first 100)</summary>
                   {excludedPaths.slice(0, 100).map((excluded) => (
                     <div key={`${excluded.sourceLabel}-${excluded.kind}-${excluded.path}`}>
-                      {excluded.reason} Source: {excluded.sourceLabel} · <code>{excluded.path}</code>
+                      {excluded.reason}{excluded.errorCode ? ` (${excluded.errorCode})` : ""} Source: {excluded.sourceLabel} · <code>{excluded.path}</code>
                     </div>
                   ))}
                   {excludedPaths.length > 100 && <small>The downloadable diagnostic log includes the first 100 paths; the backup manifest records the complete omission list.</small>}
@@ -563,7 +566,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                   ? "I understand this makes a separate readable Silo copy in the selected folder and also requests a separate Time Machine backup at macOS’s configured destination; originals and settings are not changed."
                   : "I understand this makes a separate copy and does not alter the originals."}
                 {excludedPaths.length
-                  ? ` I understand ${excludedPaths.length.toLocaleString()} source ${excludedPaths.length === 1 ? "item" : "items"} identified by preflight will be omitted. The resulting clone contains a verified copy of supported items, not a complete source mirror.`
+                  ? ` I understand ${excludedPaths.length.toLocaleString()} source ${excludedPaths.length === 1 ? "path or subtree" : "paths or subtrees"} identified by preflight will be omitted. The resulting clone contains a verified copy of supported items, not a complete source mirror.`
                   : ""}
               </span>
             </label>

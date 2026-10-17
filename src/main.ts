@@ -4536,19 +4536,21 @@ type SourceClonePhase =
   | "error"
   | "cancelled";
 
-type SourceCloneExcludedKind = "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "unsupported";
+type SourceCloneExcludedKind = "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "permission-denied" | "unsupported";
 
 interface SourceCloneExcludedPath {
   kind: SourceCloneExcludedKind;
   sourceLabel: string;
   path: string;
   reason: string;
+  errorCode?: string;
 }
 
 interface SourceCloneExcludedEntry {
   kind: SourceCloneExcludedKind;
   path: string;
   reason: string;
+  errorCode?: string;
 }
 
 function sourceCloneOmissionNotice(excludedPaths: SourceCloneExcludedPath[]) {
@@ -4562,11 +4564,12 @@ function sourceCloneOmissionNotice(excludedPaths: SourceCloneExcludedPath[]) {
     socket: "sockets",
     fifo: "named pipes",
     device: "device nodes",
+    "permission-denied": "permission-restricted paths or folders",
     unsupported: "other unsupported filesystem objects",
   };
   const summary = [...counts.entries()].map(([kind, count]) => `${count.toLocaleString()} ${labels[kind]}`).join(", ");
-  const itemLabel = excludedPaths.length === 1 ? "source item was" : "source items were";
-  return ` ${excludedPaths.length.toLocaleString()} ${itemLabel} omitted (${summary}); this is a verified copy of supported items, not a complete source mirror.`;
+  const pathLabel = excludedPaths.length === 1 ? "source path or subtree was" : "source paths or subtrees were";
+  return ` ${excludedPaths.length.toLocaleString()} ${pathLabel} omitted (${summary}); this is a verified copy of supported items, not a complete source mirror.`;
 }
 
 interface SourceCloneErrorDetails {
@@ -5537,6 +5540,24 @@ function sourceCloneErrorDetails(error: unknown): SourceCloneErrorDetails {
   };
 }
 
+function isSourceClonePermissionError(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EACCES" || code === "EPERM";
+}
+
+function sourceClonePermissionExclusion(targetPath: string, error: unknown, action: "inspect" | "list" | "read"): SourceCloneExcludedEntry {
+  const code = error && typeof error === "object" && typeof (error as NodeJS.ErrnoException).code === "string"
+    ? (error as NodeJS.ErrnoException).code
+    : undefined;
+  const reason = action === "list"
+    ? "The operating system denied Silo access while listing this folder. Any children the scanner could not enumerate are omitted; some readable children may still be included. Review folder or macOS privacy permissions before treating the clone as complete."
+    : action === "read"
+      ? "The operating system denied Silo access while reading this file. It is omitted; review file or macOS privacy permissions before treating the clone as complete."
+      : "The operating system denied Silo access while inspecting this path. It and any contents that could not be inventoried are omitted; review permissions before treating the clone as complete.";
+  return { kind: "permission-denied", path: targetPath, reason, ...(code ? { errorCode: code } : {}) };
+}
+
 function ensureCloneActive(operationId: string) {
   if (sourceCloneOperations.get(operationId)?.cancelled)
     throw new Error("Source clone cancelled.");
@@ -5579,7 +5600,14 @@ async function listLocalCloneEntries(
     throw new Error("Could not verify the internal data-volume boundary; this machine source was not cloned.");
   if (isSiloAppData(root)) return;
   if (!options.allowMarkedRoot && await isSiloCloneDirectory(root)) return;
-  const rootStats = await originalFs.promises.lstat(root);
+  let rootStats: fs.Stats;
+  try {
+    rootStats = await originalFs.promises.lstat(root);
+  } catch (error) {
+    if (!isSourceClonePermissionError(error)) throw error;
+    options.onExcludedPath?.(sourceClonePermissionExclusion(root, error, "inspect"));
+    return;
+  }
   if (rootStats.isSymbolicLink()) {
     options.onExcludedPath?.({
       kind: "symbolic-link",
@@ -5625,67 +5653,86 @@ async function listLocalCloneEntries(
     if (isSiloAppData(current.directory)) continue;
     if (!(options.allowMarkedRoot && current.directory === root) &&
       await isSiloCloneDirectory(current.directory)) continue;
-    const dir = await originalFs.promises.opendir(current.directory);
-    for await (const entry of dir) {
-      ensureCloneActive(operationId);
-      const absolutePath = path.join(current.directory, entry.name);
-      if (options.skipRootManifest && current.directory === root && entry.name === "silo-clone-manifest.json") continue;
-      if (isMacTrashPath(absolutePath, root)) {
-        options.onExcludedPath?.({
-          kind: "macos-trash",
-          path: absolutePath,
-          reason: "macOS Trash is intentionally excluded; deleted items are not included in this backup.",
-        });
-        continue;
+    let dir: fs.Dir;
+    try {
+      dir = await originalFs.promises.opendir(current.directory);
+    } catch (error) {
+      if (!isSourceClonePermissionError(error)) throw error;
+      options.onExcludedPath?.(sourceClonePermissionExclusion(current.directory, error, "list"));
+      continue;
+    }
+    try {
+      for await (const entry of dir) {
+        ensureCloneActive(operationId);
+        const absolutePath = path.join(current.directory, entry.name);
+        if (options.skipRootManifest && current.directory === root && entry.name === "silo-clone-manifest.json") continue;
+        if (isMacTrashPath(absolutePath, root)) {
+          options.onExcludedPath?.({
+            kind: "macos-trash",
+            path: absolutePath,
+            reason: "macOS Trash is intentionally excluded; deleted items are not included in this backup.",
+          });
+          continue;
+        }
+        if (isMacDataVolumePathExcluded(absolutePath, root)) continue;
+        if (isSiloAppData(absolutePath)) continue;
+        if (entry.isDirectory() && await isSiloCloneDirectory(absolutePath)) continue;
+        const relativePath = path.join(current.relativePath, entry.name);
+        let stats: fs.Stats;
+        try {
+          stats = await originalFs.promises.lstat(absolutePath);
+        } catch (error) {
+          if (!isSourceClonePermissionError(error)) throw error;
+          options.onExcludedPath?.(sourceClonePermissionExclusion(absolutePath, error, "inspect"));
+          continue;
+        }
+        if (machineDevice !== null && stats.dev !== machineDevice) continue;
+        if (stats.isSymbolicLink()) {
+          options.onExcludedPath?.({
+            kind: "symbolic-link",
+            path: absolutePath,
+            reason: "Symbolic links are not followed or recreated by this backup, so their targets are not included through this path.",
+          });
+        } else if (stats.isDirectory()) {
+          onEntry({
+            sourcePath: absolutePath,
+            destinationRelativePath: relativePath,
+            size: 0,
+            modified: stats.mtimeMs,
+            isDirectory: true,
+          });
+          stack.push({ directory: absolutePath, relativePath });
+        } else if (stats.isFile()) {
+          onEntry({
+            sourcePath: absolutePath,
+            destinationRelativePath: relativePath,
+            localPath: absolutePath,
+            size: stats.size,
+            modified: stats.mtimeMs,
+            isDirectory: false,
+          });
+        } else {
+          const kind: SourceCloneExcludedKind = stats.isSocket()
+            ? "socket"
+            : stats.isFIFO()
+              ? "fifo"
+              : stats.isBlockDevice() || stats.isCharacterDevice()
+                ? "device"
+                : "unsupported";
+          const typeLabel = kind === "socket" ? "Socket"
+            : kind === "fifo" ? "Named pipe"
+              : kind === "device" ? "Device node"
+                : "Unsupported filesystem object";
+          options.onExcludedPath?.({
+            kind,
+            path: absolutePath,
+            reason: `${typeLabel}s do not contain copyable regular-file data and are excluded from this backup.`,
+          });
+        }
       }
-      if (isMacDataVolumePathExcluded(absolutePath, root)) continue;
-      if (isSiloAppData(absolutePath)) continue;
-      if (entry.isDirectory() && await isSiloCloneDirectory(absolutePath)) continue;
-      const relativePath = path.join(current.relativePath, entry.name);
-      const stats = await originalFs.promises.lstat(absolutePath);
-      if (machineDevice !== null && stats.dev !== machineDevice) continue;
-      if (stats.isSymbolicLink()) {
-        options.onExcludedPath?.({
-          kind: "symbolic-link",
-          path: absolutePath,
-          reason: "Symbolic links are not followed or recreated by this backup, so their targets are not included through this path.",
-        });
-      } else if (stats.isDirectory()) {
-        onEntry({
-          sourcePath: absolutePath,
-          destinationRelativePath: relativePath,
-          size: 0,
-          modified: stats.mtimeMs,
-          isDirectory: true,
-        });
-        stack.push({ directory: absolutePath, relativePath });
-      } else if (stats.isFile()) {
-        onEntry({
-          sourcePath: absolutePath,
-          destinationRelativePath: relativePath,
-          localPath: absolutePath,
-          size: stats.size,
-          modified: stats.mtimeMs,
-          isDirectory: false,
-        });
-      } else {
-        const kind: SourceCloneExcludedKind = stats.isSocket()
-          ? "socket"
-          : stats.isFIFO()
-            ? "fifo"
-            : stats.isBlockDevice() || stats.isCharacterDevice()
-              ? "device"
-              : "unsupported";
-        const typeLabel = kind === "socket" ? "Socket"
-          : kind === "fifo" ? "Named pipe"
-            : kind === "device" ? "Device node"
-              : "Unsupported filesystem object";
-        options.onExcludedPath?.({
-          kind,
-          path: absolutePath,
-          reason: `${typeLabel}s do not contain copyable regular-file data and are excluded from this backup.`,
-        });
-      }
+    } catch (error) {
+      if (!isSourceClonePermissionError(error)) throw error;
+      options.onExcludedPath?.(sourceClonePermissionExclusion(current.directory, error, "list"));
     }
   }
 }
@@ -5757,10 +5804,12 @@ async function prepareSourceClone(
       if (typeof record.path !== "string" || typeof record.reason !== "string" ||
           typeof record.sourceLabel !== "string") continue;
       const kind: SourceCloneExcludedKind = record.kind === "macos-trash" || record.kind === "symbolic-link" ||
-        record.kind === "socket" || record.kind === "fifo" || record.kind === "device" || record.kind === "unsupported"
+        record.kind === "socket" || record.kind === "fifo" || record.kind === "device" ||
+        record.kind === "permission-denied" || record.kind === "unsupported"
         ? record.kind
         : "unsupported";
-      excludedPaths.push({ kind, sourceLabel: record.sourceLabel, path: record.path, reason: record.reason });
+      excludedPaths.push({ kind, sourceLabel: record.sourceLabel, path: record.path, reason: record.reason,
+        ...(typeof record.errorCode === "string" ? { errorCode: record.errorCode } : {}) });
     }
   }
   let scannedEntries = 0;
@@ -5812,11 +5861,20 @@ async function prepareSourceClone(
             sourceLabel: source.label,
             path: excludedEntry.path,
             reason: excludedEntry.reason,
+            ...(excludedEntry.errorCode ? { errorCode: excludedEntry.errorCode } : {}),
           };
           excludedPaths.push(excluded);
+          if (excluded.kind === "permission-denied") {
+            const excludedPath = path.resolve(excluded.path);
+            for (let index = entries.length - 1; index >= 0; index -= 1) {
+              const entry = entries[index];
+              if (entry.isDirectory && path.resolve(entry.sourcePath) === excludedPath)
+                entries.splice(index, 1);
+            }
+          }
           if (excludedPaths.length === 1 || excludedPaths.length % 100 === 0)
             sendSourceCloneProgress({ ...initial, currentFile: excluded.path,
-              message: `Found ${excludedPaths.length.toLocaleString()} source item(s) that this backup will omit.` });
+              message: `Found ${excludedPaths.length.toLocaleString()} source paths or folders that this backup will omit.` });
         },
       });
       continue;
@@ -5903,27 +5961,48 @@ async function prepareSourceClone(
       }
     }
 
-    const files = entries.filter((entry) => !entry.isDirectory);
+    let files = entries.filter((entry) => !entry.isDirectory);
     if (files.length === 0) throw new Error("The selected sources contain no files to clone.");
     const canonicalByDigest = new Map<string, SourceClonePlanEntry>();
+    const permissionDeniedFiles = new Set<SourceClonePlanEntry>();
     let totalBytes = 0;
     for (let index = 0; index < files.length; index += 1) {
       ensureCloneActive(operationId);
       const entry = files[index];
-      const localPath = entry.localPath ?? await resolveLocalPath(entry.sourcePath);
-      const stats = await originalFs.promises.stat(localPath);
+      let localPath: string;
+      let stats: fs.Stats;
+      let digest: string;
+      try {
+        localPath = entry.localPath ?? await resolveLocalPath(entry.sourcePath);
+        stats = await originalFs.promises.stat(localPath);
+        digest = await hashFile(localPath);
+      } catch (error) {
+        const source = selected.find((candidate) => candidate.id === entry.sourceId);
+        if (!source || (source.kind !== "local" && source.kind !== "machine") ||
+            !isSourceClonePermissionError(error)) throw error;
+        permissionDeniedFiles.add(entry);
+        excludedPaths.push({
+          ...sourceClonePermissionExclusion(entry.sourcePath, error, "read"),
+          sourceLabel: source.label,
+        });
+        continue;
+      }
       entry.localPath = localPath;
       entry.size = stats.size;
       entry.modified = stats.mtimeMs;
-      const digest = await hashFile(localPath);
       if (entry.sha256 && entry.sha256 !== digest)
         throw new Error(`Fallout Shelter alias no longer matches its verified source: ${entry.destinationRelativePath}`);
       entry.sha256 = digest;
       if (entry.duplicateOf) {
         const canonical = entries.find((candidate) => candidate.destinationRelativePath === entry.duplicateOf);
-        if (!canonical || canonical.sha256 !== entry.sha256)
+        if (!canonical)
           throw new Error(`Fallout Shelter alias target is missing or has changed: ${entry.destinationRelativePath}`);
-        continue;
+        if (permissionDeniedFiles.has(canonical)) entry.duplicateOf = undefined;
+        else {
+          if (canonical.sha256 !== entry.sha256)
+            throw new Error(`Fallout Shelter alias target is missing or has changed: ${entry.destinationRelativePath}`);
+          continue;
+        }
       }
       const canonical = canonicalByDigest.get(entry.sha256);
       if (canonical) {
@@ -5938,6 +6017,14 @@ async function prepareSourceClone(
         sendSourceCloneProgress({ ...initial, phase: "checking-space", totalFiles: canonicalByDigest.size,
           completedFiles: index + 1, totalBytes, currentFile: entry.destinationRelativePath,
           message: `Hashed ${(index + 1).toLocaleString()} of ${files.length.toLocaleString()} paths · ${canonicalByDigest.size.toLocaleString()} unique files…` });
+    }
+    if (permissionDeniedFiles.size) {
+      files = files.filter((entry) => !permissionDeniedFiles.has(entry));
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        if (permissionDeniedFiles.has(entries[index])) entries.splice(index, 1);
+      }
+      if (files.length === 0)
+        throw new Error("No readable files remained after permission-restricted paths were omitted. Review the diagnostic log and source permissions.");
     }
     const uniqueFiles = files.filter((entry) => !entry.duplicateOf);
     const duplicateFiles = files.length - uniqueFiles.length;
