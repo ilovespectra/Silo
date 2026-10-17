@@ -96,6 +96,7 @@ interface IndexStorageStatus {
   selectedDestination: string;
   localFreeBytes: number | null;
   reserveBytes: number;
+  missingRoots: string[];
   transfer: {
     state: "idle" | "moving" | "complete" | "error";
     message: string;

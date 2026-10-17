@@ -10,6 +10,7 @@ interface IndexStorageSettings {
   format: string;
   version: number;
   path: string;
+  knownPaths?: string[];
   pendingPath?: string;
   allowLocalFallback?: boolean;
 }
@@ -127,8 +128,113 @@ export async function getIndexStorageSettings(userDataPath: string) {
   const settings = await readIndexStorageSettings(userDataPath);
   return {
     path: settings.path,
+    knownPaths: settings.knownPaths ?? [],
     allowLocalFallback: settings.allowLocalFallback !== false,
   };
+}
+
+const MAX_INDEX_MARKER_JSON_BYTES = 8 * 1024 * 1024;
+
+async function getIndexMarkerStats(markerPath: string) {
+  try {
+    return await fsPromises.stat(markerPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw error;
+  }
+}
+
+async function hasNonEmptyIndexFile(storageRoot: string, relativePath: string) {
+  const stats = await getIndexMarkerStats(path.join(storageRoot, relativePath));
+  return Boolean(stats?.isFile() && stats.size > 0);
+}
+
+async function hasStructuredIndexData(
+  storageRoot: string,
+  relativePath: string,
+  hasData: (value: any) => boolean,
+) {
+  const markerPath = path.join(storageRoot, relativePath);
+  const stats = await getIndexMarkerStats(markerPath);
+  if (!stats?.isFile() || stats.size === 0) return false;
+  // Preserve oversized or malformed stores conservatively without loading them
+  // into memory or mistaking them for an empty index.
+  if (stats.size > MAX_INDEX_MARKER_JSON_BYTES) return true;
+  try {
+    return hasData(JSON.parse(await fsPromises.readFile(markerPath, "utf8")));
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Cache folders are disposable and may exist after a first launch without any
+ * indexed data. Only recognize a root when a persisted index contains records.
+ */
+async function hasPersistedIndexData(storageRoot: string) {
+  const recordFiles = [
+    "semantic-index/records.jsonl",
+    "semantic-index/vectors.bin",
+    "face-index/faces.jsonl",
+    "pets/clusters.jsonl",
+    "geo-index.jsonl",
+    "aesthetic-index.jsonl",
+  ];
+  for (const relativePath of recordFiles)
+    if (await hasNonEmptyIndexFile(storageRoot, relativePath)) return true;
+
+  const structuredMarkers: {
+    relativePath: string;
+    hasData: (value: any) => boolean;
+  }[] = [
+    {
+      relativePath: "face-index/people.json",
+      hasData: (value) =>
+        (Array.isArray(value?.people) && value.people.length > 0) ||
+        Object.keys(value?.faceEdits ?? {}).length > 0 ||
+        Object.keys(value?.bannedFaces ?? {}).length > 0 ||
+        (Array.isArray(value?.bannedPhotoPaths) &&
+          value.bannedPhotoPaths.length > 0) ||
+        (Array.isArray(value?.missingPhotoPaths) &&
+          value.missingPhotoPaths.length > 0),
+    },
+    {
+      relativePath: "pets/summary.json",
+      hasData: (value) => Array.isArray(value) && value.length > 0,
+    },
+    {
+      relativePath: "duplicate-index.json",
+      hasData: (value) =>
+        Object.keys(value?.hashes ?? {}).length > 0 ||
+        (Array.isArray(value?.groups) && value.groups.length > 0),
+    },
+    {
+      relativePath: "content-safety-index.json",
+      hasData: (value) => Array.isArray(value?.paths) && value.paths.length > 0,
+    },
+    {
+      relativePath: "audio-library-index.json",
+      hasData: (value) => Array.isArray(value?.files) && value.files.length > 0,
+    },
+    {
+      relativePath: "library-stats.json",
+      hasData: (value) => Array.isArray(value?.sources) && value.sources.length > 0,
+    },
+  ];
+  for (const { relativePath, hasData } of structuredMarkers)
+    if (await hasStructuredIndexData(storageRoot, relativePath, hasData))
+      return true;
+  return false;
+}
+
+export async function findExistingIndexStorageRoots(
+  candidates: readonly string[],
+) {
+  const found: string[] = [];
+  for (const candidate of new Set(candidates.filter(Boolean).map((root) => path.resolve(root))))
+    if (await hasPersistedIndexData(candidate)) found.push(candidate);
+  return found;
 }
 
 export async function setLocalIndexStorageFallback(
@@ -166,6 +272,7 @@ async function readIndexStorageSettings(
   }
   const storedPath = (settings as { path?: unknown })?.path;
   const pendingPath = (settings as { pendingPath?: unknown })?.pendingPath;
+  const knownPaths = (settings as { knownPaths?: unknown })?.knownPaths;
   const allowLocalFallback = (settings as { allowLocalFallback?: unknown })
     ?.allowLocalFallback;
   if (
@@ -181,6 +288,12 @@ async function readIndexStorageSettings(
   )
     throw new Error("The pending index storage setting is invalid.");
   if (
+    knownPaths !== undefined &&
+    (!Array.isArray(knownPaths) ||
+      knownPaths.some((root) => typeof root !== "string" || !path.isAbsolute(root)))
+  )
+    throw new Error("The remembered index storage paths are invalid.");
+  if (
     allowLocalFallback !== undefined &&
     typeof allowLocalFallback !== "boolean"
   )
@@ -189,6 +302,13 @@ async function readIndexStorageSettings(
     format: "silo-index-storage",
     version: 1,
     path: path.resolve(storedPath),
+    ...(Array.isArray(knownPaths)
+      ? {
+          knownPaths: Array.from(
+            new Set(knownPaths.map((root) => path.resolve(root as string))),
+          ),
+        }
+      : {}),
     ...(typeof pendingPath === "string"
       ? { pendingPath: path.resolve(pendingPath) }
       : {}),
@@ -199,12 +319,58 @@ async function readIndexStorageSettings(
 export async function writeIndexStorageRoot(
   userDataPath: string,
   storageRoot: string,
+  knownPaths?: readonly string[],
+  options: { replaceKnownPaths?: boolean } = {},
 ) {
   if (!path.isAbsolute(storageRoot))
     throw new Error("Index storage path must be absolute.");
   const settingsPath = path.join(userDataPath, INDEX_STORAGE_SETTINGS_FILE);
   const temporaryPath = `${settingsPath}.tmp-${process.pid}`;
-  const currentSettings = await readIndexStorageSettings(userDataPath);
+  let currentSettings: IndexStorageSettings;
+  try {
+    currentSettings = await readIndexStorageSettings(userDataPath);
+  } catch {
+    const originalSettings = await fsPromises.readFile(settingsPath, "utf8");
+    const recoveryPath = `${settingsPath}.recovery-${Date.now()}-${randomBytes(4).toString("hex")}.json`;
+    await fsPromises.writeFile(recoveryPath, originalSettings, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    let recoveredPaths: string[] = [];
+    try {
+      const parsed = JSON.parse(originalSettings) as {
+        path?: unknown;
+        knownPaths?: unknown;
+      };
+      recoveredPaths = [
+        ...(typeof parsed.path === "string" && path.isAbsolute(parsed.path)
+          ? [parsed.path]
+          : []),
+        ...(Array.isArray(parsed.knownPaths)
+          ? parsed.knownPaths.filter(
+              (root): root is string =>
+                typeof root === "string" && path.isAbsolute(root),
+            )
+          : []),
+      ];
+    } catch {
+      // Keep the original settings file as a recovery copy even if its JSON
+      // cannot be parsed; the user can still choose a cache folder safely.
+    }
+    currentSettings = {
+      format: "silo-index-storage",
+      version: 1,
+      path: path.resolve(userDataPath),
+      knownPaths: recoveredPaths,
+    };
+  }
+  const nextKnownPaths = options.replaceKnownPaths
+    ? knownPaths ?? [path.resolve(storageRoot)]
+    : [
+        ...(currentSettings.knownPaths ?? []),
+        ...(knownPaths ?? []),
+      ];
   await fsPromises.writeFile(
     temporaryPath,
     JSON.stringify(
@@ -213,6 +379,9 @@ export async function writeIndexStorageRoot(
         format: "silo-index-storage",
         version: 1,
         path: path.resolve(storageRoot),
+        knownPaths: Array.from(
+          new Set(nextKnownPaths.map((root) => path.resolve(root))),
+        ),
         pendingPath: undefined,
       },
       null,
@@ -243,12 +412,19 @@ export async function stageIndexStorageRoot(
       "Choose a cache folder separate from the current cache folder.",
     );
   await validateExternalVolume(userDataPath, nextRoot);
+  const knownPaths = new Set(settings.knownPaths ?? []);
+  if (
+    path.resolve(settings.path) !== path.resolve(userDataPath) &&
+    (await hasPersistedIndexData(settings.path))
+  )
+    knownPaths.add(path.resolve(settings.path));
+  if (await hasPersistedIndexData(nextRoot)) knownPaths.add(nextRoot);
   const settingsPath = path.join(userDataPath, INDEX_STORAGE_SETTINGS_FILE);
   const temporaryPath = `${settingsPath}.tmp-${process.pid}`;
   await fsPromises.writeFile(
     temporaryPath,
-    JSON.stringify(
-      { ...settings, pendingPath: nextRoot },
+      JSON.stringify(
+      { ...settings, knownPaths: Array.from(knownPaths), pendingPath: nextRoot },
       null,
       2,
     ),
@@ -870,6 +1046,22 @@ export async function prepareConfiguredIndexStorage(
 ) {
   const settings = await readIndexStorageSettings(userDataPath);
   const storageRoot = settings.pendingPath ?? settings.path;
+  const rememberedRoots = Array.from(
+    new Set(
+      (settings.knownPaths ?? []).map((root) => path.resolve(root)),
+    ),
+  );
+  if (
+    settings.pendingPath &&
+    path.resolve(settings.path) !== path.resolve(userDataPath) &&
+    !(await exists(settings.path))
+  )
+    rememberedRoots.push(path.resolve(settings.path));
+  const missingRoots: string[] = [];
+  for (const root of rememberedRoots) {
+    if (root === path.resolve(storageRoot)) continue;
+    if (!(await hasPersistedIndexData(root))) missingRoots.push(root);
+  }
   if (path.resolve(storageRoot) === path.resolve(userDataPath))
     return {
       storageRoot: path.resolve(userDataPath),
@@ -879,6 +1071,7 @@ export async function prepareConfiguredIndexStorage(
       localFallbackEnabled: settings.allowLocalFallback !== false,
       migrationCompleted: false,
       migrationError: null as string | null,
+      missingRoots,
       filesVerified: 0,
       bytesVerified: 0,
     };
@@ -893,8 +1086,10 @@ export async function prepareConfiguredIndexStorage(
     await validateExternalVolume(userDataPath, storageRoot);
   } catch (error) {
     if (!(error instanceof ExternalIndexStorageUnavailableError)) throw error;
+    const unavailableRoot = path.resolve(storageRoot);
+    if (!missingRoots.includes(unavailableRoot)) missingRoots.push(unavailableRoot);
     const unavailableMessage =
-      `The selected cache destination is unavailable: ${storageRoot}`;
+      `The selected cache destination is unavailable: ${unavailableRoot}`;
     if (settings.allowLocalFallback === false)
       return {
         // Keep all cache paths pointed at the selected destination while it is
@@ -906,34 +1101,32 @@ export async function prepareConfiguredIndexStorage(
         localFallbackEnabled: false,
         migrationCompleted: false,
         migrationError: unavailableMessage,
+        missingRoots,
         filesVerified: 0,
         bytesVerified: 0,
       };
     try {
       await fsPromises.mkdir(localFallbackRoot, { recursive: true });
-      const sourceRoots = [path.resolve(userDataPath), legacyFallbackRoot];
+      const sourceRoots = Array.from(
+        new Set([
+          ...rememberedRoots,
+          path.resolve(userDataPath),
+          legacyFallbackRoot,
+        ]),
+      ).filter(
+        (root) =>
+          path.resolve(root) !== path.resolve(localFallbackRoot) &&
+          path.resolve(root) !== path.resolve(storageRoot),
+      );
       const requiredBytes = await migrationBytes(sourceRoots);
       await assertLocalIndexStorageCapacity(localFallbackRoot, requiredBytes);
-      let legacyFilesVerified = 0;
-      let legacyBytesVerified = 0;
-      if (
-        path.resolve(legacyFallbackRoot) !== path.resolve(localFallbackRoot) &&
-        (await exists(legacyFallbackRoot))
-      ) {
-        const legacyResult = await migrateIndexStorageRoots(
-          [legacyFallbackRoot],
-          localFallbackRoot,
-          INDEX_STORAGE_ENTRIES,
-          onProgress,
-        );
-        legacyFilesVerified = legacyResult.filesVerified;
-        legacyBytesVerified = legacyResult.bytesVerified;
-      }
       const result = await migrateIndexStorageRoots(
-        [path.resolve(userDataPath)],
+        sourceRoots,
         localFallbackRoot,
         INDEX_STORAGE_ENTRIES,
         onProgress,
+        undefined,
+        { conflictPolicy: "strict" },
       );
       return {
         storageRoot: localFallbackRoot,
@@ -943,8 +1136,9 @@ export async function prepareConfiguredIndexStorage(
         localFallbackEnabled: true,
         migrationCompleted: false,
         migrationError: null,
-        filesVerified: legacyFilesVerified + result.filesVerified,
-        bytesVerified: legacyBytesVerified + result.bytesVerified,
+        missingRoots,
+        filesVerified: result.filesVerified,
+        bytesVerified: result.bytesVerified,
       };
     } catch (fallbackError) {
       return {
@@ -961,6 +1155,7 @@ export async function prepareConfiguredIndexStorage(
           fallbackError instanceof Error
             ? fallbackError.message
             : String(fallbackError),
+        missingRoots,
         filesVerified: 0,
         bytesVerified: 0,
       };
@@ -970,6 +1165,7 @@ export async function prepareConfiguredIndexStorage(
   await fsPromises.mkdir(storageRoot, { recursive: true });
   const sourceRoots = new Set([
     settings.path,
+    ...rememberedRoots,
     path.resolve(userDataPath),
     localFallbackRoot,
     legacyFallbackRoot,
@@ -979,18 +1175,36 @@ export async function prepareConfiguredIndexStorage(
     if (!(await exists(sourceRoot))) sourceRoots.delete(sourceRoot);
   const fallbackWasPresent =
     sourceRoots.has(localFallbackRoot) || sourceRoots.has(legacyFallbackRoot);
+  const preserveKnownRoots = rememberedRoots.some(
+    (root) => root !== path.resolve(storageRoot),
+  );
+  const storageRootHasIndexes = await hasPersistedIndexData(storageRoot);
+  const committedKnownPaths = Array.from(
+    new Set([
+      ...(storageRootHasIndexes ? [path.resolve(storageRoot)] : []),
+      ...missingRoots,
+    ]),
+  );
+  const persistCommittedRoot = () =>
+    writeIndexStorageRoot(userDataPath, storageRoot, committedKnownPaths, {
+      replaceKnownPaths: true,
+    });
   const result = await migrateIndexStorageRoots(
     Array.from(sourceRoots),
     storageRoot,
     INDEX_STORAGE_ENTRIES,
     onProgress,
-    settings.pendingPath
-      ? () => writeIndexStorageRoot(userDataPath, storageRoot)
-      : undefined,
-    // A reconnecting destination already owns its indexes; only a
-    // user-requested move must refuse to overwrite existing data.
-    { conflictPolicy: settings.pendingPath ? "strict" : "keep-destination" },
+    settings.pendingPath ? persistCommittedRoot : undefined,
+    // Remembered roots and staged moves must reconcile strictly. Only ordinary
+    // fallback reconnection may keep the destination's existing index stores.
+    {
+      conflictPolicy:
+        settings.pendingPath || preserveKnownRoots
+          ? "strict"
+          : "keep-destination",
+    },
   );
+  if (!settings.pendingPath) await persistCommittedRoot();
   return {
     storageRoot,
     selectedStorageRoot: path.resolve(storageRoot),
@@ -999,6 +1213,7 @@ export async function prepareConfiguredIndexStorage(
     localFallbackEnabled: settings.allowLocalFallback !== false,
     migrationCompleted: fallbackWasPresent,
     migrationError: null,
+    missingRoots,
     filesVerified: result.filesVerified,
     bytesVerified: result.bytesVerified,
   };

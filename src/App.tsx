@@ -78,6 +78,7 @@ import {
 import {
   GRID_THUMBNAIL_SIZE,
   LRUCache,
+  loadThumbnail,
   thumbnailCache,
   thumbnailCacheKey,
 } from "./utils/thumbnailCache";
@@ -560,10 +561,15 @@ function SearchTiming({
   );
 }
 
-function cachedImagePreview(file: FileInfo): FilePreview | null {
+const VIEWER_PREFETCH_THUMBNAIL_SIZE = 480;
+
+function cachedImagePreview(
+  file: FileInfo,
+  size = GRID_THUMBNAIL_SIZE,
+): FilePreview | null {
   if (file.type !== "image") return null;
   const previewDataUrl = thumbnailCache.peek(
-    thumbnailCacheKey(file.path, GRID_THUMBNAIL_SIZE),
+    thumbnailCacheKey(file.path, size),
   );
   if (!previewDataUrl) return null;
   const modified = Number(file.modified);
@@ -704,6 +710,7 @@ function App() {
   const [viewerOpen, setViewerOpen] = useState(false);
   const viewerOpenRef = useRef(viewerOpen);
   viewerOpenRef.current = viewerOpen;
+  const [viewerImageLoading, setViewerImageLoading] = useState(false);
   const [viewerMediaFile, setViewerMediaFile] = useState<FileInfo | null>(null);
   const [viewerScopeFiles, setViewerScopeFiles] = useState<FileInfo[] | null>(
     null,
@@ -773,6 +780,7 @@ function App() {
       selectedDestination: "",
       localFreeBytes: null,
       reserveBytes: 10 * 1024 * 1024 * 1024,
+      missingRoots: [],
       transfer: null,
     });
   const [indexStorageNoticeDontShowAgain, setIndexStorageNoticeDontShowAgain] = useState(false);
@@ -798,7 +806,11 @@ function App() {
   const showIndexStorageFallbackDetails = indexStorageStatus.usingLocalFallback &&
     Boolean(indexStorageStatus.message || hasVisibleIndexStorageTransfer) &&
     (!isIndexStorageFallbackNotice || showIndexStorageFallbackNotice);
-  const showIndexStorageBanner = showIndexStorageMessage || showIndexStorageFallbackDetails || hasVisibleIndexStorageTransfer;
+  const showIndexStorageBanner =
+    showIndexStorageMessage ||
+    showIndexStorageFallbackDetails ||
+    hasVisibleIndexStorageTransfer ||
+    indexStorageStatus.missingRoots.length > 0;
   const [indexProgress, setIndexProgress] =
     useState<IndexProgress>(emptyIndexProgress);
   const [thumbnailPregen, setThumbnailPregen] =
@@ -3401,13 +3413,25 @@ function App() {
           : null;
       const playbackFile = livePhotoVideo ?? file;
       setViewerMediaFile(playbackFile);
-      // While navigating inside an open viewer, keep the current full-size image
-      // until the next one is ready instead of flashing a low-res thumbnail.
+      // Keep the current image until a warmed adjacent thumbnail is ready;
+      // then show it while the full-size preview finishes loading.
       const navigatingImages =
         viewerOpenRef.current && playbackFile.type === "image";
+      setViewerImageLoading(playbackFile.type === "image");
       if (!navigatingImages) {
-        setFilePreview(cachedImagePreview(playbackFile));
+        setFilePreview(
+          cachedImagePreview(playbackFile, VIEWER_PREFETCH_THUMBNAIL_SIZE) ??
+            cachedImagePreview(playbackFile),
+        );
         setViewerDimensions({ width: 0, height: 0 });
+      } else {
+        const preparedPreview =
+          cachedImagePreview(playbackFile, VIEWER_PREFETCH_THUMBNAIL_SIZE) ??
+          cachedImagePreview(playbackFile);
+        if (preparedPreview) {
+          setFilePreview(preparedPreview);
+          setViewerDimensions({ width: 0, height: 0 });
+        }
       }
       setViewerZoom(1);
       setViewerFit(true);
@@ -3420,8 +3444,13 @@ function App() {
       setViewerOpen(true);
       try {
         const preview = await electronAPI.getFilePreview(playbackFile.path);
-        if (request !== filePreviewRequestRef.current || !preview) return;
-        if (navigatingImages && preview.previewDataUrl) {
+        if (request !== filePreviewRequestRef.current) return;
+        if (!preview) {
+          setViewerImageLoading(false);
+          setMediaError(`Could not open "${playbackFile.name}".`);
+          return;
+        }
+        if (playbackFile.type === "image" && preview.previewDataUrl) {
           const nextImage = new Image();
           nextImage.src = preview.previewDataUrl;
           await nextImage.decode().catch(() => undefined);
@@ -3433,11 +3462,14 @@ function App() {
             });
         }
         setFilePreview(preview);
+        setViewerImageLoading(false);
       } catch (error) {
-        if (request === filePreviewRequestRef.current)
+        if (request === filePreviewRequestRef.current) {
+          setViewerImageLoading(false);
           setMediaError(
             `Could not open "${playbackFile.name}". Check that the file is accessible, then reopen it. ${error instanceof Error ? error.message : String(error)}`,
           );
+        }
       }
     },
     [electronAPI, files],
@@ -5407,6 +5439,30 @@ function App() {
     [filteredAndSortedFiles, viewerOpen, viewerScopeFiles],
   );
 
+  useEffect(() => {
+    if (!viewerOpen || !electronAPI || !selectedFile) return;
+    const currentIndex = viewerImages.findIndex(
+      (file) => file.path === selectedFile.path,
+    );
+    if (currentIndex < 0) return;
+
+    const adjacentImages = [
+      viewerImages[currentIndex - 1],
+      viewerImages[currentIndex + 1],
+    ].filter((file): file is FileInfo => file?.type === "image");
+    if (adjacentImages.length === 0) return;
+
+    const timer = window.setTimeout(() => {
+      void Promise.all(
+        adjacentImages.map((file) =>
+          loadThumbnail(file.path, true, VIEWER_PREFETCH_THUMBNAIL_SIZE),
+        ),
+      );
+    }, 120);
+
+    return () => window.clearTimeout(timer);
+  }, [electronAPI, selectedFile?.path, viewerImages, viewerOpen]);
+
   const selectAllFiles = useCallback(() => {
     const selectableFiles = filteredAndSortedFiles.filter(
       (file) => !file.isDirectory,
@@ -5502,7 +5558,7 @@ function App() {
         }
         if (event.key === "-") {
           setViewerFit(false);
-          setViewerZoom((zoom) => Math.max(zoom - 0.25, 0.25));
+          setViewerZoom((zoom) => Math.max(zoom - 0.25, 0.05));
         }
         return;
       }
@@ -5974,6 +6030,12 @@ function App() {
               <div className="index-storage-banner-content">
                 {showIndexStorageMessage && indexStorageStatus.message && (
                   <strong>{indexStorageStatus.message}</strong>
+                )}
+                {indexStorageStatus.missingRoots.length > 0 && (
+                  <span>
+                    Cache locations Silo needs you to reconnect or locate:{" "}
+                    {indexStorageStatus.missingRoots.join(" · ")}
+                  </span>
                 )}
                 {showIndexStorageFallbackDetails && (
                   <span>
@@ -7001,7 +7063,14 @@ function App() {
           </section>
 
           {personDetail ? (
-            <section className="person-detail">
+            <section
+              className="person-detail"
+              style={
+                {
+                  "--people-photo-thumbnail-size": `${thumbnailSize}px`,
+                } as React.CSSProperties
+              }
+            >
               <div className="person-detail-header">
                 <button
                   className="back-to-people"
@@ -7035,6 +7104,24 @@ function App() {
                     {uniquePersonPhotos.length} unique photos ·{" "}
                     {personDetail.faceCount} detected faces
                   </p>
+                  <label
+                    className="thumbnail-size-control person-detail-thumbnail-size-control"
+                    title="Adjust photo thumbnails in this cluster"
+                  >
+                    <FiColumns aria-hidden="true" />
+                    <input
+                      type="range"
+                      min="120"
+                      max="200"
+                      step="10"
+                      value={thumbnailSize}
+                      onChange={(event) =>
+                        setThumbnailSize(Number(event.target.value))
+                      }
+                      aria-label="Cluster photo thumbnail size"
+                    />
+                    <output>{thumbnailSize}px</output>
+                  </label>
                 </div>
                 <div className="person-actions" data-tour="person-actions" data-help="These actions change person/profile records and assignments only. Rename changes the profile label; Merge combines profiles after confirmation and can be undone. Source photos are unchanged.">
                   <select
@@ -7229,6 +7316,7 @@ function App() {
                       >
                         <FileThumbnail
                           file={photo}
+                          thumbnailSize={thumbnailSize}
                           onOpen={() =>
                             openMediaViewer(photo, personSuggestions)
                           }
@@ -7314,6 +7402,7 @@ function App() {
                           />
                           <FileThumbnail
                             file={photo}
+                            thumbnailSize={thumbnailSize}
                             onOpen={() =>
                               openMediaViewer(photo, uniquePersonPhotos)
                             }
@@ -7623,26 +7712,6 @@ function App() {
                 >
                   <FiUserPlus aria-hidden="true" /> New Person +
                 </button>
-                {peopleTab === "all" && (
-                  <label
-                    className="thumbnail-size-control people-thumbnail-size-control"
-                    title="Adjust People cluster thumbnail size"
-                  >
-                    <FiColumns aria-hidden="true" />
-                    <input
-                      type="range"
-                      min="120"
-                      max="200"
-                      step="10"
-                      value={thumbnailSize}
-                      onChange={(event) =>
-                        setThumbnailSize(Number(event.target.value))
-                      }
-                      aria-label="People cluster thumbnail size"
-                    />
-                    <output>{thumbnailSize}px</output>
-                  </label>
-                )}
               </nav>
               {peopleTab === "confirmed" ? (
                 <section className="confirmed-faces">
@@ -7751,14 +7820,7 @@ function App() {
                   </section>
                 </section>
               ) : (
-                <section
-                  className="people-grid"
-                  style={
-                    {
-                      "--people-thumbnail-size": `${thumbnailSize}px`,
-                    } as React.CSSProperties
-                  }
-                >
+                <section className="people-grid">
                   {people.length === 0 ? (
                     <div className="people-empty">
                       <FiUsers />
@@ -9564,7 +9626,7 @@ function App() {
                   <button
                     onClick={() => {
                       setViewerFit(false);
-                      setViewerZoom((zoom) => Math.max(zoom - 0.25, 0.25));
+                      setViewerZoom((zoom) => Math.max(zoom - 0.25, 0.05));
                     }}
                     title="Zoom out"
                   >
@@ -9632,11 +9694,37 @@ function App() {
           <div
             className="viewer-stage"
             ref={viewerStageRef}
+            onWheel={(event) => {
+              const isImagePreview = Boolean(
+                filePreview?.previewDataUrl &&
+                  !filePreview.documentPreview &&
+                  viewerPlaybackFile?.type !== "audio" &&
+                  viewerPlaybackFile?.type !== "video",
+              );
+              if (!event.ctrlKey || !isImagePreview || faceAssignmentOpen) return;
+              event.preventDefault();
+              const currentScale = viewerFit ? fittedImageScale : viewerZoom;
+              const scaleFactor = Math.exp(-event.deltaY * 0.002);
+              setViewerFit(false);
+              setViewerZoom(
+                Math.max(0.05, Math.min(4, currentScale * scaleFactor)),
+              );
+            }}
             onDoubleClick={() => {
               setViewerFit((fit) => !fit);
               setViewerZoom(1);
             }}
           >
+            {viewerImageLoading && filePreview?.previewDataUrl && (
+              <div
+                className="viewer-image-loading"
+                role="status"
+                aria-live="polite"
+              >
+                <span className="viewer-image-loading-spinner" />
+                Preparing photo…
+              </div>
+            )}
             {!filePreview ? (
               <div className="viewer-status preview-loading">Loading preview...</div>
             ) : filePreview.documentPreview ? (
@@ -9799,6 +9887,7 @@ function App() {
               </div>
             ) : filePreview.previewDataUrl ? (
               <div
+                key={filePreview.path}
                 className={`viewer-image-wrap ${faceAssignmentOpen ? "face-box-editing" : ""}`}
                 style={{
                   width:

@@ -134,6 +134,7 @@ const context = vm.createContext({
     listPhoneFiles: async () => [],
     statPhoneFile: async () => null,
   },
+  memoryContentAllowed: async (filePath) => context.memoryAllowed(filePath),
   fullAccessEnabled: () => context.__fullAccess,
   __fullAccess: true,
   isSiloInternalRoot: async () => false,
@@ -228,7 +229,7 @@ function evaluate(source) {
 for (const name of [
   "memoryFileMetadata", "memoryObviousNonPhotoPath", "memoryAllowed", "memorySearchImageEligible", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
   "memoryTopCounts", "memoryPersonalRejectionSummary", "memoryErrorDetails",
-  "memoryDot", "memoryImageContentFactor", "memoryImageIsObviousNonPhoto", "filterMemoryPhotos", "memoryNameMatches", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
+  "memoryDot", "memoryImageContentFactor", "memoryImageIsObviousNonPhoto", "filterMemoryPhotos", "normalizeMemoryName", "memoryNameMatches", "memoryPathInRoots", "memoryPromptContext", "applyMemoryPromptContext", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
   "promptedVideoPhotoCandidate", "searchPromptedMemoryMedia", "memoryVideoMatchesForPhotos", "memoryMusicDirectories",
   "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
   "memoryPreviewOptions", "memoryPreviewFileName", "memoryTitleStem", "memoryMovieDirectory", "findMemoryMovie", "runMemoryRender",
