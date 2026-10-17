@@ -5385,7 +5385,10 @@ input[type="range"]::-moz-range-progress {
 
 .people-tabs {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 4px;
+  row-gap: 6px;
   padding: 14px 20px 0;
   border-bottom: 1px solid var(--line);
 }
@@ -5428,6 +5431,25 @@ input[type="range"]::-moz-range-progress {
   border-color: var(--border-strong);
   background: var(--surface-hover);
   color: var(--text);
+}
+
+.people-thumbnail-size-control {
+  flex: 0 0 auto;
+  min-width: 132px;
+  padding: 0 0 0 10px;
+  border-bottom: 2px solid transparent;
+  font-size: 11px;
+}
+
+.people-thumbnail-size-control input {
+  width: 82px;
+}
+
+.people-thumbnail-size-control output {
+  min-width: 38px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 
 .person-card-confirmed {
@@ -5679,7 +5701,10 @@ input[type="range"]::-moz-range-progress {
 
 .people-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(
+    auto-fill,
+    minmax(calc(var(--people-thumbnail-size, 160px) + 32px), 1fr)
+  );
   gap: 12px;
   padding: 20px;
 }
@@ -5704,7 +5729,7 @@ input[type="range"]::-moz-range-progress {
 
 .person-cover {
   display: grid;
-  width: min(124px, 82%);
+  width: min(var(--people-thumbnail-size, 124px), 100%);
   aspect-ratio: 1;
   place-items: center;
   overflow: hidden;

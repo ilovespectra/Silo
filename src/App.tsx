@@ -7528,6 +7528,26 @@ function App() {
                 >
                   <FiUserPlus aria-hidden="true" /> New Person +
                 </button>
+                {peopleTab === "all" && (
+                  <label
+                    className="thumbnail-size-control people-thumbnail-size-control"
+                    title="Adjust People cluster thumbnail size"
+                  >
+                    <FiColumns aria-hidden="true" />
+                    <input
+                      type="range"
+                      min="120"
+                      max="200"
+                      step="10"
+                      value={thumbnailSize}
+                      onChange={(event) =>
+                        setThumbnailSize(Number(event.target.value))
+                      }
+                      aria-label="People cluster thumbnail size"
+                    />
+                    <output>{thumbnailSize}px</output>
+                  </label>
+                )}
               </nav>
               {peopleTab === "confirmed" ? (
                 <section className="confirmed-faces">
@@ -7636,7 +7656,14 @@ function App() {
                   </section>
                 </section>
               ) : (
-                <section className="people-grid">
+                <section
+                  className="people-grid"
+                  style={
+                    {
+                      "--people-thumbnail-size": `${thumbnailSize}px`,
+                    } as React.CSSProperties
+                  }
+                >
                   {people.length === 0 ? (
                     <div className="people-empty">
                       <FiUsers />
