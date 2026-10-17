@@ -669,6 +669,8 @@ interface SourceCloneProgress {
   destination: string;
   totalSources: number;
   totalFiles: number;
+  discoveredFiles?: number;
+  omittedPaths?: number;
   completedFiles: number;
   totalBytes: number;
   copiedBytes: number;

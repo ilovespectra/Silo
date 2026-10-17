@@ -491,6 +491,14 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 <div className="source-clone-progress">
                   <div><span>{progress?.message || "Choose a destination to begin…"}</span></div>
                   <progress />
+                  {progress && (progress.discoveredFiles !== undefined || progress.omittedPaths !== undefined) && (
+                    <div className="source-clone-scan-counts" aria-live="polite">
+                      <div><span>Files found</span><strong>{(progress.discoveredFiles ?? 0).toLocaleString()}</strong></div>
+                      <div><span>Paths omitted</span><strong>{(progress.omittedPaths ?? 0).toLocaleString()}</strong></div>
+                    </div>
+                  )}
+                  <small className="source-clone-scan-note">Omitted paths include unsupported items and files or folders Silo cannot read; they are left out of the clone.</small>
+                  {progress?.currentFile && <small className="source-clone-scan-current">Current path: {progress.currentFile}</small>}
                 </div>
                 {preparing && <button className="source-clone-cancel" onClick={() => void cancel()}>Cancel scan</button>}
               </div>

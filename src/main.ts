@@ -4587,6 +4587,8 @@ interface SourceCloneProgress {
   destination: string;
   totalSources: number;
   totalFiles: number;
+  discoveredFiles?: number;
+  omittedPaths?: number;
   completedFiles: number;
   totalBytes: number;
   copiedBytes: number;
@@ -5813,9 +5815,10 @@ async function prepareSourceClone(
     }
   }
   let scannedEntries = 0;
+  let discoveredFiles = 0;
   const initial: SourceCloneProgress = {
     operationId, phase: "scanning", destination: destinationPlans[0].cloneRoot,
-    totalSources: selected.length, totalFiles: 0, completedFiles: 0,
+    totalSources: selected.length, totalFiles: 0, discoveredFiles, omittedPaths: excludedPaths.length, completedFiles: 0,
     totalBytes: 0, copiedBytes: 0, verifiedFiles: 0, failedFiles: 0,
     currentFile: "", message: "Preparing a read-only source inventory…",
   };
@@ -5823,7 +5826,8 @@ async function prepareSourceClone(
 
   for (const [sourceIndex, source] of selected.entries()) {
     ensureCloneActive(operationId);
-    sendSourceCloneProgress({ ...initial, currentFile: source.label,
+    sendSourceCloneProgress({ ...initial, discoveredFiles, omittedPaths: excludedPaths.length,
+      currentFile: source.label,
       message: `Scanning ${source.label} (${sourceIndex + 1} of ${selected.length})…` });
     const prefix = prepareOptions.prefixSources === false
       ? ""
@@ -5848,10 +5852,12 @@ async function prepareSourceClone(
         entry.destinationRelativePath = path.join(prefix, cloneSafeRelativePath(entry.destinationRelativePath));
         entries.push(entry);
         scannedEntries += 1;
+        if (!entry.isDirectory) discoveredFiles += 1;
         if (scannedEntries % 250 === 0)
-          sendSourceCloneProgress({ ...initial, totalFiles: entries.filter((item) => !item.isDirectory).length,
+          sendSourceCloneProgress({ ...initial, totalFiles: discoveredFiles, discoveredFiles,
+            omittedPaths: excludedPaths.length,
             currentFile: entry.destinationRelativePath,
-            message: `Found ${entries.filter((item) => !item.isDirectory).length.toLocaleString()} files so far…` });
+            message: "Scanning source files…" });
       }, {
         allowMarkedRoot: prepareOptions.allowMarkedRoot,
         skipRootManifest: prepareOptions.skipRootManifest,
@@ -5873,10 +5879,14 @@ async function prepareSourceClone(
             }
           }
           if (excludedPaths.length === 1 || excludedPaths.length % 100 === 0)
-            sendSourceCloneProgress({ ...initial, currentFile: excluded.path,
-              message: `Found ${excludedPaths.length.toLocaleString()} source paths or folders that this backup will omit.` });
+            sendSourceCloneProgress({ ...initial, totalFiles: discoveredFiles, discoveredFiles,
+              omittedPaths: excludedPaths.length, currentFile: excluded.path,
+              message: "Recording source paths that will be omitted…" });
         },
       });
+      sendSourceCloneProgress({ ...initial, totalFiles: discoveredFiles, discoveredFiles,
+        omittedPaths: excludedPaths.length, currentFile: source.rootPath,
+        message: "Source scan complete; checking readable files…" });
       continue;
     }
     const remoteEntries = phoneManager.isPhonePath(source.rootPath)
@@ -5890,7 +5900,11 @@ async function prepareSourceClone(
         sourceSize: remote.size, sourceModified: remote.modified,
         size: remote.size, modified: remote.modified, isDirectory: remote.isDirectory });
       scannedEntries += 1;
+      if (!remote.isDirectory) discoveredFiles += 1;
     }
+    sendSourceCloneProgress({ ...initial, totalFiles: discoveredFiles, discoveredFiles,
+      omittedPaths: excludedPaths.length, currentFile: source.rootPath,
+      message: "Source scan complete; checking readable files…" });
   }
 
   const configDirectory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "silo-clone-config-"));
@@ -5985,6 +5999,11 @@ async function prepareSourceClone(
           ...sourceClonePermissionExclusion(entry.sourcePath, error, "read"),
           sourceLabel: source.label,
         });
+        if (permissionDeniedFiles.size === 1 || permissionDeniedFiles.size % 100 === 0 || index + 1 === files.length)
+          sendSourceCloneProgress({ ...initial, phase: "checking-space", totalFiles: canonicalByDigest.size,
+            discoveredFiles, omittedPaths: excludedPaths.length, completedFiles: index + 1,
+            currentFile: entry.destinationRelativePath,
+            message: "Recording a source file that could not be read during verification…" });
         continue;
       }
       entry.localPath = localPath;
@@ -6015,7 +6034,8 @@ async function prepareSourceClone(
       }
       if ((index + 1) % 100 === 0 || index + 1 === files.length)
         sendSourceCloneProgress({ ...initial, phase: "checking-space", totalFiles: canonicalByDigest.size,
-          completedFiles: index + 1, totalBytes, currentFile: entry.destinationRelativePath,
+          discoveredFiles, omittedPaths: excludedPaths.length, completedFiles: index + 1,
+          totalBytes, currentFile: entry.destinationRelativePath,
           message: `Hashed ${(index + 1).toLocaleString()} of ${files.length.toLocaleString()} paths · ${canonicalByDigest.size.toLocaleString()} unique files…` });
     }
     if (permissionDeniedFiles.size) {

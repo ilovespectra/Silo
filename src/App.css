@@ -2309,6 +2309,37 @@ label.settings-row {
   color: var(--muted);
   font-size: 9px;
 }
+.source-clone-scan-counts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.source-clone-scan-counts > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  background: var(--surface-card);
+}
+.source-clone-scan-counts span,
+.source-clone-scan-note,
+.source-clone-scan-current {
+  color: var(--muted);
+  font-size: 9px;
+}
+.source-clone-scan-counts strong {
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.source-clone-scan-note,
+.source-clone-scan-current {
+  display: block;
+  line-height: 1.4;
+}
 .source-clone-progress.scanning progress,
 .source-clone-progress.checking-space progress {
   opacity: 0.5;
