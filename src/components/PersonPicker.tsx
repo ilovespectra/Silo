@@ -44,17 +44,16 @@ export default function PersonPicker({
   const matches = useMemo(() => {
     const clean = query.trim().toLowerCase();
     return people
+      .filter((person) => person.nameSource === "user")
+      .filter((person) => person.name.trim().length > 0)
       .filter((person) => !excludeIds.includes(person.id))
       .filter((person) => !clean || person.name.toLowerCase().includes(clean))
-      .sort(
-        (first, second) =>
-          Number(first.status === "banned") -
-            Number(second.status === "banned") ||
-          Number(second.status === "confirmed") -
-            Number(first.status === "confirmed") ||
-          Number(/^Person \d+$/.test(first.name)) -
-            Number(/^Person \d+$/.test(second.name)) ||
-          second.photoCount - first.photoCount,
+      .sort((first, second) =>
+        second.confirmedCount - first.confirmedCount ||
+        Number(first.status === "banned") - Number(second.status === "banned") ||
+        Number(second.status === "confirmed") - Number(first.status === "confirmed") ||
+        second.photoCount - first.photoCount ||
+        first.name.localeCompare(second.name),
       )
       .slice(0, 300);
   }, [excludeIds, people, query]);

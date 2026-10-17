@@ -52,6 +52,7 @@ export function isSignedEntitlementAllowed(
   nowMs = Date.now(),
 ): boolean {
   if (!payload) return false;
+
   const required = [
     "status",
     "deviceId",
@@ -65,30 +66,47 @@ export function isSignedEntitlementAllowed(
   for (const key of required) {
     if (typeof payload[key] === "undefined") return false;
   }
-  if (payload.status !== "allowed") return false;
-  if (typeof payload.deviceId !== "string" || payload.deviceId.trim().length === 0) return false;
-  if (payload.deviceId !== expectedDeviceId) return false;
-  if (typeof payload.signature !== "string" || payload.signature.trim().length === 0) return false;
-  if (typeof payload.issuedAt !== "number" || typeof payload.expiresAt !== "number") return false;
-  if (payload.expiresAt <= nowMs) return false;
-  if (typeof payload.appVersion !== "string" || payload.appVersion.trim().length === 0) return false;
-  if (typeof payload.minimumRequiredVersion !== "string" || payload.minimumRequiredVersion.trim().length === 0) return false;
-  if (typeof payload.nonce !== "string" || payload.nonce.trim().length === 0) return false;
+
+  const {
+    status,
+    deviceId,
+    appVersion,
+    minimumRequiredVersion: serverMinimumRequiredVersion,
+    issuedAt,
+    expiresAt,
+    nonce,
+    signature,
+  } = payload;
+
+  if (status !== "allowed") return false;
+  if (typeof deviceId !== "string" || deviceId.trim().length === 0) return false;
+  if (deviceId !== expectedDeviceId) return false;
+  if (typeof signature !== "string" || signature.trim().length === 0) return false;
+  if (typeof issuedAt !== "number" || typeof expiresAt !== "number") return false;
+  if (expiresAt <= nowMs) return false;
+  if (typeof appVersion !== "string" || appVersion.trim().length === 0) return false;
+  if (
+    typeof serverMinimumRequiredVersion !== "string" ||
+    serverMinimumRequiredVersion.trim().length === 0
+  )
+    return false;
+  if (typeof nonce !== "string" || nonce.trim().length === 0) return false;
+
   const signedPayload: Omit<SignedEntitlement, "signature"> = {
-    status: payload.status,
-    deviceId: payload.deviceId,
-    appVersion: payload.appVersion,
-    minimumRequiredVersion: payload.minimumRequiredVersion,
-    issuedAt: payload.issuedAt,
-    expiresAt: payload.expiresAt,
-    nonce: payload.nonce,
+    status,
+    deviceId,
+    appVersion,
+    minimumRequiredVersion: serverMinimumRequiredVersion,
+    issuedAt,
+    expiresAt,
+    nonce,
   };
-  if (!verifyRelaySignature(signedPayload, payload.signature, publicKeyPem)) return false;
-  if (payload.appVersion !== currentVersion) {
+  if (!verifyRelaySignature(signedPayload, signature, publicKeyPem)) return false;
+  if (appVersion !== currentVersion) {
     // The server can allow a newer app version; the client still must not accept a stale or mismatched entitlement.
     return false;
   }
-  if (minimumRequiredVersion && payload.minimumRequiredVersion !== minimumRequiredVersion) {
+  if (minimumRequiredVersion && serverMinimumRequiredVersion !== minimumRequiredVersion) {
     return false;
   }
   return true;

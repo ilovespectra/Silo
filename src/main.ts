@@ -372,6 +372,18 @@ interface DiagnosticReport {
   message: string;
 }
 
+function isLocalRelayHostname(hostname: string): boolean {
+  const normalized = hostname.trim().replace(/\.$/, "").toLowerCase();
+  if (!normalized) return false;
+  if (["localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal", "gateway.docker.internal"].includes(normalized))
+    return true;
+  if (normalized.endsWith(".localhost") || normalized.endsWith(".local") || normalized.endsWith(".internal"))
+    return true;
+  if (/^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(normalized))
+    return true;
+  return false;
+}
+
 async function requestRelayJson(
   endpoint: URL,
   options: {
@@ -387,10 +399,9 @@ async function requestRelayJson(
   payload: Record<string, any>;
 }> {
   const isLocalHttp =
-    endpoint.protocol === "http:" &&
-    ["localhost", "127.0.0.1", "::1"].includes(endpoint.hostname);
+    endpoint.protocol === "http:" && isLocalRelayHostname(endpoint.hostname);
   if (endpoint.protocol !== "https:" && !isLocalHttp)
-    throw new Error("The relay must use HTTPS.");
+    throw new Error("The relay must use HTTPS unless it is a localhost/private-network endpoint.");
 
   const body = options.body === undefined ? undefined : JSON.stringify(options.body);
   const headers: Record<string, string> = { ...options.headers };
@@ -12888,7 +12899,16 @@ ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
     };
   }
 });
-const isLocalNpmDev = () => !app.isPackaged && process.env.SILO_LOCAL_DEV === "1";
+const isLocalNpmDev = () => {
+  if (!app.isPackaged && process.env.SILO_LOCAL_DEV === "1") return true;
+  const entitlementUrl = process.env.SILO_ENTITLEMENT_URL?.trim();
+  if (!entitlementUrl) return false;
+  try {
+    return isLocalRelayHostname(new URL(entitlementUrl).hostname);
+  } catch {
+    return false;
+  }
+};
 
 ipcMain.handle("get-demo-testing-mode", () => ({
   available: lifetimeLicensed && isLocalNpmDev(),
