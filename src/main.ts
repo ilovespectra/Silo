@@ -22,6 +22,7 @@ import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
+const originalFs = require("original-fs") as typeof fs;
 import isDev from "electron-is-dev";
 import { autoUpdater } from "electron-updater";
 import {
@@ -5483,7 +5484,7 @@ function ensureCloneActive(operationId: string) {
 
 async function hashFile(filePath: string) {
   const hash = createHash("sha256");
-  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  for await (const chunk of originalFs.createReadStream(filePath)) hash.update(chunk);
   return hash.digest("hex");
 }
 
@@ -5494,10 +5495,10 @@ async function listLocalCloneEntries(
   options: { allowMarkedRoot?: boolean; skipRootManifest?: boolean } = {},
 ) {
   const appDataPath = path.resolve(app.getPath("userData"));
-  const canonicalAppDataPath = await fsPromises
+  const canonicalAppDataPath = await originalFs.promises
     .realpath(appDataPath)
     .catch(() => appDataPath);
-  const canonicalRootPath = await fsPromises
+  const canonicalRootPath = await originalFs.promises
     .realpath(root)
     .catch(() => path.resolve(root));
   const isSiloAppData = (candidatePath: string) =>
@@ -5520,13 +5521,13 @@ async function listLocalCloneEntries(
     const current = stack.pop()!;
     if (isMacDataVolumePathExcluded(current.directory, root)) continue;
     if (machineDevice !== null) {
-      const directoryStats = await fsPromises.stat(current.directory).catch(() => null);
+      const directoryStats = await originalFs.promises.stat(current.directory).catch(() => null);
       if (!directoryStats || directoryStats.dev !== machineDevice) continue;
     }
     if (isSiloAppData(current.directory)) continue;
     if (!(options.allowMarkedRoot && current.directory === root) &&
       await isSiloCloneDirectory(current.directory)) continue;
-    const dir = await fsPromises.opendir(current.directory);
+    const dir = await originalFs.promises.opendir(current.directory);
     for await (const entry of dir) {
       ensureCloneActive(operationId);
       if (entry.isSymbolicLink()) continue;
@@ -5536,7 +5537,7 @@ async function listLocalCloneEntries(
       if (isSiloAppData(absolutePath)) continue;
       if (entry.isDirectory() && await isSiloCloneDirectory(absolutePath)) continue;
       const relativePath = path.join(current.relativePath, entry.name);
-      const stats = await fsPromises.stat(absolutePath);
+      const stats = await originalFs.promises.stat(absolutePath);
       if (machineDevice !== null && stats.dev !== machineDevice) continue;
       if (stats.isDirectory()) {
         onEntry({
@@ -5596,7 +5597,7 @@ async function prepareSourceClone(
     const resolved = await fsPromises.realpath(destination);
     for (const source of selected) {
       if (source.kind !== "local" && source.kind !== "machine") continue;
-      const sourceResolved = await fsPromises.realpath(source.rootPath);
+      const sourceResolved = await originalFs.promises.realpath(source.rootPath);
       const relative = path.relative(sourceResolved, resolved);
       if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative)))
         throw new Error(`Destination cannot be inside selected source “${source.label}”. Choose a different folder.`);
@@ -5700,7 +5701,7 @@ async function prepareSourceClone(
     }
     if (prepareOptions.replicaSourceManifestPath) {
       const sourceManifestPath = prepareOptions.replicaSourceManifestPath;
-      const manifestStats = await fsPromises.stat(sourceManifestPath);
+      const manifestStats = await originalFs.promises.stat(sourceManifestPath);
       entries.push({
         sourcePath: sourceManifestPath,
         localPath: sourceManifestPath,
@@ -5727,7 +5728,7 @@ async function prepareSourceClone(
         const relative = path.relative(canonicalRoot, canonicalPath);
         if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
           throw new Error("Fallout Shelter manifest contains an unsafe duplicate alias.");
-        const stats = await fsPromises.stat(canonicalPath);
+        const stats = await originalFs.promises.stat(canonicalPath);
         entries.push({
           sourcePath: canonicalPath,
           localPath: canonicalPath,
@@ -5755,7 +5756,7 @@ async function prepareSourceClone(
       ensureCloneActive(operationId);
       const entry = files[index];
       const localPath = entry.localPath ?? await resolveLocalPath(entry.sourcePath);
-      const stats = await fsPromises.stat(localPath);
+      const stats = await originalFs.promises.stat(localPath);
       entry.localPath = localPath;
       entry.size = stats.size;
       entry.modified = stats.mtimeMs;
@@ -6137,7 +6138,7 @@ async function runSourceClone(
           if (prior && prior.size === entry.size) {
             let linked = false;
             try {
-              const sourceStats = await fsPromises.stat(sourcePath);
+              const sourceStats = await originalFs.promises.stat(sourcePath);
               if (sourceStats.size !== entry.size || sourceStats.mtimeMs !== entry.modified)
                 throw new Error(`Source changed after preflight: ${entry.destinationRelativePath}`);
               try {
@@ -6173,7 +6174,7 @@ async function runSourceClone(
           }
           const partialPath = `${destinationPath}.silo-partial`;
           const sourceHash = createHash("sha256");
-          const inputStats = await fsPromises.stat(sourcePath);
+          const inputStats = await originalFs.promises.stat(sourcePath);
           if (inputStats.size !== entry.size || inputStats.mtimeMs !== entry.modified)
             throw new Error(`Source changed after preflight: ${entry.destinationRelativePath}`);
           const meter = new Transform({
@@ -6188,11 +6189,11 @@ async function runSourceClone(
             },
           });
           try {
-            await pipeline(fs.createReadStream(sourcePath), meter, fs.createWriteStream(partialPath, { flags: "wx" }));
+            await pipeline(originalFs.createReadStream(sourcePath), meter, fs.createWriteStream(partialPath, { flags: "wx" }));
             const hash = sourceHash.digest("hex");
             if (hash !== entry.sha256)
               throw new Error(`Source content changed after hash preflight: ${entry.destinationRelativePath}`);
-            const sourceAfter = await fsPromises.stat(sourcePath);
+            const sourceAfter = await originalFs.promises.stat(sourcePath);
             if (sourceAfter.size !== entry.size || sourceAfter.mtimeMs !== entry.modified)
               throw new Error(`Source changed during copy: ${entry.destinationRelativePath}`);
             await fsPromises.chmod(partialPath, inputStats.mode & 0o777).catch(() => undefined);
@@ -6226,7 +6227,7 @@ async function runSourceClone(
         }
         for (const entry of plan.entries.filter((item) => !item.isDirectory && item.duplicateOf)) {
           ensureCloneActive(operationId);
-          const sourceStats = await fsPromises.stat(entry.localPath!);
+          const sourceStats = await originalFs.promises.stat(entry.localPath!);
           if (sourceStats.size !== entry.size || sourceStats.mtimeMs !== entry.modified)
             throw new Error(`Duplicate source changed after hash preflight: ${entry.destinationRelativePath}`);
           const crossCloneTarget = crossCloneTargets.get(entry.duplicateOf!);

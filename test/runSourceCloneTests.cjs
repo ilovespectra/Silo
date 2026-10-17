@@ -134,7 +134,7 @@ const fsPromises = new Proxy(fsp, {
   },
 });
 const context = vm.createContext({
-  console, path, os, fs, fsPromises, Buffer, Date, Math, Number, String, Array, Set, Map, Object, Error, Promise,
+  console, path, os, fs, fsPromises, originalFs: fs, Buffer, Date, Math, Number, String, Array, Set, Map, Object, Error, Promise,
   Transform, pipeline, createHash: crypto.createHash,
   InventoryFingerprint,
   CLONE_ARCHIVE_EXTENSION,

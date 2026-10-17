@@ -7,6 +7,16 @@ import { Readable, Transform } from "stream";
 import { pipeline } from "stream/promises";
 import yauzl from "yauzl";
 
+// Electron's patched fs treats .asar archives as virtual directories. Source
+// clone inputs must be read as their actual on-disk files instead.
+const sourceFs: typeof fs = (() => {
+  try {
+    return require("original-fs") as typeof fs;
+  } catch {
+    return fs;
+  }
+})();
+
 export const CLONE_ARCHIVE_MANIFEST_NAME = "silo-clone-manifest.json";
 export const CLONE_ARCHIVE_EXTENSION = ".zip";
 
@@ -293,7 +303,7 @@ export async function writeCloneArchive(options: WriteCloneArchiveOptions): Prom
       if (isCancelled()) throw cancelledError();
       if (archiveError) throw archiveError;
       const name = toArchiveName(file.archivePath);
-      const before = await fsPromises.stat(file.localPath);
+      const before = await sourceFs.promises.stat(file.localPath);
       if (before.size !== file.size || before.mtimeMs !== file.modified)
         throw new Error(`Source changed after preflight: ${file.archivePath}`);
       const hash = createHash("sha256");
@@ -306,7 +316,7 @@ export async function writeCloneArchive(options: WriteCloneArchiveOptions): Prom
           callback(null, chunk);
         },
       });
-      const source = fs.createReadStream(file.localPath);
+      const source = sourceFs.createReadStream(file.localPath);
       source.on("error", (error) => meter.destroy(error));
       const meterFailed = new Promise<never>((_resolve, reject) => meter.once("error", reject));
       meterFailed.catch(() => undefined);
@@ -320,7 +330,7 @@ export async function writeCloneArchive(options: WriteCloneArchiveOptions): Prom
       await Promise.race([allEntriesWritten(), meterFailed, failed]);
       if (hash.digest("hex") !== file.sha256)
         throw new Error(`Source content changed after hash preflight: ${file.archivePath}`);
-      const after = await fsPromises.stat(file.localPath);
+      const after = await sourceFs.promises.stat(file.localPath);
       if (after.size !== file.size || after.mtimeMs !== file.modified)
         throw new Error(`Source changed during compression: ${file.archivePath}`);
       processedFiles += 1;
