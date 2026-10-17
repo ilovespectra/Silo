@@ -531,11 +531,8 @@ export class MemoryManager {
       const score = (hits[i] as MemoryMedia & { score?: number }).score;
       candidates.push({ media, score: typeof score === "number" && Number.isFinite(score) ? score : 1 - i / limit });
     }
-    if (materiallyOverlapsStory(candidates.filter(item => item.media.type === "image").map(item => item.media), existingStories))
-      return reject("overlaps-existing-story", { hits: hits.length, allowed: candidates.length,
-        fresh: candidates.filter(item => !usedPaths.has(item.media.path)).length,
-        images: candidates.filter(item => item.media.type === "image").length });
-    // Do not refill a sparse prompt with photos already used by another story.
+    // Remove photos already used by a saved story before checking overlap. A broad search
+    // result can overlap an existing story even when its fresh photos form a distinct story.
     const pool = candidates.filter(item => !usedPaths.has(item.media.path));
     const ranked = pool.filter(item => item.media.type === "image").sort((a, b) => b.score - a.score);
     const counts = { hits: hits.length, allowed: candidates.length, fresh: pool.length, images: ranked.length,
