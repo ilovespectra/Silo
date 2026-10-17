@@ -111,6 +111,10 @@ script rejects a mismatched commit. Without those two variables, GitHub CLI
 (`gh`) must be installed and authenticated with permission to run this
 repository's Actions workflow. `SILO_RELEASE_STAGE_DIR` selects the temporary
 staging parent, and `SILO_RELEASE_DEST` overrides the default Downloads folder.
+`SILO_RELEASE_VERSION` pins the exact version to package and build; when set, the
+script skips the automatic bump-and-push loop and uses that version exactly. If
+it is unset, the script treats the latest release in
+`ilovespectra/silo-downloads` as the canonical baseline for the next build.
 The script refuses a non-`main` branch, tracked or staged changes, unexpected
 untracked files, existing destination assets, or a local commit that does not
 match GitHub `main`. It prints SHA-256 hashes after copying. It does not publish

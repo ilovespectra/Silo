@@ -45,28 +45,36 @@ function readLatestGitHubReleaseTag() {
 const explicitDestination = process.env.SILO_RELEASE_DEST
   ? path.resolve(process.env.SILO_RELEASE_DEST)
   : '';
+const explicitVersion = process.env.SILO_RELEASE_VERSION
+  ? String(process.env.SILO_RELEASE_VERSION).trim()
+  : '';
 // With an explicit output root, each release gets its own <root>/<version> folder.
 const defaultDestinationFor = (value) => (explicitDestination
   ? path.join(explicitDestination, value)
   : path.join(os.homedir(), 'Downloads', `SILO ${value} TEST`));
 
-// The release version always comes from package.json. When that version was
-// already packaged (in the destination) or published, increment (patch 9 rolls
-// into the next minor version) and
-// commit/push the bump so the Mac builds and Windows CI use the same version.
 function resolveReleaseVersion() {
+  if (explicitVersion) {
+    const parsed = parseSemver(explicitVersion);
+    if (!parsed) throw new Error(`Invalid SILO_RELEASE_VERSION: ${explicitVersion}`);
+    return explicitVersion;
+  }
+
   const current = packageJson.version;
+  const remoteVersion = readLatestGitHubReleaseTag();
+  const latestKnownVersion = remoteVersion && compareVersions(remoteVersion, current) > 0
+    ? remoteVersion
+    : current;
+
   const existingFolders = [...new Set(
     [explicitDestination, defaultDestinationFor(current)].filter(Boolean),
   )];
   const alreadyPackaged = existingFolders.some((folder) =>
     fs.existsSync(path.join(folder, `${product}-${current}-arm64.dmg`)));
-  const remoteVersion = readLatestGitHubReleaseTag();
   const remoteIsNewerOrSame = remoteVersion && compareVersions(remoteVersion, current) >= 0;
-  if (!alreadyPackaged && !remoteIsNewerOrSame) return current;
-  const base = remoteVersion && compareVersions(remoteVersion, current) > 0
-    ? parseSemver(remoteVersion).join('.')
-    : current;
+  if (!alreadyPackaged && !remoteIsNewerOrSame) return latestKnownVersion;
+
+  const base = latestKnownVersion;
   let next = bumpPatchVersion(base);
   for (const folder of existingFolders) {
     const folderVersion = findLatestVersionInFolder(folder);
