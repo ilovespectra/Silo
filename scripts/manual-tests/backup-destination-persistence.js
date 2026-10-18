@@ -5,6 +5,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const projectRoot = path.resolve(__dirname, "../..");
 
 const testDataDir = path.join(
   os.tmpdir(),
@@ -22,7 +23,7 @@ async function runTest() {
 
   // Import PhoneManager after build
   try {
-    require("./electron-dist/phoneManager.js");
+    require(path.join(projectRoot, "electron-dist/phoneManager.js"));
   } catch (e) {
     console.log("Note: Using source TypeScript directly (requires ts-node)");
   }
@@ -85,7 +86,7 @@ async function runTest() {
   console.log("\n✅ All persistence tests passed!");
   console.log("\nHow to test with the app:");
   console.log(
-    "1. Start the app: ELECTRON_IS_DEV=0 ./node_modules/.bin/electron .",
+    "1. From the repository root, start: ELECTRON_IS_DEV=0 ./node_modules/.bin/electron .",
   );
   console.log(
     "2. Click 'Choose Destination' and select a folder (e.g., external drive)",

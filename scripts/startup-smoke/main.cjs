@@ -6,12 +6,13 @@ const debug = (...values) => {
     console.error("[startup-smoke]", ...values);
 };
 
+const projectRoot = path.resolve(__dirname, "../..");
 const userDataPath = process.env.SILO_STARTUP_SMOKE_USER_DATA;
 const markerPath = process.env.SILO_STARTUP_SMOKE_MARKER;
 const noticeMarkerPath = process.env.SILO_STARTUP_SMOKE_NOTICE_MARKER;
 const scenario = process.env.SILO_STARTUP_SMOKE_SCENARIO;
 const allowedTempRoot = path.resolve(
-  process.env.SILO_STARTUP_SMOKE_ROOT || path.resolve(__dirname, "../../tmp"),
+  process.env.SILO_STARTUP_SMOKE_ROOT || path.resolve(projectRoot, "../../tmp"),
 );
 if (!userDataPath || !markerPath || !scenario) {
   console.error("Startup smoke test environment is incomplete.");
@@ -58,5 +59,5 @@ setTimeout(() => {
   app.exit(22);
 }, 45000).unref();
 
-require("./electron-dist/main.js");
+require(path.join(projectRoot, "electron-dist/main.js"));
 debug("main module loaded");

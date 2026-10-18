@@ -227,7 +227,7 @@ function buildMac() {
       const buildArguments = [
         "electron-builder",
         "--config",
-        "electron-builder.config.cjs",
+        "config/packaging/electron-builder.config.cjs",
         "--mac",
         "dmg",
         "zip",

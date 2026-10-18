@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
-const packageJson = require('./package.json');
+const projectRoot = path.resolve(__dirname, '../..');
+const packageJson = require(path.join(projectRoot, 'package.json'));
 const testOutput = process.env.SILO_TEST_OUTPUT_DIR;
 const externalRendererBuild = process.env.BUILD_PATH;
 const files = externalRendererBuild
@@ -15,7 +16,7 @@ const files = externalRendererBuild
 function writeGoogleOAuthResource() {
   const values = {};
   try {
-    for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split('\n')) {
+    for (const line of fs.readFileSync(path.join(projectRoot, '.env'), 'utf8').split('\n')) {
       const match = /^\s*(GOOGLE_[A-Z_]+)\s*=\s*(.*?)\s*$/.exec(line);
       if (match) values[match[1]] = match[2].replace(/^["']|["']$/g, '');
     }
@@ -25,7 +26,7 @@ function writeGoogleOAuthResource() {
   for (const key of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI'])
     if (process.env[key]) values[key] = process.env[key];
   if (!values.GOOGLE_CLIENT_ID || !values.GOOGLE_CLIENT_SECRET) return null;
-  const target = path.join(__dirname, '.google-oauth', 'google.env');
+  const target = path.join(projectRoot, '.google-oauth', 'google.env');
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n') + '\n', { mode: 0o600 });
   return { from: '.google-oauth/google.env', to: 'google.env' };
@@ -57,7 +58,7 @@ module.exports = {
     ...(testOutput ? { output: testOutput } : {}),
   },
   extraResources,
-  afterPack: require('./scripts/after-pack.cjs'),
+  afterPack: require(path.join(projectRoot, 'scripts', 'after-pack.cjs')),
   mac: {
     ...packageJson.build.mac,
     identity: hasCompleteSigningSetup ? undefined : null,

@@ -32,7 +32,7 @@
     "beta:grant": "node scripts/beta-license.cjs grant",
     "brand-dev": "node scripts/brand-dev-app.js",
     "unbrand-dev": "node scripts/brand-dev-app.js --restore",
-    "dist": "npm run react-build && tsc && npm run release:check && electron-builder --config electron-builder.config.cjs",
+    "dist": "npm run react-build && tsc && npm run release:check && electron-builder --config config/packaging/electron-builder.config.cjs",
     "dist:mac:x64": "node scripts/dist-mac.cjs x64",
     "dist:mac:arm64": "node scripts/dist-mac.cjs arm64",
     "release:merge-mac-updates": "node scripts/merge-mac-update-manifests.cjs",

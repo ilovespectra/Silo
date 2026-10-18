@@ -6,8 +6,8 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/windows-exe.yml'
-      - 'electron-builder.windows.config.cjs'
-      - 'electron-builder.config.cjs'
+      - 'config/packaging/electron-builder.windows.config.cjs'
+      - 'config/packaging/electron-builder.config.cjs'
       - 'package.json'
       - 'package-lock.json'
       - 'scripts/**'
@@ -180,7 +180,7 @@ jobs:
           !macroend
           '@ | Set-Content -Path $hook -Encoding Ascii
           $env:SILO_NSIS_INCLUDE = $hook
-          npx electron-builder --config electron-builder.windows.config.cjs --win nsis --x64 --publish never
+          npx electron-builder --config config/packaging/electron-builder.windows.config.cjs --win nsis --x64 --publish never
 
           $appExe = 'release/win-unpacked/Silo.exe'
           $resources = 'release/win-unpacked/resources'

@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/macos-arm64-signing.yml'
-      - 'electron-builder.config.cjs'
+      - 'config/packaging/electron-builder.config.cjs'
       - 'package.json'
       - 'package-lock.json'
       - 'signing/**'
@@ -86,7 +86,7 @@ jobs:
           echo "SILO_MAC_SIGNING_KEYCHAIN_PASSWORD=$password" >> "$GITHUB_ENV"
 
       - name: Package arm64 ad hoc DMG
-        run: npx electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64 --publish never
+        run: npx electron-builder --config config/packaging/electron-builder.config.cjs --mac dmg zip --arm64 --publish never
 
       - name: Verify Google sign-in config is bundled
         shell: bash
@@ -256,11 +256,11 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npx electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64 --publish never
+        run: npx electron-builder --config config/packaging/electron-builder.config.cjs --mac dmg zip --arm64 --publish never
 
       - name: Package ad hoc arm64 DMG fallback
         if: steps.signing.outputs.mode == 'adhoc'
-        run: npx electron-builder --config electron-builder.config.cjs --mac dmg zip --arm64 --publish never
+        run: npx electron-builder --config config/packaging/electron-builder.config.cjs --mac dmg zip --arm64 --publish never
 
       - name: Verify Google sign-in config is bundled
         shell: bash
