@@ -2090,6 +2090,9 @@ const EARLY_IPC_CHANNELS = new Set([
   "check-app-updates",
   "get-app-version",
   "get-startup-state",
+  "get-search-index-readiness",
+  "minimize-startup-splash",
+  "complete-startup-presentation",
   "get-content-settings",
   "get-search-performance-settings",
   "get-lifetime-license",
@@ -2162,6 +2165,16 @@ function sendToRenderer(channel: string, payload: unknown) {
     contents.send(channel, payload);
   } catch {
     // Frame may be mid-navigation; the renderer re-fetches state on mount.
+  }
+}
+
+function sendToStartupSplash(channel: string, payload: unknown) {
+  const contents = startupSplashWindow?.webContents;
+  if (!contents || contents.isDestroyed()) return;
+  try {
+    contents.send(channel, payload);
+  } catch {
+    // The splash can be between navigation and its first paint during startup.
   }
 }
 
@@ -2685,8 +2698,10 @@ const sendFaceIndexProgress = createProgressThrottle(
   5000,
 );
 const sendSearchIndexReadiness = createProgressThrottle(
-  (status: SearchIndexReadiness) =>
-    sendToRenderer("search-index-readiness", status),
+  (status: SearchIndexReadiness) => {
+    sendToRenderer("search-index-readiness", status);
+    sendToStartupSplash("search-index-readiness", status);
+  },
   200,
 );
 
@@ -2707,6 +2722,7 @@ function reportStartup(label: string, ready = false) {
     `[STARTUP] ${startupState.step}/${startupState.total} ${label} (+${Date.now() - startupStartedAt}ms)`,
   );
   sendToRenderer("startup-progress", startupState);
+  sendToStartupSplash("startup-progress", startupState);
 }
 
 /** Updates what the current step is doing without advancing the step count. */
@@ -2714,6 +2730,7 @@ function reportStartupDetail(label: string) {
   if (startupState.ready || startupState.label === label) return;
   startupState = { ...startupState, label };
   sendToRenderer("startup-progress", startupState);
+  sendToStartupSplash("startup-progress", startupState);
 }
 
 interface SearchIndexReadiness {
@@ -2724,6 +2741,8 @@ interface SearchIndexReadiness {
 }
 
 let mainWindow: BrowserWindow | null = null;
+let startupSplashWindow: BrowserWindow | null = null;
+let startupPresentationComplete = false;
 let cacheSetupWindow: BrowserWindow | null = null;
 let cacheSetupResolve: ((complete: boolean) => void) | null = null;
 let searchIndexReadiness: SearchIndexReadiness = {
@@ -8102,6 +8121,82 @@ function getPreloadPath(): string {
   return path.join(app.getAppPath(), "public", "preload.js");
 }
 
+function createStartupSplashWindow() {
+  if (startupSplashWindow && !startupSplashWindow.isDestroyed()) return;
+  try {
+    const splashPage = path.join(
+      app.getAppPath(),
+      app.isPackaged ? "build" : "public",
+      "startup-splash.html",
+    );
+    const window = new BrowserWindow({
+      width: 560,
+      height: 330,
+      resizable: false,
+      minimizable: true,
+      maximizable: false,
+      fullscreenable: false,
+      frame: false,
+      transparent: true,
+      backgroundColor: "#00000000",
+      hasShadow: true,
+      show: false,
+      title: "Silo is starting",
+      icon: appIconPath(),
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        preload: getPreloadPath(),
+        sandbox: true,
+      },
+    });
+    startupSplashWindow = window;
+    window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    window.once("ready-to-show", () => {
+      if (startupSplashWindow === window && !window.isDestroyed()) window.show();
+    });
+    window.on("close", (event) => {
+      if (shuttingDown) return;
+      event.preventDefault();
+      if (!window.isDestroyed()) window.minimize();
+    });
+    window.on("closed", () => {
+      if (startupSplashWindow === window) startupSplashWindow = null;
+    });
+    void window.loadFile(splashPage).catch((error) => {
+      startupPresentationComplete = true;
+      runtimeLog("startup-splash-load-failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (!window.isDestroyed()) window.destroy();
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.showInactive();
+    });
+    window.center();
+  } catch (error) {
+    startupPresentationComplete = true;
+    runtimeLog("startup-splash-create-failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function finishStartupPresentation() {
+  if (startupPresentationComplete) return;
+  startupPresentationComplete = true;
+  const splash = startupSplashWindow;
+  const shouldFocusMainWindow = Boolean(splash && splash.isFocused());
+  startupSplashWindow = null;
+  if (splash && !splash.isDestroyed()) splash.destroy();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (shouldFocusMainWindow) {
+      mainWindow.show();
+      mainWindow.focus();
+    } else {
+      mainWindow.showInactive();
+    }
+  }
+}
+
 async function createWindow() {
   const preloadPath = getPreloadPath();
 
@@ -8110,6 +8205,7 @@ async function createWindow() {
     height: 900,
     title: accessDisplayName(),
     icon: appIconPath(),
+    show: false,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -8117,6 +8213,15 @@ async function createWindow() {
       sandbox: true,
       autoplayPolicy: "no-user-gesture-required",
     },
+  });
+  const window = mainWindow;
+  window.once("ready-to-show", () => {
+    if (
+      startupPresentationComplete &&
+      mainWindow === window &&
+      !window.isDestroyed()
+    )
+      window.show();
   });
   const inventoryOwner = mainWindow.webContents.id;
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -9178,6 +9283,7 @@ function installApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  createStartupSplashWindow();
   const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
   await initializeSourceCloneSessionLogs(previousSessionWasUnclosed);
   if (app.isPackaged) app.setAsDefaultProtocolClient("silo");
@@ -10591,10 +10697,27 @@ for (const signal of ["SIGTERM", "SIGINT"] as const)
   process.on(signal, () => app.quit());
 
 app.on("activate", () => {
+  if (!app.isReady()) return;
+  if (!startupPresentationComplete) {
+    if (!startupSplashWindow || startupSplashWindow.isDestroyed())
+      createStartupSplashWindow();
+    if (startupSplashWindow && !startupSplashWindow.isDestroyed()) {
+      if (startupSplashWindow.isMinimized()) startupSplashWindow.restore();
+      else startupSplashWindow.show();
+      startupSplashWindow.focus();
+    } else if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+    return;
+  }
   // Before startup finishes opening storage and licenses, a Dock click must not
   // open a half-initialized window (it would show Demo mode and never load).
   if (mainWindow === null && mainStartupWindowAllowed) {
     void createWindow();
+  } else if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
   }
 });
 
@@ -14193,6 +14316,17 @@ ipcMain.handle("get-indexing-overview", async () => {
 });
 
 ipcMain.handle("get-startup-state", () => startupState);
+ipcMain.handle("minimize-startup-splash", (event) => {
+  if (event.sender !== startupSplashWindow?.webContents) return false;
+  startupSplashWindow.minimize();
+  return true;
+});
+ipcMain.handle("complete-startup-presentation", (event) => {
+  if (event.sender !== mainWindow?.webContents) return false;
+  if (!startupState.ready) return false;
+  finishStartupPresentation();
+  return true;
+});
 ipcMain.handle("get-app-version", () => app.getVersion());
 
 function getVisibleDemoMapPhotos(

@@ -68,6 +68,7 @@ interface MapPageProps {
   autoplay: boolean;
   onOpenFile: (file: FileInfo, clusterFiles: FileInfo[]) => void;
   onStateChanged: (state: PersistedAppState) => void;
+  onOpenFiles?: () => void;
   onOpenFolder?: (folderId: string) => void;
 }
 
@@ -360,6 +361,7 @@ export default function MapPage({
   autoplay,
   onOpenFile,
   onStateChanged,
+  onOpenFiles,
   onOpenFolder,
 }: MapPageProps) {
   const electronAPI = window.electron;
@@ -1705,6 +1707,28 @@ export default function MapPage({
           <FiRefreshCw />
         </button>
       </div>
+      {photosLoaded &&
+        geoState.geotagged === 0 &&
+        geoState.status !== "scanning" &&
+        geoState.status !== "error" && (
+          <section className="map-empty-state" data-tour="map-empty-state" role="status">
+            <span className="map-empty-mark" aria-hidden="true">
+              <FiMapPin />
+            </span>
+            <span className="map-empty-kicker">YOUR PHOTO MAP</span>
+            <h2>No location photos found</h2>
+            <p>
+              Silo hasn’t found photos with location data in the current library
+              index. Add or index a photo folder in Files, then check the map
+              again.
+            </p>
+            {onOpenFiles && (
+              <button type="button" onClick={onOpenFiles}>
+                <FiFolderPlus aria-hidden="true" /> Open Files
+              </button>
+            )}
+          </section>
+        )}
       <section className="map-selection-toolbar" aria-label="Map selection" data-tour="map-selection-tools" data-help="Choose rectangle or circle selection and whether to select individual place bubbles or whole regions. Use Shift-drag or Shift-click to add and Option to subtract.">
         <div className="map-selection-modes">
           <div

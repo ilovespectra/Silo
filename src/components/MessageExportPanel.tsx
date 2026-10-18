@@ -250,6 +250,7 @@ export const MessageExportPanel: React.FC<{
   const [phoneMessageBackup, setPhoneMessageBackup] =
     useState<PhoneMessageBackupMetadata | null>(null);
   const [selectedDeviceKey, setSelectedDeviceKey] = useState("");
+  const [mobileWorkflow, setMobileWorkflow] = useState<"devices" | "messages">("devices");
   const [threads, setThreads] = useState<DeviceMessageThread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [query, setQuery] = useState("");
@@ -654,8 +655,71 @@ export const MessageExportPanel: React.FC<{
 
   return (
     <main className={`messages-browser platform-${platform}`} data-tour="mobile-messages" data-help="Select a connected phone or saved message history, load and review a conversation, then choose an export folder and format. Refresh and update actions can read device history, so use them only when you intend to.">
+      <div className="mobile-workflow-bar">
+        <nav className="mobile-workflow-tabs" role="tablist" aria-label="Mobile workflows" data-tour="mobile-workflow-tabs">
+          <button
+            type="button"
+            role="tab"
+            id="mobile-devices-tab"
+            aria-selected={mobileWorkflow === "devices"}
+            aria-controls="mobile-devices-panel"
+            className={mobileWorkflow === "devices" ? "active" : ""}
+            onClick={() => setMobileWorkflow("devices")}
+          >
+            <FiWifi aria-hidden="true" /> Devices &amp; backups
+          </button>
+          <button
+            type="button"
+            role="tab"
+            id="mobile-messages-tab"
+            aria-selected={mobileWorkflow === "messages"}
+            aria-controls="mobile-messages-panel"
+            className={mobileWorkflow === "messages" ? "active" : ""}
+            onClick={() => setMobileWorkflow("messages")}
+          >
+            <FiMessageSquare aria-hidden="true" /> Messages
+          </button>
+        </nav>
+        <button
+          type="button"
+          className="mobile-scan-button"
+          disabled={scanningPhones}
+          onClick={onScanPhones}
+          title="Find phones connected to this Mac. Scanning does not start a backup."
+          data-help="Discover connected phones and tablets. Scanning only finds devices; choose Back up now to save a snapshot."
+        >
+          <FiRefreshCw className={scanningPhones ? "spinning" : ""} aria-hidden="true" />
+          {scanningPhones ? "Scanning…" : "Scan for phones"}
+        </button>
+      </div>
+
+      <section
+        className="mobile-workflow-panel mobile-devices-workflow"
+        id="mobile-devices-panel"
+        role="tabpanel"
+        aria-labelledby="mobile-devices-tab"
+        data-tour="mobile-device-workflow"
+        hidden={mobileWorkflow !== "devices"}
+      >
+        {devicePanel ?? (
+          <div className="mobile-device-workflow-empty">
+            <FiWifi aria-hidden="true" />
+            <h2>Connect a phone to get started</h2>
+            <p>Scan for a connected phone, then choose when to make a separate browseable snapshot.</p>
+          </div>
+        )}
+      </section>
+
+      <section
+        className="mobile-workflow-panel mobile-messages-workflow"
+        id="mobile-messages-panel"
+        role="tabpanel"
+        aria-labelledby="mobile-messages-tab"
+        data-tour="mobile-message-workflow"
+        hidden={mobileWorkflow !== "messages"}
+      >
       <header className="messages-toolbar">
-        <h2>Mobile manager</h2>
+        <h2>Message history</h2>
         <div className="messages-device-select-tools">
           <select
             aria-label="Phone message history"
@@ -727,18 +791,6 @@ export const MessageExportPanel: React.FC<{
             </option>
           ))}
           </select>
-          <button
-            type="button"
-            className="messages-scan-button"
-            disabled={scanningPhones}
-            onClick={onScanPhones}
-            title="Scan for connected phones and tablets"
-            aria-label="Scan for phones"
-            data-help="Discover phones connected to this Mac. Scanning does not start a backup."
-          >
-            <FiRefreshCw className={scanningPhones ? "spinning" : ""} />
-            {scanningPhones ? "Scanning…" : "Scan for phones"}
-          </button>
         </div>
         <button
           className="messages-icon-button"
@@ -766,8 +818,6 @@ export const MessageExportPanel: React.FC<{
             : "Messages are not in this phone snapshot yet. Choose Update Messages from phone to create the backup."}
         </div>
       )}
-
-      {devicePanel && <div className="mobile-manager-devices">{devicePanel}</div>}
 
       {(error || notice) && (
         <div className={`messages-notice ${error ? "error" : ""}`}>
@@ -1146,6 +1196,7 @@ export const MessageExportPanel: React.FC<{
             </p>
           )}
         </aside>
+      </section>
       </section>
     </main>
   );

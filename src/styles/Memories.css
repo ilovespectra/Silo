@@ -17,8 +17,8 @@
 .memories-page :focus-visible, .memories-modal :focus-visible { outline: 2px solid var(--memories-orange); outline-offset: 4px; }
 .memories-page-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 28px; }
 .memories-eyebrow { color: var(--memories-orange); font-size: 11px; letter-spacing: .16em; text-transform: uppercase; }
-.memories-page-header h1 { margin: 12px 0; font-size: clamp(28px, 3.2vw, 46px); font-weight: 550; letter-spacing: -.045em; }
-.memories-page-header h1 > span { color: var(--memories-orange); }
+.memories-page-header h2 { margin: 12px 0; font-size: clamp(28px, 3.2vw, 46px); font-weight: 550; letter-spacing: -.045em; }
+.memories-page-header h2 > span { color: var(--memories-orange); }
 .memories-page-header p { margin: 0; color: var(--memories-muted); font-size: 14px; line-height: 1.6; }
 .memories-header-actions, .memories-modal-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .memories-local-discovery { display: flex; align-items: flex-start; gap: 12px; max-width: 760px; margin: -8px 0 22px; padding: 12px 15px; border: 1px solid color-mix(in srgb, var(--memories-orange) 18%, var(--memories-border)); border-radius: 12px; background: color-mix(in srgb, var(--memories-orange) 3%, var(--memories-panel)); }

@@ -776,6 +776,7 @@ function App() {
     total: 1,
     label: "Starting…",
   });
+  const startupPresentationSignaledRef = useRef(false);
   useEffect(() => {
     if (!electronAPI?.getAppVersion) return;
     void electronAPI
@@ -1542,6 +1543,22 @@ function App() {
       removeListener();
     };
   }, [electronAPI]);
+
+  useEffect(() => {
+    if (
+      !electronAPI?.completeStartupPresentation ||
+      startupPresentationSignaledRef.current ||
+      !startupState.ready ||
+      !hydrated
+    )
+      return;
+    startupPresentationSignaledRef.current = true;
+    void electronAPI.completeStartupPresentation().then((finished) => {
+      if (!finished) startupPresentationSignaledRef.current = false;
+    }).catch(() => {
+      startupPresentationSignaledRef.current = false;
+    });
+  }, [electronAPI, hydrated, startupState.ready]);
 
   useEffect(() => {
     if (!electronAPI?.onDemoLimitReached) return;
@@ -6043,6 +6060,35 @@ function App() {
   const formatDate = (timestamp: number): string =>
     new Date(timestamp).toLocaleString();
 
+  const activeSectionTitle = {
+    files: "Files",
+    people: "People",
+    map: "Map",
+    duplicates: "Duplicates",
+    pets: "Pets",
+    mobile: "Mobile",
+    memories: "Memories",
+    stats: "Library Statistics",
+  }[appSection];
+  const activeSectionDetail =
+    appSection === "files"
+      ? currentPath && currentPath !== allSourcesPath
+        ? currentPath.split(/[\\/]/).filter(Boolean).slice(-2).join(" / ")
+        : "Your library"
+      : ({
+          memories: "Your moments, ready to explore",
+          people: "People in your photo library",
+          map: "Photos, organized by place",
+          duplicates: "Review matching files safely",
+          mobile: "Devices, backups, and messages",
+          pets: "Pets in your photo library",
+          stats: "A detailed view of your library",
+      } as Record<string, string>)[appSection] ?? "Silo Explorer";
+  const isBrowsingFilesLocation = Boolean(
+    activeDigitalFolderId ||
+      (currentPath && currentPath !== allSourcesPath),
+  );
+
   if (!electronAPI) {
     return (
       <div className="empty-state standalone-error">
@@ -6176,68 +6222,125 @@ function App() {
           )}
         </div>
       )}
+      <div className="app-workspace-row">
+        <aside className="primary-nav-rail" aria-label="Silo navigation">
+          <div className="primary-nav-brand" aria-label="Silo home">
+            <span>silo</span>
+            <i aria-hidden="true" />
+          </div>
+          {/* Keep legacy tour selectors stable during the shell redesign. Rebuild the guided tour after the workflows settle: navigation → source choice → indexing → Files browse/search/folders → Memories → People → Map → Duplicates → Mobile workflows → Settings. */}
+          <nav className="primary-nav-main" aria-label="Main sections" data-tour="app-tabs">
+            <button
+              type="button"
+              className={appSection === "memories" ? "active" : ""}
+              aria-current={appSection === "memories" ? "page" : undefined}
+              onClick={() => setAppSection("memories")}
+              data-tour="memories-tab"
+              title="Memories"
+              data-help="Browse story suggestions, then create or export a memory when you choose."
+            >
+              <FiPlay aria-hidden="true" />
+              <span>Memories</span>
+            </button>
+            <button
+              type="button"
+              className={appSection === "files" ? "active" : ""}
+              aria-current={appSection === "files" ? "page" : undefined}
+              onClick={() => setAppSection("files")}
+              data-tour="files-tab"
+              title="Files"
+              data-help="Browse and organize local folders, connected accounts, and saved device sources."
+            >
+              <FiGrid aria-hidden="true" />
+              <span>Files</span>
+            </button>
+            <button
+              type="button"
+              className={appSection === "people" ? "active" : ""}
+              aria-current={appSection === "people" ? "page" : undefined}
+              onClick={() => setAppSection("people")}
+              title="People"
+              data-help="Review offline face groups, name people, and correct or merge assignments."
+            >
+              <FiUsers aria-hidden="true" />
+              <span>People</span>
+            </button>
+            <button
+              type="button"
+              className={appSection === "map" ? "active" : ""}
+              aria-current={appSection === "map" ? "page" : undefined}
+              onClick={() => setAppSection("map")}
+              title="Map"
+              data-help="Explore geotagged photos by place and update selected photo locations."
+            >
+              <FiMap aria-hidden="true" />
+              <span>Map</span>
+            </button>
+            <button
+              type="button"
+              className={appSection === "duplicates" ? "active" : ""}
+              aria-current={appSection === "duplicates" ? "page" : undefined}
+              onClick={() => setAppSection("duplicates")}
+              title="Duplicates"
+              data-help="Compare exact duplicates, review recoverable removals, and confirm before permanent deletion."
+            >
+              <FiCopy aria-hidden="true" />
+              <span>Duplicates</span>
+            </button>
+            <button
+              type="button"
+              className={appSection === "mobile" ? "active" : ""}
+              aria-current={appSection === "mobile" ? "page" : undefined}
+              onClick={() => setAppSection("mobile")}
+              title="Mobile"
+              data-help="Connect phones and tablets, browse saved copies, and review or export message histories."
+            >
+              <FiSmartphone aria-hidden="true" />
+              <span>Mobile</span>
+            </button>
+          </nav>
+          <nav className="primary-nav-utilities" aria-label="Support and settings">
+            <button
+              type="button"
+              className={showSettings || appSection === "stats" ? "active" : ""}
+              onClick={() => setShowSettings(true)}
+              title="Settings"
+              aria-label="Settings"
+              aria-haspopup="dialog"
+              aria-expanded={showSettings}
+              data-tour="settings-button"
+              data-help="Open appearance, content protection, memory storage, configuration backup, bug reporting, and Library Statistics."
+            >
+              <FiSettings aria-hidden="true" />
+              <span>Settings</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowLocalHelp(true)}
+              title="Local help and replay the guided tour"
+              aria-label="Open Silo Help"
+              data-tour="help-button"
+              data-help="Search local help or replay the guided tour."
+            >
+              <FiHelpCircle aria-hidden="true" />
+              <span>Help</span>
+            </button>
+          </nav>
+        </aside>
+        <div className="app-main-column">
       <header className={`header${headerToolsCollapsed ? " header-tools-collapsed" : ""}`}>
         <div className="header-primary">
           <div className="header-left">
-            <h1>silo</h1>
-            <nav className="app-tabs" data-tour="app-tabs">
-              <button className={appSection === "memories" ? "active" : ""}
-                            onClick={() => setAppSection("memories")}
-                            data-tour="memories-tab"
-                            data-help="Open the story-video area. Browse suggestions and create or export a memory only when you choose."><FiPlay /> Memories</button>
-              <button
-                className={appSection === "files" ? "active" : ""}
-                onClick={() => setAppSection("files")}
-                data-help="Browse local folders, connected cloud accounts, and saved device sources; search and organize their files."
+            <div className="header-section-context">
+              <span className="header-section-kicker">SILO EXPLORER</span>
+              <h1>{activeSectionTitle}</h1>
+              <span
+                className="header-section-detail"
+                title={appSection === "files" ? currentPath || "Your library" : activeSectionDetail}
               >
-                <FiGrid /> Files
-              </button>
-              <button
-                className={appSection === "people" ? "active" : ""}
-                onClick={() => setAppSection("people")}
-                data-help="Review offline face clusters, name people, and correct or merge their photo assignments."
-              >
-                <FiUsers /> People
-              </button>
-              <button
-                className={appSection === "map" ? "active" : ""}
-                onClick={() => setAppSection("map")}
-                data-help="Explore geotagged photos by place and update selected photos’ location metadata."
-              >
-                <FiMap /> Map
-              </button>
-              <button
-                className={appSection === "duplicates" ? "active" : ""}
-                onClick={() => setAppSection("duplicates")}
-                data-help="Compare exact duplicate files, review recoverable removals, and verify before permanent deletion."
-              >
-                <FiCopy /> Duplicates
-              </button>
-              <button
-                className={appSection === "mobile" ? "active" : ""}
-                onClick={() => setAppSection("mobile")}
-                data-help="Connect phones and tablets, browse saved copies, and review or export message histories."
-              >
-                <FiSmartphone /> Mobile
-              </button>
-              <button
-                onClick={() => setShowSettings(true)}
-                title="Settings"
-                aria-label="Settings"
-                data-help="Open appearance, content protection, memory storage, configuration backup, bug reporting, and full Library Statistics."
-              >
-                <FiSettings />
-              </button>
-              <button
-                onClick={() => setShowLocalHelp(true)}
-                title="Local help and replay the guided tour"
-                aria-label="Open Silo Help"
-                data-tour="help-button"
-                data-help="Search the built-in local help and replay the guided tour; no live AI or network call is used."
-              >
-                <FiHelpCircle aria-hidden="true" />
-              </button>
-            </nav>
+                {activeSectionDetail}
+              </span>
+            </div>
           </div>
           {appSection === "files" ? (
             <div className="header-search-group">
@@ -6455,7 +6558,7 @@ function App() {
           ) : (
             <div className="header-primary-spacer" />
           )}
-          {!(["duplicates", "mobile", "map"] as const).includes(appSection as "duplicates" | "mobile" | "map") && (
+          {appSection === "files" && (
             <button
               className="header-tools-toggle"
               type="button"
@@ -6475,10 +6578,15 @@ function App() {
           <div className="header-directory" data-help="Use Back, Forward, and Parent to navigate folder history; Refresh reloads the current source view. These controls do not alter the underlying files.">
             {appSection === "files" && (
               <>
-                <button className="btn btn-primary" onClick={selectDirectory}
-                  title="Add this folder to Silo's source list"
-                  data-help="Add a folder to Silo's source list for browsing and indexing. The source files are not changed.">
-                  <FiDownload /> Open Directory
+                <button className="btn btn-primary"
+                  title={isBrowsingFilesLocation ? "Browse another folder in this session" : "Add a folder to your library"}
+                  data-help={isBrowsingFilesLocation
+                    ? "Open another folder for this session. To keep it in your library and index it, add it as a source."
+                    : "Add a folder as a library source and index it in place. Silo leaves the originals where they are."}
+                  onClick={isBrowsingFilesLocation ? selectDirectory : addIndexSource}
+                  data-tour="files-primary-source-action">
+                  {isBrowsingFilesLocation ? <FiFolder /> : <FiFolderPlus />}
+                  {isBrowsingFilesLocation ? "Browse another folder" : "Add a folder"}
                 </button>
                 {(currentPath || activeDigitalFolderId) && (
                   <div className="header-navigation-buttons">
@@ -7063,6 +7171,7 @@ function App() {
         </div>
       )}
 
+      <div className={`section-workspace section-workspace-${appSection}`} key={`workspace-${appSection}`}>
       <React.Suspense fallback={null}>
         <MemoriesLauncher api={electronAPI} ready={startupState.ready && hydrated}
           onExplore={() => setAppSection("memories")} />
@@ -7890,11 +7999,36 @@ function App() {
                   {people.length === 0 ? (
                     <div className="people-empty">
                       <FiUsers />
-                      <h2>No people clustered yet</h2>
+                      <h2>{faceProgress.status === "indexing" || faceProgress.status === "loading-model"
+                        ? "Finding people in your photos"
+                        : "Start with face indexing"}</h2>
                       <p>
-                        Face cards will appear automatically as indexed photos
-                        are scanned.
+                        {faceProgress.status === "indexing" || faceProgress.status === "loading-model"
+                          ? "People appear here as Silo finds face groups. This separate index leaves your original photos unchanged."
+                          : "Silo checks indexed photos for faces, then groups them here for you to review and name. Your original photos stay unchanged."}
                       </p>
+                      {faceProgress.status !== "indexing" && faceProgress.status !== "loading-model" && (
+                        <button
+                          type="button"
+                          className="index-action people-empty-action"
+                          onClick={() => void toggleFaceIndexing()}
+                          disabled={faceActionPending !== null}
+                          data-tour="people-empty-start"
+                        >
+                          {faceActionPending === "resume" || faceProgress.status === "paused"
+                            ? <FiRefreshCw />
+                            : <FiPlay />}
+                          {faceActionPending === "resume"
+                            ? "Queueing…"
+                            : faceProgress.status === "paused"
+                              ? "Resume face indexing"
+                              : faceProgress.status === "complete"
+                              ? "Check for new photos"
+                                : faceProgress.status === "error"
+                                  ? "Retry face indexing"
+                                  : "Start face indexing"}
+                        </button>
+                      )}
                     </div>
                   ) : (
                     people
@@ -7957,6 +8091,7 @@ function App() {
               void openMediaViewer(file, clusterFiles)
             }
             onStateChanged={applyPersistedState}
+            onOpenFiles={() => setAppSection("files")}
             onOpenFolder={(folderId) => {
               setAppSection("files");
               void openDigitalFolder(folderId);
@@ -8652,9 +8787,29 @@ function App() {
               </div>
             )}
             {!currentPath && !searchQuery.trim() && !activeDigitalFolderId ? (
-              <div className="empty-state">
-                <h2>No directory selected</h2>
-                <p>Open a directory to get started</p>
+              <div className="files-welcome" data-tour="files-welcome">
+                <div className="files-welcome-mark" aria-hidden="true">
+                  <FiImage />
+                </div>
+                <span className="files-welcome-kicker">YOUR LIBRARY STARTS HERE</span>
+                <h2>Bring your folders into Silo</h2>
+                <p>
+                  Choose the folders you want to browse. Silo indexes them in
+                  place, so your originals stay where they are.
+                </p>
+                <div className="files-welcome-actions">
+                  <button className="primary files-welcome-primary" type="button" onClick={addIndexSource} data-tour="source-add-folder" title="Register a folder as a Silo source and start indexing it" data-help="Choose a folder to add to your library. Silo indexes it without moving or changing its files.">
+                    <FiFolderPlus aria-hidden="true" /> Add a folder
+                  </button>
+                  <button className="files-welcome-secondary" type="button" onClick={addMachineSource} data-tour="source-add-machine" title="Add this Mac’s internal data volume; mounted external drives are excluded" data-help="Browse and index this Mac’s internal data volume. Mounted external drives remain separate sources.">
+                    <FiHardDrive aria-hidden="true" /> Add This Mac
+                  </button>
+                </div>
+                <div className="files-welcome-next-steps" aria-label="What you can do in Files">
+                  <span><FiSearch aria-hidden="true" /> Search across your library</span>
+                  <span><FiFolder aria-hidden="true" /> Keep sources organized</span>
+                  <span><FiHeart aria-hidden="true" /> Make folders for collections</span>
+                </div>
               </div>
             ) : searchQuery.trim() &&
               (searchIndexReadiness.status === "unavailable" ||
@@ -9220,6 +9375,7 @@ function App() {
           )}
         </div>
       )}
+      </div>
 
       <footer className="app-footer">
         <div className="app-footer-branding">
@@ -9238,6 +9394,8 @@ function App() {
           </a>
         </nav>
       </footer>
+        </div>
+      </div>
 
       {showFolderSelector && (
         <div
@@ -9635,7 +9793,7 @@ function App() {
           aria-label={selectedFile.name}
         >
           <div className="viewer-toolbar">
-            <span className="viewer-title">
+            <span className="viewer-title" title={selectedFile.name}>
               {selectedFile.name}
               {viewerIsLivePhoto && (
                 <span className="live-photo-badge">Live Photo</span>
@@ -9753,10 +9911,15 @@ function App() {
                   <FiDownload />
                 </button>
               )}
-              <button onClick={() => setViewerOpen(false)} title="Close viewer">
-                <FiX />
-              </button>
             </div>
+            <button
+              className="viewer-close"
+              onClick={() => setViewerOpen(false)}
+              title="Close preview"
+              aria-label="Close preview"
+            >
+              <FiX aria-hidden="true" />
+            </button>
           </div>
           {profilePictureNotice && (
             <div className="viewer-profile-notice" role="status">

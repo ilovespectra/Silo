@@ -1311,6 +1311,8 @@ interface Window {
     refreshGeoState(): Promise<GeoIndexState>;
     getStartupState(): Promise<StartupState>;
     onStartupProgress(callback: (state: StartupState) => void): () => void;
+    minimizeStartupSplash(): Promise<boolean>;
+    completeStartupPresentation(): Promise<boolean>;
     getCountrySummary(): Promise<
       Array<{
         country: string | null;

@@ -380,12 +380,40 @@ export default function DuplicatesPage({
     }
   }, [busy, state.scanned, state.total]);
 
+  const duplicateEmptyState = (
+    <div className="duplicates-empty duplicates-empty-guided" data-tour="duplicates-empty-state">
+      <span className="duplicates-empty-mark" aria-hidden="true"><FiCopy /></span>
+      {state.status === "idle" ? (
+        <>
+          <h3>Start with a library scan</h3>
+          <p>Compare file contents to find exact copies. Scanning does not change or move your files.</p>
+          <button className="btn btn-primary" type="button" onClick={() => void scan()} disabled={busy}>
+            <FiRefreshCw /> Scan library
+          </button>
+        </>
+      ) : state.status === "error" ? (
+        <>
+          <h3>The scan needs attention</h3>
+          <p>{state.message || "The duplicate scan could not finish. Review the status above, then try again."}</p>
+          <button className="btn btn-primary" type="button" onClick={() => void scan()} disabled={busy}>
+            <FiRefreshCw /> Try scan again
+          </button>
+        </>
+      ) : (
+        <>
+          <h3>No exact copies found</h3>
+          <p>Silo compares exact file contents. Similar looking photos are not treated as duplicates.</p>
+        </>
+      )}
+    </div>
+  );
+
   return (
     <main className="duplicates-page" data-retained-scroll="duplicates" data-help="Scan compares exact file contents. Keep the protected original, review selected copies in the recoverable removal area, and verify before permanent deletion.">
       <header className="duplicates-header" data-tour="duplicates-overview">
         <div>
           <span className="sidebar-kicker">Exact-byte comparison</span>
-          <h2>Duplicates</h2>
+          <h2>Compare matching files</h2>
           <p>{state.message}</p>
         </div>
         <div className="duplicates-summary">
@@ -710,9 +738,7 @@ export default function DuplicatesPage({
                 </div>
               )}
               {state.groups.length === 0 && (
-                <div className="duplicates-empty">
-                  No exact duplicate groups are currently indexed.
-                </div>
+                duplicateEmptyState
               )}
             </section>
           )}
@@ -954,9 +980,7 @@ export default function DuplicatesPage({
                 </div>
               )}
               {state.groups.length === 0 && (
-                <div className="duplicates-empty">
-                  No exact duplicate groups are currently indexed.
-                </div>
+                duplicateEmptyState
               )}
             </section>
           )}

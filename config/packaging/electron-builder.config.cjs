@@ -52,7 +52,12 @@ const hasCompleteSigningSetup = signingSecrets.every((name) => {
 
 module.exports = {
   ...packageJson.build,
-  files,
+  files: [
+    ...files,
+    // dist-mac temporarily parks the previous binary here during architecture staging.
+    // These copies are build-only and must not ship inside the installed app.
+    '!node_modules/ffmpeg-static/.ffmpeg-silo-backup-*',
+  ],
   directories: {
     ...packageJson.build.directories,
     ...(testOutput ? { output: testOutput } : {}),

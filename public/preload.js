@@ -277,6 +277,8 @@ contextBridge.exposeInMainWorld("electron", {
   getGeoState: () => ipcRenderer.invoke("get-geo-state"),
   refreshGeoState: () => ipcRenderer.invoke("refresh-geo-state"),
   getStartupState: () => ipcRenderer.invoke("get-startup-state"),
+  minimizeStartupSplash: () => ipcRenderer.invoke("minimize-startup-splash"),
+  completeStartupPresentation: () => ipcRenderer.invoke("complete-startup-presentation"),
   onStartupProgress: (callback) => {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on("startup-progress", listener);

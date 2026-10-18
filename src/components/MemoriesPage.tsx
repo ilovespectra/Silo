@@ -738,7 +738,7 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
   const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new editable memories. Finished ones move to your Memory Book below.";
   return <section className="memories-page" aria-label="Memories" data-retained-scroll="memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
-      <div><span className="memories-eyebrow">silo / little time capsules</span><h1>Your life, in motion<span>.</span></h1>
+      <div><span className="memories-eyebrow">silo / little time capsules</span><h2>Your life, in motion<span>.</span></h2>
         <p>Small stories from your library. Made by you, kept by you.</p></div>
       <div className="memories-header-actions">
         <span className="memories-button-wrap" title={generateMemoriesTitle}>
