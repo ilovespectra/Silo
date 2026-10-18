@@ -273,7 +273,14 @@ if (process.stderr) {
 app.setName("Silo");
 
 function appIconPath(): string {
-  return path.join(app.getAppPath(), app.isPackaged ? "build" : "public", "icon.png");
+  const appRoot = app.getAppPath();
+  const candidates = [
+    path.join(appRoot, app.isPackaged ? "build" : "public", "icon.png"),
+    path.join(appRoot, "public", "icon.png"),
+    path.join(path.resolve(appRoot, ".."), "public", "icon.png"),
+  ];
+  const resolved = candidates.find((candidate) => fs.existsSync(candidate));
+  return resolved ?? candidates[0];
 }
 
 // setName would otherwise relocate userData and orphan existing state.
@@ -768,6 +775,11 @@ async function requireIndexStorageSelection(userDataPath: string): Promise<boole
     // remain editable in Settings, where each move can copy and verify data.
     return true;
   }
+
+  const isHeadlessStartup =
+    app.commandLine.hasSwitch("headless") ||
+    Boolean(process.env.SILO_STARTUP_SMOKE_SCENARIO);
+  if (isHeadlessStartup) return true;
 
   if (await openCacheDestinationSetup()) return true;
   const justConfiguredRoots = await readCacheDestinationRoots(userDataPath).catch(() => null);
@@ -9284,8 +9296,11 @@ function installApplicationMenu() {
 
 app.whenReady().then(async () => {
   createStartupSplashWindow();
+  console.error("[startup-debug] ready");
   const previousSessionWasUnclosed = fs.existsSync(activeSessionMarkerPath);
+  console.error("[startup-debug] before initializeSourceCloneSessionLogs");
   await initializeSourceCloneSessionLogs(previousSessionWasUnclosed);
+  console.error("[startup-debug] after initializeSourceCloneSessionLogs");
   if (app.isPackaged) app.setAsDefaultProtocolClient("silo");
   const startupBetaUrl = process.argv.find((argument) =>
     argument.toLowerCase().startsWith("silo://beta-activate"),
@@ -9310,7 +9325,9 @@ app.whenReady().then(async () => {
   installApplicationMenu();
   configureAppUpdater();
   const userDataPath = app.getPath("userData");
+  console.error("[startup-debug] before requireIndexStorageSelection");
   if (!(await requireIndexStorageSelection(userDataPath))) return;
+  console.error("[startup-debug] after requireIndexStorageSelection");
   let storage: Awaited<ReturnType<typeof prepareConfiguredIndexStorage>>;
   if (cacheDestinationSettingsSaved) {
     const missing = await probeCacheDestinationRoots(cacheDestinationRoots);
@@ -9344,15 +9361,29 @@ app.whenReady().then(async () => {
         const savedRoot = savedSettings ? path.resolve(savedSettings.path) : null;
         const external = Boolean(savedRoot && savedRoot !== path.resolve(userDataPath));
         if (external && !useLocalCacheThisSession) {
-          const probe = await probeIndexStorageDestination(savedRoot!);
-          runtimeLog("index-storage-probe", { result: probe });
-          if (probe === "unresponsive") {
+          let probe = await probeIndexStorageDestination(savedRoot!);
+          runtimeLog("index-storage-probe", { result: probe, root: savedRoot! });
+          while (probe === "unresponsive") {
             const choice = await recoverUnresponsiveIndexStorage(savedRoot!);
             if (choice === "quit") {
               app.quit();
               return;
             }
-            if (choice === "retry") continue;
+            if (choice === "retry") {
+              probe = await probeIndexStorageDestination(savedRoot!);
+              runtimeLog("index-storage-probe-after-retry", { result: probe, root: savedRoot! });
+              if (probe === "ok") break;
+              continue;
+            }
+            useLocalCacheThisSession = true;
+            break;
+          }
+          if (probe === "missing" || probe === "unresponsive") {
+            runtimeLog("index-storage-probe-failed-startup", {
+              result: probe,
+              root: savedRoot!,
+              fallbackMode: true,
+            });
             useLocalCacheThisSession = true;
           }
         }
@@ -9551,10 +9582,14 @@ app.whenReady().then(async () => {
   app.setName(accessDisplayName());
   refreshHiddenFolderPathCache();
   contentSettingsStore = new ContentSettingsStore(app.getPath("userData"));
+  console.error("[startup-debug] before contentSettingsStore.initialize");
   await contentSettingsStore.initialize();
+  console.error("[startup-debug] after contentSettingsStore.initialize");
   registerMediaProtocols();
   mainStartupWindowAllowed = true;
+  console.error("[startup-debug] before createWindow");
   await createWindow();
+  console.error("[startup-debug] after createWindow");
 
   if (app.isPackaged && !isDev) void checkForAppUpdates();
   reportStartup("Loading content filters…");

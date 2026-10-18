@@ -1,6 +1,6 @@
 import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
-import { createReadStream, realpathSync } from "fs";
+import { constants as fsConstants, createReadStream, realpathSync } from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
@@ -624,6 +624,11 @@ async function validateExternalVolume(userDataPath: string, storageRoot: string)
     path.resolve(storageRoot) !== path.resolve("/Volumes")
   )
     throw new ExternalIndexStorageUnavailableError(storageRoot);
+  try {
+    await fsPromises.access(storageRoot, fsConstants.R_OK | fsConstants.W_OK);
+  } catch {
+    throw new ExternalIndexStorageUnavailableError(storageRoot);
+  }
   // Folders on the internal drive are allowed; they are created on demand.
 }
 

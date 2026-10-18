@@ -7,6 +7,7 @@ const debug = (...values) => {
 };
 
 const projectRoot = path.resolve(__dirname, "../..");
+app.setAppPath(projectRoot);
 const userDataPath = process.env.SILO_STARTUP_SMOKE_USER_DATA;
 const markerPath = process.env.SILO_STARTUP_SMOKE_MARKER;
 const noticeMarkerPath = process.env.SILO_STARTUP_SMOKE_NOTICE_MARKER;
