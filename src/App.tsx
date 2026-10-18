@@ -662,6 +662,7 @@ function pathIsVisibleForSelectedSources(
 // Fallout Shelter Silo-only aliases share a physical path with their canonical file.
 const fileListKey = (file: { path: string; relativePath?: string; siloAlias?: boolean }) =>
   file.siloAlias ? `${file.path}\u0000${file.relativePath ?? ""}` : file.path;
+const MAX_THUMBNAIL_SIZE = 500;
 
 function App() {
   const electronAPI = window.electron;
@@ -712,12 +713,11 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(
     () => Number(localStorage.getItem("silo.sidebarWidth")) || 260,
   );
-  const [thumbnailSize, setThumbnailSize] = useState(() =>
-    Math.min(
-      200,
-      Math.max(120, Number(localStorage.getItem("silo.thumbnailSize")) || 200),
-    ),
-  );
+  const [thumbnailSize, setThumbnailSize] = useState(() => {
+    const saved = Number(localStorage.getItem("silo.thumbnailSize"));
+    const fallback = 240;
+    return Math.min(MAX_THUMBNAIL_SIZE, Math.max(120, Number.isFinite(saved) ? saved : fallback));
+  });
   const retainedScrollPositionsRef = useRef<Record<string, number>>({});
   const [viewerOpen, setViewerOpen] = useState(false);
   const viewerOpenRef = useRef(viewerOpen);
@@ -7178,7 +7178,7 @@ function App() {
                     <input
                       type="range"
                       min="120"
-                      max="200"
+                      max={MAX_THUMBNAIL_SIZE}
                       step="10"
                       value={thumbnailSize}
                       onChange={(event) =>
@@ -8606,7 +8606,7 @@ function App() {
               <input
                 type="range"
                 min="120"
-                max="200"
+                max={MAX_THUMBNAIL_SIZE}
                 step="10"
                 value={thumbnailSize}
                 onChange={(event) =>

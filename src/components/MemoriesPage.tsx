@@ -624,7 +624,7 @@ function SavedMovieCard({ api, movie, onToast, onRefresh }: {
   </article>;
 }
 
-export default function MemoriesPage({ api, ready = true, thumbnailSize = 200, onThumbnailSizeChange }: MemoriesPageProps) {
+export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, onThumbnailSizeChange }: MemoriesPageProps) {
   const [state, setState] = useState<MemoryState | null>(null);
   const [demoMode, setDemoMode] = useState(false);
   const [savedMovies, setSavedMovies] = useState<SavedMemoryMovie[]>([]);
@@ -790,7 +790,7 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 200, o
       const total = moving.length + savedMovies.length;
       return <section className="memories-book" aria-label="Memory Book">
         <header className="memories-book-header"><div><h2>Memory Book</h2><span>{total} {total === 1 ? "memory" : "memories"} · saved in your memories folder</span></div>
-          <label className="memories-book-size"><span>Thumbnail size</span><input type="range" min={120} max={200} step={10} value={thumbnailSize} disabled={!onThumbnailSizeChange} aria-label="Memory Book thumbnail size" onChange={(event) => onThumbnailSizeChange?.(Number(event.target.value))} /><output>{thumbnailSize}px</output></label>
+          <label className="memories-book-size"><span>Thumbnail size</span><input type="range" min={120} max={500} step={10} value={thumbnailSize} disabled={!onThumbnailSizeChange} aria-label="Memory Book thumbnail size" onChange={(event) => onThumbnailSizeChange?.(Number(event.target.value))} /><output>{thumbnailSize}px</output></label>
         </header>
         <div className="memories-grid memories-book-grid" style={{ "--memory-book-thumbnail-size": `${thumbnailSize}px` } as React.CSSProperties}>
           {moving.map((memory) => <PendingBookCard key={`moving:${memory.id}`} api={api} memory={memory} preview={previews[memory.id]} onState={setState} onRefresh={refreshSavedMovies} />)}
