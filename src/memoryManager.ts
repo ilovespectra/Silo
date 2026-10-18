@@ -142,7 +142,17 @@ function customTopicQueries(topic: string, plan?: MemoryPromptPlan | null): stri
   const normalized = normalizeCustomTopic(topic);
   if (!normalized) return [];
   const unique = new Map<string, string>();
-  const chunks = normalized.split(/[,;|\n]+/).map(normalizeCustomTopic).filter(Boolean);
+  const splitOnClause = /(?:[\n,;|]+|\s+(?:and|plus|with|&|\+)\s+)/iu;
+  const chunks = normalized
+    .split(splitOnClause)
+    .map(normalizeCustomTopic)
+    .filter(Boolean);
+  const clauseTerms = chunks.flatMap((chunk) =>
+    chunk
+      .split(/\s+/)
+      .map((word) => word.toLocaleLowerCase())
+      .filter((word) => word.length >= 3 && !STOP_WORDS.has(word)),
+  );
   const tokens = normalized.split(/\s+/).filter(Boolean).map(word => word.toLocaleLowerCase());
   const meaningful = tokens.filter((token) => token.length >= 3 && !STOP_WORDS.has(token));
   // Search each saved name before spending the remaining request budget on
@@ -151,23 +161,31 @@ function customTopicQueries(topic: string, plan?: MemoryPromptPlan | null): stri
   const plannedQueries = (plan?.queries ?? []).slice(0, 4);
   const plannedEntities = (plan?.entities ?? []).slice(0, 6);
   const variants = [normalized, ...chunks, ...plannedEntities, ...plannedQueries];
-  if (chunks.length <= 1) {
-    if (meaningful.length) variants.push(meaningful.join(" "));
-    // Individual terms are useful union fallbacks for prompts such as
-    // "Elliott and Kat on the beach" when local planning is unavailable.
-    variants.push(...meaningful);
-    if (meaningful.length > 1) {
-      variants.push(meaningful.slice(0, Math.min(meaningful.length, 4)).join(" "));
-      variants.push(meaningful.slice(-Math.min(meaningful.length, 4)).join(" "));
+  for (const chunk of chunks) {
+    const clause = normalizeCustomTopic(chunk);
+    if (clause) {
+      variants.push(clause);
+      variants.push(`photo of ${clause}`);
+      variants.push(`photos of ${clause}`);
+      variants.push(`a photo of ${clause}`);
     }
-    variants.push(`photo of ${normalized}`, `photos of ${normalized}`, `a photo of ${normalized}`);
   }
+  if (meaningful.length) variants.push(meaningful.join(" "));
+  // Individual terms are useful union fallbacks for prompts such as
+  // "Elliott and Kat on the beach" when local planning is unavailable.
+  variants.push(...meaningful);
+  variants.push(...clauseTerms);
+  if (meaningful.length > 1) {
+    variants.push(meaningful.slice(0, Math.min(meaningful.length, 4)).join(" "));
+    variants.push(meaningful.slice(-Math.min(meaningful.length, 4)).join(" "));
+  }
+  variants.push(`photo of ${normalized}`, `photos of ${normalized}`, `a photo of ${normalized}`);
   for (const variant of variants) {
     const trimmed = normalizeCustomTopic(variant);
     if (trimmed && !unique.has(trimmed.toLocaleLowerCase()))
       unique.set(trimmed.toLocaleLowerCase(), trimmed);
   }
-  return [...unique.values()].slice(0, 12);
+  return [...unique.values()].slice(0, 18);
 }
 
 function customTopicTitle(topic: string, plan?: MemoryPromptPlan | null): string {
