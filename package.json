@@ -10,6 +10,7 @@
     "react-build": "react-scripts build",
     "react-test": "react-scripts test",
     "test:auto-indexing": "node test/runAutoIndexingTests.cjs",
+    "test:cache-destinations": "node test/runCacheDestinationTests.cjs",
     "test:semantic-isolation": "node test/runSemanticIsolationTests.cjs",
     "search-eval": "node scripts/search-eval.cjs",
     "test:search-eval": "node test/search-eval-core.test.cjs",

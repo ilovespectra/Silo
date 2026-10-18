@@ -8,12 +8,13 @@ import {
   nativeImage,
   net,
   protocol,
+  session,
   shell,
 } from "electron";
 import { createHash, randomBytes } from "crypto";
 import * as http from "http";
 import * as https from "https";
-import { execFile, spawn } from "child_process";
+import { execFile, spawn, spawnSync } from "child_process";
 import { Readable, Transform } from "stream";
 import { pipeline } from "stream/promises";
 import { promisify } from "util";
@@ -134,6 +135,10 @@ import {
   personalPhotoRejection,
 } from "./memoryDiscovery";
 import { MemoryTopicProfile, RefreshScheduler } from "./memoryTopicProfile";
+import {
+  hasValidPromptedMemoryFolderContext,
+  isMemoryVisualContentExplicit,
+} from "./memorySafetyPolicy";
 import * as exifr from "exifr";
 import { MemoryExportCancelledError, MemoryExporter } from "./memoryExporter";
 import { GOOGLE_FEATURES_ENABLED } from "./featureFlags";
@@ -155,7 +160,6 @@ import {
 import { Geocoder, GeocodedLocation } from "./geocoder";
 import { DuplicateManager } from "./duplicateManager";
 import {
-  createIndexStoragePathResolver,
   prepareConfiguredIndexStorage,
   stageIndexStorageRoot,
   validateIndexStorageDestination,
@@ -166,8 +170,10 @@ import {
   LOCAL_INDEX_STORAGE_RESERVE_BYTES,
   setLocalIndexStorageFallback,
   setActiveIndexStorageRoot,
+  setIndexStorageExclusionRoots,
   describeIndexStorageMigrationProgress,
   findExistingIndexStorageRoots,
+  getIndexStorageExclusionRoots,
   type IndexStorageMigrationProgress,
 } from "./indexingStorage";
 import {
@@ -196,6 +202,26 @@ import {
   MAC_DATA_VOLUME_ROOT,
 } from "./indexingPathPolicy";
 import { AestheticScorer, MagicItem, MagicPresetId, MagicRankResult } from "./aestheticScorer";
+import {
+  CACHE_DESTINATIONS,
+  copyBrowserSessionDataVerified,
+  copyCacheEntryVerified,
+  copyPathVerified,
+  getCacheDestinationEntryRoots,
+  getCacheDestinationEstimates,
+  hasExistingDefaultCacheProfile,
+  getCacheDestinationRoot,
+  getCacheEntryPath,
+  inspectCacheDestination,
+  isCacheDestinationId,
+  isProbablyRemovablePath,
+  measureCacheEntry,
+  readCacheDestinationRoots,
+  readCacheDestinationRootsSync,
+  writeCacheDestinationRoots,
+  type CacheDestinationId,
+  type CacheDestinationRoots,
+} from "./cacheDestinations";
 import {
   applyPendingImport,
   cancelStagedImport,
@@ -256,6 +282,32 @@ app.setPath(
   process.env.FILE_BROWSER_USER_DATA_DIR ||
     path.join(app.getPath("appData"), "file-browser-electron"),
 );
+
+// Electron keeps Chromium cache and web-session data under sessionData. Load a
+// configured location before Electron creates its default session; if an
+// external volume is missing or stalled, leave the original local location in
+// place so Silo can open and show the existing reconnect flow.
+const configuredSessionRoots = readCacheDestinationRootsSync(app.getPath("userData"));
+const sessionDestination = CACHE_DESTINATIONS.find((item) => item.id === "browser-session-data");
+const configuredSessionRoot = configuredSessionRoots?.["browser-session-data"];
+if (sessionDestination && configuredSessionRoot) {
+  const configuredSessionPath = path.join(configuredSessionRoot, sessionDestination.entry);
+  const sessionProbe = spawnSync(
+    process.execPath,
+  [
+      "-e",
+      "const fs=require('fs');const p=process.argv[1];if(!fs.statSync(p).isDirectory())process.exit(2);fs.accessSync(p,fs.constants.R_OK|fs.constants.W_OK)",
+      configuredSessionPath,
+    ],
+    {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      stdio: "ignore",
+      timeout: 1500,
+      windowsHide: true,
+    },
+  );
+  if (sessionProbe.status === 0) app.setPath("sessionData", configuredSessionPath);
+}
 
 function recommendedIndexStorageRoot(): string {
   const explicit = process.env.SILO_INDEX_STORAGE_ROOT;
@@ -407,9 +459,14 @@ function probeIndexStorageDestination(
     };
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("/bin/test", ["-d", storageRoot, "-a", "-w", storageRoot], {
+      child = spawn(process.execPath, [
+        "-e",
+        "const fs=require('fs');const p=process.argv[1];try{if(!fs.statSync(p).isDirectory())process.exit(1);fs.accessSync(p,fs.constants.R_OK|fs.constants.W_OK)}catch{process.exit(1)}",
+        storageRoot,
+      ], {
         stdio: "ignore",
         detached: true,
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
       });
     } catch {
       resolve("unresponsive");
@@ -423,6 +480,29 @@ function probeIndexStorageDestination(
     child.once("error", () => finish("unresponsive"));
     child.once("exit", (code) => finish(code === 0 ? "ok" : "missing"));
   });
+}
+
+async function probeCacheDestinationRoots(roots: CacheDestinationRoots) {
+  const destinations = CACHE_DESTINATIONS.map((item) => ({
+    id: item.id,
+    name: item.name,
+    root: getCacheDestinationRoot(item.id, roots, app.getPath("userData")),
+  }));
+  const uniqueRoots = Array.from(new Set(destinations.map((item) => item.root)));
+  const states = new Map<string, IndexStorageProbeResult>();
+  await Promise.all(uniqueRoots.map(async (root) =>
+    states.set(root, await probeIndexStorageDestination(root)),
+  ));
+  return destinations.filter((item) => states.get(item.root) !== "ok");
+}
+
+async function inspectCacheDestinationSafely(target: string) {
+  const probe = await probeIndexStorageDestination(target);
+  if (probe !== "ok")
+    throw new Error(probe === "unresponsive"
+      ? `Silo could not safely check ${target} because the drive did not respond. Reconnect it and try again.`
+      : `That cache folder is unavailable: ${target}`);
+  return inspectCacheDestination(target, app.getPath("userData"));
 }
 
 function volumeRootFor(storageRoot: string) {
@@ -588,7 +668,93 @@ function migrationProgressFraction(detail?: IndexStorageMigrationProgress) {
   return Math.min(1, detail.bytesVerified / detail.totalBytes);
 }
 
+async function openCacheDestinationSetup(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const setupPage = path.join(
+      app.getAppPath(),
+      app.isPackaged ? "build" : "public",
+      "cache-setup.html",
+    );
+    const window = new BrowserWindow({
+      width: 1060,
+      height: 850,
+      minWidth: 760,
+      minHeight: 650,
+      title: "Set up Silo storage",
+      backgroundColor: "#f4f6f8",
+      show: false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        preload: getPreloadPath(),
+        sandbox: true,
+      },
+    });
+    cacheSetupWindow = window;
+    cacheSetupResolve = resolve;
+    window.once("ready-to-show", () => window.show());
+    window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    window.on("closed", () => {
+      if (cacheSetupWindow === window) cacheSetupWindow = null;
+      const finish = cacheSetupResolve;
+      cacheSetupResolve = null;
+      finish?.(false);
+    });
+    void window.loadFile(setupPage).catch((error) => {
+      runtimeLog("cache-setup-window-failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      window.close();
+    });
+  });
+}
+
+async function validateCacheDestinationRoots(roots: CacheDestinationRoots) {
+  const normalized: CacheDestinationRoots = {};
+  for (const item of CACHE_DESTINATIONS) {
+    const selected = roots[item.id];
+    if (typeof selected !== "string" || !path.isAbsolute(selected))
+      throw new Error(`Choose a destination for ${item.name}.`);
+    const destination = await inspectCacheDestinationSafely(selected);
+    normalized[item.id] = destination.path;
+  }
+  return normalized;
+}
+
+function updateCacheDestinationExclusions() {
+  if (!cacheDestinationSettingsSaved) {
+    setIndexStorageExclusionRoots([indexStorageRoot]);
+    return;
+  }
+  setIndexStorageExclusionRoots(
+    getCacheDestinationEntryRoots(cacheDestinationRoots, indexStorageRoot),
+  );
+}
+
+function finishCacheDestinationSetup(complete: boolean) {
+  const finish = cacheSetupResolve;
+  cacheSetupResolve = null;
+  if (cacheSetupWindow && !cacheSetupWindow.isDestroyed())
+    cacheSetupWindow.close();
+  finish?.(complete);
+}
+
 async function requireIndexStorageSelection(userDataPath: string): Promise<boolean> {
+  try {
+    const savedCacheRoots = await readCacheDestinationRoots(userDataPath);
+    if (savedCacheRoots) {
+      cacheDestinationRoots = savedCacheRoots;
+      cacheDestinationSettingsSaved = true;
+      return true;
+    }
+  } catch (error) {
+    dialog.showErrorBox(
+      "Silo cache destinations need attention",
+      error instanceof Error ? error.message : String(error),
+    );
+    app.exit(1);
+    return false;
+  }
   const settings = await getIndexStorageSettings(userDataPath).catch(() => ({
     path: userDataPath,
     allowLocalFallback: true,
@@ -597,14 +763,24 @@ async function requireIndexStorageSelection(userDataPath: string): Promise<boole
   const selectedRoot = path.resolve(settings.path);
   const isDefaultBrowserLocation = selectedRoot === path.resolve(userDataPath);
   if (!isDefaultBrowserLocation) return true;
+  if (await hasExistingDefaultCacheProfile(userDataPath)) {
+    // Keep an existing profile on its current locations. The per-cache paths
+    // remain editable in Settings, where each move can copy and verify data.
+    return true;
+  }
 
-  if (await chooseIndexStorageFolder(
-    userDataPath,
-    "Choose or create a folder for Silo's indexes, caches, and settings. It can be on this computer or an external drive.",
-  )) return true;
+  if (await openCacheDestinationSetup()) return true;
+  const justConfiguredRoots = await readCacheDestinationRoots(userDataPath).catch(() => null);
+  if (justConfiguredRoots) {
+    cacheDestinationRoots = justConfiguredRoots;
+    cacheDestinationSettingsSaved = true;
+    app.relaunch();
+    app.quit();
+    return false;
+  }
   dialog.showErrorBox(
     "Silo storage destination required",
-    "Silo needs a storage folder before it can open. Reopen Silo to choose one.",
+    "Silo needs cache destinations before it can open. Reopen Silo to choose them.",
   );
   app.exit(1);
   return false;
@@ -628,8 +804,17 @@ interface MainIndexStorageStatus {
 }
 
 let indexStorageRoot = app.getPath("userData");
+let cacheDestinationRoots: CacheDestinationRoots = {};
+let cacheDestinationSettingsSaved = false;
+const cacheDestinationRoot = (id: CacheDestinationId) =>
+  getCacheDestinationRoot(id, cacheDestinationRoots, indexStorageRoot);
+const indexStoragePath = (...segments: string[]) => {
+  const [first, ...rest] = segments;
+  if (first && isCacheDestinationId(first))
+    return getCacheEntryPath(first, cacheDestinationRoots, indexStorageRoot, ...rest);
+  return path.join(indexStorageRoot, ...segments);
+};
 setActiveIndexStorageRoot(indexStorageRoot);
-const indexStoragePath = createIndexStoragePathResolver(() => indexStorageRoot);
 const diagnosticsDirectory = path.join(app.getPath("userData"), "diagnostics");
 const lifetimeLicensePath = path.join(
   app.getPath("userData"),
@@ -2539,6 +2724,8 @@ interface SearchIndexReadiness {
 }
 
 let mainWindow: BrowserWindow | null = null;
+let cacheSetupWindow: BrowserWindow | null = null;
+let cacheSetupResolve: ((complete: boolean) => void) | null = null;
 let searchIndexReadiness: SearchIndexReadiness = {
   status: "preparing",
   percentage: 0,
@@ -2677,7 +2864,7 @@ let memoryMetadataSnapshot: {
 } | null = null;
 type ScoredMemoryMedia = MemoryMedia & { score: number; size?: number; magicScore?: number };
 const MEMORY_VIDEO_EXTENSIONS = new Set([".mov", ".mp4", ".m4v", ".webm"]);
-const MEMORY_PREVIEW_RENDER_VERSION = 7;
+const MEMORY_PREVIEW_RENDER_VERSION = 8;
 const MEMORY_DUPLICATE_SIMILARITY = 0.85;
 
 function memoryFileMetadata(filePath: string): FileMetadata | undefined {
@@ -2709,11 +2896,16 @@ function memoryObviousNonPhotoPath(filePath: unknown): boolean {
 }
 
 /** Strict and toggle-independent: ignores showNsfw/showBannedPeople and folder reveal views. */
-function memoryAllowed(filePath: unknown): boolean {
+function memoryAllowed(filePath: unknown, media?: Pick<MemoryMedia, "promptedMemoryFolderId">): boolean {
   if (typeof filePath !== "string" || !filePath || filePath.includes("\0"))
     return false;
   if (memoryObviousNonPhotoPath(filePath)) return false;
   if (!stateStore || !faceIndexer) return false;
+  const promptedFolderContext = hasValidPromptedMemoryFolderContext(
+    filePath,
+    media,
+    stateStore.getSearchState().digitalFolders ?? [],
+  );
   const hidden = getHiddenFolderPaths();
   // Hidden-folder entries may be directories; their descendants are hidden too.
   for (let current = filePath; ; ) {
@@ -2724,42 +2916,53 @@ function memoryAllowed(filePath: unknown): boolean {
   }
   if (
     faceIndexer.getBannedPhotoPaths().has(filePath) ||
-    semanticUnsafePaths.has(filePath) ||
+    (!promptedFolderContext && semanticUnsafePaths.has(filePath)) ||
     memoryUnsafeVideoPaths.has(filePath)
   )
     return false;
-  return !fileTextLooksExplicit(
+  return promptedFolderContext || !fileTextLooksExplicit(
     { name: path.basename(filePath), path: filePath },
     memoryFileMetadata(filePath),
   );
 }
 
-const MEMORY_EXPLICIT_SCORE_THRESHOLD = 0.2;
-const MEMORY_EXPLICIT_SCORE_MARGIN = 0.008;
 const MEMORY_NSFW_VISUAL_PROMPT =
-  "adult nudity including exposed breasts or nipples, topless people, exposed genitals, pornography, sexual acts, erotic or fetish imagery, lingerie, sexualized posing";
+  "explicit adult sexual content, pornography, visible genitals or nipples, graphic nudity, erotic fetish imagery";
+const MEMORY_SAFE_VISUAL_PROMPT =
+  "a non-explicit everyday personal photograph, including adults kissing affectionately, people in ordinary bathing suits or bikinis at a beach or pool, ordinary bare skin such as shoulders, legs and midriff, fully clothed people, landscapes and objects";
 let memoryExplicitPromptVectors: Promise<{ unsafe: Float32Array; safe: Float32Array }> | null = null;
 const memoryContentSafetyCache = new Map<string, { fingerprint: string; allowed: boolean; checkedAt: number }>();
 const memoryContentSafetyInFlight = new Map<string, Promise<boolean>>();
 
 function getMemoryExplicitPromptVectors(): Promise<{ unsafe: Float32Array; safe: Float32Array }> {
-  if (!memoryExplicitPromptVectors) {
-    memoryExplicitPromptVectors = semanticIndexer.embedPrompts([
-      `a photo of ${MEMORY_NSFW_VISUAL_PROMPT}`,
-      `a photo of ${SAFE_VISUAL_PROMPT}`,
-    ]).then(([unsafe, safe]) => ({ unsafe, safe }));
-    memoryExplicitPromptVectors.catch(() => { memoryExplicitPromptVectors = null; });
-  }
-  return memoryExplicitPromptVectors;
+  if (memoryExplicitPromptVectors) return memoryExplicitPromptVectors;
+  const pending = semanticIndexer.embedPrompts([
+    `a photo of ${MEMORY_NSFW_VISUAL_PROMPT}`,
+    `a photo of ${MEMORY_SAFE_VISUAL_PROMPT}`,
+  ]).then(([unsafe, safe]) => ({ unsafe, safe }));
+  memoryExplicitPromptVectors = pending;
+  pending.catch(() => { memoryExplicitPromptVectors = null; });
+  return pending;
 }
 
 /**
  * Memory-only visual safety gate. Reuses the unsafe/safe score boundary from
  * Silo's safety index; missing vectors or classifier failures fail closed.
  */
-async function memoryContentAllowed(filePath: unknown): Promise<boolean> {
-  if (!memoryAllowed(filePath) || !semanticIndexer || typeof filePath !== "string") return false;
-  const inFlight = memoryContentSafetyInFlight.get(filePath);
+async function memoryContentAllowed(filePath: unknown, media?: MemoryMedia): Promise<boolean> {
+  if (typeof filePath !== "string" || !semanticIndexer) return false;
+  const folders = stateStore?.getSearchState().digitalFolders ?? [];
+  const promptedFolderContext = media?.type === "image" &&
+    hasValidPromptedMemoryFolderContext(filePath, media, folders);
+  if (!memoryAllowed(filePath, media)) return false;
+  if (promptedFolderContext) {
+    try {
+      const localPath = await resolveLocalPath(filePath);
+      return (await fsPromises.stat(localPath)).isFile();
+    } catch { return false; }
+  }
+  const cacheKey = `${filePath}\0`;
+  const inFlight = memoryContentSafetyInFlight.get(cacheKey);
   if (inFlight) return inFlight;
   const check = (async () => {
     try {
@@ -2767,7 +2970,7 @@ async function memoryContentAllowed(filePath: unknown): Promise<boolean> {
       const stat = await fsPromises.stat(localPath);
       if (!stat.isFile()) return false;
       const fingerprint = `${stat.size}:${stat.mtimeMs}`;
-      const cached = memoryContentSafetyCache.get(filePath);
+      const cached = memoryContentSafetyCache.get(cacheKey);
       if (cached?.fingerprint === fingerprint && Date.now() - cached.checkedAt < 6 * 60 * 60 * 1000)
         return cached.allowed;
 
@@ -2782,20 +2985,19 @@ async function memoryContentAllowed(filePath: unknown): Promise<boolean> {
       const unsafe = memoryDot(prompts.unsafe, imageVector);
       const safe = memoryDot(prompts.safe, imageVector);
       if (!Number.isFinite(unsafe) || !Number.isFinite(safe)) return false;
-      const allowed = !(unsafe >= MEMORY_EXPLICIT_SCORE_THRESHOLD &&
-        unsafe - safe >= MEMORY_EXPLICIT_SCORE_MARGIN);
+      const allowed = !isMemoryVisualContentExplicit(unsafe, safe);
       if (memoryContentSafetyCache.size >= 8000)
         memoryContentSafetyCache.delete(memoryContentSafetyCache.keys().next().value!);
-      memoryContentSafetyCache.set(filePath, { fingerprint, allowed, checkedAt: Date.now() });
+      memoryContentSafetyCache.set(cacheKey, { fingerprint, allowed, checkedAt: Date.now() });
       return allowed;
     } catch {
       // A photo whose visual content could not be checked must not enter a Memory.
       return false;
     }
   })();
-  memoryContentSafetyInFlight.set(filePath, check);
+  memoryContentSafetyInFlight.set(cacheKey, check);
   try { return await check; }
-  finally { memoryContentSafetyInFlight.delete(filePath); }
+  finally { memoryContentSafetyInFlight.delete(cacheKey); }
 }
 
 /** Search results may be any indexed image format or size; safety/path filters and
@@ -2937,6 +3139,7 @@ function memoryPathInRoots(filePath: string, roots: string[]): boolean {
 
 type MemoryPromptContext = {
   folderPaths: Set<string> | null;
+  promptedFolderIdsByPath: Map<string, string>;
   placePaths: Set<string> | null;
   peoplePaths: Set<string>[];
 };
@@ -2946,11 +3149,15 @@ function memoryPromptContext(query: string, roots: string[]): MemoryPromptContex
   const state = stateStore.getState();
   let matchedFolder = false;
   const folderPaths = new Set<string>();
+  const promptedFolderIdsByPath = new Map<string, string>();
   for (const folder of state.digitalFolders) {
     if (!memoryNameMatches(folder.name, query)) continue;
     matchedFolder = true;
-    for (const filePath of folder.filePaths)
-      if (memoryPathInRoots(filePath, roots)) folderPaths.add(filePath);
+    for (const filePath of folder.filePaths) {
+      if (!memoryPathInRoots(filePath, roots)) continue;
+      folderPaths.add(filePath);
+      promptedFolderIdsByPath.set(filePath, folder.id);
+    }
   }
 
   let matchedPlace = false;
@@ -2992,31 +3199,51 @@ function memoryPromptContext(query: string, roots: string[]): MemoryPromptContex
   }
   return {
     folderPaths: matchedFolder ? folderPaths : null,
+    promptedFolderIdsByPath,
     placePaths: matchedPlace ? placePaths : null,
     peoplePaths: Array.from(peopleByName.values()).filter((paths) => paths.size > 0),
   };
 }
 
 function applyMemoryPromptContext(media: ScoredMemoryMedia[], context: MemoryPromptContext): ScoredMemoryMedia[] {
-  return media.flatMap((item) => {
-    if (context.folderPaths && !context.folderPaths.has(item.path)) return [];
-    if (context.placePaths && !context.placePaths.has(item.path)) return [];
+  const recognized = Number(context.folderPaths !== null) + Number(context.placePaths !== null) + context.peoplePaths.length;
+  return media.map((item) => {
+    const folderMatch = context.folderPaths?.has(item.path) ?? false;
+    const placeMatch = context.placePaths?.has(item.path) ?? false;
     const peoplePresent = item.type === "image"
       ? context.peoplePaths.reduce((count, paths) => count + Number(paths.has(item.path)), 0)
       : 0;
-    const peopleBoost = peoplePresent > 1 ? 42 + (peoplePresent - 2) * 8 : peoplePresent ? 5 : 0;
-    return [{ ...item, score: item.score + peopleBoost }];
+    const matched = Number(folderMatch) + Number(placeMatch) + peoplePresent;
+    // Keep separate entity hits as a union fallback. Photos matching multiple
+    // named people, places, and folders rise above them as the preferred set.
+    const cooccurrenceBoost = matched > 1 ? 28 + (matched - 2) * 12 : 0;
+    const completeMatchBoost = recognized > 1 && matched === recognized ? 32 : 0;
+    const score = item.score + Number(folderMatch) * 24 + Number(placeMatch) * 24
+      + peoplePresent * 20 + cooccurrenceBoost + completeMatchBoost;
+    const folderId = item.type === "image" ? context.promptedFolderIdsByPath.get(item.path) : undefined;
+    return { ...item, score,
+      ...(folderId ? { promptedMemoryFolderId: folderId } : {}) };
   });
 }
 
 /** Photos the user has named via digital folders, people, pets, keywords or virtual names. */
-async function namedMemoryMedia(query: string, roots: string[]): Promise<ScoredMemoryMedia[]> {
+async function namedMemoryMedia(
+  query: string,
+  roots: string[],
+  allowPromptedFolderOverride = false,
+): Promise<ScoredMemoryMedia[]> {
   const normalizedQuery = query.trim().toLocaleLowerCase();
   if (normalizedQuery.length < 3) return [];
   const state = stateStore.getState();
   const paths = new Set<string>();
-  for (const folder of state.digitalFolders)
-    if (memoryNameMatches(folder.name, normalizedQuery)) folder.filePaths.forEach((filePath) => paths.add(filePath));
+  const promptedFolderIdsByPath = new Map<string, string>();
+  for (const folder of state.digitalFolders) {
+    if (!memoryNameMatches(folder.name, normalizedQuery)) continue;
+    for (const filePath of folder.filePaths) {
+      paths.add(filePath);
+      promptedFolderIdsByPath.set(filePath, folder.id);
+    }
+  }
   for (const person of faceIndexer.getPeople())
     if (memoryNameMatches(person.name, normalizedQuery))
       faceIndexer.getPerson(person.id)?.confirmedPhotoPaths.forEach((filePath) => paths.add(filePath));
@@ -3041,7 +3268,8 @@ async function namedMemoryMedia(query: string, roots: string[]): Promise<ScoredM
   }
   const eligible = [...paths].filter((filePath) =>
     MEMORY_NAMED_IMAGE_EXTENSIONS.has(path.extname(filePath).toLowerCase())
-    && memoryAllowed(filePath)
+    && memoryAllowed(filePath, allowPromptedFolderOverride && promptedFolderIdsByPath.has(filePath)
+      ? { promptedMemoryFolderId: promptedFolderIdsByPath.get(filePath)! } : undefined)
     && roots.some((root) => filePath === root || filePath.startsWith(root.endsWith(path.sep) ? root : root + path.sep)));
   // Spread a large named collection across the whole set instead of its first entries.
   const step = Math.max(1, eligible.length / 160);
@@ -3057,7 +3285,10 @@ async function namedMemoryMedia(query: string, roots: string[]): Promise<ScoredM
     }));
     for (const entry of stats)
       if (entry) media.push({ path: entry.filePath, name: path.basename(entry.filePath), type: "image",
-        modified: entry.stat.mtimeMs, size: entry.stat.size, score: 100 });
+        modified: entry.stat.mtimeMs, size: entry.stat.size, score: 100,
+        ...(allowPromptedFolderOverride && promptedFolderIdsByPath.has(entry.filePath)
+          ? { promptedMemoryFolderId: promptedFolderIdsByPath.get(entry.filePath)! }
+          : {}) });
   }
   return media;
 }
@@ -3286,8 +3517,10 @@ async function searchPromptedMemoryMedia(query: string, contextQuery = query): P
   // Names the user saved are strong prompt anchors: retain them alongside
   // semantic matches so folder/person/place prompts can seed a memory even
   // when the visual model scores those photos below its normal confidence floor.
-  for (const candidate of await namedMemoryMedia(cleanQuery, roots))
-    byPath.set(candidate.path, candidate);
+  for (const namedQuery of new Set([cleanQuery, cleanContextQuery])) {
+    for (const candidate of await namedMemoryMedia(namedQuery, roots, true))
+      byPath.set(candidate.path, candidate);
+  }
   for (const file of matches) {
     const candidate = promptedVideoPhotoCandidate(file, musicDirectories);
     if (candidate && (!byPath.has(candidate.path) || byPath.get(candidate.path)!.score < candidate.score))
@@ -3327,9 +3560,16 @@ async function searchPromptedMemoryMedia(query: string, contextQuery = query): P
   const vectors = await semanticIndexer.getImageVectors(promptedCandidates.map((photo) => photo.path));
   const photos = promptedCandidates.filter((photo) => {
     const vector = vectors.get(photo.path);
-    return !vector || !memoryImageIsObviousNonPhoto(vector, prompts);
+    const folderContext = hasValidPromptedMemoryFolderContext(
+      photo.path, photo, stateStore.getSearchState().digitalFolders ?? [],
+    );
+    return folderContext || !vector || !memoryImageIsObviousNonPhoto(vector, prompts);
   }).sort((first, second) => second.score - first.score).slice(0, 160);
-  const videos = await memoryVideoMatchesForPhotos(cleanQuery, photos);
+  // Adjacent-clip discovery is useful for the complete prompt, but repeating
+  // it for every entity clause multiplies directory walks and frame inference.
+  const videos = cleanQuery.toLocaleLowerCase() === cleanContextQuery.toLocaleLowerCase()
+    ? await memoryVideoMatchesForPhotos(cleanQuery, photos)
+    : [];
   return [...photos, ...videos];
 }
 
@@ -3674,9 +3914,9 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   const modified = new Map(images.map((image) => [image.path, image.captured ?? image.modified]));
   const topics = profile.getSnapshot()?.topics ?? [];
   const concepts: DiscoveredConcept[] = topics.filter((topic) => topic.estimatedCount >= 5).slice(0, 18)
-    .map((topic) => ({ id: topic.id, paths: topic.paths.filter(memoryAllowed), count: topic.estimatedCount }));
+    .map((topic) => ({ id: topic.id, paths: topic.paths.filter((filePath) => memoryAllowed(filePath)), count: topic.estimatedCount }));
   const signals: TopicSignal[] = topics.map((topic) => ({ id: topic.id, interest: topic.interest, lift: topic.lift,
-    recentCount: topic.recentCount, recentPaths: topic.recentPaths.filter(memoryAllowed) }));
+    recentCount: topic.recentCount, recentPaths: topic.recentPaths.filter((filePath) => memoryAllowed(filePath)) }));
   const places = geoIndexer
     ? getVisibleDemoMapPhotos(
         geoIndexer.getState().photos,
@@ -3794,7 +4034,7 @@ async function verifyMemoryExport(options: MemoryExportOptions) {
   if (options.count < minimumCount || options.count > maximumCount)
     throw new Error(`Choose ${minimumCount} to ${maximumCount} items to keep this memory moving briskly.`);
   const mediaSafety = await Promise.all(suggestion.media.map(async (file) =>
-    await memoryContentAllowed(file.path) &&
+    await memoryContentAllowed(file.path, file) &&
     (!file.liveVideoPath || await memoryContentAllowed(file.liveVideoPath))));
   if (!mediaSafety.every(Boolean))
     throw new Error("This memory contains photos that failed the current content safety check. Regenerate suggestions before exporting.");
@@ -4317,10 +4557,7 @@ function registerMediaProtocols() {
       return new Response("Not found", { status: 404 });
     }
   });
-  const thumbnailDirectory = path.join(
-    indexStorageRoot,
-    "thumbnail-cache",
-  );
+  const thumbnailDirectory = indexStoragePath("thumbnail-cache");
   protocol.handle("thumb", async (request) => {
     const fileName = new URL(request.url).pathname.slice(1);
     // Only content-hash names from getThumbnail are servable; blocks path traversal.
@@ -4989,10 +5226,7 @@ let thumbnailCacheReady: Promise<void> | null = null;
 /** Version 1 stored QuickLook placeholder icons as thumbnails; move that cache aside and delete it in the background. */
 function ensureThumbnailCacheVersion() {
   thumbnailCacheReady ??= (async () => {
-    const cacheDirectory = path.join(
-      indexStorageRoot,
-      "thumbnail-cache",
-    );
+    const cacheDirectory = indexStoragePath("thumbnail-cache");
     const versionPath = path.join(cacheDirectory, ".version");
     const current = await fsPromises
       .readFile(versionPath, "utf8")
@@ -8054,13 +8288,11 @@ async function sourceIncludesSiloAppData(sourcePath: string): Promise<boolean> {
 async function isSiloInternalRoot(sourcePath: string): Promise<boolean> {
   if (isRemotePath(sourcePath)) return false;
   const appDataPath = path.resolve(app.getPath("userData"));
-  const indexDataPath = path.resolve(indexStorageRoot);
-  const canonicalAppDataPath = await fsPromises
-    .realpath(appDataPath)
-    .catch(() => appDataPath);
-  const canonicalIndexDataPath = await fsPromises
-    .realpath(indexDataPath)
-    .catch(() => indexDataPath);
+  const indexDataRoots = getIndexStorageExclusionRoots();
+  const canonicalAppDataPath = await fsPromises.realpath(appDataPath).catch(() => appDataPath);
+  const canonicalIndexDataRoots = await Promise.all(
+    indexDataRoots.map((root) => fsPromises.realpath(root).catch(() => root)),
+  );
   const canonicalSourcePath = await fsPromises
     .realpath(sourcePath)
     .catch(() => path.resolve(sourcePath));
@@ -8072,8 +8304,8 @@ async function isSiloInternalRoot(sourcePath: string): Promise<boolean> {
       appDataPath,
       canonicalAppDataPath,
     ) ||
-    isPathWithin(path.resolve(sourcePath), indexDataPath) ||
-    isPathWithin(canonicalSourcePath, canonicalIndexDataPath)
+    indexDataRoots.some((root) => isPathWithin(path.resolve(sourcePath), root)) ||
+    canonicalIndexDataRoots.some((root) => isPathWithin(canonicalSourcePath, root))
   );
 }
 
@@ -8189,10 +8421,10 @@ async function createUnifiedScanSource() {
   const canonicalAppDataPath = await fsPromises
     .realpath(appDataPath)
     .catch(() => appDataPath);
-  const indexDataPath = path.resolve(indexStorageRoot);
-  const canonicalIndexDataPath = await fsPromises
-    .realpath(indexDataPath)
-    .catch(() => indexDataPath);
+  const indexDataRoots = getIndexStorageExclusionRoots();
+  const canonicalIndexDataRoots = await Promise.all(
+    indexDataRoots.map((root) => fsPromises.realpath(root).catch(() => root)),
+  );
   return async (
     sourcePath: string,
     onFile: (file: any) => void,
@@ -8247,9 +8479,9 @@ async function createUnifiedScanSource() {
         canonicalSourcePath,
         path.relative(sourcePath, candidatePath),
       );
-      return (
-        isPathWithin(resolvedPath, indexDataPath) ||
-        isPathWithin(canonicalPath, canonicalIndexDataPath)
+      return indexDataRoots.some((root, index) =>
+        isPathWithin(resolvedPath, root) ||
+        isPathWithin(canonicalPath, canonicalIndexDataRoots[index]),
       );
     };
     const isSiloPrivatePath = (candidatePath: string) =>
@@ -8793,6 +9025,31 @@ async function monitorIndexStorageAvailability() {
     return;
   indexStorageMonitorRunning = true;
   try {
+    if (cacheDestinationSettingsSaved) {
+      const unavailable = await probeCacheDestinationRoots(cacheDestinationRoots);
+      indexStorageMissingRoots = Array.from(new Set(unavailable.map((item) => item.root)));
+      indexStorageDestinationAvailable = unavailable.length === 0;
+      indexStorageUsingLocalFallback = false;
+      indexStorageFreeBytes = null;
+      if (unavailable.length) {
+        const message = `Silo cannot reach these cache destinations: ${unavailable.map((item) => `${item.name} (${item.root})`).join("; ")}. Reconnect the drive, or open Settings → Silo cache destination and locate the existing cache. Indexing is paused until every destination is available.`;
+        if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
+          await pauseIndexingForStorage(message);
+        else {
+          indexStorageUnavailableMessage = message;
+          publishIndexStorageStatus(message);
+        }
+        return;
+      }
+      if (!indexStorageAvailable) {
+        await resumeIndexingAfterStorage();
+        return;
+      }
+      indexStorageUnavailableMessage = null;
+      publishIndexStorageStatus(null);
+      return;
+    }
+
     const externalDestination =
       path.resolve(selectedIndexStorageRoot) !== path.resolve(app.getPath("userData"));
     const destinationAvailable = await checkSelectedIndexStorageAvailable();
@@ -8949,105 +9206,139 @@ app.whenReady().then(async () => {
   const userDataPath = app.getPath("userData");
   if (!(await requireIndexStorageSelection(userDataPath))) return;
   let storage: Awaited<ReturnType<typeof prepareConfiguredIndexStorage>>;
-  const startupStorageProgress = createStartupStorageProgress();
-  let useLocalCacheThisSession = false;
-  for (;;) {
-    let watchdog: NodeJS.Timeout | null = null;
-    try {
-      const savedSettings = await getIndexStorageSettings(userDataPath).catch(() => null);
-      const savedRoot = savedSettings ? path.resolve(savedSettings.path) : null;
-      const external = Boolean(savedRoot && savedRoot !== path.resolve(userDataPath));
-      if (external && !useLocalCacheThisSession) {
-        const probe = await probeIndexStorageDestination(savedRoot!);
-        runtimeLog("index-storage-probe", { result: probe });
-        if (probe === "unresponsive") {
-          const choice = await recoverUnresponsiveIndexStorage(savedRoot!);
-          if (choice === "quit") {
-            app.quit();
-            return;
-          }
-          if (choice === "retry") continue;
-          useLocalCacheThisSession = true;
-        }
-      }
-      let lastProgressAt = Date.now();
-      let stallCheckRunning = false;
-      if (external && !useLocalCacheThisSession)
-        watchdog = setInterval(() => {
-          if (stallCheckRunning || indexStorageRecoveryPromptOpen || Date.now() - lastProgressAt < 45_000)
-            return;
-          stallCheckRunning = true;
-          void probeIndexStorageDestination(savedRoot!).then(async (probe) => {
-            if (probe !== "unresponsive") {
-              lastProgressAt = Date.now();
+  if (cacheDestinationSettingsSaved) {
+    const missing = await probeCacheDestinationRoots(cacheDestinationRoots);
+    const semanticRoot = getCacheDestinationRoot(
+      "semantic-index",
+      cacheDestinationRoots,
+      app.getPath("userData"),
+    );
+    const missingRoots = Array.from(new Set(missing.map((item) => item.root)));
+    storage = {
+      storageRoot: semanticRoot,
+      selectedStorageRoot: semanticRoot,
+      usingLocalFallback: false,
+      destinationAvailable: missing.length === 0,
+      localFallbackEnabled: false,
+      migrationCompleted: false,
+      migrationError: missing.length
+        ? `These Silo cache destinations are unavailable: ${missing.map((item) => `${item.name}: ${item.root}`).join("; ")}`
+        : null,
+      missingRoots,
+      filesVerified: 0,
+      bytesVerified: 0,
+    };
+  } else {
+    const startupStorageProgress = createStartupStorageProgress();
+    let useLocalCacheThisSession = false;
+    for (;;) {
+      let watchdog: NodeJS.Timeout | null = null;
+      try {
+        const savedSettings = await getIndexStorageSettings(userDataPath).catch(() => null);
+        const savedRoot = savedSettings ? path.resolve(savedSettings.path) : null;
+        const external = Boolean(savedRoot && savedRoot !== path.resolve(userDataPath));
+        if (external && !useLocalCacheThisSession) {
+          const probe = await probeIndexStorageDestination(savedRoot!);
+          runtimeLog("index-storage-probe", { result: probe });
+          if (probe === "unresponsive") {
+            const choice = await recoverUnresponsiveIndexStorage(savedRoot!);
+            if (choice === "quit") {
+              app.quit();
               return;
             }
-            startupStorageProgress.update(
-              "The drive stopped responding",
-              "Waiting for your choice…",
-              null,
-            );
-            // Ejecting makes the stuck file calls fail, which ends this attempt
-            // and returns to the retry dialog below.
-            await recoverUnresponsiveIndexStorage(savedRoot!);
-            lastProgressAt = Date.now();
-          }).finally(() => {
-            stallCheckRunning = false;
-          });
-        }, 10_000);
-      storage = await prepareConfiguredIndexStorage(
-        userDataPath,
-        (filesVerified, bytesVerified, detail) => {
-          lastProgressAt = Date.now();
-          runtimeLog("index-storage-migration-progress", {
-            filesVerified,
-            bytesVerified,
-            phase: detail?.phase,
-            totalFiles: detail?.totalFiles,
-            totalBytes: detail?.totalBytes,
-          });
-          if (detail)
-            startupStorageProgress.update(
-              "Moving Silo's cache back to your drive",
-              describeIndexStorageMigrationProgress(detail),
-              migrationProgressFraction(detail),
-            );
-        },
-        { destinationUnavailable: useLocalCacheThisSession },
-      );
-      if (watchdog) clearInterval(watchdog);
-      startupStorageProgress.close();
-      break;
-    } catch (error) {
-      if (watchdog) clearInterval(watchdog);
-      startupStorageProgress.close();
-      const message = error instanceof Error ? error.message : String(error);
-      runtimeLog("index-storage-initialization-failed", { message });
-      const savedRoot = await getIndexStorageSettings(userDataPath)
-        .then((settings) => settings.path)
-        .catch(() => undefined);
-      const savedLabel = savedRoot ? path.basename(savedRoot) : "saved folder";
-      // Recover in place: retry the saved folder or pick another without relaunching.
-      const { response } = await dialog.showMessageBox({
-        type: "warning",
-        message: "Silo couldn't prepare its storage folder",
-        detail: `${message}\n\n${savedRoot ? `Saved cache folder:\n${savedRoot}\n\n` : ""}Existing index files were preserved. Retry the saved folder, or choose where your Silo cache lives.`,
-        buttons: [`Retry ${savedLabel}`, "Choose folder…", "Quit"],
-        defaultId: 0,
-        cancelId: 2,
-        noLink: true,
-      });
-      if (response === 2) {
-        app.quit();
-        return;
-      }
-      if (response === 1)
-        await chooseIndexStorageFolder(
+            if (choice === "retry") continue;
+            useLocalCacheThisSession = true;
+          }
+        }
+        let lastProgressAt = Date.now();
+        let stallCheckRunning = false;
+        if (external && !useLocalCacheThisSession)
+          watchdog = setInterval(() => {
+            if (stallCheckRunning || indexStorageRecoveryPromptOpen || Date.now() - lastProgressAt < 45_000)
+              return;
+            stallCheckRunning = true;
+            void probeIndexStorageDestination(savedRoot!).then(async (probe) => {
+              if (probe !== "unresponsive") {
+                lastProgressAt = Date.now();
+                return;
+              }
+              startupStorageProgress.update(
+                "The drive stopped responding",
+                "Waiting for your choice…",
+                null,
+              );
+              await recoverUnresponsiveIndexStorage(savedRoot!);
+              lastProgressAt = Date.now();
+            }).finally(() => {
+              stallCheckRunning = false;
+            });
+          }, 10_000);
+        storage = await prepareConfiguredIndexStorage(
           userDataPath,
-          "Choose the folder that holds Silo's indexes and caches.",
-          savedRoot,
+          (filesVerified, bytesVerified, detail) => {
+            lastProgressAt = Date.now();
+            runtimeLog("index-storage-migration-progress", {
+              filesVerified,
+              bytesVerified,
+              phase: detail?.phase,
+              totalFiles: detail?.totalFiles,
+              totalBytes: detail?.totalBytes,
+            });
+            if (detail)
+              startupStorageProgress.update(
+                "Moving Silo's cache back to your drive",
+                describeIndexStorageMigrationProgress(detail),
+                migrationProgressFraction(detail),
+              );
+          },
+          { destinationUnavailable: useLocalCacheThisSession },
         );
+        if (watchdog) clearInterval(watchdog);
+        startupStorageProgress.close();
+        break;
+      } catch (error) {
+        if (watchdog) clearInterval(watchdog);
+        startupStorageProgress.close();
+        const message = error instanceof Error ? error.message : String(error);
+        runtimeLog("index-storage-initialization-failed", { message });
+        const savedRoot = await getIndexStorageSettings(userDataPath)
+          .then((settings) => settings.path)
+          .catch(() => undefined);
+        const savedLabel = savedRoot ? path.basename(savedRoot) : "saved folder";
+        const { response } = await dialog.showMessageBox({
+          type: "warning",
+          message: "Silo couldn't prepare its storage folder",
+          detail: `${message}\n\n${savedRoot ? `Saved cache folder:\n${savedRoot}\n\n` : ""}Existing index files were preserved. Retry the saved folder, or choose where your Silo cache lives.`,
+          buttons: [`Retry ${savedLabel}`, "Choose folder…", "Quit"],
+          defaultId: 0,
+          cancelId: 2,
+          noLink: true,
+        });
+        if (response === 2) {
+          app.quit();
+          return;
+        }
+        if (response === 1)
+          await chooseIndexStorageFolder(
+            userDataPath,
+            "Choose the folder that holds Silo's indexes and caches.",
+            savedRoot,
+          );
+      }
     }
+  }
+  if (!cacheDestinationSettingsSaved && storage.destinationAvailable) {
+    const legacyRoots: CacheDestinationRoots = {};
+    for (const item of CACHE_DESTINATIONS)
+      legacyRoots[item.id] = storage.storageRoot;
+    await copyBrowserSessionDataVerified(
+      app.getPath("sessionData"),
+      storage.storageRoot,
+      userDataPath,
+    );
+    await writeCacheDestinationRoots(userDataPath, legacyRoots);
+    cacheDestinationRoots = legacyRoots;
+    cacheDestinationSettingsSaved = true;
   }
   indexStorageRoot = storage.storageRoot;
   selectedIndexStorageRoot = storage.selectedStorageRoot;
@@ -9056,6 +9347,7 @@ app.whenReady().then(async () => {
   indexStorageDestinationAvailable = storage.destinationAvailable;
   indexStorageMissingRoots = storage.missingRoots;
   setActiveIndexStorageRoot(indexStorageRoot);
+  updateCacheDestinationExclusions();
   indexStorageAvailable =
     storage.destinationAvailable ||
     (storage.usingLocalFallback && storage.localFallbackEnabled && !storage.migrationError);
@@ -9166,7 +9458,7 @@ app.whenReady().then(async () => {
     : path.join(app.getAppPath(), ".model-test-cache");
   const unifiedScanSource = await createUnifiedScanSource();
   libraryStatsManager = new LibraryStatsManager(
-    indexStorageRoot,
+    cacheDestinationRoot("library-stats.json"),
     (sourcePath, onFile, isCancelled) =>
       unifiedScanSource(sourcePath, (file) => onFile(file), isCancelled),
   );
@@ -9212,7 +9504,7 @@ app.whenReady().then(async () => {
         scheduleThumbnailPregeneration(progress.status === "indexing");
     },
     logIndexingDiagnostic,
-    indexStorageRoot,
+    cacheDestinationRoot("semantic-index"),
   );
   semanticIndexer.setPerformanceSettings(
     contentSettingsStore.getSearchPerformanceSnapshot().settings,
@@ -9348,7 +9640,7 @@ app.whenReady().then(async () => {
       if (statusChanged)
         scheduleThumbnailPregeneration(progress.status === "indexing");
     },
-    indexStorageRoot,
+    cacheDestinationRoot("face-index"),
     contentSettingsStore.getSearchPerformanceSnapshot().settings
       .backgroundWorkPercent,
     () => activeInteractiveSearches > 0,
@@ -9390,8 +9682,7 @@ app.whenReady().then(async () => {
     thumbnailFile: async (filePath) => {
       const url = await getThumbnail(await resolveLocalPath(filePath));
       return url
-        ? path.join(
-            indexStorageRoot,
+        ? indexStoragePath(
             "thumbnail-cache",
             url.slice(url.lastIndexOf("/") + 1),
           )
@@ -9404,7 +9695,7 @@ app.whenReady().then(async () => {
         return url
           ? {
               file: path.join(
-                indexStorageRoot,
+                cacheDestinationRoot("thumbnail-cache"),
                 "thumbnail-cache",
                 url.slice(url.lastIndexOf("/") + 1),
               ),
@@ -9442,7 +9733,7 @@ app.whenReady().then(async () => {
     },
   });
   petIndexer = new PetIndexer(
-    indexStorageRoot,
+    cacheDestinationRoot("pets"),
     indexStoragePath("semantic-index"),
     semanticIndexer,
   );
@@ -9506,7 +9797,7 @@ app.whenReady().then(async () => {
   );
   googleManager = new GoogleManager(
     app.getPath("userData"),
-    indexStorageRoot,
+    cacheDestinationRoot("cloud-cache"),
   );
   if (!indexStorageInitializationDeferred)
     await googleManager.initialize(
@@ -9565,15 +9856,19 @@ app.whenReady().then(async () => {
     // Progress events carry counts only; the renderer fetches photos when photosVersion changes.
     sendToRenderer("geo-index-progress", state);
     scheduleThumbnailPregeneration();
-  }, indexStorageRoot);
+  }, cacheDestinationRoot("geo-index.jsonl"));
   const geoLoad = indexStorageInitializationDeferred
     ? Promise.resolve()
     : geoIndexer.initialize();
-  geocoder = new Geocoder(app.getPath("userData"), indexStorageRoot);
+  geocoder = new Geocoder(
+    app.getPath("userData"),
+    cacheDestinationRoot("geocode-cache.json"),
+    cacheDestinationRoot("geocode-search-cache.json"),
+  );
   if (!indexStorageInitializationDeferred) await geocoder.initialize();
   duplicateManager = new DuplicateManager(app.getPath("userData"), (state) => {
     sendToRenderer("duplicate-progress", filterDuplicateState(state));
-  }, indexStorageRoot);
+  }, cacheDestinationRoot("duplicate-index.json"));
   const duplicateLoad = indexStorageInitializationDeferred
     ? Promise.resolve()
     : duplicateManager.initialize();
@@ -9624,7 +9919,7 @@ app.whenReady().then(async () => {
     if (result.status === "rejected")
       runtimeLog("startup-load-error", { message: String(result.reason) });
   }
-  audioLibraryCache = new AudioLibraryCache(indexStorageRoot);
+  audioLibraryCache = new AudioLibraryCache(cacheDestinationRoot("audio-library-index.json"));
   if (!indexStorageInitializationDeferred) await audioLibraryCache.initialize();
   geoIndexer.setOverrides(stateStore.getState().geoOverrides);
   thumbnailPregenerator = new ThumbnailPregenerator({
@@ -9698,7 +9993,7 @@ app.whenReady().then(async () => {
     }),
     onTrace: (event, details) => runtimeLog(event, details),
     onGenerationProgress: (status) => sendToRenderer("memory-generation-progress", status),
-    isAllowed: memoryContentAllowed,
+    isAllowed: (filePath, media) => memoryContentAllowed(filePath, media),
     findLiveVideo: memoryLiveVideo,
   });
   await memoryManager.initialize();
@@ -10573,7 +10868,7 @@ async function openMemoryMovie(id: string, revealInFolder: boolean): Promise<{ o
   if (!suggestion)
     return { ok: false, error: "This memory is no longer available. Refresh suggestions." };
   const mediaSafety = await Promise.all(suggestion.media.map(async (file) =>
-    await memoryContentAllowed(file.path) &&
+    await memoryContentAllowed(file.path, file) &&
     (!file.liveVideoPath || await memoryContentAllowed(file.liveVideoPath))));
   if (!mediaSafety.every(Boolean))
     return { ok: false, error: "This memory is no longer available after the content safety check. Refresh suggestions." };
@@ -11181,39 +11476,6 @@ ipcMain.handle("cancel-source-clone", (_event, operationId: unknown) => {
   return true;
 });
 
-ipcMain.handle("get-filter-inventory", async (event, requestId: unknown) => {
-  if (typeof requestId !== "number" || !Number.isSafeInteger(requestId))
-    throw new Error("Invalid filter inventory request.");
-  let errors = 0;
-  const files = filterForContentSafety(
-    await readAllSources(true, (fileDeltas, scanned, total, _audioFound, scanErrors) => {
-      errors = scanErrors;
-      if (!event.sender.isDestroyed())
-        event.sender.send("filter-inventory-progress", {
-          requestId,
-          scanned,
-          total,
-          errors,
-          found: fileDeltas.length,
-          done: false,
-        });
-    }),
-  );
-  if (!event.sender.isDestroyed())
-    event.sender.send("filter-inventory-progress", {
-      requestId,
-      scanned: files.length,
-      total: files.length,
-      errors,
-      found: 0,
-      done: true,
-    });
-  return {
-    inventory: inventoryTransfers.create(files, event.sender.id),
-    errors,
-  };
-});
-
 ipcMain.handle(
   "get-files",
   async (
@@ -11581,6 +11843,9 @@ async function refreshAudioInventory(requestId: number, force = false) {
       () => semanticIndexer.isSearchActive(),
     );
     sendToRenderer("audio-library-cache-changed", snapshot.scannedAt);
+    void refreshMemorySoundtracksAfterAudioIndexing().catch((error) =>
+      runtimeLog("memory-soundtrack-refresh-error", memoryErrorDetails(error)),
+    );
     runtimeLog("audio-inventory-checkpoint", {
       files: snapshot.files.length,
       sources: snapshot.sourceIds.length,
@@ -11594,6 +11859,27 @@ async function refreshAudioInventory(requestId: number, force = false) {
   } finally {
     audioInventoryRunning = false;
   }
+}
+
+/** Refresh saved cards once songs arrive, then replace previews made without music. */
+async function refreshMemorySoundtracksAfterAudioIndexing(): Promise<void> {
+  if (!memoryManager) return;
+  const { state, changedIds } = await memoryManager.refreshSoundtracks();
+  if (!changedIds.length) return;
+
+  // Let an in-flight original-audio render finish before clearing its status.
+  await memoryPreviewQueue.catch(() => undefined);
+  const changed = new Set(changedIds);
+  const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
+  const changedCards = [...state.suggestions, ...reserve].filter((card) => changed.has(card.id));
+  for (const id of changedIds) memoryPreviewStatus.delete(id);
+
+  const currentState = await memoryManager.getState();
+  sendToRenderer("memories-changed", await memoryStateWithPreviews(currentState));
+  runtimeLog("memory-soundtracks-assigned", { count: changedIds.length });
+  void prepareMemoryPreviews(changedCards).catch((error) =>
+    runtimeLog("memory-soundtrack-preview-error", memoryErrorDetails(error)),
+  );
 }
 
 ipcMain.handle(
@@ -16196,6 +16482,159 @@ ipcMain.handle("select-backup-destination", async (_event, current: unknown) => 
 
 ipcMain.handle("get-index-storage-root", () => selectedIndexStorageRoot);
 ipcMain.handle("get-index-storage-status", () => currentIndexStorageStatus());
+function effectiveCacheDestinationRoots(): CacheDestinationRoots {
+  return Object.fromEntries(
+    CACHE_DESTINATIONS.map((item) => [
+      item.id,
+      getCacheDestinationRoot(item.id, cacheDestinationRoots, indexStorageRoot),
+    ]),
+  ) as CacheDestinationRoots;
+}
+
+ipcMain.handle("get-cache-destination-setup-state", async () => {
+  const roots = await readCacheDestinationRoots(app.getPath("userData"));
+  if (roots) {
+    cacheDestinationRoots = roots;
+    cacheDestinationSettingsSaved = true;
+  }
+  // Older installs have one selected index root rather than per-cache roots.
+  // Surface that active location in Settings so a later move can copy and
+  // verify each cache from its actual current folder.
+  const effectiveRoots = roots ?? effectiveCacheDestinationRoots();
+  const unavailable = await probeCacheDestinationRoots(effectiveRoots);
+  const values = Object.values(effectiveRoots);
+  return {
+    catalog: getCacheDestinationEstimates(),
+    roots: effectiveRoots,
+    sharedPath:
+      values.length && values.every((root) => root === values[0])
+        ? values[0]
+        : null,
+    unavailable,
+  };
+});
+ipcMain.handle("choose-cache-destination-folder", async (_event, current: unknown) => {
+  const parent = cacheSetupWindow && !cacheSetupWindow.isDestroyed()
+    ? cacheSetupWindow
+    : mainWindow;
+  const options = destinationPickerOptions("Choose a Silo cache folder", current);
+  const result = parent
+    ? await dialog.showOpenDialog(parent, options)
+    : await dialog.showOpenDialog(options);
+  if (result.canceled || !result.filePaths[0]) return null;
+  return inspectCacheDestinationSafely(result.filePaths[0]);
+});
+ipcMain.handle("inspect-cache-destination", async (_event, target: unknown) => {
+  if (typeof target !== "string") throw new Error("Choose a cache folder.");
+  return inspectCacheDestinationSafely(target);
+});
+ipcMain.handle(
+  "save-initial-cache-destinations",
+  async (_event, _sharedPath: unknown, roots: unknown) => {
+    if (!roots || typeof roots !== "object" || Array.isArray(roots))
+      throw new Error("Choose a folder for every Silo cache.");
+    if (await readCacheDestinationRoots(app.getPath("userData")))
+      throw new Error("Silo cache destinations have already been set up.");
+    const normalized = await validateCacheDestinationRoots(roots as CacheDestinationRoots);
+    const userDataPath = app.getPath("userData");
+    const browserSession = CACHE_DESTINATIONS.find((item) => item.id === "browser-session-data")!;
+    await session.defaultSession.flushStorageData();
+    // Copy any existing first-run cache entries into their selected homes. The
+    // originals stay in the profile so a failed copy never loses user data.
+    for (const item of CACHE_DESTINATIONS) {
+      if (item.id === "browser-session-data") continue;
+      await copyCacheEntryVerified(
+        item.entry,
+        userDataPath,
+        normalized[item.id]!,
+        userDataPath,
+      );
+    }
+    await copyBrowserSessionDataVerified(
+      app.getPath("sessionData"),
+      normalized[browserSession.id]!,
+      userDataPath,
+    );
+    await writeCacheDestinationRoots(userDataPath, normalized);
+    cacheDestinationRoots = normalized;
+    cacheDestinationSettingsSaved = true;
+    updateCacheDestinationExclusions();
+    // Electron must restart to use the selected sessionData directory.
+    finishCacheDestinationSetup(false);
+    return { restarting: true };
+  },
+);
+ipcMain.handle("change-cache-destination", async (_event, id: unknown) => {
+  if (!isCacheDestinationId(id))
+    return { canceled: false, error: "That Silo cache is not recognized." };
+  if (!mainWindow || mainWindow.isDestroyed())
+    return { canceled: false, error: "Silo Settings is unavailable." };
+  const current = getCacheDestinationRoot(id, cacheDestinationRoots, indexStorageRoot);
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions(`Choose ${CACHE_DESTINATIONS.find((item) => item.id === id)!.name} folder`, current),
+  );
+  if (result.canceled || !result.filePaths[0]) return { canceled: true };
+  try {
+    const next = await inspectCacheDestinationSafely(result.filePaths[0]);
+    if (path.resolve(next.path) === path.resolve(current))
+      return { canceled: false, path: current };
+    if (await probeIndexStorageDestination(current) !== "ok") {
+      throw new Error(`Reconnect ${current} first, or use “Locate existing cache” if you already copied this cache to another folder. No settings were changed.`);
+    }
+    const item = CACHE_DESTINATIONS.find((candidate) => candidate.id === id)!;
+    if (id === "browser-session-data") {
+      await session.defaultSession.flushStorageData();
+      await copyBrowserSessionDataVerified(
+        app.getPath("sessionData"),
+        next.path,
+        app.getPath("userData"),
+      );
+    } else {
+      await copyCacheEntryVerified(item.entry, current, next.path, app.getPath("userData"));
+    }
+    const roots = { ...effectiveCacheDestinationRoots(), [id]: next.path };
+    await writeCacheDestinationRoots(app.getPath("userData"), roots);
+    cacheDestinationRoots = roots;
+    cacheDestinationSettingsSaved = true;
+    updateCacheDestinationExclusions();
+    app.relaunch();
+    app.quit();
+    return { canceled: false, restarting: true, path: next.path };
+  } catch (error) {
+    return { canceled: false, error: error instanceof Error ? error.message : "Could not move this cache." };
+  }
+});
+ipcMain.handle("locate-cache-destination", async (_event, id: unknown) => {
+  if (!isCacheDestinationId(id))
+    return { canceled: false, error: "That Silo cache is not recognized." };
+  if (!mainWindow || mainWindow.isDestroyed())
+    return { canceled: false, error: "Silo Settings is unavailable." };
+  const item = CACHE_DESTINATIONS.find((candidate) => candidate.id === id)!;
+  const current = getCacheDestinationRoot(id, cacheDestinationRoots, indexStorageRoot);
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions(`Locate existing ${item.name}`, current),
+  );
+  if (result.canceled || !result.filePaths[0]) return { canceled: true };
+  try {
+    const destination = await inspectCacheDestinationSafely(result.filePaths[0]);
+    await measureCacheEntry(destination.path, item.entry);
+    const entryPath = path.join(destination.path, item.entry);
+    const stats = await fsPromises.lstat(entryPath);
+    if (stats.isSymbolicLink()) throw new Error("Silo will not use a cache entry that is a symbolic link.");
+    const roots = { ...effectiveCacheDestinationRoots(), [id]: destination.path };
+    await writeCacheDestinationRoots(app.getPath("userData"), roots);
+    cacheDestinationRoots = roots;
+    cacheDestinationSettingsSaved = true;
+    updateCacheDestinationExclusions();
+    app.relaunch();
+    app.quit();
+    return { canceled: false, restarting: true, path: destination.path };
+  } catch (error) {
+    return { canceled: false, error: error instanceof Error ? error.message : "Could not locate that cache." };
+  }
+});
 ipcMain.handle("get-local-index-fallback-enabled", () => indexStorageFallbackEnabled);
 ipcMain.handle("set-local-index-fallback-enabled", async (_event, enabled: boolean) => {
   if (typeof enabled !== "boolean")

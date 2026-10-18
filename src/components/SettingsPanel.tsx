@@ -902,6 +902,21 @@ export default function SettingsPanel({
   );
   const [memoryDirectory, setMemoryDirectory] = useState<string | null>(null);
   const [cacheDestination, setCacheDestination] = useState("");
+  const [cacheCatalog, setCacheCatalog] = useState<Array<{
+    id: CacheDestinationId;
+    entry: string;
+    name: string;
+    description: string;
+    estimatePerTenThousand: string;
+    estimateBytesPerTenThousand: number;
+    kind: string;
+  }>>([]);
+  const [cacheRoots, setCacheRoots] = useState<CacheDestinationRoots>({});
+  const [unavailableCacheRoots, setUnavailableCacheRoots] = useState<Array<{
+    id: CacheDestinationId;
+    name: string;
+    root: string;
+  }>>([]);
   const [localFallbackEnabled, setLocalFallbackEnabled] = useState(true);
   const [showLifetimeUnlock, setShowLifetimeUnlock] = useState(false);
   const [directLifetimePurchase, setDirectLifetimePurchase] = useState(false);
@@ -976,9 +991,12 @@ export default function SettingsPanel({
 
   useEffect(() => {
     let disposed = false;
-    void electronAPI?.getLocalIndexFallbackEnabled()
-      .then((enabled) => {
-        if (!disposed) setLocalFallbackEnabled(enabled);
+    void electronAPI?.getCacheDestinationSetupState()
+      .then((state) => {
+        if (disposed) return;
+        setCacheCatalog(state.catalog);
+        setCacheRoots(state.roots ?? {});
+        setUnavailableCacheRoots(state.unavailable);
       })
       .catch(() => undefined);
     return () => {
@@ -1104,23 +1122,42 @@ export default function SettingsPanel({
     }
   };
 
-  const changeCacheDestination = async () => {
+  const changeCacheDestination = async (id: CacheDestinationId) => {
     if (!electronAPI) return;
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      const result = await electronAPI.selectIndexStorageRoot();
+      const result = await electronAPI.changeCacheDestination(id);
       if (result.error) throw new Error(result.error);
-      if (result.path) setCacheDestination(result.path);
-      if (result.restarting)
-        setNotice("Silo is restarting to verify and move its index caches.");
+      if (result.path) setCacheRoots((current) => ({ ...current, [id]: result.path }));
+      if (result.restarting) {
+        setNotice("Silo is restarting after copying and verifying this cache. The original folder was kept.");
+      }
     } catch (cause) {
       setError(
         cause instanceof Error
           ? cause.message
           : "Silo cache destination could not be changed.",
       );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const locateCacheDestination = async (id: CacheDestinationId) => {
+    if (!electronAPI) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await electronAPI.locateCacheDestination(id);
+      if (result.error) throw new Error(result.error);
+      if (result.path) setCacheRoots((current) => ({ ...current, [id]: result.path }));
+      if (result.restarting)
+        setNotice("Silo is restarting with the located cache. The old folder was left in place.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The cache folder could not be located.");
     } finally {
       setBusy(false);
     }
@@ -1724,47 +1761,53 @@ export default function SettingsPanel({
       case "cache":
         return (
           <section
-            className="settings-card"
+            className="settings-card cache-destination-settings"
             data-tour="settings-cache-destination"
-            data-help="Choose the external drive folder for Silo's indexes, thumbnails, previews, and other large generated caches."
+            data-help="Choose a separate folder or drive for each Silo cache."
           >
-            <div className="settings-row">
-              <div className="settings-row-text">
-                <strong className="settings-status-title">
-                  <span className={cacheDestinationIsRequired ? "settings-required-dot" : "settings-ready-dot"} />
-                  {cacheDestinationIsRequired ? "Destination required" : "Destination ready"}
-                </strong>
-                <span className="settings-path" title={cacheDestination || undefined}>
-                  {cacheDestinationIsRequired
-                    ? "Choose a folder outside Silo's app profile, ideally on an external drive."
-                    : cacheDestination}
-                </span>
-              </div>
-              <button
-                className="settings-save"
-                disabled={busy}
-                onClick={() => void changeCacheDestination()}
-                data-help="Choose an external-drive folder. Silo restarts, verifies the cache copies, and then removes the old copies."
-              >
-                <FiFolder /> {cacheDestinationIsRequired ? "Choose…" : "Change…"}
-              </button>
+            <div className="cache-destination-intro">
+              <strong>Choose a home for each cache</strong>
+              <span>Changing a destination copies and verifies its files, then restarts Silo. The original copy stays where it is.</span>
             </div>
-            <label className="settings-row settings-toggle">
-              <div className="settings-row-text">
-                <strong>Use a local cache if the destination disconnects</strong>
-                <span>
-                  Keeps at least 10 GB free and moves the cache back automatically when the
-                  destination reconnects. Turn off to pause indexing instead.
-                </span>
-              </div>
-              <input
-                type="checkbox"
-                className="settings-switch"
-                checked={localFallbackEnabled}
-                disabled={busy || !electronAPI || !cacheDestination}
-                onChange={() => void changeLocalFallback()}
-              />
-            </label>
+            {cacheCatalog.map((item) => {
+              const root = cacheRoots[item.id];
+              const unavailable = unavailableCacheRoots.some((entry) => entry.id === item.id);
+              return (
+                <div className="cache-destination-row" key={item.id}>
+                  <div className="cache-destination-copy">
+                    <div className="cache-destination-heading">
+                      <strong>{item.name}</strong>
+                      <small>{item.estimatePerTenThousand} per 10,000 files</small>
+                    </div>
+                    <span>{item.description}</span>
+                    <code title={root}>{root || "Not configured"}</code>
+                    {unavailable && (
+                      <em>Drive unavailable. Reconnect it, or locate a verified copy of this cache.</em>
+                    )}
+                  </div>
+                  <div className="cache-destination-actions">
+                    {unavailable && (
+                      <button
+                        className="settings-secondary"
+                        disabled={busy || !electronAPI}
+                        onClick={() => void locateCacheDestination(item.id)}
+                      >
+                        <FiFolder /> Locate…
+                      </button>
+                    )}
+                    <button
+                      className="settings-save"
+                      disabled={busy || !electronAPI}
+                      onClick={() => void changeCacheDestination(item.id)}
+                    >
+                      <FiFolder /> Change…
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            {!cacheCatalog.length && <p>Loading Silo cache destinations…</p>}
+            <p className="cache-destination-footnote">External and removable drives must be connected before Silo starts. If any selected cache is missing, indexing pauses until its drive is reconnected or its existing cache is located.</p>
           </section>
         );
       case "memories":

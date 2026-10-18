@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;">
+  <title>Set up Silo storage</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #20242b; background: #f4f6f8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1040px; margin: 0 auto; padding: 30px 34px 28px; }
+    h1 { margin: 0 0 9px; font-size: 27px; letter-spacing: -.02em; }
+    .intro { margin: 0 0 21px; max-width: 790px; color: #606874; line-height: 1.5; }
+    .shared { display: grid; grid-template-columns: minmax(0,1fr) auto auto; gap: 10px; align-items: center; padding: 15px; margin-bottom: 12px; border: 1px solid #d8e0e7; border-radius: 12px; background: #fff; }
+    .shared-copy strong, .shared-copy span { display: block; }
+    .shared-copy span { color: #69717c; margin-top: 4px; font-size: 13px; }
+    .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #4e5968; font-size: 13px; }
+    button { border: 1px solid #bfc9d2; border-radius: 8px; background: #fff; color: #20242b; font: inherit; font-weight: 600; padding: 9px 12px; cursor: pointer; }
+    button.primary { border-color: #215db4; background: #2468c5; color: #fff; }
+    button:disabled { opacity: .48; cursor: default; }
+    .notice { display: flex; gap: 9px; align-items: flex-start; padding: 11px 13px; margin: 10px 0 14px; border-radius: 9px; color: #60420b; background: #fff4d8; font-size: 13px; line-height: 1.45; }
+    .notice b { flex: 0 0 auto; }
+    #rows { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; max-height: calc(100vh - 312px); overflow: auto; padding: 1px 3px 5px 1px; }
+    .row { min-width: 0; padding: 13px; border: 1px solid #dce2e8; border-radius: 10px; background: #fff; }
+    .row-head { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+    .row h2 { margin: 0; font-size: 15px; }
+    .row p { min-height: 34px; margin: 5px 0 9px; color: #68717c; font-size: 12px; line-height: 1.4; }
+    .estimate { color: #7b8490; font-size: 11px; white-space: nowrap; }
+    .row-bottom { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 8px; }
+    .row-bottom button { padding: 7px 10px; font-size: 12px; }
+    .space { margin-top: 7px; color: #6d7782; font-size: 11px; overflow-wrap: anywhere; }
+    .space.warn { color: #9d4a1c; }
+    footer { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding-top: 14px; }
+    #status { min-height: 18px; color: #b23d32; font-size: 13px; }
+    .footnote { margin-top: 12px; color: #77808a; font-size: 11px; }
+    @media (max-width: 760px) { main { padding: 22px; } #rows { grid-template-columns: 1fr; max-height: calc(100vh - 345px); } .shared { grid-template-columns: 1fr 1fr; } .shared-copy { grid-column: 1/-1; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Choose where Silo keeps its caches</h1>
+    <p class="intro">Each cache can use a different folder or drive. These are generated indexes, previews, and browser session files; your original photos stay where they are. Choose a shared folder first, then change any individual destination you want. If the folder you chose before looked empty, that can be normal on a fresh install: Silo creates each named cache folder as that feature starts saving data.</p>
+    <section class="shared" aria-label="Shared cache destination">
+      <div class="shared-copy"><strong>Shared folder</strong><span id="sharedPath">Choose a folder to get started</span></div>
+      <button id="chooseShared" type="button">Choose folder…</button>
+      <button id="applyShared" type="button" disabled>Use for every cache</button>
+    </section>
+    <div class="notice"><b>Drive reminder</b><span>External or removable locations are flagged below; connect them before opening Silo. Browser cache and web-session storage includes cookies and site data, so keep that destination connected for saved web sessions. If any cache drive is missing, Silo pauses indexing until you reconnect or locate that cache. Available space is checked for each destination.</span></div>
+    <section id="rows" aria-label="Cache destinations"></section>
+    <footer><span id="status" role="status"></span><button id="finish" class="primary" type="button" disabled>Save destinations and continue</button></footer>
+    <p class="footnote">Storage estimates are approximate per 10,000 files. Thumbnails and converted previews vary with image size and format. Existing cache files are kept when you move a destination later. Silo settings, browsing state, logs, crash reports, phone and Messages backups, and Fallout Shelter copies use their existing app-data or backup destinations; they are not moved by this cache setup.</p>
+  </main>
+  <script src="cache-setup.js"></script>
+</body>
+</html>

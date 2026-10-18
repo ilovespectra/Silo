@@ -81,14 +81,6 @@ contextBridge.exposeInMainWorld("electron", {
   releaseInventory: (token) => ipcRenderer.invoke("release-inventory", token),
   getFiles: (dirPath, exploded, requestId, scanOptions) =>
     ipcRenderer.invoke("get-files", dirPath, exploded, requestId, scanOptions),
-  getFilterInventory: (requestId) =>
-    ipcRenderer.invoke("get-filter-inventory", requestId),
-  onFilterInventoryProgress: (callback) => {
-    const listener = (_event, progress) => callback(progress);
-    ipcRenderer.on("filter-inventory-progress", listener);
-    return () =>
-      ipcRenderer.removeListener("filter-inventory-progress", listener);
-  },
   getAudioLibraryCache: () => ipcRenderer.invoke("get-audio-library-cache"),
   refreshAudioLibraryCache: (requestId, force) =>
     ipcRenderer.invoke(
@@ -621,6 +613,18 @@ contextBridge.exposeInMainWorld("electron", {
   },
   selectIndexStorageRoot: () =>
     ipcRenderer.invoke("select-index-storage-root"),
+  getCacheDestinationSetupState: () =>
+    ipcRenderer.invoke("get-cache-destination-setup-state"),
+  chooseCacheDestinationFolder: (current) =>
+    ipcRenderer.invoke("choose-cache-destination-folder", current),
+  inspectCacheDestination: (target) =>
+    ipcRenderer.invoke("inspect-cache-destination", target),
+  saveInitialCacheDestinations: (sharedPath, roots) =>
+    ipcRenderer.invoke("save-initial-cache-destinations", sharedPath, roots),
+  changeCacheDestination: (id) =>
+    ipcRenderer.invoke("change-cache-destination", id),
+  locateCacheDestination: (id) =>
+    ipcRenderer.invoke("locate-cache-destination", id),
   startFaceIndexingForSource: (sourcePath) =>
     ipcRenderer.invoke("start-face-indexing-for-source", sourcePath),
   getFaceIndexProgress: (deviceId) =>

@@ -712,6 +712,71 @@ body {
 .settings-row + .settings-row {
   border-top: 1px solid var(--line);
 }
+.cache-destination-intro,
+.cache-destination-row {
+  padding: 12px 14px;
+}
+.cache-destination-intro {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+}
+.cache-destination-intro span,
+.cache-destination-copy > span,
+.cache-destination-footnote {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.cache-destination-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.cache-destination-row:last-of-type {
+  border-bottom: 0;
+}
+.cache-destination-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+.cache-destination-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+.cache-destination-heading small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.cache-destination-copy code {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cache-destination-copy em {
+  color: #a34827;
+  font-size: 11px;
+  font-style: normal;
+}
+.cache-destination-actions {
+  display: flex;
+  flex: none;
+  gap: 7px;
+}
+.cache-destination-footnote {
+  margin: 0;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+}
 label.settings-row {
   cursor: pointer;
 }

@@ -230,6 +230,12 @@ interface FilePreview {
   documentPreview?: import("./documentPreview").DocumentPreview;
 }
 
+interface PreparedViewerImage {
+  preview: FilePreview;
+  width: number;
+  height: number;
+}
+
 const livePhotoStillExtensions = new Set([".heic", ".heif", ".jpg", ".jpeg"]);
 const livePhotoVideoExtensions = new Set([".mov", ".mp4", ".m4v"]);
 
@@ -562,6 +568,12 @@ function SearchTiming({
 }
 
 const VIEWER_PREFETCH_THUMBNAIL_SIZE = 480;
+const MAX_VIEWER_PREVIEW_CACHE_ENTRIES = 3;
+const MAX_VIEWER_PREVIEW_CACHE_CHARS = 48 * 1024 * 1024;
+
+function viewerPreviewCacheKey(file: FileInfo) {
+  return `${file.path}\0${file.size}\0${file.modified}`;
+}
 
 function cachedImagePreview(
   file: FileInfo,
@@ -1329,24 +1341,29 @@ function App() {
   const [sortIndicatorRevision, setSortIndicatorRevision] = useState(0);
   const metadataRevisionRef = useRef(sortIndicatorRevision);
   metadataRevisionRef.current = sortIndicatorRevision;
-  const [sortIndicatorSnapshot, setSortIndicatorSnapshot] = useState<{
-    files: FileInfo[];
-    revision: number;
-  } | null>(null);
   const [sortIndicatorError, setSortIndicatorError] = useState("");
-  const [filterInventory, setFilterInventory] = useState<{
-    sourceKey: string;
-    files: FileInfo[];
-    errors: number;
-  } | null>(null);
-  const [filterInventoryProgress, setFilterInventoryProgress] =
-    useState<FilterInventoryProgress | null>(null);
-  const [filterInventoryError, setFilterInventoryError] = useState("");
   const [metadataIndicatorProgress, setMetadataIndicatorProgress] = useState<{
     processed: number;
     total: number;
   } | null>(null);
-  const filterInventoryRequestRef = useRef(0);
+  const photoIndicatorWorkRef = useRef({
+    pending: new Map<string, FileInfo>(),
+    active: new Set<string>(),
+    completed: new Set<string>(),
+    failed: new Set<string>(),
+    currentFiles: new Map<string, FileInfo>(),
+    currentPaths: new Set<string>(),
+    currentTotal: 0,
+    currentProcessed: 0,
+    running: false,
+    enabled: false,
+    revision: sortIndicatorRevision,
+    generation: 0,
+  });
+  const browseScanModeRef = useRef<{
+    path: string;
+    recursive: boolean;
+  } | null>(null);
   const [peopleFilter, setPeopleFilter] = useState<MetadataFilter>("all");
   const [locationFilter, setLocationFilter] = useState<MetadataFilter>("all");
   const needsPhotoMetadata =
@@ -1355,12 +1372,26 @@ function App() {
       sort.field === "mapped" ||
       peopleFilter !== "all" ||
       locationFilter !== "all");
+  const needsRecursiveBrowse =
+    appSection === "files" &&
+    !audioOnlySelected &&
+    !searchQuery.trim() &&
+    !activeDigitalFolderId &&
+    (showFilters || yearFilter !== "all" || needsPhotoMetadata);
+  const needsRecursiveBrowseRef = useRef(needsRecursiveBrowse);
+  needsRecursiveBrowseRef.current = needsRecursiveBrowse;
   const explodedRef = useRef(exploded);
   const contentVisibilityRef = useRef(`${contentSettings.showNsfw}:0`);
   const sortRef = useRef(sort);
   const filtersRef = useRef(filters);
   const scanRequestRef = useRef(0);
   const filePreviewRequestRef = useRef(0);
+  const preparedViewerImagesRef = useRef(
+    new Map<string, PreparedViewerImage>(),
+  );
+  const viewerImageRequestsRef = useRef(
+    new Map<string, Promise<PreparedViewerImage | null>>(),
+  );
   const settledScanRef = useRef(0);
   const previewedScanRef = useRef<number | null>(null);
   const allSourcesLoadedRef = useRef(new Set<string>());
@@ -2017,11 +2048,17 @@ function App() {
     ) => {
       if (!electronAPI) return;
       const requestId = ++scanRequestRef.current;
+      const scanRecursively =
+        explodedMode || needsRecursiveBrowseRef.current;
+      browseScanModeRef.current = {
+        path: directoryPath,
+        recursive: scanRecursively,
+      };
       preserveScanRequestRef.current =
         preserveView && !streamWhilePreserving ? requestId : null;
       preserveSelectionRequestRef.current = preserveView ? requestId : null;
       const scannedSourceIds =
-        directoryPath === allSourcesPathRef.current && explodedMode
+        directoryPath === allSourcesPathRef.current && scanRecursively
           ? sourcesRef.current
               .filter((source) => source.enabled && source.available)
               .map((source) => source.id)
@@ -2038,7 +2075,7 @@ function App() {
       try {
         const inventory = await electronAPI.getFiles(
           directoryPath,
-          explodedMode,
+          scanRecursively,
           requestId,
           {
             sortField: sortRef.current.field,
@@ -2055,7 +2092,7 @@ function App() {
         );
         if (requestId !== scanRequestRef.current) return;
         settledScanRef.current = requestId;
-        if (directoryPath === allSourcesPathRef.current && explodedMode) {
+        if (directoryPath === allSourcesPathRef.current && scanRecursively) {
           scannedSourceIds.forEach((sourceId) =>
             allSourcesLoadedRef.current.add(sourceId),
           );
@@ -2141,6 +2178,34 @@ function App() {
       removeListener();
     };
   }, [electronAPI]);
+
+  useEffect(() => {
+    if (
+      !hydrated ||
+      !electronAPI ||
+      appSection !== "files" ||
+      !currentPath ||
+      activeDigitalFolderId
+    )
+      return;
+    const expectedRecursive = exploded || needsRecursiveBrowse;
+    const currentScan = browseScanModeRef.current;
+    if (
+      currentScan?.path === currentPath &&
+      currentScan.recursive === expectedRecursive
+    )
+      return;
+    void loadDirectory(currentPath, exploded, true, true);
+  }, [
+    activeDigitalFolderId,
+    appSection,
+    currentPath,
+    electronAPI,
+    exploded,
+    hydrated,
+    loadDirectory,
+    needsRecursiveBrowse,
+  ]);
 
   useEffect(() => {
     if (!electronAPI?.onThumbnailPregenProgress) return;
@@ -2388,9 +2453,9 @@ function App() {
         }
         for (const file of progress.fileDeltas)
           pendingDeltas.set(file.path, file);
-        if (pendingDeltas.size >= 10000) flushDeltas();
+        if (pendingDeltas.size >= 2000) flushDeltas();
         else if (flushTimer === null)
-          flushTimer = window.setTimeout(flushDeltas, 5000);
+          flushTimer = window.setTimeout(flushDeltas, 500);
       }
       if (progress.done) flushDeltas();
     });
@@ -3401,6 +3466,61 @@ function App() {
     [electronAPI],
   );
 
+  const prepareViewerImage = useCallback(
+    (file: FileInfo): Promise<PreparedViewerImage | null> => {
+      if (!electronAPI || file.type !== "image") return Promise.resolve(null);
+      const key = viewerPreviewCacheKey(file);
+      const cached = preparedViewerImagesRef.current.get(key);
+      if (cached) {
+        preparedViewerImagesRef.current.delete(key);
+        preparedViewerImagesRef.current.set(key, cached);
+        return Promise.resolve(cached);
+      }
+      const pending = viewerImageRequestsRef.current.get(key);
+      if (pending) return pending;
+
+      const request = (async () => {
+        const preview = await electronAPI.getFilePreview(file.path);
+        if (!preview?.previewDataUrl) return null;
+        const image = new Image();
+        image.src = preview.previewDataUrl;
+        await image.decode().catch(() => undefined);
+        if (image.naturalWidth <= 0 || image.naturalHeight <= 0) return null;
+
+        const prepared = {
+          preview,
+          width: image.naturalWidth,
+          height: image.naturalHeight,
+        };
+        const cache = preparedViewerImagesRef.current;
+        if (preview.previewDataUrl.length <= MAX_VIEWER_PREVIEW_CACHE_CHARS) {
+          cache.set(key, prepared);
+          let cachedChars = Array.from(cache.values()).reduce(
+            (total, entry) => total + (entry.preview.previewDataUrl?.length ?? 0),
+            0,
+          );
+          while (
+            cache.size > MAX_VIEWER_PREVIEW_CACHE_ENTRIES ||
+            cachedChars > MAX_VIEWER_PREVIEW_CACHE_CHARS
+          ) {
+            const oldestKey = cache.keys().next().value as string | undefined;
+            if (!oldestKey) break;
+            const oldest = cache.get(oldestKey);
+            cache.delete(oldestKey);
+            cachedChars -= oldest?.preview.previewDataUrl?.length ?? 0;
+          }
+        }
+        return prepared;
+      })()
+        .catch(() => null)
+        .finally(() => viewerImageRequestsRef.current.delete(key));
+
+      viewerImageRequestsRef.current.set(key, request);
+      return request;
+    },
+    [electronAPI],
+  );
+
   const openMediaViewer = useCallback(
     async (file: FileInfo, scopeFiles?: FileInfo[]) => {
       if (!electronAPI || file.isDirectory) return;
@@ -3415,21 +3535,23 @@ function App() {
       setViewerMediaFile(playbackFile);
       // Keep the current image until a warmed adjacent thumbnail is ready;
       // then show it while the full-size preview finishes loading.
-      const navigatingImages =
-        viewerOpenRef.current && playbackFile.type === "image";
+      const navigatingBetweenImages =
+        viewerOpenRef.current &&
+        viewerMediaFile?.type === "image" &&
+        playbackFile.type === "image";
       setViewerImageLoading(playbackFile.type === "image");
-      if (!navigatingImages) {
+      if (!navigatingBetweenImages) {
         setFilePreview(
           cachedImagePreview(playbackFile, VIEWER_PREFETCH_THUMBNAIL_SIZE) ??
             cachedImagePreview(playbackFile),
         );
         setViewerDimensions({ width: 0, height: 0 });
       } else {
-        const preparedPreview =
-          cachedImagePreview(playbackFile, VIEWER_PREFETCH_THUMBNAIL_SIZE) ??
-          cachedImagePreview(playbackFile);
-        if (preparedPreview) {
-          setFilePreview(preparedPreview);
+        const preparedImage = preparedViewerImagesRef.current.get(
+          viewerPreviewCacheKey(playbackFile),
+        );
+        if (preparedImage) {
+          setFilePreview(preparedImage.preview);
           setViewerDimensions({ width: 0, height: 0 });
         }
       }
@@ -3443,23 +3565,25 @@ function App() {
       setMediaError("");
       setViewerOpen(true);
       try {
-        const preview = await electronAPI.getFilePreview(playbackFile.path);
+        const preparedImage =
+          playbackFile.type === "image"
+            ? await prepareViewerImage(playbackFile)
+            : null;
+        const preview =
+          playbackFile.type === "image"
+            ? preparedImage?.preview ?? null
+            : await electronAPI.getFilePreview(playbackFile.path);
         if (request !== filePreviewRequestRef.current) return;
         if (!preview) {
           setViewerImageLoading(false);
           setMediaError(`Could not open "${playbackFile.name}".`);
           return;
         }
-        if (playbackFile.type === "image" && preview.previewDataUrl) {
-          const nextImage = new Image();
-          nextImage.src = preview.previewDataUrl;
-          await nextImage.decode().catch(() => undefined);
-          if (request !== filePreviewRequestRef.current) return;
-          if (nextImage.naturalWidth > 0)
-            setViewerDimensions({
-              width: nextImage.naturalWidth,
-              height: nextImage.naturalHeight,
-            });
+        if (playbackFile.type === "image" && preparedImage) {
+          setViewerDimensions({
+            width: preparedImage.width,
+            height: preparedImage.height,
+          });
         }
         setFilePreview(preview);
         setViewerImageLoading(false);
@@ -3472,7 +3596,7 @@ function App() {
         }
       }
     },
-    [electronAPI, files],
+    [electronAPI, files, prepareViewerImage, viewerMediaFile],
   );
 
   const openFaceAssignment = useCallback(
@@ -5049,210 +5173,170 @@ function App() {
     };
   }, [electronAPI]);
 
-  const filterInventoryNeeded =
-    appSection === "files" &&
-    !audioOnlySelected &&
-    !activeDigitalFolderId &&
-    !searchQuery.trim() &&
-    (peopleFilter !== "all" || locationFilter !== "all");
-  const useFullFilterInventoryForResults = filterInventoryNeeded;
-  const filterInventoryFiles = useMemo(() => {
-    if (filterInventory?.sourceKey !== enabledSourcePathsKey) return null;
-    return filterInventory.files.filter(
-      (file) =>
-        !file.isDirectory &&
-        pathIsVisibleForSelectedSources(
-          file.path,
-          enabledSourcePaths,
-          allSourcePaths,
-        ) &&
-        (!currentPath ||
-          currentPath === allSourcesPath ||
-          pathIsWithinSourceRoot(file.path, currentPath)),
-    );
-  }, [
-    allSourcePaths,
-    allSourcesPath,
-    currentPath,
-    enabledSourcePaths,
-    enabledSourcePathsKey,
-    filterInventory,
-  ]);
-  const metadataFiles = filterInventoryNeeded
-    ? filterInventoryFiles ?? []
-    : contentFiles;
+  const metadataFiles = contentFiles;
 
   useEffect(() => {
-    if (!electronAPI || !filterInventoryNeeded) {
-      setFilterInventoryProgress(null);
-      return;
-    }
-    if (filterInventory?.sourceKey === enabledSourcePathsKey) return;
-
-    let cancelled = false;
-    const requestId = ++filterInventoryRequestRef.current;
-    setFilterInventoryError("");
-    setFilterInventoryProgress({
-      requestId,
-      scanned: 0,
-      total: 0,
-      errors: 0,
-      found: 0,
-      done: false,
-    });
-    const removeProgress = electronAPI.onFilterInventoryProgress((progress) => {
-      if (!cancelled && progress.requestId === requestId)
-        setFilterInventoryProgress(progress);
-    });
-    void (async () => {
-      try {
-        const result = await electronAPI.getFilterInventory(requestId);
-        const inventory = await readInventory<FileInfo>(
-          electronAPI,
-          result.inventory,
-        );
-        if (cancelled) return;
-        setFilterInventory({
-          sourceKey: enabledSourcePathsKey,
-          files: inventory,
-          errors: result.errors,
-        });
-        setFilterInventoryError(
-          result.errors
-            ? `${result.errors} enabled source${result.errors === 1 ? "" : "s"} could not be fully scanned. Filter results may be incomplete.`
-            : "",
-        );
-        setFilterInventoryProgress(null);
-      } catch (cause) {
-        if (!cancelled) {
-          setFilterInventoryError(
-            cause instanceof Error
-              ? cause.message
-              : "Could not scan selected sources for filter options.",
-          );
-          setFilterInventoryProgress(null);
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-      removeProgress();
-    };
-  }, [
-    activeDigitalFolderId,
-    appSection,
-    audioOnlySelected,
-    electronAPI,
-    enabledSourcePathsKey,
-    filterInventory?.sourceKey,
-    searchQuery,
-    filterInventoryNeeded,
-  ]);
-
-  useEffect(() => {
-    if (!electronAPI || !needsPhotoMetadata) {
+    const work = photoIndicatorWorkRef.current;
+    if (!electronAPI || appSection !== "files" || !needsPhotoMetadata) {
+      work.enabled = false;
       setMetadataIndicatorProgress(null);
       return;
     }
-    let cancelled = false;
-    let running = false;
-    let loadedRevision = -1;
-    setSortIndicatorError("");
-    const mediaPaths = metadataFiles
-      .filter(
-        (file) =>
-          !file.isDirectory && (file.type === "image" || file.type === "video"),
-      )
-      .map((file) => file.path);
-    const refresh = async () => {
+
+    work.enabled = true;
+    const mediaFiles = metadataFiles.filter(
+      (file) =>
+        !file.isDirectory && (file.type === "image" || file.type === "video"),
+    );
+    work.currentFiles = new Map(mediaFiles.map((file) => [file.path, file]));
+    work.currentPaths = new Set(work.currentFiles.keys());
+    work.currentTotal = work.currentPaths.size;
+    for (const filePath of work.pending.keys())
+      if (!work.currentPaths.has(filePath)) work.pending.delete(filePath);
+
+    if (work.revision !== sortIndicatorRevision) {
+      work.revision = sortIndicatorRevision;
+      work.generation += 1;
+      work.completed.clear();
+      work.failed.clear();
+      work.pending.clear();
+      work.currentProcessed = 0;
+      setSortIndicatorError("");
+    } else {
+      work.currentProcessed = 0;
+      for (const filePath of work.currentPaths)
+        if (work.completed.has(filePath) || work.failed.has(filePath))
+          work.currentProcessed += 1;
+    }
+
+    for (const file of mediaFiles) {
       if (
-        cancelled ||
-        running ||
-        loadedRevision === metadataRevisionRef.current
+        !work.completed.has(file.path) &&
+        !work.failed.has(file.path) &&
+        !work.active.has(file.path) &&
+        !work.pending.has(file.path)
       )
-        return;
-      running = true;
-      const revision = metadataRevisionRef.current;
-      setMetadataIndicatorProgress(
-        mediaPaths.length ? { processed: 0, total: mediaPaths.length } : null,
+        work.pending.set(file.path, file);
+    }
+
+    const updateProgress = () => {
+      const pendingCurrent = Array.from(work.pending.keys()).some((filePath) =>
+        work.currentPaths.has(filePath),
       );
-      try {
-        const next: Record<string, { people: boolean; mapped: boolean }> = {};
-        const snapshot: Record<
-          string,
-          { hasLocation: boolean; people: string[] }
-        > = {};
-        // One snapshot: batching used to rescan every person cluster dozens of
-        // times and a progress event could cancel the run before it committed.
-        for (let offset = 0; offset < mediaPaths.length; offset += 1000) {
-          const batch = mediaPaths.slice(offset, offset + 1000);
-          const values = await electronAPI.getPhotoIndicators(batch);
-          if (cancelled) return;
-          for (const filePath of batch) {
-            const indicators = values[filePath];
-            if (!indicators)
-              throw new Error(
-                "Incomplete photo metadata. Please retry the sort.",
-              );
-            snapshot[filePath] = indicators;
-            next[filePath] = {
-              people: (indicators?.people.length ?? 0) > 0,
-              mapped: Boolean(indicators?.hasLocation),
-            };
-          }
-          publishPhotoIndicators(snapshot);
-          for (const filePath of batch) delete snapshot[filePath];
-          setMetadataIndicatorProgress({
-            processed: Math.min(offset + batch.length, mediaPaths.length),
-            total: mediaPaths.length,
-          });
-          await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
-        }
-        if (cancelled) return;
-        setSortIndicators((current) => {
-          const paths = Object.keys(next);
-          return paths.length === Object.keys(current).length &&
-            paths.every(
-              (filePath) =>
-                current[filePath]?.people === next[filePath].people &&
-                current[filePath]?.mapped === next[filePath].mapped,
-            )
-            ? current
-            : next;
+      const activeCurrent = Array.from(work.active).some((filePath) =>
+        work.currentPaths.has(filePath),
+      );
+      if (pendingCurrent || activeCurrent || work.currentProcessed < work.currentTotal)
+        setMetadataIndicatorProgress({
+          processed: work.currentProcessed,
+          total: work.currentTotal,
         });
-        loadedRevision = revision;
-        setSortIndicatorError("");
-        setSortIndicatorSnapshot({ files: metadataFiles, revision });
-        setMetadataIndicatorProgress(null);
-      } catch (cause) {
-        loadedRevision = revision;
-        if (!cancelled) {
-          setSortIndicatorError(
-            cause instanceof Error
-              ? cause.message
-              : "Could not load sorting metadata.",
-          );
-          setMetadataIndicatorProgress(null);
+      else setMetadataIndicatorProgress(null);
+    };
+
+    const processQueue = async () => {
+      if (work.running || !work.enabled) return;
+      work.running = true;
+      try {
+        while (work.enabled && work.pending.size) {
+          const batch = Array.from(work.pending.entries()).slice(0, 1000);
+          const generation = work.generation;
+          for (const [filePath] of batch) {
+            work.pending.delete(filePath);
+            work.active.add(filePath);
+          }
+          try {
+            const paths = batch.map(([filePath]) => filePath);
+            const values = await electronAPI.getPhotoIndicators(paths);
+            if (generation !== work.generation) {
+              for (const [filePath] of batch) {
+                work.active.delete(filePath);
+                const currentFile = work.currentFiles.get(filePath);
+                if (currentFile) work.pending.set(filePath, currentFile);
+              }
+              updateProgress();
+              continue;
+            }
+
+            const snapshot: Record<
+              string,
+              { hasLocation: boolean; people: string[] }
+            > = {};
+            const next: Record<string, { people: boolean; mapped: boolean }> = {};
+            let missing = 0;
+            for (const [filePath] of batch) {
+              const indicators = values[filePath];
+              work.active.delete(filePath);
+              if (!indicators || !Array.isArray(indicators.people)) {
+                work.failed.add(filePath);
+                if (work.currentPaths.has(filePath)) work.currentProcessed += 1;
+                missing += 1;
+                continue;
+              }
+              snapshot[filePath] = indicators;
+              next[filePath] = {
+                people: indicators.people.length > 0,
+                mapped: Boolean(indicators.hasLocation),
+              };
+              work.completed.add(filePath);
+              if (work.currentPaths.has(filePath)) work.currentProcessed += 1;
+            }
+            if (Object.keys(snapshot).length) {
+              publishPhotoIndicators(snapshot);
+              setSortIndicators((current) => {
+                let nextState = current;
+                for (const [filePath, flags] of Object.entries(next)) {
+                  if (
+                    current[filePath]?.people === flags.people &&
+                    current[filePath]?.mapped === flags.mapped
+                  )
+                    continue;
+                  if (nextState === current) nextState = { ...current };
+                  nextState[filePath] = flags;
+                }
+                return nextState;
+              });
+            }
+            if (missing)
+              setSortIndicatorError(
+                `Could not load people and location data for ${missing} photos. Other results will continue loading.`,
+              );
+            updateProgress();
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+          } catch (cause) {
+            for (const [filePath] of batch) {
+              work.active.delete(filePath);
+              work.failed.add(filePath);
+              if (work.currentPaths.has(filePath)) work.currentProcessed += 1;
+            }
+            setSortIndicatorError(
+              cause instanceof Error
+                ? cause.message
+                : "Could not load sorting metadata.",
+            );
+            updateProgress();
+          }
         }
       } finally {
-        running = false;
+        work.running = false;
+        updateProgress();
+        if (work.enabled && work.pending.size) void processQueue();
       }
     };
-    const timer = window.setTimeout(() => void refresh(), 300);
-    const refreshTimer = window.setInterval(() => void refresh(), 1000);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-      window.clearInterval(refreshTimer);
-    };
-  }, [metadataFiles, electronAPI, needsPhotoMetadata]);
+
+    updateProgress();
+    void processQueue();
+  }, [
+    appSection,
+    electronAPI,
+    metadataFiles,
+    needsPhotoMetadata,
+    sortIndicatorRevision,
+  ]);
 
   const waitingForSortIndicators =
     needsPhotoMetadata &&
-    ((filterInventoryNeeded &&
-      filterInventory?.sourceKey !== enabledSourcePathsKey) ||
-      sortIndicatorSnapshot?.files !== metadataFiles ||
-      sortIndicatorSnapshot?.revision !== sortIndicatorRevision);
+    (metadataIndicatorProgress !== null || (needsRecursiveBrowse && loading));
   const showMetadataBusy = useStableBusy(waitingForSortIndicators);
 
   useMagicRanks(
@@ -5278,10 +5362,7 @@ function App() {
     exploded &&
     !searchQuery.trim();
   const filteredAndSortedFiles = useMemo(() => {
-    const filterSourceFiles = useFullFilterInventoryForResults
-      ? filterInventoryFiles ?? []
-      : contentFiles;
-    const filtered = filterSourceFiles.filter((file) => {
+    const filtered = contentFiles.filter((file) => {
       if (!pathIsVisibleForSelectedSources(file.path, enabledSourcePaths, allSourcePaths)) return false;
       if (file.isDirectory)
         return !exploded && peopleFilter === "all" && locationFilter === "all";
@@ -5361,8 +5442,6 @@ function App() {
     contentFiles,
     currentPath,
     deferBrowseSort,
-    filterInventoryFiles,
-    useFullFilterInventoryForResults,
     enabledSourcePaths,
     allSourcePaths,
     exploded,
@@ -5403,9 +5482,7 @@ function App() {
       if (!showFilters) return [];
       return Array.from(
         new Set([
-          ...(filterInventoryNeeded && filterInventoryFiles
-            ? filterInventoryFiles
-            : contentFiles)
+          ...contentFiles
             .filter((file) => !file.isDirectory)
             .map(modifiedYear),
           ...(audioOnlySelected ? audioYearOptions : []),
@@ -5421,8 +5498,6 @@ function App() {
       audioOnlySelected,
       audioYearOptions,
       contentFiles,
-      filterInventoryFiles,
-      filterInventoryNeeded,
       showFilters,
       sort.ascending,
       sort.field,
@@ -5453,15 +5528,11 @@ function App() {
     if (adjacentImages.length === 0) return;
 
     const timer = window.setTimeout(() => {
-      void Promise.all(
-        adjacentImages.map((file) =>
-          loadThumbnail(file.path, true, VIEWER_PREFETCH_THUMBNAIL_SIZE),
-        ),
-      );
+      void Promise.all(adjacentImages.map((file) => prepareViewerImage(file)));
     }, 120);
 
     return () => window.clearTimeout(timer);
-  }, [electronAPI, selectedFile?.path, viewerImages, viewerOpen]);
+  }, [prepareViewerImage, selectedFile?.path, viewerImages, viewerOpen]);
 
   const selectAllFiles = useCallback(() => {
     const selectableFiles = filteredAndSortedFiles.filter(
@@ -6901,14 +6972,9 @@ function App() {
               )}
             </div>
           </div>
-          {filterInventoryProgress && (
+          {needsRecursiveBrowse && loading && (
             <div className="filter-inventory-status" role="status" aria-live="polite">
-              Scanning selected source trees · {filterInventoryProgress.scanned.toLocaleString()} files found
-            </div>
-          )}
-          {filterInventoryError && (
-            <div className="filter-inventory-status error" role="status">
-              {filterInventoryError}
+              Scanning photos as they are found · {(fileScanProgress?.scanned ?? 0).toLocaleString()} files discovered
             </div>
           )}
           <div className="filter-section">
@@ -8576,13 +8642,11 @@ function App() {
                         : "hidden",
                   }}
                 >
-                  {filterInventoryError ||
-                    sortIndicatorError ||
-                    (filterInventoryNeeded &&
-                    filterInventory?.sourceKey !== enabledSourcePathsKey
-                      ? `Scanning selected source trees · ${(filterInventoryProgress?.scanned ?? 0).toLocaleString()} files found`
-                      : metadataIndicatorProgress
-                        ? `Checking people and locations · ${metadataIndicatorProgress.processed.toLocaleString()} of ${metadataIndicatorProgress.total.toLocaleString()} photos`
+                  {sortIndicatorError ||
+                    (metadataIndicatorProgress
+                      ? `Checking people and locations · ${metadataIndicatorProgress.processed.toLocaleString()} of ${metadataIndicatorProgress.total.toLocaleString()} photos`
+                      : needsRecursiveBrowse && loading
+                        ? `Scanning photos · ${(fileScanProgress?.scanned ?? 0).toLocaleString()} files found`
                         : "Updating people and location sort…")}
                 </div>
               </div>
@@ -8734,12 +8798,12 @@ function App() {
                               setYearDisplayLimits((current) => ({
                                 ...current,
                                 [item.year]:
-                                  (current[item.year] ?? yearPageSize) + 500,
+                                  (current[item.year] ?? yearPageSize) +
+                                  Math.min(500, item.count),
                               }))
                             }
                           >
-                            Load 500 more from {item.year} (
-                            {item.count.toLocaleString()} remaining)
+                            Load {Math.min(500, item.count).toLocaleString()} more from {item.year}
                           </button>
                         </td>
                       </tr>
@@ -8875,12 +8939,12 @@ function App() {
                           setYearDisplayLimits((current) => ({
                             ...current,
                             [item.year]:
-                              (current[item.year] ?? yearPageSize) + 500,
+                              (current[item.year] ?? yearPageSize) +
+                              Math.min(500, item.count),
                           }))
                         }
                       >
-                        Load 500 more from {item.year} (
-                        {item.count.toLocaleString()} remaining)
+                        Load {Math.min(500, item.count).toLocaleString()} more from {item.year}
                       </button>
                     </div>
                   ) : (
@@ -9002,9 +9066,17 @@ function App() {
                 </p>
                 <button
                   className="load-more"
-                  onClick={() => setDisplayLimit((limit) => limit + 500)}
+                  onClick={() =>
+                    setDisplayLimit((limit) =>
+                      limit +
+                      Math.min(500, filteredAndSortedFiles.length - limit),
+                    )
+                  }
                 >
-                  Load 500 more results
+                  Load {Math.min(
+                    500,
+                    filteredAndSortedFiles.length - displayLimit,
+                  ).toLocaleString()} more results
                 </button>
               </div>
             ) : !searchQuery.trim() &&
@@ -9017,9 +9089,17 @@ function App() {
                 </p>
                 <button
                   className="load-more"
-                  onClick={() => setDisplayLimit((limit) => limit + 500)}
+                  onClick={() =>
+                    setDisplayLimit((limit) =>
+                      limit +
+                      Math.min(500, yearSections.allFolders.length - limit),
+                    )
+                  }
                 >
-                  Load 500 more folders
+                  Load {Math.min(
+                    500,
+                    yearSections.allFolders.length - displayLimit,
+                  ).toLocaleString()} more folders
                 </button>
               </div>
             )}

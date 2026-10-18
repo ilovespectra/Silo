@@ -108,6 +108,81 @@ test("custom topic searches locally, keeps its wording, and selects a matching l
   assert.match(state.message, /Created a memory for/);
 });
 
+test("a broad prompt still searches its people and place names when already returning 15 photos", async t => {
+  const searched = [];
+  let planned = 0;
+  const f = await fixture(t, {
+    search: async query => {
+      searched.push(query);
+      return photos(query.replace(/[^a-z]+/gi, "-").toLowerCase(), query === "Elliott and Kat in Croatia" ? 20 : 8);
+    },
+    planPromptedMemory: async () => {
+      planned++;
+      return {
+        title: "Croatia Together",
+        entities: ["Elliott", "Kat", "Croatia"],
+        queries: ["Elliott and Kat", "Elliott in Croatia", "Kat in Croatia"],
+      };
+    },
+  });
+
+  const state = await f.manager.generate(false, "Elliott and Kat in Croatia");
+  assert.equal(planned, 1, "Ollama planning runs even when the full prompt already has 15 results");
+  for (const query of ["Elliott", "Kat", "Croatia", "Elliott and Kat", "Elliott in Croatia", "Kat in Croatia"])
+    assert(searched.includes(query), `missing entity search: ${query}`);
+  assert.equal(state.suggestions.length, 1);
+  assert.equal(state.suggestions[0].media.filter(item => item.type === "image").length, 24,
+    "the combined candidate pool retains the full story selection");
+});
+
+test("prompted memories combine entity searches to reach the 15-photo floor", async t => {
+  const searched = [];
+  const f = await fixture(t, {
+    searchPrompted: async (query, contextQuery) => {
+      searched.push([query, contextQuery]);
+      if (query === "Elliott and Kat in Croatia") return photos("complete-prompt", 12);
+      if (["Elliott", "Kat", "Croatia"].includes(query)) return photos(`entity-${query}`, 2);
+      return [];
+    },
+    planPromptedMemory: async () => ({ entities: ["Elliott", "Kat", "Croatia"] }),
+  });
+  const state = await f.manager.generate(false, "Elliott and Kat in Croatia");
+  assert.equal(state.suggestions.length, 1, state.message);
+  assert.ok(["Elliott", "Kat", "Croatia"].every(name =>
+    searched.some(([query, context]) => query === name && context === "Elliott and Kat in Croatia")));
+  assert.ok(state.suggestions[0].media.filter(item => item.type === "image").length >= 15);
+
+  const sparse = await fixture(t, {
+    search: async () => photos("only-twelve", 12),
+    planPromptedMemory: async () => null,
+  });
+  const rejected = await sparse.manager.generate(false, "a summer holiday");
+  assert.equal(rejected.suggestions.length, 0, "a prompted memory below fifteen photos must not pass as ready");
+  assert.match(rejected.message, /Not enough distinct, strong photos/);
+});
+
+test("existing memories receive distinct source-library songs when audio indexing finishes", async t => {
+  let audioFiles = [];
+  const f = await fixture(t, { listAudio: async () => audioFiles });
+  const generated = await f.manager.generate();
+  assert.ok(generated.suggestions.every(card => !card.soundtrackId), "no fake song ID is saved without an audio index");
+
+  audioFiles = Array.from({ length: 5 }, (_, index) => ({
+    name: `Song ${index}.mp3`,
+    path: `/music/Artist ${index}/Album/Song ${index}.mp3`,
+    size: 2_000_000,
+  }));
+  const refreshed = await f.manager.refreshSoundtracks();
+  assert.equal(refreshed.changedIds.length, 5);
+  assert.ok(refreshed.state.suggestions.every(card => /^library:/.test(card.soundtrackId)));
+  assert.equal(new Set(refreshed.state.suggestions.map(card => card.soundtrackId)).size, 5);
+
+  const restarted = new MemoryManager(f.root, f.deps);
+  const persisted = await restarted.getState();
+  assert.deepEqual(persisted.suggestions.map(card => card.soundtrackId),
+    refreshed.state.suggestions.map(card => card.soundtrackId));
+});
+
 test("custom topics go to the front without discarding existing suggestions; invalid topics do not search", async t => {
   const f = await fixture(t);
   const initial = await f.manager.generate();
@@ -340,7 +415,7 @@ test("movie destination accepts absolute folders or null only", async t => {
   assert.equal((await f.manager.getSettings()).movieDirectory, null);
 });
 
-test("prefer disjoint stories where possible, otherwise preserve valid overlapping themes", async t => {
+test("Generate replaces old stories with fresh photos when enough results exist", async t => {
   let count = 0;
   const common = photos("common", 4);
   const f = await fixture(t, { search: async () => [...common, ...photos(`unique-${count++}`, 4)] });
@@ -348,10 +423,11 @@ test("prefer disjoint stories where possible, otherwise preserve valid overlappi
   assert.equal(state.suggestions.length, 5);
   const first = new Set(state.suggestions[0].media.map(item => item.path));
   assert.ok(state.suggestions.slice(1).every(card => card.media.every(item => !first.has(item.path))));
-  f.deps.search = async () => [...common, ...photos(`small-${count++}`, 1)];
-  const overlapping = await f.manager.generate(true);
-  assert.equal(overlapping.suggestions.length, 5, "do not discard all themes merely to avoid overlap");
-  assert.ok(overlapping.suggestions.slice(0, 5).every(card => card.media.length === 5));
+  f.deps.search = async () => photos(`replacement-${count++}`, 5);
+  const replacement = await f.manager.generate(true);
+  assert.equal(replacement.suggestions.length, 5, "Generate fills the editable set from fresh results");
+  assert.ok(replacement.suggestions.every(card => card.media.length === 5));
+  assert.ok(replacement.suggestions.every(card => card.media.every(item => !first.has(item.path))));
 });
 
 test("Live Photo failures and denied companions are optional; mixed stories still need four photos", async t => {

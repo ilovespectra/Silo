@@ -23,9 +23,13 @@ export class Geocoder {
   private requestChain = Promise.resolve();
   private lastRequestTime = 0;
 
-  constructor(userDataPath: string, indexStoragePath: string = userDataPath) {
-    this.cachePath = path.join(indexStoragePath, "geocode-cache.json");
-    this.searchCachePath = path.join(indexStoragePath, "geocode-search-cache.json");
+  constructor(
+    userDataPath: string,
+    cachePath: string = path.join(userDataPath, "geocode-cache.json"),
+    searchCachePath: string = path.join(userDataPath, "geocode-search-cache.json"),
+  ) {
+    this.cachePath = cachePath;
+    this.searchCachePath = searchCachePath;
   }
 
   async initialize() {

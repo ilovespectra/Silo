@@ -619,15 +619,6 @@ interface DiagnosticReport {
 
 type IndexingDiagnosticReport = DiagnosticReport;
 
-interface FilterInventoryProgress {
-  requestId: number;
-  scanned: number;
-  total: number;
-  errors: number;
-  found: number;
-  done: boolean;
-}
-
 interface FileScanProgress {
   inventory?: { inventoryToken: string; total: number };
   requestId: number;
@@ -972,6 +963,9 @@ interface AppUpdateState {
   message?: string;
 }
 
+type CacheDestinationId = import("./cacheDestinations").CacheDestinationId;
+type CacheDestinationRoots = import("./cacheDestinations").CacheDestinationRoots;
+
 interface Window {
   electron?: {
     getAppUpdateState(): Promise<AppUpdateState>;
@@ -1046,13 +1040,6 @@ interface Window {
       title?: string;
       defaultPath?: string | null;
     }): Promise<{ path: string; isTimeMachine: boolean } | null>;
-    getFilterInventory(requestId: number): Promise<{
-      inventory: FileInfo[] | { inventoryToken: string; total: number };
-      errors: number;
-    }>;
-    onFilterInventoryProgress(
-      callback: (progress: FilterInventoryProgress) => void,
-    ): () => void;
     getFiles(
       dirPath: string,
       exploded: boolean,
@@ -1595,6 +1582,46 @@ interface Window {
       callback: (status: IndexStorageStatus) => void,
     ): () => void;
     selectIndexStorageRoot(): Promise<{
+      canceled: boolean;
+      restarting?: boolean;
+      path?: string;
+      error?: string;
+    }>;
+    getCacheDestinationSetupState(): Promise<{
+      catalog: Array<{
+        id: CacheDestinationId;
+        entry: string;
+        name: string;
+        description: string;
+        estimatePerTenThousand: string;
+        estimateBytesPerTenThousand: number;
+        kind: string;
+      }>;
+      roots: CacheDestinationRoots | null;
+      sharedPath: string | null;
+      unavailable: Array<{ id: CacheDestinationId; name: string; root: string }>;
+    }>;
+    chooseCacheDestinationFolder(current?: string): Promise<{
+      path: string;
+      freeBytes: number;
+      removable: boolean;
+    } | null>;
+    inspectCacheDestination(target: string): Promise<{
+      path: string;
+      freeBytes: number;
+      removable: boolean;
+    }>;
+    saveInitialCacheDestinations(
+      sharedPath: string,
+      roots: CacheDestinationRoots,
+    ): Promise<{ restarting?: boolean }>;
+    changeCacheDestination(id: CacheDestinationId): Promise<{
+      canceled: boolean;
+      restarting?: boolean;
+      path?: string;
+      error?: string;
+    }>;
+    locateCacheDestination(id: CacheDestinationId): Promise<{
       canceled: boolean;
       restarting?: boolean;
       path?: string;

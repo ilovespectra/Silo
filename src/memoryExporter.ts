@@ -2,7 +2,6 @@ import { spawn, ChildProcess } from "child_process";
 import { promises as fs } from "fs";
 import * as os from "os";
 import * as path from "path";
-import { createOriginalSoundtrack } from "./memoryMusic";
 import {
   isMemoryDurationAllowed,
   MEMORY_DURATION_SECONDS,
@@ -272,10 +271,7 @@ export class MemoryExporter {
       const joined = path.join(directory, "joined.mov");
       emit("mixing", total, "Joining clips and preparing soundtrack");
       await this.ffmpeg(["-f", "concat", "-safe", "1", "-i", list, "-c", "copy", joined]);
-      if (!musicPath) {
-        musicPath = path.join(directory, "original-score.wav");
-        await createOriginalSoundtrack(musicPath, movieDuration, suggestion.mood, this.controller.signal);
-      } else {
+      if (musicPath) {
         // Bound a looping library source before mixing: an infinite demuxer inside amix
         // can stall at EOF with some FFmpeg builds, even when the output has -t.
         const boundedMusic = path.join(directory, "library-score.wav");
@@ -285,12 +281,19 @@ export class MemoryExporter {
       }
       this.checkCancelled();
       const finished = path.join(directory, "finished.mp4");
+      const outputArgs = musicPath
+        ? [
+            "-i", joined, "-i", musicPath,
+            "-filter_complex", `[1:a:0]volume=0.32,afade=t=in:d=0.6,afade=t=out:st=${movieDuration - 0.9}:d=0.9[score];[0:a:0][score]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:latency=1[a]`,
+            "-map", "0:v:0", "-map", "[a]",
+          ]
+        : ["-i", joined, "-map", "0:v:0", "-map", "0:a:0?"];
       await this.ffmpeg([
-        "-i", joined, "-i", musicPath,
-        "-filter_complex", `[1:a:0]volume=0.32,afade=t=in:d=0.6,afade=t=out:st=${movieDuration - 0.9}:d=0.9[score];[0:a:0][score]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:latency=1[a]`,
-        "-map", "0:v:0", "-map", "[a]", "-t", String(movieDuration), "-c:v", "copy",
+        ...outputArgs, "-t", String(movieDuration), "-c:v", "copy",
         "-c:a", "aac", "-b:a", "192k", "-threads", "2", "-movflags", "+faststart", "-map_metadata", "-1", finished,
-      ], seconds => emit("mixing", total, `Mixing soundtrack (${Math.min(100, Math.round(seconds / movieDuration * 100))}%)`));
+      ], seconds => emit("mixing", total, musicPath
+        ? `Mixing soundtrack (${Math.min(100, Math.round(seconds / movieDuration * 100))}%)`
+        : `Finishing movie (${Math.min(100, Math.round(seconds / movieDuration * 100))}%)`));
       this.checkCancelled();
       // Same filesystem atomic replacement. Main must confirm overwrites in its save dialog.
       await fs.rename(finished, output);

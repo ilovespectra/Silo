@@ -6,6 +6,8 @@ export interface MemoryMedia {
   modified: number;
   thumbnailUrl?: string | null;
   liveVideoPath?: string;
+  /** Set only for a user-prompted Memory that explicitly names this live virtual folder. */
+  promptedMemoryFolderId?: string;
 }
 export interface MemorySuggestion {
   id: string;

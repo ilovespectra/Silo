@@ -38,7 +38,7 @@ export interface MemoryManagerDependencies {
   filterImages?(paths: string[]): Promise<string[]>;
   thumb(path: string): string | null | undefined | Promise<string | null | undefined>;
   listAudio(): MemoryAudioFile[] | Promise<MemoryAudioFile[]>;
-  isAllowed(path: string): boolean | Promise<boolean>;
+  isAllowed(path: string, media?: MemoryMedia): boolean | Promise<boolean>;
   findLiveVideo?(file: MemoryMedia): Promise<string | null | undefined>;
   /** Story ideas mined from the library (time, places, people, pets, subjects, folders). */
   discover?(): Promise<MemoryStoryCandidate[]>;
@@ -119,7 +119,8 @@ const RIGHTS = "Song from your music library. Memory movies are for personal vie
 const MUSIC_EXTENSION = /\.(mp3|m4a|aac|flac|alac|wav|aiff?|ogg|opus)$/i;
 const NOT_MUSIC = /(voice ?memos?|recordings?|ringtones?|podcasts?|audiobooks?|sound ?effects?|\bsfx\b|samples?|whatsapp|telegram|attachments|voicemail|notifications?|alarms?|system sounds|garageband|phone backups?)/i;
 const STOP_WORDS = new Set(["photo", "photos", "with", "from", "your", "days", "the", "and", "over", "years",
-  "year", "this", "week", "ago", "memories", "moments", "story", "inspired", "across", "library", "folder"]);
+  "year", "this", "week", "ago", "memories", "moments", "story", "inspired", "across", "library", "folder",
+  "a", "an", "at", "by", "during", "for", "in", "into", "of", "on", "to"]);
 const MAX_CUSTOM_TOPIC_LENGTH = 120;
 const TITLE_CONNECTORS = new Set(["a", "an", "and", "at", "for", "in", "of", "on", "the", "to", "with"]);
 
@@ -144,21 +145,29 @@ function customTopicQueries(topic: string, plan?: MemoryPromptPlan | null): stri
   const chunks = normalized.split(/[,;|\n]+/).map(normalizeCustomTopic).filter(Boolean);
   const tokens = normalized.split(/\s+/).filter(Boolean).map(word => word.toLocaleLowerCase());
   const meaningful = tokens.filter((token) => token.length >= 3 && !STOP_WORDS.has(token));
-  const variants = [normalized, ...chunks, ...(plan?.entities ?? []), ...(plan?.queries ?? [])];
+  // Search each saved name before spending the remaining request budget on
+  // planner combinations or generic wording variants. A broad prompt can
+  // already return hundreds of hits while missing one named person or place.
+  const plannedQueries = (plan?.queries ?? []).slice(0, 4);
+  const plannedEntities = (plan?.entities ?? []).slice(0, 6);
+  const variants = [normalized, ...chunks, ...plannedEntities, ...plannedQueries];
   if (chunks.length <= 1) {
     if (meaningful.length) variants.push(meaningful.join(" "));
-    variants.push(`photo of ${normalized}`, `photos of ${normalized}`, `a photo of ${normalized}`);
+    // Individual terms are useful union fallbacks for prompts such as
+    // "Elliott and Kat on the beach" when local planning is unavailable.
+    variants.push(...meaningful);
     if (meaningful.length > 1) {
       variants.push(meaningful.slice(0, Math.min(meaningful.length, 4)).join(" "));
       variants.push(meaningful.slice(-Math.min(meaningful.length, 4)).join(" "));
     }
-    for (const word of meaningful) variants.push(word);
+    variants.push(`photo of ${normalized}`, `photos of ${normalized}`, `a photo of ${normalized}`);
   }
   for (const variant of variants) {
     const trimmed = normalizeCustomTopic(variant);
-    if (trimmed) unique.set(trimmed.toLocaleLowerCase(), trimmed);
+    if (trimmed && !unique.has(trimmed.toLocaleLowerCase()))
+      unique.set(trimmed.toLocaleLowerCase(), trimmed);
   }
-  return [...unique.values()].slice(0, 24);
+  return [...unique.values()].slice(0, 12);
 }
 
 function customTopicTitle(topic: string, plan?: MemoryPromptPlan | null): string {
@@ -212,6 +221,8 @@ function mediaValue(value: unknown): MemoryMedia | undefined {
     ...(typeof item.thumbnailUrl === "string" && item.thumbnailUrl.length <= 128 * 1024
       ? { thumbnailUrl: item.thumbnailUrl } : {}),
     ...(text(item.liveVideoPath) && item.type === "image" ? { liveVideoPath: item.liveVideoPath } : {}),
+    ...(text(item.promptedMemoryFolderId) && item.promptedMemoryFolderId.length <= 200
+      ? { promptedMemoryFolderId: item.promptedMemoryFolderId } : {}),
   };
 }
 
@@ -284,8 +295,8 @@ export class MemoryManager {
     return this.initialization;
   }
 
-  private async allowed(filePath: string): Promise<boolean> {
-    try { return await this.deps.isAllowed(filePath) === true; } catch { return false; }
+  private async allowed(filePath: string, media?: MemoryMedia): Promise<boolean> {
+    try { return await this.deps.isAllowed(filePath, media) === true; } catch { return false; }
   }
 
   private async safeMedia(items: MemoryMedia[], limit: number): Promise<MemoryMedia[]> {
@@ -293,7 +304,7 @@ export class MemoryManager {
     const seen = new Set<string>();
     for (const value of items.slice(0, limit)) {
       const item = mediaValue(value);
-      if (!item || seen.has(item.path) || !await this.allowed(item.path)) continue;
+      if (!item || seen.has(item.path) || !await this.allowed(item.path, item)) continue;
       seen.add(item.path);
       if (item.liveVideoPath && !await this.allowed(item.liveVideoPath)) delete item.liveVideoPath;
       if (result.length >= 3) delete item.thumbnailUrl;
@@ -610,15 +621,14 @@ export class MemoryManager {
         ...[...current, ...reserve].map(card => card.storyKey).filter((key): key is string => Boolean(key))]);
       const usedPaths = new Set(current.flatMap(card => card.media.map(item => item.path)));
       const produced: MemorySuggestion[] = [];
-      // Thin stories (under 15 shots) are kept only as a last resort.
+      // Prompted memories need 15 distinct photos so each shot has enough screen time.
       const thin: MemorySuggestion[] = [];
-      const take = (card: MemorySuggestion | null, allowThin = false) => {
+      const take = (card: MemorySuggestion | null) => {
         if (!card) return;
-        if (!allowThin && card.media.length < MEMORY_MIN_SELECTION_COUNT) {
+        const photoCount = card.media.filter(item => item.type === "image").length;
+        if (customTopic && photoCount < MEMORY_MIN_SELECTION_COUNT) {
           thin.push(card);
-          // Reserve its shots so later stories stay distinct if this one is used as a fallback.
-          if (!customTopic) card.media.forEach(item => usedPaths.add(item.path));
-          this.trace("memory-story-thin", { story: card.storyKey?.split(":")[0] ?? "theme", items: card.media.length });
+          this.trace("memory-story-thin", { story: card.storyKey?.split(":")[0] ?? "theme", photos: photoCount });
           return;
         }
         const cardSignature = signature(card.media);
@@ -681,30 +691,23 @@ export class MemoryManager {
             hits: hits.length, added, merged: mergedByPath.size });
         };
 
-        // Start with the user's words, before asking Ollama to reinterpret them.
-        // Simple named people, folders, and places can then generate immediately.
+        // Search the user's complete request first, then always gather its
+        // recognized entities. A broad query can find plenty of photos while
+        // still missing one named person or place.
         const directQuery = customTopic;
+        const planPromise = this.deps.planPromptedMemory
+          ? Promise.resolve().then(() => this.deps.planPromptedMemory!(customTopic)).catch((error) => {
+              this.deps.onSearchError?.("custom-topic-plan", error);
+              return null;
+            })
+          : Promise.resolve(null);
         try {
           advance("scanning", `Searching “${promptedTopicTitle ?? customTopicTitle(customTopic)}”`, 1);
           const hits = this.deps.searchPrompted
             ? await this.deps.searchPrompted(directQuery, customTopic)
             : await this.deps.search(directQuery);
-          if (Array.isArray(hits)) {
-            addQueryHits(directQuery, hits, 0, 1);
-            const directTitle = customTopicTitle(customTopic);
-            const directCard = await this.buildCard({
-              key: `custom:${createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16)}`,
-              title: directTitle,
-              description: `A story shaped by “${customTopic}” from your library.`,
-              query: customTopic,
-              mood: customTopicMood(customTopic),
-            }, hits, signatures, usedPaths, existingStories);
-            if (directCard) {
-              take(directCard);
-              if (produced.length)
-                advance("matching", `Found a memory for “${directTitle}”`, 1);
-            }
-          } else {
+          if (Array.isArray(hits)) addQueryHits(directQuery, hits, 0, 1);
+          else {
             this.trace("memory-custom-query", { index: 0, of: 1, words: directQuery.split(/\s+/).length, hits: -1 });
           }
         } catch (error) {
@@ -712,24 +715,14 @@ export class MemoryManager {
           this.deps.onSearchError?.("custom-topic", error);
         }
 
-        if (!produced.length && this.deps.planPromptedMemory) {
-          this.updateGenerationProgress("scanning", completedSteps, totalSteps, "Expanding your Memory search…", startedAt);
-          try {
-            customPlan = await this.deps.planPromptedMemory(customTopic);
-          } catch (error) {
-            this.deps.onSearchError?.("custom-topic-plan", error);
-          }
-        }
+        this.updateGenerationProgress("scanning", completedSteps, totalSteps, "Expanding your Memory search…", startedAt);
+        customPlan = await planPromise;
         promptedTopicTitle = customTopicTitle(customTopic, customPlan);
-        if (!produced.length) {
-          const directKey = directQuery.toLocaleLowerCase().replace(/\s+/g, " ").trim();
-          broadQueries = customTopicQueries(customTopic, customPlan)
-            .filter((query) => query.toLocaleLowerCase().replace(/\s+/g, " ").trim() !== directKey);
-        } else {
-          broadQueries = [];
-        }
+        const directKey = directQuery.toLocaleLowerCase().replace(/\s+/g, " ").trim();
+        broadQueries = customTopicQueries(customTopic, customPlan)
+          .filter((query) => query.toLocaleLowerCase().replace(/\s+/g, " ").trim() !== directKey);
 
-        for (let index = 0; !produced.length && index < broadQueries.length; index++) {
+        for (let index = 0; index < broadQueries.length; index++) {
           const query = broadQueries[index];
           try {
             const topicTitle = promptedTopicTitle ?? customTopicTitle(customTopic);
@@ -749,7 +742,7 @@ export class MemoryManager {
           }
         }
         // Only report search as unavailable when every query actually failed.
-        if (!produced.length && searchErrors > 0 && searchErrors === broadQueries.length + 1) searchFailed = true;
+        if (searchErrors > 0 && searchErrors === broadQueries.length + 1) searchFailed = true;
         // Interleave result lists before the card's bounded candidate pass, so the first
         // phrase cannot crowd every later person, place, or folder out of the 200-photo pool.
         const orderedPaths: string[] = [];
@@ -781,7 +774,7 @@ export class MemoryManager {
           }];
         });
         const topicTitle = promptedTopicTitle ?? customTopicTitle(customTopic);
-        if (!produced.length && mergedHits.length) {
+        if (mergedHits.length) {
           const card = await this.buildCard({
             key: `custom:${createHash("sha1").update(customTopic.toLocaleLowerCase()).digest("hex").slice(0, 16)}`,
             title: topicTitle,
@@ -824,12 +817,6 @@ export class MemoryManager {
         try { hits = await this.deps.search(theme.query); } catch (error) { searchFailed = true; this.deps.onSearchError?.("theme", error); continue; }
         take(await this.buildCard({ ...theme, key: `theme:${theme.title}`,
           description: `A ${theme.mood} story inspired by ${theme.title.toLowerCase()}.` }, hits, signatures, usedPaths, existingStories));
-      }
-
-      if (produced.length < want && thin.length) {
-        const fallback = thin.sort((a, b) => b.media.length - a.media.length).slice(0, want - produced.length);
-        this.trace("memory-thin-fallback", { used: fallback.length, items: fallback.map(card => card.media.length) });
-        fallback.forEach(card => take(card, true));
       }
 
       let visible: MemorySuggestion[];
@@ -900,10 +887,11 @@ export class MemoryManager {
   }
 
   /** Gives each story without a song its own track, distinct from the other stories' songs and artists. */
-  private async assignSoundtracks(cards: MemorySuggestion[]): Promise<void> {
-    if (!cards.some(card => !card.soundtrackId)) return;
+  private async assignSoundtracks(cards: MemorySuggestion[]): Promise<string[]> {
+    if (!cards.some(card => !card.soundtrackId)) return [];
     const pool = await this.musicPool();
-    if (!pool.length) return;
+    if (!pool.length) return [];
+    const changed: string[] = [];
     const usedTracks = new Set(cards.map(card => card.soundtrackId).filter((id): id is string => Boolean(id)));
     const usedArtists = new Set<string>();
     for (const id of usedTracks) {
@@ -913,8 +901,22 @@ export class MemoryManager {
     for (const card of cards) {
       if (card.soundtrackId) continue;
       const picked = await this.pickSoundtrack(card, pool, usedTracks, usedArtists);
-      if (picked) card.soundtrackId = picked;
+      if (picked) {
+        card.soundtrackId = picked;
+        changed.push(card.id);
+      }
     }
+    return changed;
+  }
+
+  /** Assign songs discovered after app startup to saved cards that had none. */
+  async refreshSoundtracks(): Promise<{ state: MemoryState; changedIds: string[] }> {
+    await this.initialize();
+    if (this.generation) await this.generation.catch(() => undefined);
+    const cards = [...this.state.suggestions, ...this.reserve];
+    const changedIds = await this.assignSoundtracks(cards);
+    if (changedIds.length) await this.persist();
+    return { state: await this.getState(), changedIds };
   }
 
   async dismiss(id: string): Promise<MemoryState> {
