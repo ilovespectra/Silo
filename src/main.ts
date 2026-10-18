@@ -9968,8 +9968,8 @@ app.whenReady().then(async () => {
     : geoIndexer.initialize();
   geocoder = new Geocoder(
     app.getPath("userData"),
-    cacheDestinationRoot("geocode-cache.json"),
-    cacheDestinationRoot("geocode-search-cache.json"),
+    indexStoragePath("geocode-cache.json"),
+    indexStoragePath("geocode-search-cache.json"),
   );
   if (!indexStorageInitializationDeferred) await geocoder.initialize();
   duplicateManager = new DuplicateManager(app.getPath("userData"), (state) => {
