@@ -713,6 +713,20 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(
     () => Number(localStorage.getItem("silo.sidebarWidth")) || 260,
   );
+  const [primaryNavCollapsed, setPrimaryNavCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("silo.primaryNavCollapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const [librarySidebarCollapsed, setLibrarySidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("silo.librarySidebarCollapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
   const [thumbnailSize, setThumbnailSize] = useState(() => {
     const saved = Number(localStorage.getItem("silo.thumbnailSize"));
     const fallback = 240;
@@ -1243,6 +1257,30 @@ function App() {
       const next = { ...current, [section]: !current[section] };
       try {
         localStorage.setItem("silo.sidebarCollapsed", JSON.stringify(next));
+      } catch {
+        // Keep the current-session preference if storage is unavailable.
+      }
+      return next;
+    });
+  };
+
+  const togglePrimaryNavCollapsed = () => {
+    setPrimaryNavCollapsed((current) => {
+      const next = !current;
+      try {
+        localStorage.setItem("silo.primaryNavCollapsed", String(next));
+      } catch {
+        // Keep the current-session preference if storage is unavailable.
+      }
+      return next;
+    });
+  };
+
+  const toggleLibrarySidebarCollapsed = () => {
+    setLibrarySidebarCollapsed((current) => {
+      const next = !current;
+      try {
+        localStorage.setItem("silo.librarySidebarCollapsed", String(next));
       } catch {
         // Keep the current-session preference if storage is unavailable.
       }
@@ -6223,10 +6261,23 @@ function App() {
         </div>
       )}
       <div className="app-workspace-row">
-        <aside className="primary-nav-rail" aria-label="Silo navigation">
+        <aside
+          className={`primary-nav-rail${primaryNavCollapsed ? " is-collapsed" : ""}`}
+          aria-label="Silo navigation"
+        >
           <div className="primary-nav-brand" aria-label="Silo home">
             <span>silo</span>
             <i aria-hidden="true" />
+            <button
+              className="primary-nav-collapse-toggle"
+              type="button"
+              aria-label={primaryNavCollapsed ? "Expand section navigation" : "Collapse section navigation"}
+              aria-expanded={!primaryNavCollapsed}
+              title={primaryNavCollapsed ? "Expand section navigation" : "Collapse section navigation"}
+              onClick={togglePrimaryNavCollapsed}
+            >
+              {primaryNavCollapsed ? <FiChevronRight aria-hidden="true" /> : <FiChevronLeft aria-hidden="true" />}
+            </button>
           </div>
           {/* Keep legacy tour selectors stable during the shell redesign. Rebuild the guided tour after the workflows settle: navigation → source choice → indexing → Files browse/search/folders → Memories → People → Map → Duplicates → Mobile workflows → Settings. */}
           <nav className="primary-nav-main" aria-label="Main sections" data-tour="app-tabs">
@@ -6237,6 +6288,7 @@ function App() {
               onClick={() => setAppSection("memories")}
               data-tour="memories-tab"
               title="Memories"
+              aria-label="Memories"
               data-help="Browse story suggestions, then create or export a memory when you choose."
             >
               <FiPlay aria-hidden="true" />
@@ -6249,6 +6301,7 @@ function App() {
               onClick={() => setAppSection("files")}
               data-tour="files-tab"
               title="Files"
+              aria-label="Files"
               data-help="Browse and organize local folders, connected accounts, and saved device sources."
             >
               <FiGrid aria-hidden="true" />
@@ -6260,6 +6313,7 @@ function App() {
               aria-current={appSection === "people" ? "page" : undefined}
               onClick={() => setAppSection("people")}
               title="People"
+              aria-label="People"
               data-help="Review offline face groups, name people, and correct or merge assignments."
             >
               <FiUsers aria-hidden="true" />
@@ -6271,6 +6325,7 @@ function App() {
               aria-current={appSection === "map" ? "page" : undefined}
               onClick={() => setAppSection("map")}
               title="Map"
+              aria-label="Map"
               data-help="Explore geotagged photos by place and update selected photo locations."
             >
               <FiMap aria-hidden="true" />
@@ -6282,6 +6337,7 @@ function App() {
               aria-current={appSection === "duplicates" ? "page" : undefined}
               onClick={() => setAppSection("duplicates")}
               title="Duplicates"
+              aria-label="Duplicates"
               data-help="Compare exact duplicates, review recoverable removals, and confirm before permanent deletion."
             >
               <FiCopy aria-hidden="true" />
@@ -6293,6 +6349,7 @@ function App() {
               aria-current={appSection === "mobile" ? "page" : undefined}
               onClick={() => setAppSection("mobile")}
               title="Mobile"
+              aria-label="Mobile"
               data-help="Connect phones and tablets, browse saved copies, and review or export message histories."
             >
               <FiSmartphone aria-hidden="true" />
@@ -8158,7 +8215,24 @@ function App() {
             } as React.CSSProperties
           }
         >
-          <aside className="library-sidebar">
+          <aside
+            className={`library-sidebar${librarySidebarCollapsed ? " is-collapsed" : ""}`}
+            aria-label="Files sources and folders"
+          >
+            <div className="library-sidebar-controls">
+              <button
+                className="library-sidebar-collapse-button"
+                type="button"
+                aria-label={librarySidebarCollapsed ? "Expand source and folder sidebar" : "Collapse source and folder sidebar"}
+                aria-expanded={!librarySidebarCollapsed}
+                title={librarySidebarCollapsed ? "Expand source and folder sidebar" : "Collapse source and folder sidebar"}
+                onClick={toggleLibrarySidebarCollapsed}
+              >
+                {librarySidebarCollapsed ? <FiChevronRight aria-hidden="true" /> : <FiChevronLeft aria-hidden="true" />}
+                <span>{librarySidebarCollapsed ? "Expand" : "Collapse sidebar"}</span>
+              </button>
+            </div>
+            {!librarySidebarCollapsed && <>
             <section className="sidebar-section volumes" data-tour="source-controls" data-help="Choose which local, cloud, or saved-device sources are included in Files. Available sources can be browsed; adding a folder starts indexing.">
               <div className="sidebar-heading">
                 <button
@@ -8687,8 +8761,9 @@ function App() {
                 onToggleCollapsed={() => toggleSidebarSection("indexing")}
               />
             </section>
+            </>}
           </aside>
-          <div
+          {!librarySidebarCollapsed && <div
             className="sidebar-resizer"
             role="separator"
             aria-orientation="vertical"
@@ -8707,7 +8782,7 @@ function App() {
               if (event.key === "ArrowRight")
                 setSidebarWidth((width) => Math.min(520, width + 16));
             }}
-          />
+          />}
           <div
             className={`file-browser ${audioOnlySelected ? "audio-only" : ""} ${videoOnlySelected ? "video-only" : ""}`}
             data-retained-scroll="files"

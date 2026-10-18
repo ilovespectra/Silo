@@ -1787,6 +1787,62 @@ label.settings-row {
   overflow-y: auto;
   border-right: 1px solid var(--line);
   background: var(--surface-sidebar);
+  transition: flex-basis 160ms ease, width 160ms ease;
+}
+
+.library-sidebar-controls {
+  display: flex;
+  min-height: 38px;
+  justify-content: flex-end;
+  padding: 6px 12px 0;
+}
+
+.library-sidebar-collapse-button {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface-control);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.library-sidebar-collapse-button:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.library-sidebar-collapse-button:focus-visible {
+  outline: 2px solid var(--orange-bright);
+  outline-offset: 2px;
+}
+
+.library-sidebar.is-collapsed {
+  flex: 0 0 42px;
+  width: 42px;
+  min-width: 42px;
+  overflow: hidden;
+}
+
+.library-sidebar.is-collapsed .library-sidebar-controls {
+  justify-content: center;
+  padding: 8px 4px 0;
+}
+
+.library-sidebar.is-collapsed .library-sidebar-collapse-button {
+  width: 30px;
+  padding: 0;
+}
+
+.library-sidebar.is-collapsed .library-sidebar-collapse-button span {
+  display: none;
 }
 
 .sidebar-resizer {
@@ -10465,6 +10521,15 @@ input[type="range"]::-moz-range-progress {
   overflow-y: auto;
   border-right: 1px solid var(--border-soft);
   background: var(--surface-sidebar);
+  transition: flex-basis 160ms ease, width 160ms ease;
+}
+
+.primary-nav-rail.is-collapsed {
+  flex-basis: 68px;
+  width: 68px;
+  align-items: center;
+  padding-right: 7px;
+  padding-left: 7px;
 }
 
 .primary-nav-brand {
@@ -10485,6 +10550,60 @@ input[type="range"]::-moz-range-progress {
   border-radius: 50%;
   background: var(--orange);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--orange) 15%, transparent);
+}
+
+.primary-nav-collapse-toggle {
+  display: inline-flex;
+  flex: 0 0 30px;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  margin-left: auto;
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface-control);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.primary-nav-collapse-toggle:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.primary-nav-collapse-toggle:focus-visible {
+  outline: 2px solid var(--orange-bright);
+  outline-offset: 2px;
+}
+
+.primary-nav-rail.is-collapsed .primary-nav-brand {
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+}
+
+.primary-nav-rail.is-collapsed .primary-nav-brand > span,
+.primary-nav-rail.is-collapsed .primary-nav-brand > i {
+  display: none;
+}
+
+.primary-nav-rail.is-collapsed .primary-nav-collapse-toggle {
+  margin: 0;
+}
+
+.primary-nav-rail.is-collapsed .primary-nav-main button,
+.primary-nav-rail.is-collapsed .primary-nav-utilities button {
+  justify-content: center;
+  padding-right: 4px;
+  padding-left: 4px;
+}
+
+.primary-nav-rail.is-collapsed .primary-nav-main button span,
+.primary-nav-rail.is-collapsed .primary-nav-utilities button span {
+  display: none;
 }
 
 .primary-nav-main,
@@ -11084,11 +11203,22 @@ input[type="range"]::-moz-range-progress {
     padding-left: 7px;
   }
 
+  .primary-nav-rail.is-collapsed {
+    flex-basis: 50px;
+    width: 50px;
+    padding-right: 3px;
+    padding-left: 3px;
+  }
+
   .primary-nav-brand {
     justify-content: center;
     gap: 4px;
     padding: 0;
     font-size: 18px;
+  }
+
+  .primary-nav-brand > span {
+    display: none;
   }
 
   .primary-nav-brand i {
@@ -11156,6 +11286,19 @@ input[type="range"]::-moz-range-progress {
     width: 54px;
     gap: 10px;
     padding: 10px 5px;
+  }
+
+  .primary-nav-rail.is-collapsed {
+    flex-basis: 44px;
+    width: 44px;
+    padding-right: 2px;
+    padding-left: 2px;
+  }
+
+  .primary-nav-collapse-toggle {
+    flex-basis: 28px;
+    width: 28px;
+    height: 28px;
   }
 
   .primary-nav-main button,
