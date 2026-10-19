@@ -4072,9 +4072,15 @@ async function verifyMemoryExport(options: MemoryExportOptions) {
     throw new Error("This memory contains photos that failed the current content safety check. Regenerate suggestions before exporting.");
   const soundtrack = await memoryManager.resolveSoundtrack(options.soundtrackId, suggestion.id);
   if (!soundtrack) throw new Error("Soundtrack is no longer available.");
-  if (soundtrack.source === "library" && (!soundtrack.path || !memoryAllowed(soundtrack.path)
-    || !await fsPromises.access(soundtrack.path).then(() => true, () => false)))
-    throw new Error("Soundtrack is no longer available.");
+  if (soundtrack.source === "library") {
+    const localPath = soundtrack.path
+      ? await resolveLocalPath(soundtrack.path).catch(() => null)
+      : null;
+    const available = localPath
+      ? await fsPromises.stat(localPath).then((stat) => stat.isFile(), () => false)
+      : false;
+    if (!available) throw new Error("Soundtrack is no longer available.");
+  }
   return { suggestion, soundtrack };
 }
 
@@ -10060,6 +10066,12 @@ app.whenReady().then(async () => {
   audioLibraryCache = new AudioLibraryCache(cacheDestinationRoot("audio-library-index.json"));
   if (!indexStorageInitializationDeferred) await audioLibraryCache.initialize();
   geoIndexer.setOverrides(stateStore.getState().geoOverrides);
+  geoIndexer.setBorrowedLocationsEnabled(
+    stateStore.getState().borrowedLocationsEnabled,
+  );
+  geoIndexer.setInferenceWindowMinutes(
+    stateStore.getState().borrowedLocationWindowMinutes,
+  );
   thumbnailPregenerator = new ThumbnailPregenerator({
     getSourceRoots: getAllIndexSources,
     isMedia: (fileName) => {
@@ -10125,6 +10137,15 @@ app.whenReady().then(async () => {
     filterImages: filterMemoryPhotos,
     thumb: async (filePath) => getThumbnail(await resolveLocalPath(filePath), false, 200),
     listAudio: () => audioLibraryCache?.getSnapshot().files ?? [],
+    isAudioAvailable: async (file) => {
+      if (!isAudioFile(file.name, mime.getType(file.name))) return false;
+      try {
+        const localPath = await resolveLocalPath(file.path);
+        return (await fsPromises.stat(localPath)).isFile();
+      } catch {
+        return false;
+      }
+    },
     discover: discoverMemoryIdeas,
     onSearchError: (stage, error) => runtimeLog("memory-search-error", {
       stage, ...memoryErrorDetails(error), ...memoryEnvironmentSnapshot(),
@@ -12037,13 +12058,21 @@ async function refreshAudioInventory(requestId: number, force = false) {
 async function refreshMemorySoundtracksAfterAudioIndexing(): Promise<void> {
   if (!memoryManager) return;
   const { state, changedIds } = await memoryManager.refreshSoundtracks();
+  const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
+  const allCards = [...state.suggestions, ...reserve];
+  const inventoryFiles = audioLibraryCache?.getSnapshot().files ?? [];
+  runtimeLog("memory-soundtrack-refresh", {
+    indexedAudioFiles: inventoryFiles.filter((file) => isAudioFile(file.name, mime.getType(file.name))).length,
+    cards: allCards.length,
+    cardsWithLibrarySoundtrack: allCards.filter((card) => card.soundtrackId?.startsWith("library:")).length,
+    assignedNow: changedIds.length,
+  });
   if (!changedIds.length) return;
 
   // Let an in-flight original-audio render finish before clearing its status.
   await memoryPreviewQueue.catch(() => undefined);
   const changed = new Set(changedIds);
-  const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
-  const changedCards = [...state.suggestions, ...reserve].filter((card) => changed.has(card.id));
+  const changedCards = allCards.filter((card) => changed.has(card.id));
   for (const id of changedIds) memoryPreviewStatus.delete(id);
 
   const currentState = await memoryManager.getState();
@@ -14578,6 +14607,26 @@ ipcMain.handle("clear-geo-location", async (_event, filePaths: string[]) => {
     appState,
     geoState: getVisibleGeoState(geoState, sources),
   };
+});
+ipcMain.handle(
+  "set-borrowed-locations-enabled",
+  async (_event, enabled: boolean) => {
+    const appState = await stateStore.setBorrowedLocationsEnabled(enabled);
+    geoIndexer.setBorrowedLocationsEnabled(appState.borrowedLocationsEnabled);
+    const sources = await getEnabledIndexSources();
+    return getVisibleGeoState(geoIndexer.getState(), sources);
+  },
+);
+ipcMain.handle("set-borrowed-location-window", async (_event, windowMinutes: number) => {
+  const appState = await stateStore.setBorrowedLocationWindow(windowMinutes);
+  geoIndexer.setInferenceWindowMinutes(appState.borrowedLocationWindowMinutes);
+  const sources = await getEnabledIndexSources();
+  return getVisibleGeoState(geoIndexer.getState(), sources);
+});
+ipcMain.handle("dismiss-borrowed-location", async (_event, filePath: string) => {
+  const state = await geoIndexer.dismissBorrowedLocation(filePath);
+  const sources = await getEnabledIndexSources();
+  return getVisibleGeoState(state, sources);
 });
 ipcMain.handle("start-face-indexing", async () => {
   await retryIndexRecoveryStage("faces");

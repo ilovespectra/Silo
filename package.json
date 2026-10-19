@@ -15,6 +15,7 @@
     "search-eval": "node scripts/search-eval.cjs",
     "test:search-eval": "node test/search-eval-core.test.cjs",
     "test:face-clustering": "node test/runFaceClusteringTests.cjs",
+    "test:borrowed-locations": "node test/runBorrowedLocationTests.cjs",
     "test:message-coverage": "node test/runMessageCoverageTests.cjs",
     "test:ios-message-backup": "node test/runIosMessageBackupTests.cjs",
     "test:beta-license": "npm run test:license",

@@ -7,6 +7,10 @@ import * as readline from "readline";
 import * as exifr from "exifr";
 import { IndexableFile } from "./semanticIndexer";
 import type { GeoOverride } from "./stateStore";
+import {
+  inferBorrowedLocations,
+  type BorrowedLocationConfidence,
+} from "./borrowedLocationInference";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,7 +22,11 @@ export interface GeoPhoto extends IndexableFile {
   region: string | null;
   country: string | null;
   locationLabel: string;
-  locationSource: "embedded" | "manual";
+  locationSource: "embedded" | "manual" | "inferred";
+  captureTime?: number | null;
+  inferenceConfidence?: BorrowedLocationConfidence;
+  inferenceReferenceCount?: number;
+  inferenceTimeOffsetMs?: number;
 }
 
 export interface GeoIndexState {
@@ -29,6 +37,9 @@ export interface GeoIndexState {
   message: string;
   photos: GeoPhoto[];
   photosVersion: number;
+  borrowedLocationsEnabled: boolean;
+  inferenceWindowMinutes: number;
+  inferenceSummary: { high: number; medium: number; low: number };
 }
 
 export type GeoIndexStatus = Omit<GeoIndexState, "photos">;
@@ -48,6 +59,15 @@ interface GeoCacheEntry {
   path: string;
   signature: string;
   photo: GeoPhoto | null;
+  captureTime?: number | null;
+  cameraKey?: string | null;
+  dismissedInference?: boolean;
+}
+
+interface CachedPhotoTime {
+  captureTime: number | null;
+  cameraKey: string | null;
+  dismissedInference: boolean;
 }
 
 type ProgressListener = (state: GeoIndexStatus) => void;
@@ -56,6 +76,8 @@ export class GeoIndexer {
   private readonly cachePath: string;
   private readonly onProgress: ProgressListener;
   private readonly photos = new Map<string, GeoPhoto>();
+  private readonly inferredPhotos = new Map<string, GeoPhoto>();
+  private readonly photoTimes = new Map<string, CachedPhotoTime>();
   private readonly checkedSignatures = new Map<string, string>();
   private readonly invalidRetryPaths = new Set<string>();
   private overrides = new Map<string, GeoOverride>();
@@ -64,6 +86,9 @@ export class GeoIndexer {
   private rerunRequested = false;
   private pauseRequested = false;
   private latestImages: IndexableFile[] = [];
+  private latestImagesByPath = new Map<string, IndexableFile>();
+  private borrowedLocationsEnabled = true;
+  private inferenceWindowMinutes = 15;
   private photosVersion = 0;
   private cacheAppends = 0;
   private state: Omit<GeoIndexState, "photos" | "photosVersion"> = {
@@ -72,6 +97,9 @@ export class GeoIndexer {
     total: 0,
     geotagged: 0,
     message: "Waiting for CLIP-indexed photos.",
+    borrowedLocationsEnabled: true,
+    inferenceWindowMinutes: 15,
+    inferenceSummary: { high: 0, medium: 0, low: 0 },
   };
 
   constructor(
@@ -107,24 +135,51 @@ export class GeoIndexer {
         continue;
       }
       if ("photo" in parsed) {
+        const entry = parsed as GeoCacheEntry;
+        const hasCachedTime = Object.prototype.hasOwnProperty.call(
+          entry,
+          "captureTime",
+        );
+        if (hasCachedTime) {
+          this.photoTimes.set(entry.path, {
+            captureTime: Number.isFinite(entry.captureTime)
+              ? Number(entry.captureTime)
+              : null,
+            cameraKey: typeof entry.cameraKey === "string" ? entry.cameraKey : null,
+            dismissedInference: entry.dismissedInference === true,
+          });
+        } else {
+          // Older caches never kept capture times; re-read only those files once.
+          this.invalidRetryPaths.add(entry.path);
+        }
         if (
-          !parsed.photo ||
-          this.validCoordinates(parsed.photo.latitude, parsed.photo.longitude)
+          !entry.photo ||
+          this.validCoordinates(entry.photo.latitude, entry.photo.longitude)
         )
-          this.checkedSignatures.set(parsed.path, parsed.signature);
+          this.checkedSignatures.set(entry.path, entry.signature);
         if (
-          parsed.photo &&
-          this.validCoordinates(parsed.photo.latitude, parsed.photo.longitude)
+          entry.photo &&
+          this.validCoordinates(entry.photo.latitude, entry.photo.longitude)
         ) {
-          this.photos.set(parsed.path, parsed.photo);
-          this.invalidRetryPaths.delete(parsed.path);
-        } else if (parsed.photo) this.invalidRetryPaths.add(parsed.path);
-        else this.photos.delete(parsed.path);
+          this.photos.set(entry.path, entry.photo);
+          if (hasCachedTime) this.invalidRetryPaths.delete(entry.path);
+          else this.invalidRetryPaths.add(entry.path);
+        } else if (entry.photo) this.invalidRetryPaths.add(entry.path);
+        else this.photos.delete(entry.path);
       } else {
         const photo = parsed as GeoPhoto;
         if (this.validCoordinates(photo.latitude, photo.longitude)) {
           this.photos.set(photo.path, photo);
           this.checkedSignatures.set(photo.path, this.signature(photo));
+          this.photoTimes.set(photo.path, {
+            captureTime: Number.isFinite(photo.captureTime)
+              ? Number(photo.captureTime)
+              : null,
+            cameraKey: null,
+            dismissedInference: false,
+          });
+          if (!Number.isFinite(photo.captureTime))
+            this.invalidRetryPaths.add(photo.path);
         } else this.invalidRetryPaths.add(photo.path);
       }
     }
@@ -146,10 +201,14 @@ export class GeoIndexer {
     const output = fs.createWriteStream(temporaryPath, { encoding: "utf8" });
     try {
       for (const [filePath, signature] of this.checkedSignatures) {
+        const cachedTime = this.photoTimes.get(filePath);
         const entry: GeoCacheEntry = {
           path: filePath,
           signature,
           photo: this.photos.get(filePath) ?? null,
+          captureTime: cachedTime?.captureTime ?? null,
+          cameraKey: cachedTime?.cameraKey ?? null,
+          dismissedInference: cachedTime?.dismissedInference ?? false,
         };
         if (!output.write(`${JSON.stringify(entry)}\n`))
           await new Promise<void>((resolve) =>
@@ -178,7 +237,10 @@ export class GeoIndexer {
       if (!this.photos.has(filePath)) manualOnly += 1;
     return {
       ...this.state,
-      geotagged: this.photos.size + manualOnly,
+      geotagged:
+        this.photos.size +
+        (this.borrowedLocationsEnabled ? this.inferredPhotos.size : 0) +
+        manualOnly,
       photosVersion: this.photosVersion,
     };
   }
@@ -188,7 +250,11 @@ export class GeoIndexer {
   }
 
   hasLocation(filePath: string) {
-    return this.overrides.has(filePath) || this.photos.has(filePath);
+    return (
+      this.overrides.has(filePath) ||
+      this.photos.has(filePath) ||
+      (this.borrowedLocationsEnabled && this.inferredPhotos.has(filePath))
+    );
   }
 
   locationLabel(filePath: string): string | null {
@@ -205,7 +271,7 @@ export class GeoIndexer {
           .join(", ") ||
         null
       );
-    const photo = this.photos.get(filePath);
+    const photo = this.photos.get(filePath) ?? this.inferredPhotos.get(filePath);
     if (!photo) return null;
     return (
       photo.locationLabel ||
@@ -215,7 +281,7 @@ export class GeoIndexer {
   }
 
   getState(): GeoIndexState {
-    const mergedPhotos = new Map(this.photos);
+    const mergedPhotos = this.mergedPhotos();
     for (const override of this.overrides.values()) {
       mergedPhotos.set(override.file.path, {
         ...override.file,
@@ -228,22 +294,149 @@ export class GeoIndexer {
         locationSource: "manual",
       });
     }
+    const photos = Array.from(mergedPhotos.values()).filter(
+      (photo) =>
+        this.activeSources.size === 0 ||
+        this.activeSources.has(photo.sourcePath),
+    );
     return {
       ...this.state,
-      geotagged: mergedPhotos.size,
+      geotagged: photos.length,
       photosVersion: this.photosVersion,
-      photos: Array.from(mergedPhotos.values()).filter(
-        (photo) =>
-          this.activeSources.size === 0 ||
-          this.activeSources.has(photo.sourcePath),
-      ),
+      borrowedLocationsEnabled: this.borrowedLocationsEnabled,
+      inferenceWindowMinutes: this.inferenceWindowMinutes,
+      inferenceSummary: this.inferenceSummaryFor(photos),
+      photos,
     };
   }
 
   setOverrides(overrides: Record<string, GeoOverride>) {
     this.overrides = new Map(Object.entries(overrides));
+    this.rebuildInferredLocations();
     this.photosVersion += 1;
     this.emit();
+  }
+
+  setBorrowedLocationsEnabled(enabled: boolean) {
+    this.borrowedLocationsEnabled = enabled;
+    this.rebuildInferredLocations();
+    this.photosVersion += 1;
+    this.emit();
+  }
+
+  setInferenceWindowMinutes(windowMinutes: number) {
+    this.inferenceWindowMinutes = [5, 15, 30, 60].includes(windowMinutes)
+      ? windowMinutes
+      : 15;
+    this.rebuildInferredLocations();
+    this.photosVersion += 1;
+    this.emit();
+  }
+
+  async dismissBorrowedLocation(filePath: string) {
+    if (!this.inferredPhotos.has(filePath)) return this.getState();
+    const cachedTime = this.photoTimes.get(filePath);
+    const signature = this.checkedSignatures.get(filePath);
+    if (cachedTime && signature) {
+      cachedTime.dismissedInference = true;
+      const entry: GeoCacheEntry = {
+        path: filePath,
+        signature,
+        photo: this.photos.get(filePath) ?? null,
+        captureTime: cachedTime.captureTime,
+        cameraKey: cachedTime.cameraKey,
+        dismissedInference: true,
+      };
+      await fsPromises.appendFile(this.cachePath, `${JSON.stringify(entry)}\n`);
+      this.cacheAppends += 1;
+    }
+    this.inferredPhotos.delete(filePath);
+    this.photosVersion += 1;
+    this.recountInferenceSummary();
+    this.emit();
+    return this.getState();
+  }
+
+  private mergedPhotos() {
+    const mergedPhotos = new Map(this.photos);
+    if (this.borrowedLocationsEnabled)
+      for (const [filePath, photo] of this.inferredPhotos)
+        if (!this.overrides.has(filePath)) mergedPhotos.set(filePath, photo);
+    return mergedPhotos;
+  }
+
+  private inferenceSummaryFor(photos: GeoPhoto[]) {
+    const summary = { high: 0, medium: 0, low: 0 };
+    for (const photo of photos) {
+      if (photo.locationSource === "inferred" && photo.inferenceConfidence)
+        summary[photo.inferenceConfidence] += 1;
+    }
+    return summary;
+  }
+
+  private recountInferenceSummary() {
+    this.state.inferenceSummary = this.inferenceSummaryFor(
+      Array.from(this.inferredPhotos.values()),
+    );
+  }
+
+  private rebuildInferredLocations() {
+    this.inferredPhotos.clear();
+    if (this.borrowedLocationsEnabled) {
+      const activePaths = new Set(this.latestImages.map((image) => image.path));
+      const references = Array.from(this.photos.values()).flatMap((photo) => {
+        const captureTime = this.photoTimes.get(photo.path)?.captureTime;
+        if (!Number.isFinite(captureTime) || !activePaths.has(photo.path))
+          return [];
+        return [{
+          path: photo.path,
+          captureTime: Number(captureTime),
+          latitude: photo.latitude,
+          longitude: photo.longitude,
+        }];
+      });
+      const targets = this.latestImages.flatMap((image) => {
+        const cachedTime = this.photoTimes.get(image.path);
+        if (
+          this.photos.has(image.path) ||
+          this.overrides.has(image.path) ||
+          !cachedTime ||
+          cachedTime.dismissedInference ||
+          !Number.isFinite(cachedTime.captureTime)
+        )
+          return [];
+        return [{
+          path: image.path,
+          captureTime: Number(cachedTime.captureTime),
+          cameraKey: cachedTime.cameraKey,
+        }];
+      });
+      const suggestions = inferBorrowedLocations([...references, ...targets], {
+        windowMinutes: this.inferenceWindowMinutes,
+      });
+      for (const suggestion of suggestions) {
+        const image = this.latestImagesByPath.get(suggestion.path);
+        if (!image) continue;
+        this.inferredPhotos.set(suggestion.path, {
+          ...image,
+          isDirectory: false,
+          type: "image",
+          sourcePath: this.findSource(image.path),
+          latitude: suggestion.latitude,
+          longitude: suggestion.longitude,
+          city: null,
+          region: null,
+          country: null,
+          locationLabel: `${suggestion.latitude.toFixed(4)}°, ${suggestion.longitude.toFixed(4)}°`,
+          locationSource: "inferred",
+          captureTime: this.photoTimes.get(suggestion.path)?.captureTime ?? null,
+          inferenceConfidence: suggestion.confidence,
+          inferenceReferenceCount: suggestion.referenceCount,
+          inferenceTimeOffsetMs: suggestion.timeOffsetMs,
+        });
+      }
+    }
+    this.recountInferenceSummary();
   }
 
   start(images: IndexableFile[], sourcePaths: string[]) {
@@ -264,6 +457,9 @@ export class GeoIndexer {
           Number(this.invalidRetryPaths.has(first.path));
         return retryDifference || first.modified - second.modified;
       });
+    this.latestImagesByPath = new Map(
+      this.latestImages.map((image) => [image.path, image]),
+    );
     if (this.runPromise) {
       this.rerunRequested = true;
       return this.runPromise;
@@ -291,15 +487,20 @@ export class GeoIndexer {
         this.rerunRequested = false;
         const pending = this.latestImages.filter(
           (image) =>
-            this.checkedSignatures.get(image.path) !== this.signature(image),
+            this.checkedSignatures.get(image.path) !== this.signature(image) ||
+            this.invalidRetryPaths.has(image.path),
         );
         if (pending.length === 0) {
-          if (this.state.status !== "complete")
-            this.update({
-              status: "complete",
-              scanned: this.latestImages.length,
-              total: this.latestImages.length,
-            });
+          this.rebuildInferredLocations();
+          this.photosVersion += 1;
+          this.update({
+            status: "complete",
+            scanned: this.latestImages.length,
+            total: this.latestImages.length,
+            message: this.borrowedLocationsEnabled
+              ? `${this.photos.size.toLocaleString()} GPS photos and ${this.inferredPhotos.size.toLocaleString()} inferred locations ready.`
+              : `${this.photos.size.toLocaleString()} geotagged photos ready.`,
+          });
           continue;
         }
         this.update({
@@ -312,16 +513,25 @@ export class GeoIndexer {
         for (let index = 0; index < pending.length; index += 1) {
           if (this.pauseRequested) break;
           const image = pending[index];
-          const photo = await this.readPhoto(
+          const result = await this.readPhoto(
             image,
             this.findSource(image.path),
           );
+          const photo = result.photo;
           const entry: GeoCacheEntry = {
             path: image.path,
             signature: this.signature(image),
             photo,
+            captureTime: result.captureTime,
+            cameraKey: result.cameraKey,
+            dismissedInference: false,
           };
           this.checkedSignatures.set(entry.path, entry.signature);
+          this.photoTimes.set(entry.path, {
+            captureTime: result.captureTime,
+            cameraKey: result.cameraKey,
+            dismissedInference: false,
+          });
           this.invalidRetryPaths.delete(entry.path);
           if (photo) this.photos.set(photo.path, photo);
           else this.photos.delete(entry.path);
@@ -345,9 +555,13 @@ export class GeoIndexer {
         this.update({ status: "paused", message: "Location indexing paused." });
         return;
       }
+      this.rebuildInferredLocations();
+      this.photosVersion += 1;
       this.update({
         status: "complete",
-        message: `${this.photos.size.toLocaleString()} geotagged photos ready.`,
+        message: this.borrowedLocationsEnabled
+          ? `${this.photos.size.toLocaleString()} GPS photos and ${this.inferredPhotos.size.toLocaleString()} inferred locations ready.`
+          : `${this.photos.size.toLocaleString()} geotagged photos ready.`,
       });
     } catch (error) {
       this.update({
@@ -361,13 +575,19 @@ export class GeoIndexer {
   private async readPhoto(
     image: IndexableFile,
     sourcePath: string,
-  ): Promise<GeoPhoto | null> {
+  ): Promise<{
+    photo: GeoPhoto | null;
+    captureTime: number | null;
+    cameraKey: string | null;
+  }> {
     const localPath = await this.resolveImagePath(image.path);
     let latitude: number | null = null;
     let longitude: number | null = null;
     let city: string | null = null;
     let region: string | null = null;
     let country: string | null = null;
+    let captureTime: number | null = null;
+    let cameraKey: string | null = null;
 
     try {
       const gps = await exifr.gps(localPath);
@@ -379,6 +599,11 @@ export class GeoIndexer {
         latitude = gps.latitude;
         longitude = gps.longitude;
       }
+    } catch {
+      // A missing or malformed GPS block must not prevent reading capture time.
+    }
+
+    try {
       const metadata = (await exifr.parse(localPath, {
         pick: [
           "GPSLatitude",
@@ -391,6 +616,11 @@ export class GeoIndexer {
           "State",
           "Country-PrimaryLocationName",
           "Country",
+          "DateTimeOriginal",
+          "CreateDate",
+          "DateTimeDigitized",
+          "Make",
+          "Model",
         ],
         translateValues: false,
         reviveValues: false,
@@ -408,8 +638,16 @@ export class GeoIndexer {
         "Country-PrimaryLocationName",
         "Country",
       ]);
+      captureTime = this.captureTime(metadata);
+      const make = this.firstString(metadata, ["Make"]);
+      const model = this.firstString(metadata, ["Model"]);
+      cameraKey = [make, model]
+        .filter(Boolean)
+        .join(" ")
+        .trim()
+        .toLowerCase() || null;
     } catch {
-      // Spotlight is a fallback for unusual containers.
+      // Keep any usable GPS data while allowing inference when metadata parsing fails.
     }
 
     if (
@@ -436,7 +674,7 @@ export class GeoIndexer {
         region ||= this.stringField(stdout, "kMDItemStateOrProvince");
         country ||= this.stringField(stdout, "kMDItemCountry");
       } catch {
-        return null;
+        return { photo: null, captureTime, cameraKey };
       }
     }
 
@@ -445,22 +683,42 @@ export class GeoIndexer {
       longitude === null ||
       !this.validCoordinates(latitude, longitude)
     )
-      return null;
+      return { photo: null, captureTime, cameraKey };
     const place = [city, region, country].filter(Boolean).join(", ");
     return {
-      ...image,
-      isDirectory: false,
-      type: "image",
-      sourcePath,
-      latitude,
-      longitude,
-      city,
-      region,
-      country,
-      locationLabel:
-        place || `${latitude.toFixed(2)}°, ${longitude.toFixed(2)}°`,
-      locationSource: "embedded",
+      captureTime,
+      cameraKey,
+      photo: {
+        ...image,
+        isDirectory: false,
+        type: "image",
+        sourcePath,
+        latitude,
+        longitude,
+        city,
+        region,
+        country,
+        locationLabel:
+          place || `${latitude.toFixed(2)}°, ${longitude.toFixed(2)}°`,
+        locationSource: "embedded",
+        captureTime,
+      },
     };
+  }
+
+  private captureTime(metadata: Record<string, unknown> | undefined) {
+    if (!metadata) return null;
+    for (const key of ["DateTimeOriginal", "CreateDate", "DateTimeDigitized"]) {
+      const value = metadata[key];
+      const timestamp =
+        value instanceof Date
+          ? value.getTime()
+          : typeof value === "string"
+            ? Date.parse(value.replace(/^(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3"))
+            : NaN;
+      if (Number.isFinite(timestamp) && timestamp > 0) return timestamp;
+    }
+    return null;
   }
 
   private findSource(filePath: string): string {
@@ -570,7 +828,7 @@ export class GeoIndexer {
     photoCount: number;
   }> {
     const countries = new Map<string, number>();
-    const mergedPhotos = new Map(this.photos);
+    const mergedPhotos = this.mergedPhotos();
     for (const override of this.overrides.values()) {
       mergedPhotos.set(override.file.path, {
         ...override.file,
@@ -607,7 +865,7 @@ export class GeoIndexer {
     targetCountry: string | null,
   ): Array<{ state: string | null; photoCount: number }> {
     const states = new Map<string, number>();
-    const mergedPhotos = new Map(this.photos);
+    const mergedPhotos = this.mergedPhotos();
     for (const override of this.overrides.values()) {
       mergedPhotos.set(override.file.path, {
         ...override.file,
@@ -641,7 +899,7 @@ export class GeoIndexer {
   }
 
   getPhotosByRegion(country: string | null, state?: string | null): GeoPhoto[] {
-    const mergedPhotos = new Map(this.photos);
+    const mergedPhotos = this.mergedPhotos();
     for (const override of this.overrides.values()) {
       mergedPhotos.set(override.file.path, {
         ...override.file,

@@ -44,7 +44,11 @@ interface GeoPhoto extends FileInfo {
   region: string | null;
   country: string | null;
   locationLabel: string;
-  locationSource: "embedded" | "manual";
+  locationSource: "embedded" | "manual" | "inferred";
+  captureTime?: number | null;
+  inferenceConfidence?: "high" | "medium" | "low";
+  inferenceReferenceCount?: number;
+  inferenceTimeOffsetMs?: number;
 }
 
 interface GeoLocationSuggestion {
@@ -77,6 +81,9 @@ interface GeoIndexState {
   message: string;
   photos: GeoPhoto[];
   photosVersion: number;
+  borrowedLocationsEnabled: boolean;
+  inferenceWindowMinutes: number;
+  inferenceSummary: { high: number; medium: number; low: number };
 }
 
 type GeoIndexStatus = Omit<GeoIndexState, "photos">;
@@ -794,6 +801,8 @@ interface PersistedAppState {
   searchFeedback: Record<string, "confirmed" | "removed">;
   messageFlags: Record<string, MessageDisplayFlags>;
   geoOverrides: Record<string, GeoOverride>;
+  borrowedLocationsEnabled?: boolean;
+  borrowedLocationWindowMinutes?: number;
   indexProgress?: IndexProgress;
 }
 
@@ -1338,6 +1347,9 @@ interface Window {
       location: GeoLocationSuggestion,
     ): Promise<GeoAssignmentResult>;
     clearGeoLocation(filePaths: string[]): Promise<GeoAssignmentResult>;
+    setBorrowedLocationsEnabled(enabled: boolean): Promise<GeoIndexState>;
+    setBorrowedLocationWindow(windowMinutes: number): Promise<GeoIndexState>;
+    dismissBorrowedLocation(filePath: string): Promise<GeoIndexState>;
     onGeoIndexProgress(callback: (state: GeoIndexStatus) => void): () => void;
     onFileScanProgress(
       callback: (progress: FileScanProgress) => void,

@@ -296,6 +296,12 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("set-geo-location", files, location),
   clearGeoLocation: (filePaths) =>
     ipcRenderer.invoke("clear-geo-location", filePaths),
+  setBorrowedLocationsEnabled: (enabled) =>
+    ipcRenderer.invoke("set-borrowed-locations-enabled", enabled),
+  setBorrowedLocationWindow: (windowMinutes) =>
+    ipcRenderer.invoke("set-borrowed-location-window", windowMinutes),
+  dismissBorrowedLocation: (filePath) =>
+    ipcRenderer.invoke("dismiss-borrowed-location", filePath),
   onGeoIndexProgress: (callback) => {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on("geo-index-progress", listener);
