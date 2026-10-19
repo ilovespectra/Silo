@@ -43,6 +43,13 @@ export interface MemoryGenerationProgress {
   progress: number;
   etaSeconds?: number;
 }
+export interface MemoryMusicAvailability {
+  available: boolean;
+  scanning: boolean;
+  sourceCount: number;
+  indexedTrackCount: number;
+  cacheAvailable: boolean;
+}
 export interface MemoryGenerationStatus {
   generating: boolean;
   /** How many stories this run is trying to create. */
@@ -164,6 +171,7 @@ export interface SavedMemoryMovie {
 
 export interface MemoriesAPI {
   getMemories(prepareViews?: boolean): Promise<MemoryState>;
+  getMemoryMusicAvailability(): Promise<MemoryMusicAvailability>;
   generateMemories(replace?: boolean, customTopic?: string): Promise<MemoryState>;
   dismissMemory(id: string): Promise<MemoryState>;
   renameMemory(id: string, title: string): Promise<MemoryState>;

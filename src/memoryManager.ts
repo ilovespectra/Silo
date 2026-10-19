@@ -39,6 +39,8 @@ export interface MemoryManagerDependencies {
   thumb(path: string): string | null | undefined | Promise<string | null | undefined>;
   listAudio(): MemoryAudioFile[] | Promise<MemoryAudioFile[]>;
   isAllowed(path: string, media?: MemoryMedia): boolean | Promise<boolean>;
+  /** Audio files must use audio availability checks, never the visual photo-safety classifier. */
+  isAudioAvailable?(file: MemoryAudioFile): boolean | Promise<boolean>;
   findLiveVideo?(file: MemoryMedia): Promise<string | null | undefined>;
   /** Story ideas mined from the library (time, places, people, pets, subjects, folders). */
   discover?(): Promise<MemoryStoryCandidate[]>;
@@ -210,7 +212,7 @@ function customTopicMood(topic: string): MemoryMood {
 }
 
 /** Songs only: no voice memos, ringtones, podcasts or tiny sound effects. */
-function isMusicTrack(file: MemoryAudioFile): boolean {
+export function isMemoryMusicTrack(file: MemoryAudioFile): boolean {
   if (!MUSIC_EXTENSION.test(file.path) || NOT_MUSIC.test(file.path)) return false;
   return !Number.isFinite(file.size) || ((file.size as number) >= 1.5 * 1024 * 1024 && (file.size as number) <= 60 * 1024 * 1024);
 }
@@ -315,6 +317,16 @@ export class MemoryManager {
 
   private async allowed(filePath: string, media?: MemoryMedia): Promise<boolean> {
     try { return await this.deps.isAllowed(filePath, media) === true; } catch { return false; }
+  }
+
+  private async audioAvailable(file: MemoryAudioFile): Promise<boolean> {
+    if (!file || !text(file.path) || !text(file.name) || !isMemoryMusicTrack(file)) return false;
+    try {
+      // The photo safety callback runs image embedding and must never inspect songs.
+      return this.deps.isAudioAvailable
+        ? await this.deps.isAudioAvailable(file) === true
+        : await this.allowed(file.path);
+    } catch { return false; }
   }
 
   private async safeMedia(items: MemoryMedia[], limit: number): Promise<MemoryMedia[]> {
@@ -906,9 +918,22 @@ export class MemoryManager {
 
   /** Gives each story without a song its own track, distinct from the other stories' songs and artists. */
   private async assignSoundtracks(cards: MemorySuggestion[]): Promise<string[]> {
-    if (!cards.some(card => !card.soundtrackId)) return [];
+    const needingMusic = cards.filter(card => !card.soundtrackId).length;
+    if (!needingMusic) return [];
     const pool = await this.musicPool();
-    if (!pool.length) return [];
+    this.trace("memory-audio-curation-start", {
+      cards: cards.length,
+      needingMusic,
+      musicCandidates: pool.length,
+    });
+    if (!pool.length) {
+      this.trace("memory-audio-curation-result", {
+        assigned: 0,
+        unassigned: needingMusic,
+        musicCandidates: 0,
+      });
+      return [];
+    }
     const changed: string[] = [];
     const usedTracks = new Set(cards.map(card => card.soundtrackId).filter((id): id is string => Boolean(id)));
     const usedArtists = new Set<string>();
@@ -924,6 +949,11 @@ export class MemoryManager {
         changed.push(card.id);
       }
     }
+    this.trace("memory-audio-curation-result", {
+      assigned: changed.length,
+      unassigned: needingMusic - changed.length,
+      musicCandidates: pool.length,
+    });
     return changed;
   }
 
@@ -1088,9 +1118,22 @@ export class MemoryManager {
   /** Music pool for one generation, so each story is scored against the same snapshot. */
   private async musicPool(): Promise<{ file: MemoryAudioFile; haystack: string; artist: string }[]> {
     let files: MemoryAudioFile[];
-    try { files = await this.deps.listAudio(); } catch { return []; }
-    if (!Array.isArray(files)) return [];
-    return files.filter(file => file && text(file.path) && text(file.name) && isMusicTrack(file))
+    try { files = await this.deps.listAudio(); } catch (error) {
+      this.trace("memory-audio-index-read-error", {
+        errorName: error instanceof Error ? error.name : "UnknownError",
+      });
+      return [];
+    }
+    if (!Array.isArray(files)) {
+      this.trace("memory-audio-index-invalid", { valueType: typeof files });
+      return [];
+    }
+    const candidates = files.filter(file => file && text(file.path) && text(file.name) && isMemoryMusicTrack(file));
+    this.trace("memory-audio-index-snapshot", {
+      indexedFiles: files.length,
+      musicCandidates: candidates.length,
+    });
+    return candidates
       .map(file => ({ file, haystack: `${file.name} ${file.path}`.toLowerCase(), artist: artistOf(file.path) }));
   }
 
@@ -1121,7 +1164,7 @@ export class MemoryManager {
     }
     for (const { file, artist } of ranked) {
       const id = audioId(file.path);
-      if (usedTracks.has(id) || !await this.allowed(file.path)) continue;
+      if (usedTracks.has(id) || !await this.audioAvailable(file)) continue;
       usedTracks.add(id);
       usedArtists.add(artist);
       return id;
@@ -1131,11 +1174,17 @@ export class MemoryManager {
 
   /**
    * Folder-by-folder (or searched) view of the indexed audio library, for the in-app
-   * song explorer. Only one page of files is returned and every file is safety-checked.
+   * song explorer. Only one page of files is returned and each song is checked for
+   * audio type and source availability, never run through the photo safety classifier.
    */
   async browseAudio(request: MemoryAudioBrowseRequest = {}): Promise<MemoryAudioBrowseResult> {
     let files: MemoryAudioFile[];
-    try { files = await this.deps.listAudio(); } catch { files = []; }
+    try { files = await this.deps.listAudio(); } catch (error) {
+      this.trace("memory-audio-browse-index-error", {
+        errorName: error instanceof Error ? error.name : "UnknownError",
+      });
+      files = [];
+    }
     if (!Array.isArray(files)) files = [];
     const sourceOf = (file: MemoryAudioFile) => file.sourceId || file.sourceLabel || path.dirname(file.path);
     const relativeOf = (file: MemoryAudioFile) =>
@@ -1180,35 +1229,61 @@ export class MemoryManager {
     const limit = Math.min(500, Math.max(1, Math.floor(request.limit ?? 200)));
     const page: MemoryAudioBrowseFile[] = [];
     for (const file of matched.slice(offset, offset + limit)) {
-      if (!await this.allowed(file.path)) continue;
+      if (!await this.audioAvailable(file)) continue;
       const relative = relativeOf(file);
       page.push({ id: audioId(file.path), name: file.name, path: file.path, sourceId: sourceOf(file),
         sourceLabel: sources.get(sourceOf(file))?.label ?? "", folder: relative.includes("/") ? relative.slice(0, relative.lastIndexOf("/")) : "",
         size: file.size ?? 0, modified: file.modified ?? 0 });
     }
-    return {
+    const result = {
       sources: Array.from(sources.values()).sort((a, b) => collator.compare(a.label, b.label)),
       folders: Array.from(folders, ([name, count]) => ({ name, path: folder ? `${folder}/${name}` : name, count }))
         .sort((a, b) => collator.compare(a.name, b.name)),
       files: page,
       total: matched.length,
     };
+    this.trace("memory-audio-browse-result", {
+      indexedFiles: files.length,
+      totalMatches: result.total,
+      returnedFiles: result.files.length,
+      sourceCount: result.sources.length,
+      folderCount: result.folders.length,
+    });
+    return result;
   }
 
   /** Use a library song for this memory; returns undefined when the card or song is gone. */
   async setSoundtrack(id: string, soundtrackId: string): Promise<MemorySuggestion | undefined> {
     await this.initialize();
-    if (!/^library:[a-f0-9]{64}$/.test(soundtrackId)) return undefined;
+    if (!/^library:[a-f0-9]{64}$/.test(soundtrackId)) {
+      this.trace("memory-audio-selection-rejected", { reason: "invalid-library-track-id" });
+      return undefined;
+    }
     const card = this.state.suggestions.find((item) => item.id === id) ?? this.reserve.find((item) => item.id === id);
-    if (!card || !await this.resolveSoundtrack(soundtrackId, id)) return undefined;
+    if (!card) {
+      this.trace("memory-audio-selection-rejected", { reason: "suggestion-not-found" });
+      return undefined;
+    }
+    if (!await this.resolveSoundtrack(soundtrackId, id)) {
+      this.trace("memory-audio-selection-rejected", { reason: "track-not-resolvable-from-current-index" });
+      return undefined;
+    }
     card.soundtrackId = soundtrackId;
     await this.persist();
+    this.trace("memory-audio-selection-saved", { source: "library" });
     return { ...card };
   }
 
   async getSoundtracks(id: string): Promise<MemorySoundtrack[]> {
     const card = await this.getSuggestion(id);
-    if (!card) return [];
+    if (!card) {
+      this.trace("memory-audio-soundtrack-list", {
+        choices: 0,
+        libraryChoices: 0,
+        reason: "suggestion-not-found",
+      });
+      return [];
+    }
     const result = [this.original(card)];
     const pool = await this.musicPool();
     const keywords = new Set([...MOOD_WORDS[card.mood], ...storyWords(card),
@@ -1228,10 +1303,16 @@ export class MemoryManager {
     for (const { file } of top) {
       if (result.length >= 13) break;
       const trackId = audioId(file.path);
-      if (trackId === picked?.id || !await this.allowed(file.path)) continue;
+      if (trackId === picked?.id || !await this.audioAvailable(file)) continue;
       result.push({ id: trackId, name: file.name, path: file.path, source: "library",
         rights: `${RIGHTS}${text(file.sourceLabel, 200) ? ` Source: ${file.sourceLabel}.` : ""}` });
     }
+    this.trace("memory-audio-soundtrack-list", {
+      choices: result.length,
+      libraryChoices: result.filter((track) => track.source === "library").length,
+      indexedMusicCandidates: pool.length,
+      selectedLibraryTrackAvailable: Boolean(picked),
+    });
     return result;
   }
 
@@ -1250,7 +1331,13 @@ export class MemoryManager {
     if (!/^library:[a-f0-9]{64}$/.test(soundtrackId)) return undefined;
     if (suggestionId !== undefined && !await this.getSuggestion(suggestionId)) return undefined;
     let files: MemoryAudioFile[];
-    try { files = await this.deps.listAudio(); } catch { return undefined; }
+    try { files = await this.deps.listAudio(); } catch (error) {
+      this.trace("memory-audio-resolve-error", {
+        reason: "audio-index-read-failed",
+        errorName: error instanceof Error ? error.name : "UnknownError",
+      });
+      return undefined;
+    }
     if (!Array.isArray(files)) return undefined;
     // Hashing every path per lookup is slow for large libraries; index once per audio snapshot.
     if (this.audioIndex?.files !== files) {
@@ -1259,7 +1346,7 @@ export class MemoryManager {
       this.audioIndex = { files, ids };
     }
     const file = this.audioIndex.ids.get(soundtrackId);
-    if (!file || !await this.allowed(file.path)) return undefined;
+    if (!file || !await this.audioAvailable(file)) return undefined;
     return { id: soundtrackId, name: file.name, path: file.path, source: "library", rights: RIGHTS };
   }
 }

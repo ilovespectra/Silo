@@ -535,6 +535,25 @@ test("soundtracks: original, the story's own picked song, then mood/story-ranked
   assert.equal(await f.manager.resolveSoundtrack(tracks[1].id), undefined);
 });
 
+test("library soundtracks use audio availability, not the photo safety classifier", async t => {
+  const audio = [{ name: "Beach Holiday Waves.mp3", path: "/audio/Beach Holiday Waves.mp3" }];
+  const f = await fixture(t, {
+    listAudio: async () => audio,
+    isAllowed: async filePath => !filePath.startsWith("/audio/"),
+    isAudioAvailable: async file => file.path.startsWith("/audio/"),
+  });
+  const card = (await f.manager.generate()).suggestions[0];
+  const tracks = await f.manager.getSoundtracks(card.id);
+  assert.equal(tracks.length, 2, "the photo-only safety callback must not hide a valid song");
+  assert.equal(tracks[1].path, audio[0].path);
+  assert.equal((await f.manager.resolveSoundtrack(tracks[1].id, card.id)).path, audio[0].path);
+  const browsed = await f.manager.browseAudio({ query: "Beach Holiday" });
+  assert.deepEqual(browsed.files.map(file => file.path), [audio[0].path],
+    "the audio browser must use audio availability instead of the photo safety callback");
+  assert.ok(await f.manager.setSoundtrack(card.id, tracks[1].id));
+  assert.equal((await f.manager.getSuggestion(card.id)).soundtrackId, tracks[1].id);
+});
+
 test("audio explorer: sources, nested folders, search, sorting, paging, privacy and choosing a memory's song", async t => {
   const library = [
     ["listen", "LISTEN", "Black Lips/Arabia Mountain/01 Modern Art.mp3", 5_000_000, 30],

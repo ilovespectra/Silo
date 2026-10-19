@@ -211,7 +211,7 @@ const ALL_GUIDED_TOUR_STEPS: GuidedTourStep[] = [
     id: "mobile-messages",
     title: "Browse and export messages",
     body: "Choose a connected phone or saved history, load it, then review the output destination and format before exporting. Updating history requires a connected, trusted phone.",
-    target: '[data-tour="mobile-messages"]',
+    target: '[data-tour="mobile-message-workflow"]',
     fallbackTarget: '[data-tour="mobile-overview"]',
     section: "mobile",
   },

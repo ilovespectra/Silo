@@ -926,6 +926,7 @@ function App() {
   const [tourDuplicateView, setTourDuplicateView] = useState<
     "duplicates" | "trash" | null
   >(null);
+  const [mobileMessagesHelpRequest, setMobileMessagesHelpRequest] = useState(0);
   const [showTourAtStartup, setShowTourAtStartup] = useState(() => {
     try {
       return localStorage.getItem("silo.guidedTour.showAtStartup") !== "false";
@@ -1855,6 +1856,8 @@ function App() {
   }, []);
 
   const navigateGuidedTour = useCallback((section: GuidedTourSection, step: GuidedTourStep) => {
+    if (section === "mobile" && step.target === '[data-tour="mobile-message-workflow"]')
+      setMobileMessagesHelpRequest((request) => request + 1);
     setTourDuplicateView(section === "duplicates"
       ? step.target === '[data-tour="duplicate-trash-actions"]' ? "trash" : "duplicates"
       : null);
@@ -4070,14 +4073,16 @@ function App() {
   }, [currentPath, electronAPI, loadDirectory, openDialog, selectedFile]);
 
   const addIndexSource = useCallback(async () => {
-    if (!electronAPI) return;
+    if (!electronAPI) return false;
     const state = await electronAPI.selectIndexSource();
     if (state) {
       applyPersistedState(state);
       await refreshSources();
       if (currentPath === allSourcesPath)
         void loadDirectory(allSourcesPath, explodedRef.current, true, true);
+      return true;
     }
+    return false;
   }, [
     allSourcesPath,
     applyPersistedState,
@@ -7290,7 +7295,7 @@ function App() {
       </React.Suspense>
       {appSection === "memories" ? (
         <React.Suspense fallback={<main className="viewer-status">Loading Memories…</main>}>
-          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={thumbnailSize} onThumbnailSizeChange={setThumbnailSize} />
+          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={thumbnailSize} onThumbnailSizeChange={setThumbnailSize} onChooseMusicFolder={addIndexSource} />
         </React.Suspense>
       ) : appSection === "stats" ? (
         electronAPI ? <StatsDashboard api={electronAPI} /> : <main className="viewer-status">Stats services are unavailable.</main>
@@ -8241,6 +8246,7 @@ function App() {
             phoneDevices={phoneDevices}
             connectedPhone={connectedPhone}
             showHiddenMessages={showHiddenMessages}
+            messagesWorkflowRequest={mobileMessagesHelpRequest}
             onScanPhones={scanForPhones}
             scanningPhones={phoneScanning}
             devicePanel={

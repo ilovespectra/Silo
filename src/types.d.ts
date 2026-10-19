@@ -1022,6 +1022,7 @@ interface Window {
       signature: string,
     ): Promise<import("./lifetimePayment").LifetimePaymentVerification>;
     getMemories: import("./memoryTypes").MemoriesAPI["getMemories"];
+    getMemoryMusicAvailability: import("./memoryTypes").MemoriesAPI["getMemoryMusicAvailability"];
     generateMemories: import("./memoryTypes").MemoriesAPI["generateMemories"];
     dismissMemory: import("./memoryTypes").MemoriesAPI["dismissMemory"];
     renameMemory: import("./memoryTypes").MemoriesAPI["renameMemory"];
