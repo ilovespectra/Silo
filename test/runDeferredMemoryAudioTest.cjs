@@ -21,6 +21,7 @@ const managerRequire = (id) => id === "./memoryTypes" ? typeModule.exports : req
 new Function("require", "module", "exports", compiled)(managerRequire, implementation, implementation.exports);
 const { MemoryManager } = implementation.exports;
 const mainSource = fs.readFileSync(path.join(__dirname, "../src/main.ts"), "utf8");
+const exporterSource = fs.readFileSync(path.join(__dirname, "../src/memoryExporter.ts"), "utf8");
 
 function photos(prefix, count = 8) {
   return Array.from({ length: count }, (_, index) => ({
@@ -44,7 +45,8 @@ test("deferred audio indexing assigns distinct theme-matched songs and persists 
     search: async (query) => photos(query),
     thumb: async () => null,
     listAudio: async () => audioFiles,
-    isAllowed: async () => true,
+    isAllowed: async (filePath) => !filePath.startsWith("/music/"),
+    isAudioAvailable: async (file) => file.path.startsWith("/music/"),
   });
 
   assert.match(mainSource,
@@ -56,6 +58,27 @@ test("deferred audio indexing assigns distinct theme-matched songs and persists 
   assert.match(mainSource,
     /memoryPreviewStatus\.delete\(id\);[\s\S]*?prepareMemoryPreviews\(changedCards\)/,
     "previews created before audio indexing must be regenerated with the chosen songs");
+
+  const audioStage = /id: "audio",([\s\S]*?)id: "quality"/.exec(mainSource);
+  assert.ok(audioStage, "the automatic audio recovery stage must exist");
+  assert.doesNotMatch(audioStage[1], /searchSettled\(\)/,
+    "paused or errored search must not block independent audio discovery");
+  assert.doesNotMatch(audioStage[1], /analysisIdle\(\)/,
+    "long-running photo and face indexing must not hold up soundtrack discovery");
+  assert.match(mainSource, /\(\) => semanticIndexer\.isSearchActive\(\)/,
+    "the throttled audio scan must still yield while a user search is active");
+  assert.match(mainSource, /isAudioAvailable: async \(file\)[\s\S]*?resolveLocalPath\(file\.path\)/,
+    "library songs must be validated as audio files without visual photo safety");
+  const exportVerifier = /async function verifyMemoryExport\([\s\S]*?\n\}/.exec(mainSource);
+  assert.ok(exportVerifier, "the export verifier must exist");
+  assert.match(exportVerifier[0], /resolveLocalPath\(soundtrack\.path\)/,
+    "library exports must validate the resolved local audio path");
+  assert.doesNotMatch(exportVerifier[0], /memoryAllowed\(soundtrack\.path\)/,
+    "the photo-only safety gate must not reject the selected soundtrack");
+  assert.match(exporterSource, /musicPath = await this\.deps\.resolveLocalPath\(soundtrack\.path\)/,
+    "preview/export rendering must open the selected song through the source resolver");
+  assert.match(exporterSource, /amix=inputs=2:duration=first/,
+    "the selected library song must be mixed into the final movie audio");
 
   const generated = await manager.generate();
   assert.equal(generated.suggestions.length, 5);
@@ -89,11 +112,17 @@ test("deferred audio indexing assigns distinct theme-matched songs and persists 
       `${title} should choose a matching library song, got ${track?.name ?? "no track"}`);
   }
 
+  const firstTrackId = refreshed.state.suggestions[0].soundtrackId;
+  assert.ok(firstTrackId);
+  assert.equal((await manager.resolveSoundtrack(firstTrackId, refreshed.state.suggestions[0].id)).source, "library",
+    "selected source songs must pass audio availability checks even when image safety rejects them");
+
   const restarted = new MemoryManager(root, {
     search: async (query) => photos(query),
     thumb: async () => null,
     listAudio: async () => audioFiles,
-    isAllowed: async () => true,
+    isAllowed: async (filePath) => !filePath.startsWith("/music/"),
+    isAudioAvailable: async (file) => file.path.startsWith("/music/"),
   });
   const persisted = await restarted.getState();
   assert.deepEqual(persisted.suggestions.map((card) => card.soundtrackId),

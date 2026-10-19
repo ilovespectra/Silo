@@ -810,31 +810,20 @@ function App() {
       missingRoots: [],
       transfer: null,
     });
-  const [indexStorageNoticeDontShowAgain, setIndexStorageNoticeDontShowAgain] = useState(false);
-  const [indexStorageNoticeDismissed, setIndexStorageNoticeDismissed] = useState(false);
-  const [hideIndexStorageNoticePermanently, setHideIndexStorageNoticePermanently] = useState(() => {
-    try {
-      return localStorage.getItem("silo.hideIndexStorageFallbackNotice") === "true";
-    } catch {
-      return false;
-    }
-  });
+  const [indexStorageNoticeCollapsed, setIndexStorageNoticeCollapsed] = useState(false);
+  const [checkingIndexStorage, setCheckingIndexStorage] = useState(false);
   const indexStorageNoticeMessage = (indexStorageStatus.message ?? "").replace(/[’‘]/g, "'");
   const isIndexStorageFallbackNotice = indexStorageStatus.usingLocalFallback && (
     /selected destination.*unavailable/i.test(indexStorageNoticeMessage) ||
     /can't locate your selected destination/i.test(indexStorageNoticeMessage)
   );
-  const showIndexStorageFallbackNotice = isIndexStorageFallbackNotice &&
-    !indexStorageNoticeDismissed && !hideIndexStorageNoticePermanently;
-  const showIndexStorageMessage = Boolean(indexStorageStatus.message &&
-    (!isIndexStorageFallbackNotice || showIndexStorageFallbackNotice));
+  const hasIndexStorageProblem = indexStorageStatus.missingRoots.length > 0 || isIndexStorageFallbackNotice;
   const hasVisibleIndexStorageTransfer = indexStorageStatus.transfer?.state === "moving" ||
     indexStorageStatus.transfer?.state === "complete" || indexStorageStatus.transfer?.state === "error";
   const showIndexStorageFallbackDetails = indexStorageStatus.usingLocalFallback &&
-    Boolean(indexStorageStatus.message || hasVisibleIndexStorageTransfer) &&
-    (!isIndexStorageFallbackNotice || showIndexStorageFallbackNotice);
+    Boolean(indexStorageStatus.message || hasVisibleIndexStorageTransfer);
   const showIndexStorageBanner =
-    showIndexStorageMessage ||
+    Boolean(indexStorageStatus.message) ||
     showIndexStorageFallbackDetails ||
     hasVisibleIndexStorageTransfer ||
     indexStorageStatus.missingRoots.length > 0;
@@ -926,6 +915,7 @@ function App() {
   const [tourDuplicateView, setTourDuplicateView] = useState<
     "duplicates" | "trash" | null
   >(null);
+  const [mobileMessagesHelpRequest, setMobileMessagesHelpRequest] = useState(0);
   const [showTourAtStartup, setShowTourAtStartup] = useState(() => {
     try {
       return localStorage.getItem("silo.guidedTour.showAtStartup") !== "false";
@@ -1855,6 +1845,8 @@ function App() {
   }, []);
 
   const navigateGuidedTour = useCallback((section: GuidedTourSection, step: GuidedTourStep) => {
+    if (section === "mobile" && step.target === '[data-tour="mobile-message-workflow"]')
+      setMobileMessagesHelpRequest((request) => request + 1);
     setTourDuplicateView(section === "duplicates"
       ? step.target === '[data-tour="duplicate-trash-actions"]' ? "trash" : "duplicates"
       : null);
@@ -4070,14 +4062,16 @@ function App() {
   }, [currentPath, electronAPI, loadDirectory, openDialog, selectedFile]);
 
   const addIndexSource = useCallback(async () => {
-    if (!electronAPI) return;
+    if (!electronAPI) return false;
     const state = await electronAPI.selectIndexSource();
     if (state) {
       applyPersistedState(state);
       await refreshSources();
       if (currentPath === allSourcesPath)
         void loadDirectory(allSourcesPath, explodedRef.current, true, true);
+      return true;
     }
+    return false;
   }, [
     allSourcesPath,
     applyPersistedState,
@@ -6024,21 +6018,24 @@ function App() {
   }, [intensiveJobs.length]);
 
   useEffect(() => {
-    if (indexStorageStatus.destinationAvailable && !indexStorageStatus.usingLocalFallback) {
-      setIndexStorageNoticeDismissed(false);
-      setIndexStorageNoticeDontShowAgain(false);
-    }
-  }, [indexStorageStatus.destinationAvailable, indexStorageStatus.usingLocalFallback]);
+    if (!hasIndexStorageProblem) setIndexStorageNoticeCollapsed(false);
+  }, [hasIndexStorageProblem]);
 
-  const dismissIndexStorageFallbackNotice = (permanently: boolean) => {
-    setIndexStorageNoticeDismissed(true);
-    if (!permanently) return;
-    setHideIndexStorageNoticePermanently(true);
+  const checkIndexStorageConnection = async () => {
+    if (!electronAPI?.refreshIndexStorageStatus || checkingIndexStorage) return;
+    setCheckingIndexStorage(true);
     try {
-      localStorage.setItem("silo.hideIndexStorageFallbackNotice", "true");
+      setIndexStorageStatus(await electronAPI.refreshIndexStorageStatus());
     } catch {
-      // Keep the notice dismissed for this session if storage is unavailable.
+      // The periodic storage monitor will publish its next status update.
+    } finally {
+      setCheckingIndexStorage(false);
     }
+  };
+
+  const openCacheDestinationSettings = () => {
+    setSettingsTourTarget('[data-tour="settings-cache-destination"]');
+    setShowSettings(true);
   };
 
   const dismissPerformanceNotice = (permanently: boolean) => {
@@ -6235,17 +6232,59 @@ function App() {
         intensiveJobs.length > 0 ||
         searchError) && (
         <div className="app-notice-stack" aria-live="polite">
-          {showIndexStorageBanner && (
+          {showIndexStorageBanner && hasIndexStorageProblem && indexStorageNoticeCollapsed ? (
+            <button
+              className="index-storage-collapsed"
+              type="button"
+              aria-label="Show cache destination warning"
+              title="Cache destination needs attention"
+              onClick={() => setIndexStorageNoticeCollapsed(false)}
+            >
+              !
+            </button>
+          ) : showIndexStorageBanner && (
             <div className="index-storage-banner" role="status">
               <div className="index-storage-banner-content">
-                {showIndexStorageMessage && indexStorageStatus.message && (
+                {indexStorageStatus.missingRoots.length > 0 ? (
+                  <strong>Silo needs you to reconnect or locate a cache destination.</strong>
+                ) : indexStorageStatus.message && (
                   <strong>{indexStorageStatus.message}</strong>
                 )}
+              </div>
+              {hasIndexStorageProblem && (
+                <div className="index-storage-banner-actions">
+                  <button
+                    className="settings-secondary"
+                    type="button"
+                    disabled={!electronAPI || checkingIndexStorage}
+                    onClick={() => void checkIndexStorageConnection()}
+                    title="After reconnecting the drive, check its cache destinations again"
+                  >
+                    <FiRefreshCw aria-hidden="true" />
+                    {checkingIndexStorage ? "Checking…" : "Reconnect"}
+                  </button>
+                  <button
+                    className="settings-secondary"
+                    type="button"
+                    onClick={openCacheDestinationSettings}
+                    title="Open cache destination settings to locate existing cache folders"
+                  >
+                    <FiFolder aria-hidden="true" /> Locate…
+                  </button>
+                  <button
+                    className="index-storage-dismiss"
+                    type="button"
+                    aria-label="Minimize cache destination warning"
+                    title="Minimize warning; it will stay available as !"
+                    onClick={() => setIndexStorageNoticeCollapsed(true)}
+                  >
+                    <FiX aria-hidden="true" />
+                  </button>
+                </div>
+              )}
+              <div className="index-storage-banner-content">
                 {indexStorageStatus.missingRoots.length > 0 && (
-                  <span>
-                    Cache locations Silo needs you to reconnect or locate:{" "}
-                    {indexStorageStatus.missingRoots.join(" · ")}
-                  </span>
+                  <span>{indexStorageStatus.missingRoots.join(" · ")}</span>
                 )}
                 {showIndexStorageFallbackDetails && (
                   <span>
@@ -6258,27 +6297,6 @@ function App() {
                   <span>{indexStorageStatus.transfer.message}</span>
                 )}
               </div>
-              {showIndexStorageFallbackNotice && (
-                <div className="index-storage-banner-actions">
-                  <label className="index-storage-dismiss-choice">
-                    <input
-                      type="checkbox"
-                      checked={indexStorageNoticeDontShowAgain}
-                      onChange={(event) => setIndexStorageNoticeDontShowAgain(event.target.checked)}
-                    />
-                    Don’t show again
-                  </label>
-                  <button
-                    className="index-storage-dismiss"
-                    type="button"
-                    aria-label="Dismiss unavailable cache destination notice"
-                    title={indexStorageNoticeDontShowAgain ? "Dismiss and don’t show again" : "Dismiss until the destination reconnects"}
-                    onClick={() => dismissIndexStorageFallbackNotice(indexStorageNoticeDontShowAgain)}
-                  >
-                    <FiX aria-hidden="true" />
-                  </button>
-                </div>
-              )}
             </div>
           )}
           {intensiveJobs.length > 0 && !performanceNoticeHidden && !hidePerformanceNoticePermanently && (
@@ -7290,7 +7308,7 @@ function App() {
       </React.Suspense>
       {appSection === "memories" ? (
         <React.Suspense fallback={<main className="viewer-status">Loading Memories…</main>}>
-          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={thumbnailSize} onThumbnailSizeChange={setThumbnailSize} />
+          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={thumbnailSize} onThumbnailSizeChange={setThumbnailSize} onChooseMusicFolder={addIndexSource} />
         </React.Suspense>
       ) : appSection === "stats" ? (
         electronAPI ? <StatsDashboard api={electronAPI} /> : <main className="viewer-status">Stats services are unavailable.</main>
@@ -8241,6 +8259,7 @@ function App() {
             phoneDevices={phoneDevices}
             connectedPhone={connectedPhone}
             showHiddenMessages={showHiddenMessages}
+            messagesWorkflowRequest={mobileMessagesHelpRequest}
             onScanPhones={scanForPhones}
             scanningPhones={phoneScanning}
             devicePanel={

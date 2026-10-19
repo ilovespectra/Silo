@@ -4105,23 +4105,11 @@ input[type="range"]::-moz-range-progress {
 }
 .index-storage-banner-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
   margin-top: 2px;
-}
-.index-storage-dismiss-choice {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--muted);
-  font-size: 10px;
-  white-space: nowrap;
-  cursor: pointer;
-  user-select: none;
-}
-.index-storage-dismiss-choice input {
-  accent-color: var(--orange);
 }
 .index-storage-dismiss {
   display: inline-grid;
@@ -4137,6 +4125,28 @@ input[type="range"]::-moz-range-progress {
 .index-storage-dismiss:hover {
   background: var(--surface-hover);
   color: var(--text);
+}
+.index-storage-collapsed {
+  position: fixed;
+  z-index: 1450;
+  top: 12px;
+  right: 14px;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid rgba(217, 109, 82, 0.8);
+  border-radius: 50%;
+  background: rgba(66, 30, 24, 0.98);
+  color: var(--error-text, #efaa98);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
+  font-size: 18px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.index-storage-collapsed:hover {
+  background: rgba(92, 39, 29, 0.99);
+  transform: scale(1.04);
 }
 
 .tour-exit-backdrop,

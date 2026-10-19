@@ -120,7 +120,7 @@ import { resolveAppAssetRequest } from "./appAssets";
 import { InventoryTransfers } from "./inventoryTransfer";
 import { RendererRecovery } from "./rendererRecovery";
 import { createProgressThrottle } from "./progressThrottle";
-import { MemoryManager, MemoryPromptPlan, MemoryStoryCandidate } from "./memoryManager";
+import { isMemoryMusicTrack, MemoryManager, MemoryPromptPlan, MemoryStoryCandidate } from "./memoryManager";
 import {
   DiscoveredConcept,
   MEMORY_CONCEPTS,
@@ -2887,6 +2887,7 @@ let memoryPreviewQueue: Promise<void> = Promise.resolve();
 const memoryPreviewStatus = new Map<string, MemoryPreviewStatus>();
 const memoryPreviewCards = new Map<string, MemorySuggestion>();
 let memoryRenderQueue: Promise<void> = Promise.resolve();
+let autoMemoryMusicPreflightRunning = false;
 const memoryFrameVectors = new Map<string, Float32Array>();
 // Session-only: clips whose first frame classified unsafe; rechecked for saved suggestions.
 const memoryUnsafeVideoPaths = new Set<string>();
@@ -3882,6 +3883,19 @@ function memoryErrorDetails(error: unknown): Record<string, string> {
   };
 }
 
+/** Memory audio diagnostics keep failure stages while withholding media and source paths. */
+function memoryAudioErrorDetails(error: unknown): Record<string, string> {
+  const name = error instanceof Error ? error.name : "UnknownError";
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const message = safeRuntimeDiagnosticText(rawMessage);
+  const stack = error instanceof Error ? safeRuntimeDiagnosticStack(error.stack) : "";
+  return {
+    name,
+    message: message || "Error details withheld.",
+    ...(stack ? { stack } : {}),
+  };
+}
+
 /** Platform, model and indexer state at the moment memories are generated. */
 function memoryEnvironmentSnapshot(): Record<string, unknown> {
   const progress = semanticIndexer?.getProgress();
@@ -4146,10 +4160,33 @@ function prepareMemoryPreviews(suggestions: MemorySuggestion[]): Promise<void> {
 }
 
 /** Visible cards first, then the reserve stockpile, all on the single render queue. */
-async function prepareAllMemoryPreviews(visible: MemorySuggestion[]): Promise<void> {
+async function prepareAllMemoryPreviews(
+  visible: MemorySuggestion[],
+  logGeneratorSummary = false,
+): Promise<void> {
   const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
-  void prepareMemoryPreviews(visible).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
-  if (reserve.length) void prepareMemoryPreviews(reserve).catch((error) => runtimeLog("memory-reserve-preview-error", memoryErrorDetails(error)));
+  const visibleTask = prepareMemoryPreviews(visible);
+  if (logGeneratorSummary) {
+    void visibleTask.then(async () => {
+      const statuses = await Promise.all(visible.map(async (suggestion) => {
+        const known = memoryPreviewStatus.get(suggestion.id)?.status;
+        return known ?? (await findMemoryMovie(suggestion) ? "ready" : "queued");
+      }));
+      runtimeLog("memory-generator-preview-summary", {
+        stories: visible.length,
+        previewsReady: statuses.filter((status) => status === "ready").length,
+        previewsFailed: statuses.filter((status) => status === "failed").length,
+        previewsPending: statuses.filter((status) => status !== "ready" && status !== "failed").length,
+        librarySoundtracksSelected: visible.filter((suggestion) =>
+          suggestion.soundtrackId?.startsWith("library:"),
+        ).length,
+      });
+    }).catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
+  } else {
+    void visibleTask.catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
+  }
+  if (reserve.length)
+    void prepareMemoryPreviews(reserve).catch((error) => runtimeLog("memory-reserve-preview-error", memoryErrorDetails(error)));
 }
 
 let memoryPreviewEmitTimer: NodeJS.Timeout | null = null;
@@ -4187,6 +4224,62 @@ function runMemoryRender<T>(render: () => Promise<T>): Promise<T> {
   return task;
 }
 
+interface MemoryOutputAudioProbe {
+  probeStatus: "complete" | "timeout" | "spawn-error" | "unrecognized";
+  audioStreamPresent: boolean | null;
+}
+
+/** Read container stream metadata quickly without decoding or logging the media path. */
+function probeMemoryOutputAudioStream(filePath: string): Promise<MemoryOutputAudioProbe> {
+  let executable: string;
+  try {
+    executable = getFfmpegPath();
+  } catch {
+    return Promise.resolve({ probeStatus: "spawn-error", audioStreamPresent: null });
+  }
+  if (!executable)
+    return Promise.resolve({ probeStatus: "spawn-error", audioStreamPresent: null });
+
+  return new Promise((resolve) => {
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    let child: ReturnType<typeof spawn>;
+    const finish = (result: MemoryOutputAudioProbe) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(result);
+    };
+    let deadline: ReturnType<typeof setTimeout>;
+    try {
+      child = spawn(executable, ["-hide_banner", "-nostdin", "-i", filePath], {
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      deadline = setTimeout(() => {
+        timedOut = true;
+        child.kill();
+      }, 10000);
+    } catch {
+      resolve({ probeStatus: "spawn-error", audioStreamPresent: null });
+      return;
+    }
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString()).slice(-16384);
+    });
+    child.once("error", () =>
+      finish({ probeStatus: "spawn-error", audioStreamPresent: null }),
+    );
+    child.once("close", () => {
+      const inputRecognized = /Input #\d+/i.test(stderr);
+      finish({
+        probeStatus: timedOut ? "timeout" : inputRecognized ? "complete" : "unrecognized",
+        audioStreamPresent: inputRecognized ? /\bAudio:\s*[\w.-]+/i.test(stderr) : null,
+      });
+    });
+  });
+}
+
 async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promise<void> {
   const cacheDirectory = await memoryMovieDirectory();
   try {
@@ -4194,15 +4287,31 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
       const destination = path.join(cacheDirectory, memoryPreviewFileName(suggestion));
       if (await fsPromises.stat(destination).then((result) => result.isFile(), () => false)) {
         setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
+        const audioProbe = await probeMemoryOutputAudioStream(destination);
+        runtimeLog("memory-preview-cache-audio-probe", {
+          soundtrackSource: suggestion.soundtrackId?.startsWith("library:") ? "library" : "original",
+          ...audioProbe,
+        });
+        runtimeLog("memory-preview-cache-hit", {
+          soundtrackSource: suggestion.soundtrackId?.startsWith("library:") ? "library" : "original",
+        });
         memoryPreviewCards.delete(suggestion.id);
         await cleanupMemoryImageCache().catch((error) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(error)));
         continue;
       }
       // Reuse a movie rendered before the folder changed instead of re-rendering it.
       const existing = await findMemoryMovie(suggestion);
-      if (existing && existing !== destination) {
+        if (existing && existing !== destination) {
         if (await fsPromises.copyFile(existing, destination).then(() => true, () => false)) {
           setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
+          const audioProbe = await probeMemoryOutputAudioStream(destination);
+          runtimeLog("memory-preview-reused-audio-probe", {
+            soundtrackSource: suggestion.soundtrackId?.startsWith("library:") ? "library" : "original",
+            ...audioProbe,
+          });
+          runtimeLog("memory-preview-reused", {
+            soundtrackSource: suggestion.soundtrackId?.startsWith("library:") ? "library" : "original",
+          });
           memoryPreviewCards.delete(suggestion.id);
           await cleanupMemoryImageCache().catch((error) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(error)));
           continue;
@@ -4215,15 +4324,25 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
         const originalAudioId = `original:${suggestion.id}`;
         const verified = await verifyMemoryExport(options).catch(async (error) => {
           if (options.soundtrackId === originalAudioId) throw error;
+          runtimeLog("memory-preview-soundtrack-verification-fallback", {
+            fromSource: "library",
+            toSource: "original",
+            ...memoryAudioErrorDetails(error),
+          });
           options = { ...options, soundtrackId: originalAudioId };
           return verifyMemoryExport(options);
         });
         const { suggestion: current, soundtrack } = verified;
+        let renderedSoundtrackSource = soundtrack.source;
         await fsPromises.mkdir(cacheDirectory, { recursive: true });
         const scratch = await fsPromises.mkdtemp(path.join(os.tmpdir(), "silo-memory-preview-"));
         const renderPreview = (renderOptions: MemoryExportOptions, track: typeof soundtrack) => runMemoryRender(async () => {
             memoryExportScratch = scratch;
             const startedAt = Date.now();
+            runtimeLog("memory-preview-render-start", {
+              soundtrackSource: track.source,
+              mediaCount: renderOptions.count,
+            });
             setMemoryPreviewStatus(suggestion.id, { status: "rendering", progress: 0 });
             try {
               await memoryExporter.render(current, renderOptions, track, destination, (progress) => {
@@ -4232,6 +4351,22 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
                 setMemoryPreviewStatus(suggestion.id, { status: "rendering", progress: fraction,
                   ...(fraction > 0.05 ? { etaSeconds: Math.max(1, Math.round(elapsed / fraction * (1 - fraction))) } : {}) });
               });
+              const audioProbe = await probeMemoryOutputAudioStream(destination);
+              runtimeLog("memory-preview-audio-probe", {
+                soundtrackSource: track.source,
+                ...audioProbe,
+              });
+              runtimeLog("memory-preview-render-complete", {
+                soundtrackSource: track.source,
+                elapsedMs: Date.now() - startedAt,
+              });
+            } catch (error) {
+              runtimeLog("memory-preview-render-error", {
+                soundtrackSource: track.source,
+                elapsedMs: Date.now() - startedAt,
+                ...memoryAudioErrorDetails(error),
+              });
+              throw error;
             } finally {
               memoryExportScratch = null;
             }
@@ -4242,21 +4377,30 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
           } catch (error) {
             // A song that vanished mid-render (e.g. drive unplugged) falls back to the story's own audio.
             if (options.soundtrackId === originalAudioId) throw error;
-            runtimeLog("memory-preview-soundtrack-fallback", memoryErrorDetails(error));
+            runtimeLog("memory-preview-soundtrack-fallback", {
+              fromSource: "library",
+              toSource: "original",
+              ...memoryAudioErrorDetails(error),
+            });
             const fallbackOptions = { ...options, soundtrackId: originalAudioId };
             const fallback = await verifyMemoryExport(fallbackOptions);
             await renderPreview(fallbackOptions, fallback.soundtrack);
+            renderedSoundtrackSource = fallback.soundtrack.source;
           }
         } finally {
           await fsPromises.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
         }
         setMemoryPreviewStatus(suggestion.id, { status: "ready", progress: 1 });
+        runtimeLog("memory-preview-ready", { soundtrackSource: renderedSoundtrackSource });
         await rememberMemoryMovieTitles([suggestion]).catch(() => undefined);
         memoryPreviewCards.delete(suggestion.id);
         await cleanupMemoryImageCache().catch((error) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(error)));
       } catch (error) {
         setMemoryPreviewStatus(suggestion.id, { status: "failed" });
-        runtimeLog("memory-preview-skipped", memoryErrorDetails(error));
+        runtimeLog("memory-preview-skipped", {
+          requestedSoundtrackSource: suggestion.soundtrackId?.startsWith("library:") ? "library" : "original",
+          ...memoryAudioErrorDetails(error),
+        });
         memoryPreviewCards.delete(suggestion.id);
         await cleanupMemoryImageCache().catch((cleanupError) => runtimeLog("memory-image-cache-cleanup-error", memoryErrorDetails(cleanupError)));
       }
@@ -10165,7 +10309,7 @@ app.whenReady().then(async () => {
   // reads join the preview queue instead of racing or failing with a busy error.
   void memoryManager.getState()
     .then((state) => prepareAllMemoryPreviews(state.suggestions))
-    .catch((error) => runtimeLog("memory-preview-warmup-error", memoryErrorDetails(error)));
+    .catch((error) => runtimeLog("memory-preview-warmup-error", memoryAudioErrorDetails(error)));
   scheduleAutomaticMemories();
   // even when the audio screen is closed, and retry failures once due.
   audioInventoryRetryTimer = setInterval(
@@ -10514,17 +10658,28 @@ app.whenReady().then(async () => {
     },
     {
       id: "audio",
-      lane: "background",
+      // Audio inventory is a throttled disk walk that should run alongside
+      // long photo-indexing work. Sharing the background lane let search hold
+      // this recovery stage indefinitely, leaving Memories with no music index.
+      lane: "disk",
       progress: () => ({
         status: audioInventoryRunning ? "scanning" : "idle",
         message: "Source-aware retry coverage",
       }),
+      onDiagnostic: (event, details) =>
+        runtimeLog(`memory-audio-recovery-${event}`, {
+          ...details,
+          searchIndexStatus: semanticIndexer.getProgress().status,
+          searchRecoveryRunning: indexRecovery?.details("search").recoveryRunning ?? false,
+          interactiveSearchActive: semanticIndexer.isSearchActive(),
+          startupReconciliationSettled: startupIndexReconciliationSettled,
+          indexStorageAvailable,
+        }),
       ready: () =>
         indexStorageAvailable &&
         startupIndexReconciliationSettled &&
-        // Audio discovery must remain available when search has retryable errors
-        // or the user paused search; it does not depend on embeddings.
-        analysisIdle() &&
+        // The one-worker audio walk is throttled and yields during interactive
+        // searches. Do not hold music discovery until long-running photo work ends.
         !audioInventoryRunning,
       start: async () => {
         const requestId = pendingAudioRefreshRequestId;
@@ -10842,8 +10997,14 @@ async function runMemoryGenerator(reason: string, replace = false) {
   const state = await memoryManager.generate(replace);
   if (replace) await retireMemoriesToBook(before, state.suggestions).catch(() => undefined);
   runtimeLog("memory-generate", { reason, count: state.suggestions.length });
+  runtimeLog("memory-generator-result", {
+    stories: state.suggestions.length,
+    librarySoundtracksSelected: state.suggestions.filter((card) =>
+      card.soundtrackId?.startsWith("library:"),
+    ).length,
+  });
   if (state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+    void prepareAllMemoryPreviews(state.suggestions, true).catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
   const next = { ...(await memoryStateWithPreviews()), message: state.message };
   sendToRenderer("memories-changed", next);
   return next;
@@ -10855,11 +11016,31 @@ function scheduleAutomaticMemories() {
   const tick = () => {
     if (shuttingDown || !memoryManager) return;
     const due = lastAutoMemoryRunAt === 0 || Date.now() - lastAutoMemoryRunAt >= AUTO_MEMORY_INTERVAL_MS;
-    if (!due || getThumbnailIndexingWaitMessage() !== null) return;
+    if (!due || getThumbnailIndexingWaitMessage() !== null || autoMemoryMusicPreflightRunning) return;
     const reason = lastAutoMemoryRunAt === 0 ? "startup" : "scheduled";
-    lastAutoMemoryRunAt = Date.now();
-    void runMemoryGenerator(reason)
-      .catch((error) => runtimeLog("memory-auto-generate-error", memoryErrorDetails(error)));
+    autoMemoryMusicPreflightRunning = true;
+    void getMemoryMusicAvailability()
+      .then((availability) => {
+        runtimeLog("memory-auto-music-preflight", {
+          reason,
+          available: availability.available,
+          scanning: availability.scanning,
+          cacheAvailable: availability.cacheAvailable,
+          sourceCount: availability.sourceCount,
+          indexedAudioFiles: availability.indexedAudioFileCount,
+          eligibleMusicTracks: availability.indexedTrackCount,
+        });
+        if (!availability.available) {
+          runtimeLog("memory-auto-generate-skipped-music-unavailable", availability);
+          return;
+        }
+        lastAutoMemoryRunAt = Date.now();
+        return runMemoryGenerator(reason).catch((error) =>
+          runtimeLog("memory-auto-generate-error", memoryAudioErrorDetails(error)),
+        );
+      })
+      .catch((error) => runtimeLog("memory-auto-music-preflight-error", memoryAudioErrorDetails(error)))
+      .finally(() => { autoMemoryMusicPreflightRunning = false; });
   };
   autoMemoryTimer = setInterval(tick, AUTO_MEMORY_POLL_MS);
   autoMemoryStartupTimer = setTimeout(() => {
@@ -10873,7 +11054,7 @@ ipcMain.handle("get-memories", async (_event, prepareViews: unknown) => {
   // Returns immediately; movies render in the background and report progress per card.
   const state = await memoryManager.getState();
   if (prepareViews === true && state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
   return memoryStateWithPreviews(state);
 });
 ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic: unknown) => {
@@ -10911,7 +11092,7 @@ ipcMain.handle("generate-memories", async (_event, replace: unknown, customTopic
   await rememberMemoryMovieTitles(created).catch(() => undefined);
   for (const card of created) if (!await findMemoryMovie(card).catch(() => null)) memoryBookPending.set(card.id, card);
   if (state.suggestions.length)
-    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+    void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
   return { ...(await memoryStateWithPreviews()), message: state.message };
 });
 /**
@@ -10952,7 +11133,7 @@ ipcMain.handle("select-memory-directory", async () => {
   });
   const state = await memoryManager.updateSettings({ movieDirectory: directory });
   // Copy already-rendered movies over so saved stories stay viewable offline.
-  void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+  void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
   return state;
 });
 ipcMain.handle("dismiss-memory", (_event, id: unknown) => {
@@ -10988,7 +11169,7 @@ ipcMain.handle("rename-memory", async (_event, id: unknown, title: unknown) => {
   }
   await rememberMemoryMovieTitles([renamed]);
   memoryPreviewStatus.delete(id);
-  void prepareMemoryPreviews([renamed]).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
+  void prepareMemoryPreviews([renamed]).catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
   const result = await memoryStateWithPreviews(nextState);
   sendToRenderer("memories-changed", result);
   return result;
@@ -11011,33 +11192,86 @@ ipcMain.handle("update-memory-settings", (_event, settings: unknown) => {
   else if (values.movieDirectory !== undefined) throw new Error("Invalid memory settings.");
   return memoryManager.updateSettings(update);
 });
-ipcMain.handle("get-memory-soundtracks", (_event, id: unknown) => {
+ipcMain.handle("get-memory-soundtracks", async (_event, id: unknown) => {
   if (typeof id !== "string" || !id || id.length > 200) throw new Error("Invalid memory.");
-  return memoryManager.getSoundtracks(id);
+  const startedAt = Date.now();
+  try {
+    const soundtracks = await memoryManager.getSoundtracks(id);
+    runtimeLog("memory-soundtrack-list-result", {
+      elapsedMs: Date.now() - startedAt,
+      choices: soundtracks.length,
+      libraryChoices: soundtracks.filter((track) => track.source === "library").length,
+      originalChoiceAvailable: soundtracks.some((track) => track.source === "original"),
+    });
+    return soundtracks;
+  } catch (error) {
+    runtimeLog("memory-soundtrack-list-error", memoryAudioErrorDetails(error));
+    throw error;
+  }
 });
-ipcMain.handle("browse-memory-audio", (_event, raw: unknown) => {
+ipcMain.handle("browse-memory-audio", async (_event, raw: unknown) => {
   const value = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
   const textField = (field: unknown, max: number) =>
     typeof field === "string" && field.length <= max && !field.includes("\0") ? field : undefined;
-  return memoryManager.browseAudio({
-    sourceId: textField(value.sourceId, 4096) || undefined,
+  try {
+    const result = await memoryManager.browseAudio({
+      sourceId: textField(value.sourceId, 4096) || undefined,
     folder: textField(value.folder, 4096),
     query: textField(value.query, 200),
     sort: value.sort === "modified" || value.sort === "size" ? value.sort : "name",
     direction: value.direction === "desc" ? "desc" : "asc",
     offset: Number.isSafeInteger(value.offset) ? Number(value.offset) : 0,
     limit: Number.isSafeInteger(value.limit) ? Number(value.limit) : 200,
-  });
+    });
+    runtimeLog("memory-audio-browse-result", {
+      totalMatches: result.total,
+      pageFiles: result.files.length,
+      sources: result.sources.length,
+      folders: result.folders.length,
+      selectedSource: textField(value.sourceId, 4096) ? "filtered" : "all",
+      queryPresent: Boolean(textField(value.query, 200)?.trim()),
+    });
+    return result;
+  } catch (error) {
+    runtimeLog("memory-audio-browse-error", memoryAudioErrorDetails(error));
+    throw error;
+  }
 });
 ipcMain.handle("set-memory-soundtrack", async (_event, id: unknown, soundtrackId: unknown) => {
-  if (typeof id !== "string" || !id || id.length > 200 || typeof soundtrackId !== "string" || soundtrackId.length > 250)
+  const soundtrackSource = typeof soundtrackId === "string" && soundtrackId.startsWith("library:")
+    ? "library"
+    : typeof soundtrackId === "string" && soundtrackId.startsWith("original:")
+      ? "original"
+      : "invalid";
+  if (typeof id !== "string" || !id || id.length > 200 || typeof soundtrackId !== "string" || soundtrackId.length > 250) {
+    runtimeLog("memory-soundtrack-selection-rejected", {
+      soundtrackSource,
+      reason: "invalid-request",
+    });
     throw new Error("Invalid memory soundtrack.");
-  const card = await memoryManager.setSoundtrack(id, soundtrackId);
-  if (!card) throw new Error("That song is no longer available. Choose another one.");
-  // The watchable movie re-renders with the new song on the single background queue.
-  memoryPreviewStatus.delete(id);
-  void prepareMemoryPreviews([card]).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
-  return memoryStateWithPreviews();
+  }
+  try {
+    const card = await memoryManager.setSoundtrack(id, soundtrackId);
+    if (!card) {
+      runtimeLog("memory-soundtrack-selection-rejected", {
+        soundtrackSource,
+        suggestionFound: Boolean(await memoryManager.getSuggestion(id).catch(() => undefined)),
+        reason: "track-not-resolvable-from-current-audio-index",
+      });
+      throw new Error("That song is no longer available. Choose another one.");
+    }
+    runtimeLog("memory-soundtrack-selection-saved", { soundtrackSource });
+    // The watchable movie re-renders with the new song on the single background queue.
+    memoryPreviewStatus.delete(id);
+    void prepareMemoryPreviews([card]).catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
+    return memoryStateWithPreviews();
+  } catch (error) {
+    runtimeLog("memory-soundtrack-selection-error", {
+      soundtrackSource,
+      ...memoryAudioErrorDetails(error),
+    });
+    throw error;
+  }
 });
 async function openMemoryMovie(id: string, revealInFolder: boolean): Promise<{ ok: boolean; path?: string; error?: string; preparing?: boolean; upgradeRequired?: boolean }> {
   if (typeof id !== "string" || !id || id.length > 200) return { ok: false, error: "Invalid memory." };
@@ -11208,9 +11442,21 @@ ipcMain.handle("cancel-memory-export", () => {
   memoryExporter.cancel();
 });
 ipcMain.handle("export-memory", async (_event, rawOptions: unknown) => {
-  if (memoryExportRunning) return { ok: false, error: "Another memory movie is already rendering." };
+  if (memoryExportRunning) {
+    runtimeLog("memory-export-rejected", { reason: "another-export-running" });
+    return { ok: false, error: "Another memory movie is already rendering." };
+  }
   const options = memoryExportOptions(rawOptions);
-  if (!options) return { ok: false, error: "Invalid movie settings." };
+  if (!options) {
+    runtimeLog("memory-export-rejected", { reason: "invalid-movie-settings" });
+    return { ok: false, error: "Invalid movie settings." };
+  }
+  const requestedSoundtrackSource = options.soundtrackId.startsWith("library:") ? "library" :
+    options.soundtrackId.startsWith("original:") ? "original" : "invalid";
+  runtimeLog("memory-export-start", {
+    requestedSoundtrackSource,
+    mediaCount: options.count,
+  });
   memoryExportRunning = true;
   memoryExportCancelRequested = false;
   let scratch: string | null = null;
@@ -11226,24 +11472,56 @@ ipcMain.handle("export-memory", async (_event, rawOptions: unknown) => {
       return { ok: false, canceled: true };
     // Hidden folders, bans, or the audio index may have changed while the dialog was open.
     const { suggestion, soundtrack } = await verifyMemoryExport(options);
+    runtimeLog("memory-export-soundtrack-verified", {
+      requestedSoundtrackSource,
+      resolvedSoundtrackSource: soundtrack.source,
+    });
     scratch = await fsPromises.mkdtemp(path.join(os.tmpdir(), "silo-memory-export-"));
     if (memoryExportCancelRequested) return { ok: false, canceled: true };
     await runMemoryRender(async () => {
       memoryExportScratch = scratch;
+      const startedAt = Date.now();
+      runtimeLog("memory-export-render-start", {
+        soundtrackSource: soundtrack.source,
+        mediaCount: options.count,
+      });
       try {
         await memoryExporter.render(suggestion, options, soundtrack, destination.filePath,
           progress => sendToRenderer("memory-export-progress", progress));
+        const audioProbe = await probeMemoryOutputAudioStream(destination.filePath);
+        runtimeLog("memory-export-audio-probe", {
+          soundtrackSource: soundtrack.source,
+          ...audioProbe,
+        });
+        runtimeLog("memory-export-render-complete", {
+          soundtrackSource: soundtrack.source,
+          elapsedMs: Date.now() - startedAt,
+        });
+      } catch (error) {
+        runtimeLog("memory-export-render-error", {
+          soundtrackSource: soundtrack.source,
+          elapsedMs: Date.now() - startedAt,
+          ...memoryAudioErrorDetails(error),
+        });
+        throw error;
       } finally {
         memoryExportScratch = null;
       }
     });
     // The movie is already saved; a bookkeeping failure must not report a failed export.
     await memoryManager.markDownloaded(suggestion.id).catch(() => undefined);
+    runtimeLog("memory-export-complete", { soundtrackSource: soundtrack.source });
     return { ok: true, path: destination.filePath };
   } catch (cause) {
     if (memoryExportCancelRequested || cause instanceof MemoryExportCancelledError ||
-      (cause instanceof Error && cause.name === "AbortError"))
+      (cause instanceof Error && cause.name === "AbortError")) {
+      runtimeLog("memory-export-cancelled", { requestedSoundtrackSource });
       return { ok: false, canceled: true };
+    }
+    runtimeLog("memory-export-error", {
+      requestedSoundtrackSource,
+      ...memoryAudioErrorDetails(cause),
+    });
     return { ok: false, error: cause instanceof Error ? cause.message : String(cause) };
   } finally {
     memoryExportScratch = null;
@@ -11980,8 +12258,19 @@ async function refreshAudioInventory(requestId: number, force = false) {
     if (!(await isSiloInternalRoot(source.rootPath))) sources.push(source);
   }
   const forceRecoveredSourceScan = recoveredAudioSources.size > 0;
+  const inventoryStartedAt = Date.now();
+  const initialSnapshot = audioLibraryCache.getSnapshot();
+  runtimeLog("memory-audio-inventory-start", {
+    requestId,
+    force: force || forceRecoveredSourceScan,
+    sourceCount: sources.length,
+    sourceKinds: sources.map((source) => source.kind),
+    cachedFiles: initialSnapshot.files.length,
+    cachedSourceCount: initialSnapshot.sourceIds.length,
+    cachedFailedSourceCount: initialSnapshot.failedSources?.length ?? 0,
+  });
   if (requestId === -1 && !force && !forceRecoveredSourceScan) {
-    const cached = audioLibraryCache.getSnapshot();
+    const cached = initialSnapshot;
     const now = Date.now();
     const pending = sources.some((source) => {
       const completedAt = cached.sourceScannedAt?.[source.id] ?? 0;
@@ -11993,12 +12282,18 @@ async function refreshAudioInventory(requestId: number, force = false) {
     if (!pending) {
       // Existing cards may have been generated while the library was empty. A
       // fresh cached inventory still needs to backfill their soundtrack IDs.
+      runtimeLog("memory-audio-inventory-cache-hit", {
+        cachedFiles: cached.files.length,
+        sourceCount: sources.length,
+        failedSourceCount: cached.failedSources?.length ?? 0,
+      });
       await refreshMemorySoundtracksAfterAudioIndexing();
       return { ok: true, snapshot: await getVisibleAudioSnapshot(cached) };
     }
   }
   if (forceRecoveredSourceScan) force = true;
   audioInventoryRunning = true;
+  let lastProgressLoggedAt = 0;
   try {
     const snapshot = await audioLibraryCache.scan(
       sources,
@@ -12027,6 +12322,20 @@ async function refreshAudioInventory(requestId: number, force = false) {
       },
       (progress) => {
         audioInventoryProgress = progress;
+        const now = Date.now();
+        if (
+          progress.phase !== "scanning" ||
+          now - lastProgressLoggedAt >= 10000
+        ) {
+          lastProgressLoggedAt = now;
+          runtimeLog("memory-audio-inventory-progress", {
+            phase: progress.phase,
+            sourceIndex: progress.sourceIndex,
+            sourceCount: progress.sourceCount,
+            scanned: progress.scanned,
+            audioFound: progress.audioFound,
+          });
+        }
         sendToRenderer("audio-library-scan-progress", {
           requestId,
           ...progress,
@@ -12037,7 +12346,7 @@ async function refreshAudioInventory(requestId: number, force = false) {
     );
     sendToRenderer("audio-library-cache-changed", snapshot.scannedAt);
     void refreshMemorySoundtracksAfterAudioIndexing().catch((error) =>
-      runtimeLog("memory-soundtrack-refresh-error", memoryErrorDetails(error)),
+      runtimeLog("memory-soundtrack-refresh-error", memoryAudioErrorDetails(error)),
     );
     runtimeLog("audio-inventory-checkpoint", {
       files: snapshot.files.length,
@@ -12045,9 +12354,26 @@ async function refreshAudioInventory(requestId: number, force = false) {
       completedSources: Object.keys(snapshot.sourceScannedAt ?? {}).length,
       failedSources: snapshot.failedSources?.length ?? 0,
     });
+    runtimeLog("memory-audio-inventory-complete", {
+      elapsedMs: Date.now() - inventoryStartedAt,
+      files: snapshot.files.length,
+      supportedTracks: snapshot.files.filter((file) =>
+        isAudioFile(file.name, mime.getType(file.name)),
+      ).length,
+      sources: snapshot.sourceIds.length,
+      completedSources: Object.keys(snapshot.sourceScannedAt ?? {}).length,
+      failedSources: snapshot.failedSources?.length ?? 0,
+      failedSourceIndexes: sources.flatMap((source, index) =>
+        snapshot.failedSources?.includes(source.id) ? [index + 1] : [],
+      ),
+    });
     return { ok: true, snapshot: await getVisibleAudioSnapshot(snapshot) };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    runtimeLog("memory-audio-inventory-error", {
+      elapsedMs: Date.now() - inventoryStartedAt,
+      ...memoryAudioErrorDetails(error),
+    });
     return { ok: false, error: message };
   } finally {
     audioInventoryRunning = false;
@@ -12079,9 +12405,41 @@ async function refreshMemorySoundtracksAfterAudioIndexing(): Promise<void> {
   sendToRenderer("memories-changed", await memoryStateWithPreviews(currentState));
   runtimeLog("memory-soundtracks-assigned", { count: changedIds.length });
   void prepareMemoryPreviews(changedCards).catch((error) =>
-    runtimeLog("memory-soundtrack-preview-error", memoryErrorDetails(error)),
+    runtimeLog("memory-soundtrack-preview-error", memoryAudioErrorDetails(error)),
   );
 }
+
+async function getMemoryMusicAvailability() {
+  const activeSources = (await listSources()).filter(
+    (source) => source.enabled && source.available && source.rootPath.trim(),
+  );
+  const sourceIds = new Set(activeSources.map((source) => source.id));
+  const indexedAudioFiles = (audioLibraryCache?.getSnapshot().files ?? []).filter(
+    (file) => Boolean(file.sourceId && sourceIds.has(file.sourceId)) &&
+      isAudioFile(file.name, mime.getType(file.name)),
+  );
+  const indexedTrackCount = indexedAudioFiles.filter(isMemoryMusicTrack).length;
+  const cacheAvailable = Boolean(audioLibraryCache && indexStorageAvailable);
+  const availability = {
+    available: cacheAvailable && indexedTrackCount > 0,
+    scanning: audioInventoryRunning,
+    sourceCount: activeSources.length,
+    indexedTrackCount,
+    indexedAudioFileCount: indexedAudioFiles.length,
+    cacheAvailable,
+  };
+  runtimeLog("memory-audio-availability", availability);
+  return availability;
+}
+
+ipcMain.handle("get-memory-music-availability", async () => {
+  try {
+    return await getMemoryMusicAvailability();
+  } catch (error) {
+    runtimeLog("memory-audio-availability-error", memoryAudioErrorDetails(error));
+    throw error;
+  }
+});
 
 ipcMain.handle(
   "refresh-audio-library-cache",
@@ -16740,6 +17098,11 @@ ipcMain.handle("select-backup-destination", async (_event, current: unknown) => 
 
 ipcMain.handle("get-index-storage-root", () => selectedIndexStorageRoot);
 ipcMain.handle("get-index-storage-status", () => currentIndexStorageStatus());
+ipcMain.handle("refresh-index-storage-status", async () => {
+  mountedMacVolumesCacheAt = 0;
+  await monitorIndexStorageAvailability();
+  return currentIndexStorageStatus();
+});
 function effectiveCacheDestinationRoots(): CacheDestinationRoots {
   return Object.fromEntries(
     CACHE_DESTINATIONS.map((item) => [

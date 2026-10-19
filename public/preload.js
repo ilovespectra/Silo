@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld("electron", {
     captureBugReportScreenshot: () => ipcRenderer.invoke("capture-bug-report-screenshot"),
     submitBugReport: (report) => ipcRenderer.invoke("submit-bug-report", report),
     getMemories: (prepareViews) => ipcRenderer.invoke("get-memories", Boolean(prepareViews)),
+    getMemoryMusicAvailability: () => ipcRenderer.invoke("get-memory-music-availability"),
     generateMemories: (replace, customTopic) => ipcRenderer.invoke("generate-memories", Boolean(replace), customTopic),
     dismissMemory: (id) => ipcRenderer.invoke("dismiss-memory", id),
     renameMemory: (id, title) => ipcRenderer.invoke("rename-memory", id, title),
@@ -612,6 +613,7 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("select-backup-destination", current),
   getIndexStorageRoot: () => ipcRenderer.invoke("get-index-storage-root"),
   getIndexStorageStatus: () => ipcRenderer.invoke("get-index-storage-status"),
+  refreshIndexStorageStatus: () => ipcRenderer.invoke("refresh-index-storage-status"),
   getLocalIndexFallbackEnabled: () =>
     ipcRenderer.invoke("get-local-index-fallback-enabled"),
   setLocalIndexFallbackEnabled: (enabled) =>

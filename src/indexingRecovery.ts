@@ -5,6 +5,10 @@ export interface RecoveryStage {
   id: string;
   progress: () => { status: string; message: string };
   start: () => Promise<unknown>;
+  onDiagnostic?: (
+    event: "blocked" | "start" | "complete" | "error",
+    details: Record<string, unknown>,
+  ) => void;
   ready: () => boolean;
   unresolvedWork?: () => string | null;
   needsInitialCheck?: boolean;
@@ -27,6 +31,7 @@ interface RecoveryRecord {
 
 export class IndexingRecovery {
   private records = new Map<string, RecoveryRecord>();
+  private reportedBlockedReasons = new Map<string, string>();
   private stopped = false;
   private tickRunning = false;
   private activeLanes = new Set<string>();
@@ -126,6 +131,21 @@ export class IndexingRecovery {
         error instanceof Error ? error.message : String(error);
       console.error("[IndexingRecovery] Retry state could not be saved", error);
     }
+  }
+
+  private report(stage: RecoveryStage, event: "blocked" | "start" | "complete" | "error", details: Record<string, unknown>) {
+    try {
+      stage.onDiagnostic?.(event, details);
+    } catch {
+      // Diagnostic callbacks must never interrupt recovery.
+    }
+  }
+
+  private reportBlocked(stage: RecoveryStage, reason: string) {
+    if (!stage.onDiagnostic || this.reportedBlockedReasons.get(stage.id) === reason)
+      return;
+    this.reportedBlockedReasons.set(stage.id, reason);
+    this.report(stage, "blocked", { reason });
   }
 
   details(id: string) {
@@ -478,13 +498,22 @@ export class IndexingRecovery {
           Number(second.id === "search") - Number(first.id === "search"),
       );
       for (const stage of ordered) {
-        if (
-          this.stopped ||
-          this.externalBlockReason ||
-          (this.interactiveSearchActive && stage.id !== "semantic-runtime") ||
-          !stage.ready()
-        )
+        if (this.stopped) continue;
+        if (this.externalBlockReason) {
+          this.reportBlocked(stage, this.externalBlockReason);
           continue;
+        }
+        if (this.interactiveSearchActive && stage.id !== "semantic-runtime") {
+          this.reportBlocked(stage, "Waiting for interactive search to finish.");
+          continue;
+        }
+        if (!stage.ready()) {
+          this.reportBlocked(
+            stage,
+            stage.blockedReason?.() || "Waiting for another active index to release resources.",
+          );
+          continue;
+        }
         const progress = stage.progress();
         const record = this.records.get(stage.id);
         const interrupted =
@@ -503,11 +532,15 @@ export class IndexingRecovery {
           (!manuallyRequested && (record?.retryAt ?? 0) > this.now())
         )
           continue;
-        if (stage.lane && this.activeLanes.has(stage.lane)) continue;
+        if (stage.lane && this.activeLanes.has(stage.lane)) {
+          this.reportBlocked(stage, `Waiting for the ${stage.lane} processing lane.`);
+          continue;
+        }
         if (record && record.attempts >= 3 && record.retryAt <= this.now())
           record.attempts = 0;
         if (record?.userPaused && !manuallyRequested) continue;
         this.requested.delete(stage.id);
+        this.reportedBlockedReasons.delete(stage.id);
         // Reserve the lane immediately; independent lanes can proceed.
         void this.run(stage);
       }
@@ -529,6 +562,7 @@ export class IndexingRecovery {
     if (stage.lane) this.activeLanes.add(stage.lane);
     record.attempts += 1;
     this.records.set(stage.id, record);
+    this.report(stage, "start", { attempt: record.attempts });
     try {
       this.persist();
       await stage.start();
@@ -570,11 +604,17 @@ export class IndexingRecovery {
       record.error = "";
       record.attempts = 0;
       record.retryAt = 0;
+      this.report(stage, "complete", { status: progress.status });
     } catch (error) {
       record.error = error instanceof Error ? error.message : String(error);
       record.retryAt =
         this.now() +
         (record.attempts >= 3 ? 5 * 60000 : 10000 * 2 ** (record.attempts - 1));
+      this.report(stage, "error", {
+        attempt: record.attempts,
+        retryAt: record.retryAt,
+        message: record.error,
+      });
     } finally {
       this.priorityPausedStages.delete(stage.id);
       record.running = false;
