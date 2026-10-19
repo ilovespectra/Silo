@@ -1165,8 +1165,9 @@ function App() {
   const [faceAssignmentSelectedId, setFaceAssignmentSelectedId] = useState<
     string | null
   >(null);
-  const [faceAssignmentPersonId, setFaceAssignmentPersonId] = useState("");
-  const [faceAssignmentNewName, setFaceAssignmentNewName] = useState("");
+  const [faceAssignmentTargets, setFaceAssignmentTargets] = useState<
+    Record<string, { personId: string; newName: string }>
+  >({});
   const [faceAssignmentBusy, setFaceAssignmentBusy] = useState(false);
   const [faceAssignmentError, setFaceAssignmentError] = useState("");
   const [faceCreationBox, setFaceCreationBox] = useState<
@@ -1924,6 +1925,7 @@ function App() {
     setSelectedFilePaths(new Set());
     setSelectedFile(null);
     setFilePreview(null);
+    setViewerOpen(false);
   }, []);
 
   const openDialog = useCallback((request: DialogRequest) => {
@@ -3344,12 +3346,16 @@ function App() {
     setNavigationHistory([{ type: "path", value: allSourcesPath }]);
     setHistoryIndex(0);
     setActiveDigitalFolderId(null);
+    clearFileSelection();
+    setSelectedFilePaths(new Set());
     setAppSection("files");
     await loadDirectory(allSourcesPath, false);
-  }, [allSourcesPath, loadDirectory]);
+  }, [allSourcesPath, clearFileSelection, loadDirectory]);
 
   const navigateToPath = useCallback(
     async (targetPath: string, addToHistory = true) => {
+      clearFileSelection();
+      setSelectedFilePaths(new Set());
       setCurrentPath(targetPath);
       setActiveDigitalFolderId(null);
       if (addToHistory) {
@@ -3361,7 +3367,7 @@ function App() {
       }
       await loadDirectory(targetPath);
     },
-    [historyIndex, loadDirectory, navigationHistory],
+    [clearFileSelection, historyIndex, loadDirectory, navigationHistory],
   );
 
   const navigateUp = useCallback(async () => {
@@ -3385,6 +3391,8 @@ function App() {
 
   const navigateToDigitalFolder = useCallback(
     async (folderId: string, addToHistory = true) => {
+      clearFileSelection();
+      setSelectedFilePaths(new Set());
       setLoading(true);
       try {
         setFiles(await electronAPI.getDigitalFolderFiles(folderId));
@@ -3404,7 +3412,7 @@ function App() {
         setLoading(false);
       }
     },
-    [electronAPI, historyIndex, navigationHistory],
+    [clearFileSelection, electronAPI, historyIndex, navigationHistory],
   );
 
   const navigateHistory = useCallback(
@@ -3413,6 +3421,8 @@ function App() {
       if (!entry) return;
       setHistoryIndex(nextIndex);
       if (entry.type === "path") {
+        clearFileSelection();
+        setSelectedFilePaths(new Set());
         setCurrentPath(entry.value);
         setActiveDigitalFolderId(null);
         await loadDirectory(entry.value);
@@ -3420,7 +3430,7 @@ function App() {
         await navigateToDigitalFolder(entry.value, false);
       }
     },
-    [loadDirectory, navigationHistory, navigateToDigitalFolder],
+    [clearFileSelection, loadDirectory, navigationHistory, navigateToDigitalFolder],
   );
 
   useEffect(() => {
@@ -3661,67 +3671,69 @@ function App() {
       setFaceAssignmentOpen(true);
       setFaceAssignmentFaces([]);
       setFaceAssignmentSelectedId(null);
-      setFaceAssignmentPersonId("");
-      setFaceAssignmentNewName("");
+      setFaceAssignmentTargets({});
       setFaceAssignmentError("");
       const [faces] = await Promise.all([
         electronAPI.getImageFaces(file.path),
         refreshPeople(),
       ]);
       setFaceAssignmentFaces(faces);
-      if (faces.length === 0)
-        setFaceAssignmentError(
-          "No detected faces for this photo yet. Run face indexing first.",
-        );
+      setFaceAssignmentTargets(
+        Object.fromEntries(
+          faces.map((face) => [
+            face.id,
+            { personId: face.personIds[0] ?? "", newName: "" },
+          ]),
+        ),
+      );
     },
     [electronAPI, openMediaViewer, refreshPeople],
   );
 
-  const assignSelectedFace = useCallback(async () => {
-    if (!electronAPI || !selectedFile || !faceAssignmentSelectedId) return;
+  const saveFaceAssignments = useCallback(async () => {
+    if (!electronAPI || !selectedFile || faceAssignmentFaces.length === 0) return;
     setFaceAssignmentBusy(true);
     setFaceAssignmentError("");
     try {
-      let targetPersonId = faceAssignmentPersonId;
-      if (!targetPersonId) {
-        const name = faceAssignmentNewName.trim();
-        if (!name)
-          throw new Error("Choose a person or enter a new person name.");
-        const before = new Set(
-          (await electronAPI.getFaceState()).people.map((person) => person.id),
-        );
-        await electronAPI.createPerson(name);
-        const created = (await electronAPI.getFaceState()).people.find(
-          (person) => !before.has(person.id),
-        );
-        if (!created) throw new Error("Could not create the new person.");
-        targetPersonId = created.id;
-      }
-      await electronAPI.assignFaceToPerson(
-        targetPersonId,
-        faceAssignmentSelectedId,
+      const assignments = faceAssignmentFaces.map((face) => {
+        const target = faceAssignmentTargets[face.id];
+        if (target?.personId)
+          return { faceId: face.id, personId: target.personId };
+        if (target?.newName.trim())
+          return { faceId: face.id, newName: target.newName.trim() };
+        return null;
+      });
+      if (assignments.some((item) => !item))
+        throw new Error("Choose a person or enter a name for every face box.");
+      await electronAPI.assignFacesToPeople(
+        assignments.filter((item): item is NonNullable<typeof item> => item !== null),
       );
-      setFaceAssignmentFaces(
-        await electronAPI.getImageFaces(selectedFile.path),
+      const faces = await electronAPI.getImageFaces(selectedFile.path);
+      setFaceAssignmentFaces(faces);
+      setFaceAssignmentTargets(
+        Object.fromEntries(
+          faces.map((face) => [
+            face.id,
+            { personId: face.personIds[0] ?? "", newName: "" },
+          ]),
+        ),
       );
+      setFaceAssignmentSelectedId(null);
       refreshPhotoIndicators([selectedFile.path]);
       await refreshPeople();
-      setFaceAssignmentSelectedId(null);
-      setFaceAssignmentPersonId("");
-      setFaceAssignmentNewName("");
     } catch (cause) {
       setFaceAssignmentError(
-        cause instanceof Error ? cause.message : "Could not assign this face.",
+        cause instanceof Error ? cause.message : "Could not assign these faces.",
       );
     } finally {
       setFaceAssignmentBusy(false);
     }
   }, [
     electronAPI,
-    faceAssignmentNewName,
-    faceAssignmentPersonId,
-    faceAssignmentSelectedId,
+    faceAssignmentFaces,
+    faceAssignmentTargets,
     refreshPeople,
+    refreshPhotoIndicators,
     selectedFile,
   ]);
 
@@ -3732,6 +3744,11 @@ function App() {
       setFaceAssignmentError("");
       try {
         setFaceAssignmentFaces(await electronAPI.deleteFace(faceId));
+        setFaceAssignmentTargets((current) => {
+          const next = { ...current };
+          delete next[faceId];
+          return next;
+        });
         if (selectedPersonPhoto?.path === selectedFile.path)
           setSelectedPhotoFaces(
             await electronAPI.getImageFaces(selectedFile.path),
@@ -3828,7 +3845,19 @@ function App() {
           drag.currentBox,
         );
         setFaceAssignmentFaces(faces);
-        setFaceAssignmentSelectedId(faces[faces.length - 1]?.id ?? null);
+        const createdFace = faces[faces.length - 1];
+        setFaceAssignmentSelectedId(createdFace?.id ?? null);
+        if (createdFace) {
+          setFaceAssignmentTargets((current) => ({
+            ...current,
+            [createdFace.id]: { personId: "", newName: "" },
+          }));
+          setFaceAssignmentError(
+            createdFace.hasDescriptor
+              ? "Face box saved. Choose a person for each box, then save all assignments."
+              : "Face box saved, but Silo could not read a recognition descriptor. You can assign it, but it will not train matching.",
+          );
+        }
         if (selectedPersonPhoto?.path === selectedFile.path)
           setSelectedPhotoFaces(faces);
         await refreshPeople();
@@ -4464,9 +4493,20 @@ function App() {
     ],
   );
 
+  useEffect(() => {
+    if (appSection === "people") return;
+    setSelectedPersonId(null);
+    setPersonDetail(null);
+    setPersonPhotos([]);
+    setSelectedPersonPhoto(null);
+    setSelectedPhotoFaces([]);
+    clearFileSelection();
+  }, [appSection, clearFileSelection]);
+
   const openPerson = useCallback(
     async (personId: string) => {
       if (!electronAPI) return;
+      clearFileSelection();
       // Photos first: loading them records deleted files, which the detail's counts then exclude.
       const photos = await electronAPI.getPersonPhotoFiles(personId);
       const [detail, suggestions] = await Promise.all([
@@ -4480,7 +4520,7 @@ function App() {
       setSelectedPersonPhoto(null);
       setSelectedPhotoFaces([]);
     },
-    [electronAPI],
+    [clearFileSelection, electronAPI],
   );
 
   const createPerson = useCallback(async () => {
@@ -6140,7 +6180,22 @@ function App() {
   }
 
   return (
-    <div className="app" ref={appRootRef} aria-busy={startupBlocked}>
+    <div
+      className="app"
+      ref={appRootRef}
+      aria-busy={startupBlocked}
+      onClickCapture={(event) => {
+        const target = event.target;
+        if (!(target instanceof Element)) return;
+        if (
+          target.closest(
+            '[data-file-type="image"], .viewer-image-wrap, .preview-image-button',
+          )
+        )
+          return;
+        setSelectedFilePaths(new Set());
+      }}
+    >
       {showConstructionBanner && (
         <div className="preview-construction-banner" role="note">
           <div>
@@ -7309,6 +7364,9 @@ function App() {
                   onClick={() => {
                     setSelectedPersonId(null);
                     setPersonDetail(null);
+                    setSelectedPersonPhoto(null);
+                    setSelectedPhotoFaces([]);
+                    clearFileSelection();
                   }}
                 >
                   <FiChevronLeft /> All people
@@ -7604,6 +7662,7 @@ function App() {
                           className={`person-photo-card ${selectedPersonPhoto?.path === photo.path ? "selected" : ""} ${selectedFilePaths.has(photo.path) ? "bulk-selected" : ""}`}
                           key={photo.path}
                           data-file-path={photo.path}
+                          data-file-type="image"
                           data-directory="false"
                           onClick={(e) => {
                             if (dragCompletedRef.current) {
@@ -7615,6 +7674,7 @@ function App() {
                             } else if (e.ctrlKey || e.metaKey) {
                               toggleFileSelection(photo.path);
                             } else {
+                              clearFileSelection();
                               selectPersonPhoto(photo);
                             }
                           }}
@@ -7639,6 +7699,19 @@ function App() {
                               openMediaViewer(photo, uniquePersonPhotos)
                             }
                           />
+                          <button
+                            className="person-photo-view-faces"
+                            type="button"
+                            aria-label={`View faces in ${photo.name}`}
+                            title="View faces in this photo"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              clearFileSelection();
+                              void selectPersonPhoto(photo);
+                            }}
+                          >
+                            <FiEye aria-hidden="true" />
+                          </button>
                           {magicBadge(photo.path)}
                           <div className="person-photo-meta">
                             <span title={photo.name}>{photo.name}</span>
@@ -9044,6 +9117,7 @@ function App() {
                           <tr
                             key={fileListKey(file)}
                             data-file-path={file.path}
+                            data-file-type={file.type}
                             data-directory={file.isDirectory ? "true" : "false"}
                             className={`file-row ${file.isDirectory ? "directory" : ""} ${selectedFile?.path === file.path ? "selected" : ""} ${selectedFilePaths.has(file.path) ? "bulk-selected" : ""}`}
                             onClick={(e) => {
@@ -9184,6 +9258,7 @@ function App() {
                         <div
                           key={fileListKey(file)}
                           data-file-path={file.path}
+                          data-file-type={file.type}
                           data-directory={file.isDirectory ? "true" : "false"}
                           className={`file-card ${file.isDirectory ? "directory" : ""} ${selectedFile?.path === file.path ? "selected" : ""} ${selectedFilePaths.has(file.path) ? "bulk-selected" : ""}`}
                           onClick={(e) => {
@@ -10336,53 +10411,92 @@ function App() {
                 </button>
               </header>
               <p>
-                Select a face, then choose or create its person. Drag boxes to
-                move them; Shift-click and drag over a missed face to draw an
-                orange box. Use × to remove a bad detection.
+                {faceAssignmentFaces.length
+                  ? "Drag a box to adjust it. Shift-drag on the photo to add every missed face. Choose a person or enter a name for each box, then save them together."
+                  : "No face boxes yet. Shift-drag around each face to add it. Then choose a person or enter a name for every box."}
               </p>
+              {faceAssignmentFaces.length > 0 && (
+                <div className="face-assignment-targets">
+                  {faceAssignmentFaces.map((face, index) => {
+                    const target = faceAssignmentTargets[face.id] ?? {
+                      personId: "",
+                      newName: "",
+                    };
+                    return (
+                      <div className="face-assignment-target" key={face.id}>
+                        <label htmlFor={`face-person-${face.id}`}>
+                          Face {index + 1}
+                          <span>
+                            {face.hasDescriptor
+                              ? "Recognition ready"
+                              : "Box only · not usable for training"}
+                          </span>
+                        </label>
+                        <select
+                          id={`face-person-${face.id}`}
+                          value={target.personId}
+                          disabled={faceAssignmentBusy}
+                          onChange={(event) =>
+                            setFaceAssignmentTargets((current) => ({
+                              ...current,
+                              [face.id]: {
+                                personId: event.target.value,
+                                newName: "",
+                              },
+                            }))
+                          }
+                        >
+                          <option value="">Create a new person…</option>
+                          {people.map((person) => (
+                            <option key={person.id} value={person.id}>
+                              {person.name}
+                              {person.status === "banned" ? " · banned" : ""}
+                            </option>
+                          ))}
+                        </select>
+                        {!target.personId && (
+                          <input
+                            value={target.newName}
+                            disabled={faceAssignmentBusy}
+                            onChange={(event) =>
+                              setFaceAssignmentTargets((current) => ({
+                                ...current,
+                                [face.id]: {
+                                  personId: "",
+                                  newName: event.target.value,
+                                },
+                              }))
+                            }
+                            placeholder={`Name for face ${index + 1}`}
+                            aria-label={`Name for face ${index + 1}`}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               {faceAssignmentError && (
                 <small className="face-assignment-error">
                   {faceAssignmentError}
                 </small>
               )}
               {faceAssignmentFaces.length > 0 && (
-                <>
-                  <select
-                    value={faceAssignmentPersonId}
-                    onChange={(event) => {
-                      setFaceAssignmentPersonId(event.target.value);
-                      setFaceAssignmentNewName("");
-                    }}
-                  >
-                    <option value="">Create a new person…</option>
-                    {people.map((person) => (
-                      <option key={person.id} value={person.id}>
-                        {person.name}
-                        {person.status === "banned" ? " · banned" : ""}
-                      </option>
-                    ))}
-                  </select>
-                  {!faceAssignmentPersonId && (
-                    <input
-                      value={faceAssignmentNewName}
-                      onChange={(event) =>
-                        setFaceAssignmentNewName(event.target.value)
-                      }
-                      placeholder="New person's name"
-                    />
-                  )}
-                  <button
-                    className="primary"
-                    disabled={
-                      faceAssignmentBusy ||
-                      !faceAssignmentSelectedId ||
-                      (!faceAssignmentPersonId && !faceAssignmentNewName.trim())
-                    }
-                    onClick={() => void assignSelectedFace()}
-                  >
-                    {faceAssignmentBusy ? "Adding…" : "Assign selected face"}
-                  </button>
-                </>
+                <button
+                  className="primary"
+                  disabled={
+                    faceAssignmentBusy ||
+                    faceAssignmentFaces.some((face) => {
+                      const target = faceAssignmentTargets[face.id];
+                      return !target?.personId && !target?.newName.trim();
+                    })
+                  }
+                  onClick={() => void saveFaceAssignments()}
+                >
+                  {faceAssignmentBusy
+                    ? "Saving…"
+                    : `Save all ${faceAssignmentFaces.length} face assignments`}
+                </button>
               )}
             </section>
           )}

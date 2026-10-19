@@ -874,6 +874,7 @@ interface ImageFace {
   box: { x: number; y: number; width: number; height: number };
   cropUrl: string;
   score: number;
+  hasDescriptor: boolean;
   personIds: string[];
 }
 
@@ -1492,6 +1493,13 @@ interface Window {
       personId: string,
       faceId: string,
     ): Promise<PersonDetail | null>;
+    assignFacesToPeople(
+      assignments: Array<{
+        faceId: string;
+        personId?: string;
+        newName?: string;
+      }>,
+    ): Promise<PersonSummary[]>;
     addPhotoToPerson(
       personId: string,
       imagePath: string,

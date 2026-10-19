@@ -402,6 +402,8 @@ contextBridge.exposeInMainWorld("electron", {
   deletePerson: (personId) => ipcRenderer.invoke("delete-person", personId),
   assignFaceToPerson: (personId, faceId) =>
     ipcRenderer.invoke("assign-face-to-person", personId, faceId),
+  assignFacesToPeople: (assignments) =>
+    ipcRenderer.invoke("assign-faces-to-people", assignments),
   addPhotoToPerson: (personId, imagePath) =>
     ipcRenderer.invoke("add-photo-to-person", personId, imagePath),
   confirmPersonPhoto: (personId, imagePath) =>

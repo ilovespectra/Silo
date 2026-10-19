@@ -1148,10 +1148,10 @@ function requireDemoPersonAccess(personId: string): void {
   );
 }
 
-function requireDemoPersonSlot(): void {
+function requireDemoPersonSlot(count = 1): void {
   if (
     fullAccessEnabled() ||
-    (faceIndexer?.getPeople().length ?? 0) < DEMO_LIMITS.people
+    (faceIndexer?.getPeople().length ?? 0) + count <= DEMO_LIMITS.people
   )
     return;
   notifyDemoLimitReached("people");
@@ -10501,7 +10501,8 @@ app.whenReady().then(async () => {
       ready: () =>
         indexStorageAvailable &&
         startupIndexReconciliationSettled &&
-        searchSettled() &&
+        // Audio discovery must remain available when search has retryable errors
+        // or the user paused search; it does not depend on embeddings.
         analysisIdle() &&
         !audioInventoryRunning,
       start: async () => {
@@ -11968,8 +11969,12 @@ async function refreshAudioInventory(requestId: number, force = false) {
         !completedAt || now - completedAt >= 24 * 60 * 60 * 1000 || failed;
       return needsScan && (cached.sourceCooldownUntil?.[source.id] ?? 0) <= now;
     });
-    if (!pending)
+    if (!pending) {
+      // Existing cards may have been generated while the library was empty. A
+      // fresh cached inventory still needs to backfill their soundtrack IDs.
+      await refreshMemorySoundtracksAfterAudioIndexing();
       return { ok: true, snapshot: await getVisibleAudioSnapshot(cached) };
+    }
   }
   if (forceRecoveredSourceScan) force = true;
   audioInventoryRunning = true;
@@ -14831,6 +14836,32 @@ ipcMain.handle(
     requireDemoPersonAccess(personId);
     return faceIndexer.recordEdit("Add face", () =>
       faceIndexer.assignFace(personId, faceId),
+    );
+  },
+);
+ipcMain.handle(
+  "assign-faces-to-people",
+  (_event, assignments: unknown) => {
+    const entries = Array.isArray(assignments)
+      ? assignments.filter(
+          (item): item is { faceId: string; personId?: string; newName?: string } =>
+            Boolean(item && typeof item.faceId === "string"),
+        )
+      : [];
+    if (entries.length > 1000)
+      throw new Error("Face assignment requests must be saved in smaller groups.");
+    const uniqueNames = new Set<string>();
+    for (const item of entries) {
+      if (typeof item.personId === "string" && item.personId.trim())
+        requireDemoPersonAccess(item.personId);
+      else if (typeof item.newName === "string" && item.newName.trim())
+        uniqueNames.add(item.newName.trim().toLocaleLowerCase());
+      else throw new Error("Choose a person or enter a name for every face.");
+    }
+    requireDemoPersonSlot(uniqueNames.size);
+    return faceIndexer.recordEdit(
+      `Assign ${entries.length} photo faces`,
+      () => faceIndexer.assignFaces(entries),
     );
   },
 );

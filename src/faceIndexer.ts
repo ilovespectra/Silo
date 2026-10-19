@@ -47,6 +47,12 @@ export interface FaceRecord {
   manual?: boolean;
 }
 
+export interface FacePersonAssignment {
+  faceId: string;
+  personId?: string;
+  newName?: string;
+}
+
 interface FaceBox {
   x: number;
   y: number;
@@ -57,6 +63,7 @@ interface FaceBox {
 interface FaceEdit {
   box?: FaceBox;
   cropPath?: string;
+  descriptor?: number[];
   deleted?: boolean;
   created?: boolean;
 }
@@ -790,6 +797,93 @@ export class FaceIndexer {
     return this.getPerson(personId);
   }
 
+  /** Assigns a photo's edited face boxes in one undoable operation. */
+  async assignFaces(assignments: FacePersonAssignment[]) {
+    if (!assignments.length) throw new Error("Select at least one face.");
+
+    const seenFaces = new Set<string>();
+    const prepared = assignments.map((assignment) => {
+      if (seenFaces.has(assignment.faceId))
+        throw new Error("A face can only be assigned once per save.");
+      seenFaces.add(assignment.faceId);
+      const face = this.faces.get(assignment.faceId);
+      if (!face || this.isFaceDeleted(face))
+        throw new Error("One of the selected face boxes no longer exists.");
+      const personId = assignment.personId?.trim();
+      const newName = assignment.newName?.trim();
+      if (Boolean(personId) === Boolean(newName))
+        throw new Error("Choose an existing person or enter a new name for each face.");
+      return {
+        face,
+        person: personId ? this.requirePerson(personId) : null,
+        newName,
+      };
+    });
+
+    const newPeopleByName = new Map<string, PersonCluster>();
+    const affected = new Set<PersonCluster>();
+    for (const item of prepared) {
+      let person: PersonCluster;
+      if (item.person) {
+        person = item.person;
+      } else {
+        const key = item.newName!.toLocaleLowerCase();
+        person = newPeopleByName.get(key)!;
+        if (!person) {
+          person = {
+            id: this.newId("person"),
+            name: item.newName!,
+            nameSource: "user",
+            faceIds: [],
+            manualPhotoPaths: [],
+            confirmedPhotoPaths: [],
+            rejectedPhotoPaths: [],
+            centroid: [],
+            createdAt: Date.now(),
+            manual: true,
+          };
+          newPeopleByName.set(key, person);
+          this.state.people.push(person);
+        }
+      }
+
+      // A face has one owner. Reassignment removes stale membership and keeps
+      // a shared group photo in the old person only when another face remains.
+      for (const previous of this.state.people) {
+        if (previous === person || !previous.faceIds.includes(item.face.id))
+          continue;
+        previous.faceIds = previous.faceIds.filter((id) => id !== item.face.id);
+        const anotherFaceInPhoto = previous.faceIds.some(
+          (id) => this.faces.get(id)?.imagePath === item.face.imagePath,
+        );
+        if (
+          !anotherFaceInPhoto &&
+          !previous.manualPhotoPaths.includes(item.face.imagePath) &&
+          !previous.rejectedPhotoPaths.includes(item.face.imagePath)
+        ) {
+          previous.rejectedPhotoPaths.push(item.face.imagePath);
+          previous.confirmedPhotoPaths = previous.confirmedPhotoPaths.filter(
+            (imagePath) => imagePath !== item.face.imagePath,
+          );
+        }
+        affected.add(previous);
+      }
+
+      if (!person.faceIds.includes(item.face.id)) person.faceIds.push(item.face.id);
+      item.face.personIds = [person.id];
+      person.rejectedPhotoPaths = person.rejectedPhotoPaths.filter(
+        (imagePath) => imagePath !== item.face.imagePath,
+      );
+      affected.add(person);
+    }
+
+    for (const person of affected) this.updateCentroid(person);
+    if (Array.from(affected).some((person) => person.status === "banned"))
+      await this.queueRecognition(() => this.refreshBannedPhotos());
+    await this.persistState();
+    return this.getPeople();
+  }
+
   async addPhoto(personId: string, imagePath: string) {
     const person = this.requirePerson(personId);
     if (!person.manualPhotoPaths.includes(imagePath))
@@ -1078,6 +1172,7 @@ export class FaceIndexer {
         box: { ...face.box },
         cropUrl: this.cropUrl(face.cropPath),
         score: face.score,
+        hasDescriptor: face.descriptor.length > 0,
         personIds: this.state.people
           .filter((person) => person.faceIds.includes(face.id))
           .map((person) => person.id),
@@ -1095,36 +1190,50 @@ export class FaceIndexer {
       width,
       height,
     };
+    let descriptorResult: { descriptor: number[]; score: number } | null = null;
     if (localPath) {
       const sharp = require("sharp") as (input: string) => any;
       const image = sharp(localPath);
       const metadata = await image.metadata();
       if (!metadata.width || !metadata.height)
         throw new Error("Could not read image dimensions.");
-      const left = Math.max(0, Math.floor(nextBox.x * metadata.width));
-      const top = Math.max(0, Math.floor(nextBox.y * metadata.height));
+      const swapsDimensions = [5, 6, 7, 8].includes(
+        Number(metadata.orientation ?? 1),
+      );
+      const orientedWidth = swapsDimensions ? metadata.height : metadata.width;
+      const orientedHeight = swapsDimensions ? metadata.width : metadata.height;
+      const left = Math.max(0, Math.floor(nextBox.x * orientedWidth));
+      const top = Math.max(0, Math.floor(nextBox.y * orientedHeight));
       const cropWidth = Math.min(
-        metadata.width - left,
-        Math.ceil(width * metadata.width),
+        orientedWidth - left,
+        Math.ceil(width * orientedWidth),
       );
       const cropHeight = Math.min(
-        metadata.height - top,
-        Math.ceil(height * metadata.height),
+        orientedHeight - top,
+        Math.ceil(height * orientedHeight),
       );
       const cropPath = path.join(
         this.cropsDirectory,
         `${face.id}-edit-${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`,
       );
       await image
+        .rotate()
         .extract({ left, top, width: cropWidth, height: cropHeight })
         .resize(256, 256, { fit: "cover" })
         .jpeg({ quality: 78 })
         .toFile(cropPath);
+      descriptorResult = await this.descriptorForFaceBox(localPath, nextBox);
       face.cropPath = cropPath;
+      if (descriptorResult) {
+        face.descriptor = descriptorResult.descriptor;
+        if (descriptorResult.descriptor.length)
+          face.score = descriptorResult.score;
+      }
       this.state.faceEdits ??= {};
       this.state.faceEdits[faceId] = {
         ...this.state.faceEdits[faceId],
         cropPath,
+        ...(descriptorResult ? { descriptor: descriptorResult.descriptor } : {}),
       };
     }
     this.state.faceEdits ??= {};
@@ -1133,6 +1242,9 @@ export class FaceIndexer {
       box: nextBox,
     };
     face.box = nextBox;
+    if (descriptorResult)
+      for (const person of this.state.people)
+        if (person.faceIds.includes(faceId)) this.updateCentroid(person);
     await this.persistState();
     return this.getFacesForImage(face.imagePath);
   }
@@ -1172,32 +1284,42 @@ export class FaceIndexer {
       width,
       height,
     };
-    const left = Math.max(0, Math.floor(normalized.x * metadata.width));
-    const top = Math.max(0, Math.floor(normalized.y * metadata.height));
+    const swapsDimensions = [5, 6, 7, 8].includes(
+      Number(metadata.orientation ?? 1),
+    );
+    const orientedWidth = swapsDimensions ? metadata.height : metadata.width;
+    const orientedHeight = swapsDimensions ? metadata.width : metadata.height;
+    const left = Math.max(0, Math.floor(normalized.x * orientedWidth));
+    const top = Math.max(0, Math.floor(normalized.y * orientedHeight));
     const cropWidth = Math.min(
-      metadata.width - left,
-      Math.ceil(width * metadata.width),
+      orientedWidth - left,
+      Math.ceil(width * orientedWidth),
     );
     const cropHeight = Math.min(
-      metadata.height - top,
-      Math.ceil(height * metadata.height),
+      orientedHeight - top,
+      Math.ceil(height * orientedHeight),
     );
     if (cropWidth < 8 || cropHeight < 8)
       throw new Error("Select a larger area for the face.");
     const faceId = this.newId(`${imagePath}:manual-face`);
     const cropPath = path.join(this.cropsDirectory, `${faceId}.jpg`);
     await image
+      .rotate()
       .extract({ left, top, width: cropWidth, height: cropHeight })
       .resize(256, 256, { fit: "cover" })
       .jpeg({ quality: 78 })
       .toFile(cropPath);
+    const descriptorResult = await this.descriptorForFaceBox(
+      localPath,
+      normalized,
+    );
     const face: FaceRecord = {
       id: faceId,
       imagePath,
       signature: `${stats.size}:${stats.mtimeMs}`,
       box: normalized,
-      score: 1,
-      descriptor: [],
+      score: descriptorResult?.score ?? 1,
+      descriptor: descriptorResult?.descriptor ?? [],
       cropPath,
       personIds: [],
       manual: true,
@@ -1602,6 +1724,87 @@ export class FaceIndexer {
     return this.runtime;
   }
 
+  private async descriptorForFaceBox(
+    localPath: string,
+    box: FaceBox,
+  ): Promise<{ descriptor: number[]; score: number } | null> {
+    try {
+      const runtime = await this.loadRuntime();
+      const decoded = await runtime
+        .sharp(localPath)
+        .rotate()
+        .resize({
+          width: 1280,
+          height: 1280,
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .removeAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const padding = Math.max(
+        box.width * decoded.info.width,
+        box.height * decoded.info.height,
+      ) * 0.22;
+      const left = Math.max(
+        0,
+        Math.floor(box.x * decoded.info.width - padding),
+      );
+      const top = Math.max(
+        0,
+        Math.floor(box.y * decoded.info.height - padding),
+      );
+      const width = Math.min(
+        decoded.info.width - left,
+        Math.ceil(box.width * decoded.info.width + padding * 2),
+      );
+      const height = Math.min(
+        decoded.info.height - top,
+        Math.ceil(box.height * decoded.info.height + padding * 2),
+      );
+      const crop = await runtime
+        .sharp(decoded.data, { raw: decoded.info })
+        .extract({ left, top, width, height })
+        .removeAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const tensor = runtime.faceapi.tf.tensor3d(
+        new Uint8Array(crop.data),
+        [crop.info.height, crop.info.width, crop.info.channels],
+        "int32",
+      );
+      try {
+        const detections = await runtime.faceapi
+          .detectAllFaces(
+            tensor,
+            new runtime.faceapi.TinyFaceDetectorOptions({
+              inputSize: 416,
+              scoreThreshold: 0.2,
+            }),
+          )
+          .withFaceLandmarks()
+          .withFaceDescriptors();
+        const selected = detections.sort(
+          (first: any, second: any) =>
+            second.detection.box.width * second.detection.box.height -
+            first.detection.box.width * first.detection.box.height,
+        )[0];
+        return selected
+          ? {
+              descriptor: Array.from(selected.descriptor as Float32Array),
+              score: selected.detection.score,
+            }
+          : { descriptor: [], score: 0 };
+      } finally {
+        tensor.dispose();
+      }
+    } catch {
+      // A saved box remains useful even when the local model cannot produce a
+      // recognition vector; it simply won't train recognition until corrected.
+      return null;
+    }
+  }
+
   private async appendProcessed(
     image: IndexableFile,
     records: FaceRecord[],
@@ -1734,6 +1937,14 @@ export class FaceIndexer {
       return keep;
     });
 
+    // The people checkpoint is authoritative for face ownership. Journal rows
+    // may predate a later manual reassignment, so reconcile the in-memory links
+    // after replay to prevent stale matches after restart.
+    for (const face of this.faces.values()) {
+      face.personIds = this.state.people
+        .filter((person) => person.faceIds.includes(face.id))
+        .map((person) => person.id);
+    }
     for (const person of this.state.people) {
       this.updateCentroid(person);
     }
@@ -2198,6 +2409,7 @@ export class FaceIndexer {
     const edit = this.state.faceEdits?.[face.id];
     if (edit?.box) face.box = { ...edit.box };
     if (edit?.cropPath) face.cropPath = this.rebaseCropPath(edit.cropPath);
+    if (edit?.descriptor) face.descriptor = [...edit.descriptor];
     this.faces.set(face.id, face);
     const list = this.facesByImage.get(face.imagePath) ?? [];
     list.push(face);
@@ -2371,9 +2583,19 @@ export class FaceIndexer {
   }
 
   private updateCentroid(person: PersonCluster) {
+    const rejected = new Set(person.rejectedPhotoPaths);
     const descriptors = person.faceIds
-      .map((id) => this.faces.get(id)?.descriptor)
-      .filter((item): item is number[] => Boolean(item?.length));
+      .map((id) => this.faces.get(id))
+      .filter(
+        (face): face is FaceRecord =>
+          Boolean(
+            face &&
+              !this.isFaceDeleted(face) &&
+              !rejected.has(face.imagePath) &&
+              face.descriptor.length,
+          ),
+      )
+      .map((face) => face.descriptor);
     if (!descriptors.length) {
       if (!person.manual) person.centroid = [];
       this.centroidDescriptorCounts.set(person.id, 0);

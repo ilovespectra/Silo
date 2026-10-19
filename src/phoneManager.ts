@@ -3584,7 +3584,9 @@ export class PhoneManager {
   > {
     const result = await this.run(
       "afcclient",
-      ["-u", udid, "ls", "-l", remotePath],
+      // Keep command-specific `-l` after `--`: getopt implementations that
+      // permute arguments otherwise parse it as an unsupported global option.
+      ["-u", udid, "--", "ls", "-l", remotePath],
       60000,
     );
     const output = stripAnsi(result.stdout);
