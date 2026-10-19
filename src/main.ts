@@ -2869,6 +2869,7 @@ let thumbnailPregenerator: ThumbnailPregenerator | null = null;
 let audioLibraryCache: AudioLibraryCache | null = null;
 let audioInventoryRetryTimer: NodeJS.Timeout | null = null;
 let audioInventoryRunning = false;
+let audioSourceAvailabilityCache = new Map<string, boolean>();
 let pendingAudioRefreshRequestId = -1;
 let pendingAudioRefreshForce = false;
 let audioInventoryProgress: {
@@ -8426,9 +8427,9 @@ async function isSiloInternalRoot(sourcePath: string): Promise<boolean> {
   );
 }
 
-/** Background coverage ignores result-visibility checkboxes. Keep configured
- * local roots even when offline; scanners handle accessibility. Remote roots
- * require a ready device / authorized account. Never update the visibility cache.
+/** Background coverage ignores result-visibility checkboxes. Only active,
+ * readable sources are kept in the index set. Offline local roots are dropped
+ * so stale drive state does not keep poisoning the discovery and audio caches.
  */
 async function getAllIndexSources(): Promise<string[]> {
   return getIndexableRootsFromSources(await listSources());
@@ -8440,11 +8441,7 @@ async function getIndexableRootsFromSources(
   const candidates = sources.filter((source) =>
     source.rootPath.trim() &&
     (fullAccessEnabled() || !source.demoLocked) &&
-    // Memories use every configured source, independent of result visibility.
-    // A local root stays useful to the existing index while its drive is offline;
-    // remote roots must be available before their virtual paths can be searched.
-    (source.available || (!source.rootPath.startsWith("/__") &&
-      !(process.platform === "darwin" && isPathWithin(source.rootPath, "/Volumes") && path.resolve(source.rootPath) !== "/Volumes"))),
+    source.available,
   );
   const enabledBackupDevices = new Set<string>();
   for (const source of candidates) {
@@ -11943,14 +11940,25 @@ async function refreshAudioInventory(requestId: number, force = false) {
     return { ok: false, error: indexStorageUnavailableMessage ?? "Index storage is unavailable." };
   if (!audioLibraryCache || typeof requestId !== "number")
     return { ok: false, error: "Audio library is unavailable." };
-  const availableSources = (await listSources()).filter(
+  const discoveredSources = await listSources();
+  const availableSources = discoveredSources.filter(
     (source) => source.available && source.rootPath.trim(),
   );
   const sources = [] as typeof availableSources;
+  const currentAvailability = new Map<string, boolean>();
+  const recoveredAudioSources = new Set<string>();
+  for (const source of discoveredSources) {
+    const isAvailable = source.available && source.rootPath.trim() !== "";
+    currentAvailability.set(source.id, isAvailable);
+    const previouslyAvailable = audioSourceAvailabilityCache.get(source.id);
+    if (previouslyAvailable === false && isAvailable) recoveredAudioSources.add(source.id);
+  }
+  audioSourceAvailabilityCache = currentAvailability;
   for (const source of availableSources) {
     if (!(await isSiloInternalRoot(source.rootPath))) sources.push(source);
   }
-  if (requestId === -1 && !force) {
+  const forceRecoveredSourceScan = recoveredAudioSources.size > 0;
+  if (requestId === -1 && !force && !forceRecoveredSourceScan) {
     const cached = audioLibraryCache.getSnapshot();
     const now = Date.now();
     const pending = sources.some((source) => {
@@ -11963,6 +11971,7 @@ async function refreshAudioInventory(requestId: number, force = false) {
     if (!pending)
       return { ok: true, snapshot: await getVisibleAudioSnapshot(cached) };
   }
+  if (forceRecoveredSourceScan) force = true;
   audioInventoryRunning = true;
   try {
     const snapshot = await audioLibraryCache.scan(
