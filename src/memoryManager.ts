@@ -211,10 +211,13 @@ function customTopicMood(topic: string): MemoryMood {
   return "gentle";
 }
 
-/** Songs only: no voice memos, ringtones, podcasts or tiny sound effects. */
+/** Songs only: no voice memos, ringtones, podcasts or temporary export audio. */
 export function isMemoryMusicTrack(file: MemoryAudioFile): boolean {
-  if (!MUSIC_EXTENSION.test(file.path) || NOT_MUSIC.test(file.path)) return false;
-  return !Number.isFinite(file.size) || ((file.size as number) >= 1.5 * 1024 * 1024 && (file.size as number) <= 60 * 1024 * 1024);
+  if (!MUSIC_EXTENSION.test(file.path) || NOT_MUSIC.test(file.path)
+    || /(?:^|[\\/])(?:silo-)?\.?memory-export-[^\\/]*(?:[\\/]|$)/i.test(file.path)) return false;
+  // Short/low-bitrate songs are valid too; classify by format and known
+  // effects/voice-memo paths instead of imposing an arbitrary size threshold.
+  return true;
 }
 
 function storyWords(card: Pick<MemorySuggestion, "title" | "query" | "description" | "media">): string[] {
@@ -336,7 +339,12 @@ export class MemoryManager {
       const item = mediaValue(value);
       if (!item || seen.has(item.path) || !await this.allowed(item.path, item)) continue;
       seen.add(item.path);
-      if (item.liveVideoPath && !await this.allowed(item.liveVideoPath)) delete item.liveVideoPath;
+      if (item.liveVideoPath && !await this.allowed(item.liveVideoPath, {
+        ...item,
+        path: item.liveVideoPath,
+        name: path.basename(item.liveVideoPath),
+        type: "video",
+      })) delete item.liveVideoPath;
       if (result.length >= 3) delete item.thumbnailUrl;
       result.push(item);
     }
@@ -567,7 +575,7 @@ export class MemoryManager {
       const media = mediaValue(hits[i]);
       if (!media) { invalid++; continue; }
       if (seen.has(media.path)) { duplicate++; continue; }
-      if (!await this.allowed(media.path)) { blocked++; continue; }
+      if (!await this.allowed(media.path, media)) { blocked++; continue; }
       seen.add(media.path);
       // Main can optionally supply a relevance score without changing the shared contract.
       const score = (hits[i] as MemoryMedia & { score?: number }).score;
@@ -593,15 +601,25 @@ export class MemoryManager {
       return reject("overlaps-existing-story", { ...counts, selected: media.filter(item => item.type === "image").length });
     for (let i = 0; i < media.length; i++) {
       const item = media[i];
-      if (item.liveVideoPath && !await this.allowed(item.liveVideoPath)) delete item.liveVideoPath;
-      if (item.type === "image" && !item.liveVideoPath && this.deps.findLiveVideo && await this.allowed(item.path)) {
+      if (item.liveVideoPath && !await this.allowed(item.liveVideoPath, {
+        ...item,
+        path: item.liveVideoPath,
+        name: path.basename(item.liveVideoPath),
+        type: "video",
+      })) delete item.liveVideoPath;
+      if (item.type === "image" && !item.liveVideoPath && this.deps.findLiveVideo && await this.allowed(item.path, item)) {
         try {
           const live = await this.deps.findLiveVideo({ ...item });
-          if (text(live) && await this.allowed(live)) item.liveVideoPath = live;
+          if (text(live) && await this.allowed(live, {
+            ...item,
+            path: live,
+            name: path.basename(live),
+            type: "video",
+          })) item.liveVideoPath = live;
         } catch { /* Missing Live Photo companions are optional. */ }
       }
       // Only the first three covers need previews; never thumbnail the whole story.
-      if (i < 3 && !item.thumbnailUrl && await this.allowed(item.path)) {
+      if (i < 3 && item.type === "image" && !item.thumbnailUrl && await this.allowed(item.path, item)) {
         try {
           const thumbnail = await this.deps.thumb(item.path);
           if (typeof thumbnail === "string" && thumbnail.length <= 128 * 1024) item.thumbnailUrl = thumbnail;

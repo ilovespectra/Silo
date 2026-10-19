@@ -723,6 +723,7 @@ body {
   border-bottom: 1px solid var(--line);
 }
 .cache-destination-intro span,
+.cache-destination-set-all span,
 .cache-destination-copy > span,
 .cache-destination-footnote {
   color: var(--muted);
@@ -734,6 +735,17 @@ body {
   align-items: center;
   gap: 14px;
   border-bottom: 1px solid var(--line);
+}
+.cache-destination-set-all {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.cache-destination-set-all > span {
+  flex: 1 1 220px;
 }
 .cache-destination-row:last-of-type {
   border-bottom: 0;

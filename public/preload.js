@@ -635,6 +635,8 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("save-initial-cache-destinations", sharedPath, roots),
   changeCacheDestination: (id) =>
     ipcRenderer.invoke("change-cache-destination", id),
+  setAllCacheDestinations: () =>
+    ipcRenderer.invoke("set-all-cache-destinations"),
   locateCacheDestination: (id) =>
     ipcRenderer.invoke("locate-cache-destination", id),
   startFaceIndexingForSource: (sourcePath) =>

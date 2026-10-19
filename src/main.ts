@@ -2920,10 +2920,13 @@ function memoryObviousNonPhotoPath(filePath: unknown): boolean {
   const segments = filePath.replace(/\\/g, "/").split("/").filter(Boolean);
   const fileName = segments.at(-1) ?? "";
   const assetFolder = /^(?:assets?|resources?|icons?|logos?|thumbnails?|thumbs|wallpapers?|backgrounds?|stock(?: photos?)?|clip art|templates?|avatars?|previews?|screenshots?|screen shots?|screen captures?)$/i;
+  // Silo's managed cache can sit inside a scanned home folder. Its JPEG
+  // thumbnails are valid images, but they are previews rather than originals.
+  const generatedCacheFolder = /^(?:silo[-_ ]?cache|thumbnail[-_ ]cache|preview[-_ ]cache|media[-_ ]cache|memory[-_ ]image[-_ ]cache|cloud[-_ ]cache)$/i;
   const applicationBundle = /\.(?:app|bundle|framework|plugin|asar)$/i;
   const screenshotName = /(?:screenshot|screen[\s._-]*shot|screencap|screen[\s._-]*capture|screen[\s._-]*record)/i;
   const artworkName = /(?:^|[._\s-])(?:app[._\s-]?)?(?:icon|logo|favicon|sprite|toolbar|button|vector[._\s-]*graphic|clip[._\s-]*art|illustration)(?:[._\s-]|$)/i;
-  return segments.some((segment) => assetFolder.test(segment) || applicationBundle.test(segment))
+  return segments.some((segment) => assetFolder.test(segment) || generatedCacheFolder.test(segment) || applicationBundle.test(segment))
     || screenshotName.test(fileName)
     || artworkName.test(fileName);
 }
@@ -2984,6 +2987,8 @@ function getMemoryExplicitPromptVectors(): Promise<{ unsafe: Float32Array; safe:
  */
 async function memoryContentAllowed(filePath: unknown, media?: MemoryMedia): Promise<boolean> {
   if (typeof filePath !== "string" || !semanticIndexer) return false;
+  if (media?.type === "video")
+    return memoryVideoContentAllowed(filePath, media);
   const folders = stateStore?.getSearchState().digitalFolders ?? [];
   const promptedFolderContext = media?.type === "image" &&
     hasValidPromptedMemoryFolderContext(filePath, media, folders);
@@ -3044,9 +3049,28 @@ function memorySearchImageEligible(
 }
 
 async function memoryLiveVideo(file: MemoryMedia) {
-  if (file.type !== "image" || isRemotePath(file.path)) return undefined;
+  if (file.type !== "image") return undefined;
   const parsed = path.parse(file.path);
   if (![".heic", ".heif", ".jpg", ".jpeg"].includes(parsed.ext.toLowerCase())) return undefined;
+
+  // Phone files use virtual paths, so filesystem stat cannot find Live Photo
+  // companions. List only this still's sibling directory and match the stem.
+  if (phoneManager?.isPhonePath(file.path)) {
+    const siblings = await phoneManager.listPhoneFiles(parsed.dir, false).catch(() => []);
+    for (const sibling of siblings) {
+      const name = sibling.name || path.basename(sibling.path);
+      const companion = path.parse(name);
+      if (sibling.isDirectory || companion.name.toLocaleLowerCase() !== parsed.name.toLocaleLowerCase()
+        || ![".mov", ".mp4"].includes(companion.ext.toLowerCase()))
+        continue;
+      const candidate = sibling.path || path.join(parsed.dir, name);
+      if (memoryAllowed(candidate, { promptedMemoryFolderId: file.promptedMemoryFolderId }))
+        return candidate;
+    }
+    return undefined;
+  }
+  if (isRemotePath(file.path)) return undefined;
+
   const variants = [".mov", ".MOV", ".mp4", ".MP4"].map((ext) =>
     path.join(parsed.dir, parsed.name + ext),
   );
@@ -3071,6 +3095,53 @@ function memoryThumbnailFile(thumbnailUrl: string | null): string | null {
   if (parsed.protocol !== "thumb:" || !/^[a-f0-9]{40}\.jpg$/.test(fileName))
     return null;
   return indexStoragePath("thumbnail-cache", fileName);
+}
+
+/** Classifies a video from an extracted frame, using the same safe/explicit margin as photos. */
+async function memoryVideoContentAllowed(filePath: string, media: MemoryMedia): Promise<boolean> {
+  if (!semanticIndexer || !memoryAllowed(filePath, media)) return false;
+  const cacheKey = `${filePath}\0video`;
+  const inFlight = memoryContentSafetyInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+  const check = (async () => {
+    try {
+      const localPath = await resolveLocalPath(filePath);
+      const stat = await fsPromises.stat(localPath);
+      if (!stat.isFile()) return false;
+      const fingerprint = `${stat.size}:${stat.mtimeMs}`;
+      const cached = memoryContentSafetyCache.get(cacheKey);
+      if (cached?.fingerprint === fingerprint && Date.now() - cached.checkedAt < 6 * 60 * 60 * 1000)
+        return cached.allowed;
+
+      const frameKey = `${localPath}:${stat.size}:${stat.mtimeMs}`;
+      let frameVector = memoryFrameVectors.get(frameKey);
+      if (!frameVector) {
+        const frame = memoryThumbnailFile(await getThumbnail(localPath, false, 480));
+        if (!frame) return false;
+        frameVector = await semanticIndexer.embedPreviewImage(frame);
+        if (memoryFrameVectors.size >= 128)
+          memoryFrameVectors.delete(memoryFrameVectors.keys().next().value!);
+        memoryFrameVectors.set(frameKey, frameVector);
+      }
+      const prompts = await getMemoryExplicitPromptVectors();
+      const unsafe = memoryDot(prompts.unsafe, frameVector);
+      const safe = memoryDot(prompts.safe, frameVector);
+      if (!Number.isFinite(unsafe) || !Number.isFinite(safe)) return false;
+      const allowed = !isMemoryVisualContentExplicit(unsafe, safe);
+      if (allowed) memoryUnsafeVideoPaths.delete(filePath);
+      else memoryUnsafeVideoPaths.add(filePath);
+      if (memoryContentSafetyCache.size >= 8000)
+        memoryContentSafetyCache.delete(memoryContentSafetyCache.keys().next().value!);
+      memoryContentSafetyCache.set(cacheKey, { fingerprint, allowed, checkedAt: Date.now() });
+      return allowed;
+    } catch {
+      // A clip whose frame cannot be checked must not enter a Memory.
+      return false;
+    }
+  })();
+  memoryContentSafetyInFlight.set(cacheKey, check);
+  try { return await check; }
+  finally { memoryContentSafetyInFlight.delete(cacheKey); }
 }
 
 /** Streams directory entries; never materializes a full listing of a huge folder. */
@@ -3446,7 +3517,7 @@ async function searchMemoryMedia(query: string): Promise<ScoredMemoryMedia[]> {
         }
         // Same thresholds as SemanticIndexer.classifyUnsafeImages.
         const unsafe = memoryDot(unsafePrompt, vector);
-        if (unsafe >= 0.2 && unsafe - memoryDot(safePrompt, vector) >= 0.008) {
+        if (isMemoryVisualContentExplicit(unsafe, memoryDot(safePrompt, vector))) {
           memoryUnsafeVideoPaths.add(filePath);
           continue;
         }
@@ -3520,7 +3591,7 @@ async function memoryVideoMatchesForPhotos(
         memoryFrameVectors.set(key, vector);
       }
       const unsafe = memoryDot(unsafePrompt, vector);
-      if (unsafe >= 0.2 && unsafe - memoryDot(safePrompt, vector) >= 0.008) {
+      if (isMemoryVisualContentExplicit(unsafe, memoryDot(safePrompt, vector))) {
         memoryUnsafeVideoPaths.add(candidate.path);
         continue;
       }
@@ -4081,7 +4152,12 @@ async function verifyMemoryExport(options: MemoryExportOptions) {
     throw new Error(`Choose ${minimumCount} to ${maximumCount} items to keep this memory moving briskly.`);
   const mediaSafety = await Promise.all(suggestion.media.map(async (file) =>
     await memoryContentAllowed(file.path, file) &&
-    (!file.liveVideoPath || await memoryContentAllowed(file.liveVideoPath))));
+    (!file.liveVideoPath || await memoryContentAllowed(file.liveVideoPath, {
+      ...file,
+      path: file.liveVideoPath,
+      name: path.basename(file.liveVideoPath),
+      type: "video",
+    }))));
   if (!mediaSafety.every(Boolean))
     throw new Error("This memory contains photos that failed the current content safety check. Regenerate suggestions before exporting.");
   const soundtrack = await memoryManager.resolveSoundtrack(options.soundtrackId, suggestion.id);
@@ -11280,7 +11356,12 @@ async function openMemoryMovie(id: string, revealInFolder: boolean): Promise<{ o
     return { ok: false, error: "This memory is no longer available. Refresh suggestions." };
   const mediaSafety = await Promise.all(suggestion.media.map(async (file) =>
     await memoryContentAllowed(file.path, file) &&
-    (!file.liveVideoPath || await memoryContentAllowed(file.liveVideoPath))));
+    (!file.liveVideoPath || await memoryContentAllowed(file.liveVideoPath, {
+      ...file,
+      path: file.liveVideoPath,
+      name: path.basename(file.liveVideoPath),
+      type: "video",
+    }))));
   if (!mediaSafety.every(Boolean))
     return { ok: false, error: "This memory is no longer available after the content safety check. Refresh suggestions." };
   const moviePath = await findMemoryMovie(suggestion);
@@ -12225,7 +12306,8 @@ async function getVisibleAudioSnapshot(
       }) ||
       (snapshot.failedSources?.length ?? 0) > 0 ||
       cachedIds.length !== coverageIds.length ||
-      cachedIds.some((id, index) => id !== coverageIds[index]),
+      cachedIds.some((id, index) => id !== coverageIds[index]) ||
+      snapshot.interrupted === true,
   };
 }
 
@@ -12245,6 +12327,7 @@ async function refreshAudioInventory(requestId: number, force = false) {
     (source) => source.available && source.rootPath.trim(),
   );
   const sources = [] as typeof availableSources;
+  const configuredSourceIds: string[] = [];
   const currentAvailability = new Map<string, boolean>();
   const recoveredAudioSources = new Set<string>();
   for (const source of discoveredSources) {
@@ -12254,8 +12337,10 @@ async function refreshAudioInventory(requestId: number, force = false) {
     if (previouslyAvailable === false && isAvailable) recoveredAudioSources.add(source.id);
   }
   audioSourceAvailabilityCache = currentAvailability;
-  for (const source of availableSources) {
-    if (!(await isSiloInternalRoot(source.rootPath))) sources.push(source);
+  for (const source of discoveredSources) {
+    if (!source.rootPath.trim() || await isSiloInternalRoot(source.rootPath)) continue;
+    configuredSourceIds.push(source.id);
+    if (source.available) sources.push(source);
   }
   const forceRecoveredSourceScan = recoveredAudioSources.size > 0;
   const inventoryStartedAt = Date.now();
@@ -12267,6 +12352,7 @@ async function refreshAudioInventory(requestId: number, force = false) {
     sourceKinds: sources.map((source) => source.kind),
     cachedFiles: initialSnapshot.files.length,
     cachedSourceCount: initialSnapshot.sourceIds.length,
+    configuredSourceCount: configuredSourceIds.length,
     cachedFailedSourceCount: initialSnapshot.failedSources?.length ?? 0,
   });
   if (requestId === -1 && !force && !forceRecoveredSourceScan) {
@@ -12299,10 +12385,18 @@ async function refreshAudioInventory(requestId: number, force = false) {
       sources,
       isRemotePath,
       (fileName) => isAudioFile(fileName, mime.getType(fileName)),
-      async (source) => {
+      async (source, onFile, isCancelled) => {
         if (phoneManager.isPhonePath(source.rootPath)) {
           return (
-            await phoneManager.listPhoneFilesRecursively(source.rootPath)
+            await phoneManager.listPhoneFilesRecursively(
+              source.rootPath,
+              (file) => onFile?.({
+                ...file,
+                sourceId: source.id,
+                sourceLabel: source.label,
+              }),
+              () => isCancelled?.() ?? false,
+            )
           ).map((file) => ({
             ...file,
             sourceId: source.id,
@@ -12343,11 +12437,24 @@ async function refreshAudioInventory(requestId: number, force = false) {
       },
       force,
       () => semanticIndexer.isSearchActive(),
+      configuredSourceIds,
     );
     sendToRenderer("audio-library-cache-changed", snapshot.scannedAt);
     void refreshMemorySoundtracksAfterAudioIndexing().catch((error) =>
       runtimeLog("memory-soundtrack-refresh-error", memoryAudioErrorDetails(error)),
     );
+    if (snapshot.interrupted) {
+      runtimeLog("memory-audio-inventory-interrupted", {
+        elapsedMs: Date.now() - inventoryStartedAt,
+        files: snapshot.files.length,
+        interruptedSources: snapshot.failedSources?.length ?? 0,
+        configuredSources: configuredSourceIds.length,
+        completedSources: Object.keys(snapshot.sourceScannedAt ?? {}).length,
+      });
+      return requestId === -1
+        ? { ok: false, error: "Audio scan was interrupted; discovered tracks were retained for the next recovery pass." }
+        : { ok: true, snapshot: await getVisibleAudioSnapshot(snapshot) };
+    }
     runtimeLog("audio-inventory-checkpoint", {
       files: snapshot.files.length,
       sources: snapshot.sourceIds.length,
@@ -16657,11 +16764,22 @@ ipcMain.handle(
       await stateStore.setSourceEnabled(peer.id, false);
     await stateStore.setSourceEnabled(sourceId, shouldEnable);
     sourceListCacheAt = 0;
-    await getEnabledIndexSources();
+    const updatedSources = await listSources();
+    enabledSourcePathCache = new Set(
+      updatedSources
+        .filter((source) => source.enabled && source.available && source.rootPath.trim())
+        .map((source) => source.rootPath),
+    );
+    enabledSourceCacheReady = true;
     if (shouldEnable && phoneTarget)
       void indexNewSources([target!.rootPath], "phone-source-enabled");
-    await semanticIndexer.startWatching(await getAllIndexSources());
-    return listSources();
+    void getAllIndexSources()
+      .then((roots) => semanticIndexer.startWatching(roots))
+      .catch((error) => runtimeLog("source-watcher-refresh-error", {
+        operation: "set-source-enabled",
+        message: error instanceof Error ? error.message : String(error),
+      }));
+    return updatedSources;
   },
 );
 
@@ -16728,10 +16846,20 @@ ipcMain.handle("set-all-sources-enabled", async (_event, enabled: boolean) => {
       await stateStore.setSourceEnabled(sourceId, true);
   }
   sourceListCacheAt = 0;
-
-  await getEnabledIndexSources();
-  await semanticIndexer.startWatching(await getAllIndexSources());
-  return listSources();
+  const updatedSources = await listSources();
+  enabledSourcePathCache = new Set(
+    updatedSources
+      .filter((source) => source.enabled && source.available && source.rootPath.trim())
+      .map((source) => source.rootPath),
+  );
+  enabledSourceCacheReady = true;
+  void getAllIndexSources()
+    .then((roots) => semanticIndexer.startWatching(roots))
+    .catch((error) => runtimeLog("source-watcher-refresh-error", {
+      operation: "set-all-sources-enabled",
+      message: error instanceof Error ? error.message : String(error),
+    }));
+  return updatedSources;
 });
 
 ipcMain.handle(
@@ -17224,6 +17352,74 @@ ipcMain.handle("change-cache-destination", async (_event, id: unknown) => {
     return { canceled: false, restarting: true, path: next.path };
   } catch (error) {
     return { canceled: false, error: error instanceof Error ? error.message : "Could not move this cache." };
+  }
+});
+ipcMain.handle("set-all-cache-destinations", async () => {
+  if (!mainWindow || mainWindow.isDestroyed())
+    return { canceled: false, error: "Silo Settings is unavailable." };
+  const result = await dialog.showOpenDialog(
+    mainWindow,
+    destinationPickerOptions("Choose one folder for all Silo caches", selectedIndexStorageRoot),
+  );
+  if (result.canceled || !result.filePaths[0]) return { canceled: true };
+  try {
+    const destination = await inspectCacheDestinationSafely(result.filePaths[0]);
+    const userDataPath = app.getPath("userData");
+    const currentRoots = effectiveCacheDestinationRoots();
+    const destinationPath = path.resolve(destination.path);
+    const alreadyUnified = CACHE_DESTINATIONS.every((item) =>
+      path.resolve(currentRoots[item.id] ?? indexStorageRoot) === destinationPath,
+    ) && path.resolve(selectedIndexStorageRoot) === destinationPath;
+    if (alreadyUnified)
+      return { canceled: false, path: destination.path };
+
+    const sourceRoots = new Set(Object.values(currentRoots));
+    sourceRoots.add(app.getPath("sessionData"));
+    for (const sourceRoot of sourceRoots) {
+      const probe = await probeIndexStorageDestination(sourceRoot);
+      if (probe !== "ok")
+        throw new Error(`Reconnect the current cache drive at ${sourceRoot} before moving all caches. No settings were changed.`);
+    }
+    if (destinationPath !== path.resolve(selectedIndexStorageRoot))
+      await validateIndexStorageDestination(userDataPath, destinationPath);
+
+    const sessionCache = CACHE_DESTINATIONS.find((item) => item.id === "browser-session-data")!;
+    const currentSessionPath = path.resolve(app.getPath("sessionData"));
+    const destinationSessionPath = path.resolve(destinationPath, sessionCache.entry);
+    const moveSessionData = currentSessionPath !== destinationSessionPath;
+    if (moveSessionData) await session.defaultSession.flushStorageData();
+    for (const item of CACHE_DESTINATIONS) {
+      const currentRoot = path.resolve(currentRoots[item.id] ?? indexStorageRoot);
+      if (item.id === "browser-session-data") {
+        if (moveSessionData)
+          await copyBrowserSessionDataVerified(
+            currentSessionPath,
+            destinationPath,
+            userDataPath,
+          );
+      } else {
+        if (currentRoot === destinationPath) continue;
+        await copyCacheEntryVerified(item.entry, currentRoot, destinationPath, userDataPath);
+      }
+    }
+
+    if (destinationPath !== path.resolve(selectedIndexStorageRoot))
+      await stageIndexStorageRoot(userDataPath, destinationPath);
+    const roots = Object.fromEntries(
+      CACHE_DESTINATIONS.map((item) => [item.id, destinationPath]),
+    ) as CacheDestinationRoots;
+    await writeCacheDestinationRoots(userDataPath, roots);
+    cacheDestinationRoots = roots;
+    cacheDestinationSettingsSaved = true;
+    updateCacheDestinationExclusions();
+    app.relaunch();
+    app.quit();
+    return { canceled: false, restarting: true, path: destination.path };
+  } catch (error) {
+    return {
+      canceled: false,
+      error: error instanceof Error ? error.message : "Could not move all Silo caches.",
+    };
   }
 });
 ipcMain.handle("locate-cache-destination", async (_event, id: unknown) => {

@@ -239,6 +239,8 @@ function audioRecoveryMessage(snapshot: AudioLibraryCacheSnapshot) {
     return "A Google account needs Drive permission. Reconnect it under Google Accounts and approve Drive access to finish scanning.";
   return snapshot.failedSources?.length
     ? `${snapshot.failedSources.length} source(s) awaiting automatic recovery. Discovered tracks remain available.`
+    : snapshot.interrupted
+      ? "Audio scanning was interrupted. Discovered tracks remain available and Silo will retry the incomplete source."
     : "";
 }
 

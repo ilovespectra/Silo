@@ -649,6 +649,7 @@ interface AudioLibraryCacheSnapshot {
   files: CachedAudioFile[];
   extensions: string[];
   stale?: boolean;
+  interrupted?: boolean;
   failedSources?: string[];
   sourceScannedAt?: Record<string, number>;
   sourceCooldownUntil?: Record<string, number>;
@@ -662,7 +663,7 @@ interface AudioLibraryScanProgress {
   audioFound: number;
   sourceIndex: number;
   sourceCount: number;
-  phase: "scanning" | "retrying" | "cooldown" | "source-complete";
+  phase: "scanning" | "retrying" | "cooldown" | "source-complete" | "interrupted";
   message: string;
   files?: FileInfo[];
 }
@@ -1640,6 +1641,12 @@ interface Window {
       roots: CacheDestinationRoots,
     ): Promise<{ restarting?: boolean }>;
     changeCacheDestination(id: CacheDestinationId): Promise<{
+      canceled: boolean;
+      restarting?: boolean;
+      path?: string;
+      error?: string;
+    }>;
+    setAllCacheDestinations(): Promise<{
       canceled: boolean;
       restarting?: boolean;
       path?: string;

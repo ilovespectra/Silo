@@ -9,6 +9,7 @@ import { createPortal } from "react-dom";
 import { DEFAULT_SEMANTIC_SEARCH_CONFIDENCE } from "./searchSettings";
 import {
   FiArrowUp,
+  FiBarChart2,
   FiCheck,
   FiCheckCircle,
   FiChevronDown,
@@ -3164,29 +3165,35 @@ function App() {
   const toggleSource = useCallback(
     async (sourceId: string, enabled: boolean) => {
       if (!electronAPI) return;
-      const updated = await electronAPI.setSourceEnabled(sourceId, enabled);
-      sourcesRefreshRequestRef.current += 1;
-      sourcesRef.current = updated;
-      setSources(updated);
-      const inAggregateBrowse =
-        currentPath === allSourcesPath ||
-        (activeDigitalFolderId === null && currentPath === null);
-      if (!inAggregateBrowse) return;
-      setCurrentPath(allSourcesPath);
-      if (!explodedRef.current) {
-        if (sourceRefreshTimerRef.current !== null)
-          window.clearTimeout(sourceRefreshTimerRef.current);
-        sourceRefreshTimerRef.current = window.setTimeout(() => {
-          sourceRefreshTimerRef.current = null;
-          void loadDirectory(allSourcesPath, false, true, true);
-        }, 180);
-        return;
+      setBrowseError("");
+      try {
+        const updated = await electronAPI.setSourceEnabled(sourceId, enabled);
+        sourcesRefreshRequestRef.current += 1;
+        sourcesRef.current = updated;
+        setSources(updated);
+        const inAggregateBrowse =
+          currentPath === allSourcesPath ||
+          (activeDigitalFolderId === null && currentPath === null);
+        if (!inAggregateBrowse) return;
+        setCurrentPath(allSourcesPath);
+        if (!explodedRef.current) {
+          if (sourceRefreshTimerRef.current !== null)
+            window.clearTimeout(sourceRefreshTimerRef.current);
+          sourceRefreshTimerRef.current = window.setTimeout(() => {
+            sourceRefreshTimerRef.current = null;
+            void loadDirectory(allSourcesPath, false, true, true);
+          }, 180);
+          return;
+        }
+        if (!enabled) return;
+        const source = updated.find((item) => item.id === sourceId);
+        if (!source?.available || allSourcesLoadedRef.current.has(source.id))
+          return;
+        void loadAggregateSource(source);
+      } catch (error) {
+        setBrowseError(error instanceof Error ? error.message : "The source selection could not be changed.");
+        void refreshSources().catch(() => undefined);
       }
-      if (!enabled) return;
-      const source = updated.find((item) => item.id === sourceId);
-      if (!source?.available || allSourcesLoadedRef.current.has(source.id))
-        return;
-      await loadAggregateSource(source);
     },
     [
       activeDigitalFolderId,
@@ -3195,6 +3202,7 @@ function App() {
       electronAPI,
       loadAggregateSource,
       loadDirectory,
+      refreshSources,
     ],
   );
 
@@ -3249,30 +3257,36 @@ function App() {
   const setEverySource = useCallback(
     async (enabled: boolean) => {
       if (!electronAPI) return;
-      const updated = await electronAPI.setAllSourcesEnabled(enabled);
-      sourcesRefreshRequestRef.current += 1;
-      sourcesRef.current = updated;
-      setSources(updated);
-      const inAggregateBrowse =
-        currentPath === allSourcesPath ||
-        (activeDigitalFolderId === null && currentPath === null);
-      if (!inAggregateBrowse) return;
-      setCurrentPath(allSourcesPath);
-      if (!explodedRef.current) {
-        if (sourceRefreshTimerRef.current !== null)
-          window.clearTimeout(sourceRefreshTimerRef.current);
-        sourceRefreshTimerRef.current = window.setTimeout(() => {
-          sourceRefreshTimerRef.current = null;
-          void loadDirectory(allSourcesPath, false, true, true);
-        }, 180);
-      } else if (enabled) {
-        const toLoad = updated.filter(
-          (source) =>
-            source.enabled &&
-            source.available &&
-            !allSourcesLoadedRef.current.has(source.id),
-        );
-        await Promise.all(toLoad.map(loadAggregateSource));
+      setBrowseError("");
+      try {
+        const updated = await electronAPI.setAllSourcesEnabled(enabled);
+        sourcesRefreshRequestRef.current += 1;
+        sourcesRef.current = updated;
+        setSources(updated);
+        const inAggregateBrowse =
+          currentPath === allSourcesPath ||
+          (activeDigitalFolderId === null && currentPath === null);
+        if (!inAggregateBrowse) return;
+        setCurrentPath(allSourcesPath);
+        if (!explodedRef.current) {
+          if (sourceRefreshTimerRef.current !== null)
+            window.clearTimeout(sourceRefreshTimerRef.current);
+          sourceRefreshTimerRef.current = window.setTimeout(() => {
+            sourceRefreshTimerRef.current = null;
+            void loadDirectory(allSourcesPath, false, true, true);
+          }, 180);
+        } else if (enabled) {
+          const toLoad = updated.filter(
+            (source) =>
+              source.enabled &&
+              source.available &&
+              !allSourcesLoadedRef.current.has(source.id),
+          );
+          void Promise.all(toLoad.map(loadAggregateSource));
+        }
+      } catch (error) {
+        setBrowseError(error instanceof Error ? error.message : "Source selections could not be changed.");
+        void refreshSources().catch(() => undefined);
       }
     },
     [
@@ -3282,6 +3296,7 @@ function App() {
       electronAPI,
       loadAggregateSource,
       loadDirectory,
+      refreshSources,
     ],
   );
 
@@ -6186,11 +6201,13 @@ function App() {
         if (!(target instanceof Element)) return;
         if (
           target.closest(
-            '[data-file-type="image"], .viewer-image-wrap, .preview-image-button',
+            '[data-file-type="image"], .viewer-image-wrap, .preview-image-button, [role="dialog"], [role="alertdialog"], .library-sidebar',
           )
         )
           return;
-        setSelectedFilePaths(new Set());
+        // A capture-phase rerender can commit controlled inputs before their
+        // bubble-phase onChange runs. Do not rerender for empty file selections.
+        setSelectedFilePaths((current) => (current.size ? new Set() : current));
       }}
     >
       {showConstructionBanner && (
@@ -6432,7 +6449,23 @@ function App() {
           <nav className="primary-nav-utilities" aria-label="Support and settings">
             <button
               type="button"
-              className={showSettings || appSection === "stats" ? "active" : ""}
+              className={appSection === "stats" ? "active" : ""}
+              aria-current={appSection === "stats" ? "page" : undefined}
+              onClick={() => {
+                setShowSettings(false);
+                setAppSection("stats");
+              }}
+              title="Library Statistics"
+              aria-label="Library Statistics"
+              data-tour="stats-tab"
+              data-help="Review library inventory totals, source coverage, backup health, and live indexing progress."
+            >
+              <FiBarChart2 aria-hidden="true" />
+              <span>Stats</span>
+            </button>
+            <button
+              type="button"
+              className={showSettings ? "active" : ""}
               onClick={() => setShowSettings(true)}
               title="Settings"
               aria-label="Settings"
@@ -8420,8 +8453,9 @@ function App() {
                       title={source.message || source.detail}
                     >
                       <button
-                        className={`source-enable-toggle ${source.enabled && source.available ? "active" : ""}`}
-                        disabled={!source.available || sources.some((item) => item.ejectableVolume?.ejecting)}
+                        className={`source-enable-toggle ${source.enabled ? "active" : ""}`}
+                        disabled={sources.some((item) => item.ejectableVolume?.ejecting)}
+                        aria-pressed={source.enabled}
                         onClick={() => toggleSource(source.id, !source.enabled)}
                         title={
                           source.enabled ? "Exclude source" : "Include source"
@@ -8441,11 +8475,6 @@ function App() {
                             title={`Last verified clone: ${new Date(source.lastClonedAt).toLocaleString()}${source.lastCloneDestination ? ` · ${source.lastCloneDestination}` : ""}`}
                           >
                             <FiCopy aria-hidden="true" /> Cloned {new Date(source.lastClonedAt).toLocaleString()}
-                          </small>
-                        )}
-                        {source.message && (
-                          <small className="volume-message">
-                            {source.message}
                           </small>
                         )}
                       </span>
@@ -9706,10 +9735,6 @@ function App() {
             setSettingsTourTarget(null);
           }}
           onOpenBugReport={() => setShowBugReport(true)}
-          onOpenStatistics={() => {
-            setAppSection("stats");
-            setShowSettings(false);
-          }}
           hideSettingsForScreenshot={selectingBugReportScreenshot}
           lifetimePromptRequest={lifetimePromptRequest}
           onLifetimePromptHandled={acknowledgeLifetimePrompt}
