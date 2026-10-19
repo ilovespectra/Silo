@@ -6189,11 +6189,13 @@ function App() {
         if (!(target instanceof Element)) return;
         if (
           target.closest(
-            '[data-file-type="image"], .viewer-image-wrap, .preview-image-button',
+            '[data-file-type="image"], .viewer-image-wrap, .preview-image-button, [role="dialog"], [role="alertdialog"]',
           )
         )
           return;
-        setSelectedFilePaths(new Set());
+        // A capture-phase re-render commits controlled inputs before their
+        // bubble-phase onChange runs, which reverts checkbox clicks. Skip no-op updates.
+        setSelectedFilePaths((current) => (current.size ? new Set() : current));
       }}
     >
       {showConstructionBanner && (
