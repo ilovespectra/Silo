@@ -673,15 +673,24 @@ export function BugReportDialog({
               are included automatically; you can add a screenshot yourself.
               Nothing is sent unless you consent and press Send report.
             </p>
-            <label htmlFor="bug-report-diagnostic-consent">
+            <label
+              htmlFor="bug-report-diagnostic-consent"
+              className="bug-report-diagnostic-consent-label"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+            >
               <input
                 id="bug-report-diagnostic-consent"
                 type="checkbox"
                 checked={diagnosticConsent}
                 onChange={(event) => setDiagnosticConsent(event.target.checked)}
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
                 disabled={busy || sent}
               />
-              I agree to email this report to tani@kolektivkrog.si.
+              <span>I agree to email this report to tani@kolektivkrog.si.</span>
             </label>
           </div>
         )}
