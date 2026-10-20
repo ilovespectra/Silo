@@ -21,6 +21,7 @@ require.extensions[".ts"] = (module, filename) => {
 };
 
 const { MemoryExporter } = require("../src/memoryExporter.ts");
+const { MEMORY_EXPORT_LIMITS } = require("../src/memoryTypes.ts");
 const root = path.resolve(__dirname, "..");
 const workPath = path.join(root, "tmp", "windows-memory-runtime-smoke");
 const ffmpeg = process.argv[2]
@@ -30,16 +31,20 @@ const ffmpeg = process.argv[2]
 async function main() {
   assert.ok(fs.statSync(ffmpeg).size > 0, "The selected FFmpeg binary exists");
   fs.mkdirSync(workPath, { recursive: true });
-  const imagePath = path.join(workPath, "memory-photo.jpg");
   const outputPath = path.join(workPath, "memory-smoke.mp4");
-  await sharp({
-    create: {
-      width: 320,
-      height: 240,
-      channels: 3,
-      background: { r: 130, g: 100, b: 80 },
-    },
-  }).jpeg().toFile(imagePath);
+  const media = [];
+  for (let index = 0; index < MEMORY_EXPORT_LIMITS.minCount; index += 1) {
+    const imagePath = path.join(workPath, `memory-photo-${index + 1}.jpg`);
+    await sharp({
+      create: {
+        width: 320,
+        height: 240,
+        channels: 3,
+        background: { r: 130 + index, g: 100, b: 80 },
+      },
+    }).jpeg().toFile(imagePath);
+    media.push({ path: imagePath, name: path.basename(imagePath), type: "image", modified: index });
+  }
 
   const suggestion = {
     id: "windows-runtime-smoke",
@@ -47,7 +52,7 @@ async function main() {
     description: "",
     query: "",
     mood: "gentle",
-    media: [{ path: imagePath, name: path.basename(imagePath), type: "image", modified: 0 }],
+    media,
     createdAt: 0,
   };
   const exporter = new MemoryExporter({
@@ -59,7 +64,7 @@ async function main() {
     suggestion,
     {
       suggestionId: suggestion.id,
-      count: 1,
+      count: media.length,
       duration: 60,
       soundtrackId: "original-gentle",
       originalAudio: 0,
@@ -76,7 +81,7 @@ async function main() {
   ], { stdio: "ignore", timeout: 30000 });
   assert.equal(decoded.error, undefined, decoded.error?.message);
   assert.equal(decoded.status, 0, "The bundled FFmpeg can decode the rendered memory");
-  console.log(`Windows memory export rendered and decoded a one-minute MP4 (${movie.length} bytes).`);
+  console.log(`Windows memory export rendered and decoded a one-minute MP4 with ${media.length} media items (${movie.length} bytes).`);
 }
 
 main()
