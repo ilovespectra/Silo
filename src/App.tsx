@@ -7341,7 +7341,7 @@ function App() {
       </React.Suspense>
       {appSection === "memories" ? (
         <React.Suspense fallback={<main className="viewer-status">Loading Memories…</main>}>
-          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={thumbnailSize} onThumbnailSizeChange={setThumbnailSize} />
+          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={thumbnailSize} onThumbnailSizeChange={setThumbnailSize} onChooseMusicFolder={addIndexSource} />
         </React.Suspense>
       ) : appSection === "stats" ? (
         electronAPI ? <StatsDashboard api={electronAPI} /> : <main className="viewer-status">Stats services are unavailable.</main>

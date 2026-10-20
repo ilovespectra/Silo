@@ -288,7 +288,7 @@ const ALL_HELP_ARTICLES: LocalHelpTopic[] = [
     answer:
       "In Mobile’s Messages area, choose a connected phone or saved history, then load the history. Update backup requires a connected and trusted phone. Review contact/conversation naming and the output folder and format before exporting. Exports are user-triggered; this guide never reads or exports messages.",
     section: "mobile",
-    target: '[data-tour="mobile-messages"]',
+    target: '[data-tour="mobile-message-workflow"]',
   },
   {
     id: "memory-controls",

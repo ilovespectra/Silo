@@ -1,8 +1,8 @@
 import React, { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { IconBaseProps } from "react-icons";
-import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiEdit3 as Edit3, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiLock as Lock, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
-import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryGenerationStatus, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
+import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiEdit3 as Edit3, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiLock as Lock, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
+import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryGenerationStatus, MemoryMusicAvailability, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
 import {
   MEMORY_DEFAULT_SELECTION_COUNT,
   getMemorySelectionMinimum,
@@ -23,6 +23,7 @@ export interface MemoriesPageProps {
   ready?: boolean;
   thumbnailSize?: number;
   onThumbnailSizeChange?: (size: number) => void;
+  onChooseMusicFolder?: () => Promise<boolean>;
 }
 
 const errorMessage = (cause: unknown, fallback: string) => cause instanceof Error ? cause.message : typeof cause === "string" && cause.trim() ? cause : fallback;
@@ -627,7 +628,7 @@ function SavedMovieCard({ api, movie, onToast, onRefresh }: {
   </article>;
 }
 
-export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, onThumbnailSizeChange }: MemoriesPageProps) {
+export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, onThumbnailSizeChange, onChooseMusicFolder }: MemoriesPageProps) {
   const [state, setState] = useState<MemoryState | null>(null);
   const [demoMode, setDemoMode] = useState(false);
   const [savedMovies, setSavedMovies] = useState<SavedMemoryMovie[]>([]);
@@ -640,6 +641,10 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
   const [previews, setPreviews] = useState<Record<string, MemoryPreviewStatus>>({});
   const [toast, setToast] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [musicAvailability, setMusicAvailability] = useState<MemoryMusicAvailability | null>(null);
+  const [musicGenerationRequest, setMusicGenerationRequest] = useState<{ replace: boolean; customTopic?: string } | null>(null);
+  const [checkingMusic, setCheckingMusic] = useState(false);
+  const [choosingMusicFolder, setChoosingMusicFolder] = useState(false);
   const mounted = useRef(true);
   const pending = useRef(false);
   const revision = useRef(0);
@@ -731,12 +736,63 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
   // Generate replaces the editable set, so its cards give way to placeholders; top-ups only fill open slots.
   const pendingCards = !generating ? 0 : finding ? 5 : Math.max(1, Math.min(5, generation?.expected ?? 5));
   const visibleSuggestions = finding ? [] : state?.suggestions ?? [];
-  const memoryGenerationDisabled = busy || demoMode || generating;
+  const memoryGenerationDisabled = busy || demoMode || generating || checkingMusic;
   const trimmedPrompt = prompt.trim().replace(/\s+/g, " ");
   const promptValid = trimmedPrompt.length >= 3 && trimmedPrompt.length <= 80;
+  const startMemoryGeneration = async (request: { replace: boolean; customTopic?: string }) => {
+    setMusicGenerationRequest(null);
+    setRetiring(request.replace ? state?.suggestions ?? [] : []);
+    const label = request.customTopic ? "Creating memory" : "Finding memories";
+    await run(label, () => api.generateMemories(request.replace, request.customTopic));
+    if (request.customTopic && mounted.current) setPrompt("");
+  };
+  const requestMemoryGeneration = async (request: { replace: boolean; customTopic?: string }) => {
+    if (memoryGenerationDisabled || pending.current) return;
+    setCheckingMusic(true);
+    let availability: MemoryMusicAvailability;
+    try {
+      availability = await api.getMemoryMusicAvailability();
+    } catch {
+      availability = { available: false, scanning: false, sourceCount: 0, indexedTrackCount: 0, cacheAvailable: false };
+    }
+    if (!mounted.current) return;
+    setCheckingMusic(false);
+    if (!availability.available) {
+      setMusicAvailability(availability);
+      setMusicGenerationRequest(request);
+      return;
+    }
+    await startMemoryGeneration(request);
+  };
+  const recheckMusicAvailability = async () => {
+    if (!musicGenerationRequest || checkingMusic) return;
+    setCheckingMusic(true);
+    let availability: MemoryMusicAvailability;
+    try {
+      availability = await api.getMemoryMusicAvailability();
+    } catch {
+      availability = { available: false, scanning: false, sourceCount: 0, indexedTrackCount: 0, cacheAvailable: false };
+    }
+    if (!mounted.current) return;
+    setCheckingMusic(false);
+    setMusicAvailability(availability);
+    if (availability.available) await startMemoryGeneration(musicGenerationRequest);
+  };
+  const chooseMusicFolder = async () => {
+    if (!onChooseMusicFolder || choosingMusicFolder) return;
+    setChoosingMusicFolder(true);
+    try {
+      const added = await onChooseMusicFolder();
+      if (added) await recheckMusicAvailability();
+    } catch (cause) {
+      setError(errorMessage(cause, "The music folder could not be added."));
+    } finally {
+      setChoosingMusicFolder(false);
+    }
+  };
   const createMemory = () => {
     if (memoryGenerationDisabled || !promptValid) return;
-    void run("Creating memory", () => api.generateMemories(false, trimmedPrompt)).then(() => { if (mounted.current) setPrompt(""); });
+    void requestMemoryGeneration({ replace: false, customTopic: trimmedPrompt });
   };
   const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new editable memories. Finished ones move to your Memory Book below.";
   return <section className="memories-page" aria-label="Memories" data-retained-scroll="memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
@@ -745,10 +801,39 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
         <p>Small stories from your library. Made by you, kept by you.</p></div>
       <div className="memories-header-actions">
         <span className="memories-button-wrap" title={generateMemoriesTitle}>
-          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => { setRetiring(state?.suggestions ?? []); void run("Finding memories", () => api.generateMemories(true)); }} data-help="Create 5 new editable memories. Finished ones move to your Memory Book below."><FiFilm />{action === "Finding memories" ? "Generating Memories…" : "Generate Memories"}</button>
+          <button type="button" className="memories-button memories-primary" disabled={memoryGenerationDisabled} onClick={() => void requestMemoryGeneration({ replace: true })} data-help="Create 5 new editable memories. Finished ones move to your Memory Book below."><FiFilm />{checkingMusic ? "Checking music…" : action === "Finding memories" ? "Generating Memories…" : "Generate Memories"}</button>
         </span>
       </div>
     </header>
+    {musicGenerationRequest && musicAvailability && <div className="memories-music-prompt-backdrop" role="presentation">
+      <section className="memories-music-prompt" role="alertdialog" aria-modal="true" aria-labelledby="memories-music-prompt-title" aria-describedby="memories-music-prompt-description">
+        <h2 id="memories-music-prompt-title"><FiMusic aria-hidden="true" /> Music isn’t available</h2>
+        <p id="memories-music-prompt-description">
+          {!musicAvailability.cacheAvailable
+            ? "Silo’s music index is unavailable. Reconnect or locate the cache destination before generating a soundtrack."
+            : musicAvailability.scanning
+              ? "Silo is still scanning connected sources for music. Wait for the scan to finish, then check again."
+              : musicAvailability.sourceCount === 0
+                ? "No connected music source is available. Connect a drive or choose a folder that contains your music."
+                : "No music is indexed from connected sources yet. Choose a music folder, or continue without a soundtrack."}
+        </p>
+        {musicAvailability.indexedTrackCount > 0 && <small>{musicAvailability.indexedTrackCount.toLocaleString()} indexed tracks are on sources Silo can currently see.</small>}
+        <div className="memories-music-prompt-actions">
+          <button type="button" className="memories-button memories-secondary" onClick={() => void recheckMusicAvailability()} disabled={checkingMusic || choosingMusicFolder}>
+            <FiRefreshCw aria-hidden="true" /> {checkingMusic ? "Checking…" : "Check again"}
+          </button>
+          <button type="button" className="memories-button memories-secondary" onClick={() => void chooseMusicFolder()} disabled={!onChooseMusicFolder || choosingMusicFolder}>
+            <FiFolder aria-hidden="true" /> {choosingMusicFolder ? "Choosing…" : "Choose music folder"}
+          </button>
+          <button type="button" className="memories-button memories-primary" onClick={() => void startMemoryGeneration(musicGenerationRequest)} disabled={checkingMusic || choosingMusicFolder}>
+            Continue without music
+          </button>
+          <button type="button" className="memories-button memories-secondary" onClick={() => setMusicGenerationRequest(null)} disabled={checkingMusic || choosingMusicFolder}>
+            Cancel
+          </button>
+        </div>
+      </section>
+    </div>}
     <form className={`memories-create${demoMode ? " is-locked" : ""}`} aria-label="Create a memory" data-help="Describe a moment and Silo makes one memory movie from your indexed photos and clips. Available with Silo Lifetime."
       onSubmit={(event) => { event.preventDefault(); createMemory(); }}>
       <div className="memories-create-copy"><h2><FiEdit3 />Create a memory</h2><span>{demoMode ? "Unlock Silo Lifetime to make a memory from your own words." : "Describe a moment. Silo makes one movie from your library."}</span></div>
