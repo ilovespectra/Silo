@@ -13,6 +13,44 @@ const IOS_TOOLS = [
   'idevicebackup2',
 ];
 
+function ensureWindowsSharpRuntime(context) {
+  if (context.electronPlatformName !== 'win32') return;
+
+  const sourceDirectory = path.join(__dirname, '..', 'node_modules', '@img', 'sharp-win32-x64');
+  const targetDirectory = path.join(
+    context.appOutDir,
+    'resources',
+    'app.asar.unpacked',
+    'node_modules',
+    '@img',
+    'sharp-win32-x64',
+  );
+  const requiredFiles = [
+    'lib/sharp-win32-x64.node',
+    'lib/libvips-42.dll',
+    'lib/libvips-cpp-8.17.3.dll',
+  ];
+
+  for (const relativePath of requiredFiles) {
+    const source = path.join(sourceDirectory, relativePath);
+    if (!fs.existsSync(source) || !fs.statSync(source).isFile()) {
+      throw new Error(`Installed Windows Sharp runtime is missing ${relativePath}.`);
+    }
+  }
+
+  fs.mkdirSync(path.dirname(targetDirectory), { recursive: true });
+  fs.cpSync(sourceDirectory, targetDirectory, { recursive: true, force: true });
+
+  for (const relativePath of requiredFiles) {
+    const target = path.join(targetDirectory, relativePath);
+    if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+      throw new Error(`Packaged Windows Sharp runtime is missing ${relativePath}.`);
+    }
+  }
+
+  console.log('  • Silo: verified the packaged Windows Sharp runtime.');
+}
+
 function verifyPackagedPhoneTools(context) {
   const platform = context.electronPlatformName;
   if (platform !== 'darwin' && platform !== 'win32') return;
@@ -59,6 +97,7 @@ function verifyPackagedPhoneTools(context) {
 }
 
 module.exports = async function afterPack(context) {
+  ensureWindowsSharpRuntime(context);
   verifyPackagedPhoneTools(context);
   await signPackagedMacApp(context);
 };
