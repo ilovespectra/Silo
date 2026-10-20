@@ -463,7 +463,10 @@ export class SemanticIndexer {
       completedAt:
         status === "completed" ? Date.now() : (previous?.completedAt ?? 0),
     });
-    await this.persistSourceCoverage();
+    // Coverage remains valid in memory for this session even when a removable
+    // cache destination disappears. persistSourceCoverage records the failure;
+    // don't let a sidecar write reject an otherwise handled source scan.
+    await this.persistSourceCoverage().catch(() => undefined);
   }
 
   private async persistSourceCoverage() {

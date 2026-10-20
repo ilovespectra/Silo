@@ -10608,7 +10608,32 @@ app.whenReady().then(async () => {
   };
 
   audioLibraryCache = new AudioLibraryCache(cacheDestinationRoot("audio-library-index.json"));
-  if (!indexStorageInitializationDeferred) await audioLibraryCache.initialize();
+  if (!indexStorageInitializationDeferred) {
+    try {
+      await audioLibraryCache.initialize();
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error
+          ? String(error.code)
+          : "unknown";
+      runtimeLog("audio-library-cache-init-failed", { code });
+      // A removable cache can disappear or become unwritable after the startup
+      // probe. This derived index is rebuildable, so use a local copy for this
+      // session and let the normal storage monitor expose the reconnect flow.
+      audioLibraryCache = new AudioLibraryCache(app.getPath("userData"));
+      try {
+        await audioLibraryCache.initialize();
+      } catch (fallbackError) {
+        const fallbackCode =
+          fallbackError && typeof fallbackError === "object" && "code" in fallbackError
+            ? String(fallbackError.code)
+            : "unknown";
+        runtimeLog("audio-library-cache-fallback-init-failed", {
+          code: fallbackCode,
+        });
+      }
+    }
+  }
   geoIndexer.setOverrides(stateStore.getState().geoOverrides);
   geoIndexer.setBorrowedLocationsEnabled(
     stateStore.getState().borrowedLocationsEnabled,
