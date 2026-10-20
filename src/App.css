@@ -723,6 +723,7 @@ body {
   border-bottom: 1px solid var(--line);
 }
 .cache-destination-intro span,
+.cache-destination-set-all span,
 .cache-destination-copy > span,
 .cache-destination-footnote {
   color: var(--muted);
@@ -734,6 +735,17 @@ body {
   align-items: center;
   gap: 14px;
   border-bottom: 1px solid var(--line);
+}
+.cache-destination-set-all {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.cache-destination-set-all > span {
+  flex: 1 1 220px;
 }
 .cache-destination-row:last-of-type {
   border-bottom: 0;
@@ -4105,23 +4117,11 @@ input[type="range"]::-moz-range-progress {
 }
 .index-storage-banner-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
   margin-top: 2px;
-}
-.index-storage-dismiss-choice {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--muted);
-  font-size: 10px;
-  white-space: nowrap;
-  cursor: pointer;
-  user-select: none;
-}
-.index-storage-dismiss-choice input {
-  accent-color: var(--orange);
 }
 .index-storage-dismiss {
   display: inline-grid;
@@ -4137,6 +4137,28 @@ input[type="range"]::-moz-range-progress {
 .index-storage-dismiss:hover {
   background: var(--surface-hover);
   color: var(--text);
+}
+.index-storage-collapsed {
+  position: fixed;
+  z-index: 1450;
+  top: 12px;
+  right: 14px;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid rgba(217, 109, 82, 0.8);
+  border-radius: 50%;
+  background: rgba(66, 30, 24, 0.98);
+  color: var(--error-text, #efaa98);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
+  font-size: 18px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.index-storage-collapsed:hover {
+  background: rgba(92, 39, 29, 0.99);
+  transform: scale(1.04);
 }
 
 .tour-exit-backdrop,
@@ -4556,6 +4578,44 @@ input[type="range"]::-moz-range-progress {
   font-size: 10px;
 }
 
+.map-status-copy {
+  min-width: 0;
+}
+
+.map-status .map-inference-toggle {
+  display: inline-flex;
+  width: auto;
+  height: 24px;
+  margin-top: 6px;
+  padding: 0 8px;
+  align-items: center;
+  justify-content: center;
+  border-color: color-mix(in srgb, var(--orange) 45%, var(--line));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--orange) 12%, var(--raised));
+  color: var(--text);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.map-status .map-inference-toggle[aria-pressed="false"] {
+  border-color: var(--line);
+  background: var(--raised);
+  color: var(--muted);
+}
+
+.map-status .map-inference-window {
+  display: inline-block;
+  width: auto;
+  height: 24px;
+  margin: 6px 0 0 5px;
+  padding: 0 5px;
+  border-color: var(--line);
+  background: var(--raised);
+  color: var(--text);
+  font-size: 10px;
+}
+
 .map-status progress {
   grid-column: 2 / 3;
   width: 100%;
@@ -4631,6 +4691,11 @@ input[type="range"]::-moz-range-progress {
   box-shadow: 0 3px 12px rgba(0, 0, 0, 0.65);
   color: #fff;
   font-size: 22px;
+}
+
+.geo-marker.inferred .geo-marker-image {
+  border-style: dashed;
+  border-color: var(--orange-bright, var(--orange));
 }
 
 .map-page.selection-armed .map-globe {
@@ -5167,6 +5232,54 @@ input[type="range"]::-moz-range-progress {
   position: relative;
   min-width: 0;
   aspect-ratio: 1;
+}
+
+.map-inferred-note {
+  position: absolute;
+  z-index: 4;
+  right: 4px;
+  bottom: 4px;
+  left: 4px;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 4px 5px;
+  border: 1px solid color-mix(in srgb, var(--orange) 55%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--surface-popover) 94%, transparent);
+  color: var(--text);
+  font-size: 9px;
+  line-height: 1.25;
+}
+
+.map-inferred-note > span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.map-inferred-note small {
+  color: var(--muted);
+  font-size: 8px;
+  text-transform: capitalize;
+}
+
+.map-region-panel .map-inferred-note button {
+  display: inline-flex;
+  width: auto;
+  height: 22px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  border-color: var(--line);
+  background: var(--raised);
+  color: var(--text);
+  font-size: 9px;
 }
 
 .map-region-photo > .map-photo-open {

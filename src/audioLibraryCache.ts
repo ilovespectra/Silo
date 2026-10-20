@@ -31,6 +31,8 @@ export interface AudioLibraryCacheSnapshot {
   sourceScannedAt?: Record<string, number>;
   sourceCooldownUntil?: Record<string, number>;
   sourceErrors?: Record<string, { message: string; lastAttemptAt: number }>;
+  /** A cancelled scan kept its discoveries but needs another coverage pass. */
+  interrupted?: boolean;
 }
 
 export interface AudioLibraryScanProgress {
@@ -39,7 +41,7 @@ export interface AudioLibraryScanProgress {
   audioFound: number;
   sourceIndex: number;
   sourceCount: number;
-  phase: "scanning" | "retrying" | "cooldown" | "source-complete";
+  phase: "scanning" | "retrying" | "cooldown" | "source-complete" | "interrupted";
   message: string;
   files?: CachedAudioFile[];
 }
@@ -82,6 +84,7 @@ export class AudioLibraryCache {
           sourceErrors: stored.sourceErrors ?? {},
           sourceScannedAt: stored.sourceScannedAt ?? {},
           sourceCooldownUntil: stored.sourceCooldownUntil ?? {},
+          interrupted: stored.interrupted === true,
         };
       this.sourceCooldowns = new Map(
         Object.entries(this.snapshot.sourceCooldownUntil ?? {}),
@@ -123,10 +126,11 @@ export class AudioLibraryCache {
       rootPath: string;
       kind: string;
       label: string;
-    }) => Promise<CachedAudioFile[]>,
+    }, onFile?: (file: CachedAudioFile) => void, isCancelled?: () => boolean) => Promise<CachedAudioFile[]>,
     onProgress: (progress: AudioLibraryScanProgress) => void,
     force = false,
     shouldPauseForSearch: () => boolean = () => false,
+    configuredSourceIds?: string[],
   ) {
     if (this.scanPromise) return this.scanPromise;
     this.cancelled = false;
@@ -140,6 +144,7 @@ export class AudioLibraryCache {
       onProgress,
       force,
       shouldPauseForSearch,
+      configuredSourceIds,
     ).finally(() => {
       this.scanPromise = null;
     });
@@ -161,10 +166,11 @@ export class AudioLibraryCache {
       rootPath: string;
       kind: string;
       label: string;
-    }) => Promise<CachedAudioFile[]>,
+    }, onFile?: (file: CachedAudioFile) => void, isCancelled?: () => boolean) => Promise<CachedAudioFile[]>,
     onProgress: (progress: AudioLibraryScanProgress) => void,
     force: boolean,
     shouldPauseForSearch: () => boolean,
+    configuredSourceIds?: string[],
   ) {
     const waitForSearchIdle = async () => {
       while (!this.cancelled && shouldPauseForSearch())
@@ -172,20 +178,108 @@ export class AudioLibraryCache {
       return !this.cancelled;
     };
     const sourceIds = sources.map((source) => source.id);
+    const retainedSourceIds = Array.from(
+      new Set([...sourceIds, ...(configuredSourceIds ?? [])]),
+    );
+    const retainedSourceIdSet = new Set(retainedSourceIds);
     const next = new Map(
       this.snapshot.files
-        .filter((file) => file.sourceId && sourceIds.includes(file.sourceId))
+        .filter((file) => file.sourceId && retainedSourceIdSet.has(file.sourceId))
         .map((file) => [file.path, file]),
     );
     const failedSources = new Set(
       (this.snapshot.failedSources ?? []).filter((id) =>
-        sourceIds.includes(id),
+        retainedSourceIdSet.has(id),
       ),
     );
-    const sourceScannedAt = { ...(this.snapshot.sourceScannedAt ?? {}) };
-    const sourceErrors = { ...(this.snapshot.sourceErrors ?? {}) };
+    const sourceScannedAt = Object.fromEntries(
+      Object.entries(this.snapshot.sourceScannedAt ?? {}).filter(([id]) => retainedSourceIdSet.has(id)),
+    );
+    const sourceErrors = Object.fromEntries(
+      Object.entries(this.snapshot.sourceErrors ?? {}).filter(([id]) => retainedSourceIdSet.has(id)),
+    );
+    for (const id of this.sourceCooldowns.keys())
+      if (!retainedSourceIdSet.has(id)) this.sourceCooldowns.delete(id);
+    const snapshotFiles = () => {
+      const files = Array.from(next.values()).sort(
+        (first, second) =>
+          (second.modified || 0) - (first.modified || 0) ||
+          first.path.localeCompare(second.path),
+      );
+      return {
+        files,
+        extensions: Array.from(
+          new Set(files.map((file) => file.extension || "(no extension)")),
+        ).sort((first, second) => first.localeCompare(second)),
+      };
+    };
+    const checkpointSource = async (interrupted = this.snapshot.interrupted ?? false) => {
+      const { files, extensions } = snapshotFiles();
+      this.snapshot = {
+        version: 1,
+        sourceIds: retainedSourceIds,
+        scannedAt:
+          !interrupted && failedSources.size === 0 &&
+          sourceIds.every((id) => sourceScannedAt[id])
+            ? Date.now()
+            : 0,
+        files,
+        extensions,
+        failedSources: Array.from(failedSources),
+        sourceScannedAt,
+        sourceErrors,
+        sourceCooldownUntil: Object.fromEntries(this.sourceCooldowns),
+        interrupted,
+      };
+      await this.persistSnapshot();
+    };
+    const publishLiveSnapshot = async (persist: boolean) => {
+      const { files, extensions } = snapshotFiles();
+      this.snapshot = {
+        ...this.snapshot,
+        version: 1,
+        sourceIds: retainedSourceIds,
+        scannedAt: 0,
+        files,
+        extensions,
+        failedSources: Array.from(failedSources),
+        sourceScannedAt,
+        sourceErrors,
+        sourceCooldownUntil: Object.fromEntries(this.sourceCooldowns),
+      };
+      if (persist) {
+        // A temporary checkpoint failure must not abort a long source traversal;
+        // the final checkpoint still surfaces persistent destination failures.
+        await this.persistSnapshot().catch(() => undefined);
+      }
+    };
+    const retainInterruptedSource = async (
+      source: { id: string; label: string },
+      sourceFiles: Map<string, CachedAudioFile>,
+      scanned: number,
+      audioFound: number,
+      sourceIndex: number,
+    ) => {
+      for (const [filePath, file] of sourceFiles) next.set(filePath, file);
+      failedSources.add(source.id);
+      const message = `Audio scan interrupted after finding ${audioFound.toLocaleString()} tracks; discovered tracks were retained and this source needs another scan.`;
+      sourceErrors[source.id] = { message, lastAttemptAt: Date.now() };
+      await checkpointSource(true);
+      onProgress({
+        source: source.label,
+        scanned,
+        audioFound,
+        sourceIndex,
+        sourceCount: sources.length,
+        phase: "interrupted",
+        message,
+        ...(sourceFiles.size ? { files: Array.from(sourceFiles.values()) } : {}),
+      });
+      return this.getSnapshot();
+    };
     for (const [sourceIndex, source] of sources.entries()) {
-      if (this.cancelled) return this.getSnapshot();
+      if (this.cancelled)
+        return retainInterruptedSource(source, new Map(), 0, 0, sourceIndex + 1);
       const previousScan = sourceScannedAt[source.id] ?? 0;
       const sourceIsFresh =
         previousScan > 0 && Date.now() - previousScan < 24 * 60 * 60 * 1000;
@@ -223,6 +317,7 @@ export class AudioLibraryCache {
       let succeeded = false;
       let retryWholeSource = true;
       let lastError: unknown;
+      const sourceFiles = new Map<string, CachedAudioFile>();
       for (let attempt = 0; attempt < 3 && !succeeded; attempt += 1) {
         if (attempt > 0) {
           onProgress({
@@ -238,12 +333,13 @@ export class AudioLibraryCache {
             setTimeout(resolve, 500 * 2 ** (attempt - 1)),
           );
         }
-        if (this.cancelled) return this.getSnapshot();
+        if (this.cancelled)
+          return retainInterruptedSource(source, sourceFiles, scanned, audioFound, sourceIndex + 1);
         if (
           shouldPauseForSearch() &&
           !(await waitForSearchIdle())
         )
-          return this.getSnapshot();
+          return retainInterruptedSource(source, sourceFiles, scanned, audioFound, sourceIndex + 1);
         scanned = 0;
         audioFound = 0;
         let cooldownWindowStartedAt = Date.now();
@@ -265,10 +361,16 @@ export class AudioLibraryCache {
             }, cooldownMs),
           );
         };
-        const sourceFiles = new Map<string, CachedAudioFile>();
         const pendingFiles: CachedAudioFile[] = [];
-        const emitScanProgress = (message: string) => {
+        let lastPersistedAudioCount = 0;
+        const emitScanProgress = async (message: string) => {
           const files = pendingFiles.splice(0);
+          if (files.length) {
+            const shouldPersist = audioFound === 1 ||
+              audioFound - lastPersistedAudioCount >= 128;
+            await publishLiveSnapshot(shouldPersist);
+            if (shouldPersist) lastPersistedAudioCount = audioFound;
+          }
           onProgress({
             source: source.label,
             scanned,
@@ -286,15 +388,24 @@ export class AudioLibraryCache {
               shouldPauseForSearch() &&
               !(await waitForSearchIdle())
             )
-              return this.getSnapshot();
-            const remoteFiles = await listRemoteFiles(source);
-            for (const file of remoteFiles) {
-              if (this.cancelled) return this.getSnapshot();
+              return retainInterruptedSource(source, sourceFiles, scanned, audioFound, sourceIndex + 1);
+            const discoveredRemoteFiles = new Map<string, CachedAudioFile>();
+            const remoteFiles = await listRemoteFiles(
+              source,
+              (file) => discoveredRemoteFiles.set(file.path, file),
+              () => this.cancelled,
+            );
+            for (const file of remoteFiles)
+              discoveredRemoteFiles.set(file.path, file);
+            const processedRemotePaths = new Set<string>();
+            for (const file of discoveredRemoteFiles.values()) {
+              if (processedRemotePaths.has(file.path)) continue;
+              processedRemotePaths.add(file.path);
               if (
                 shouldPauseForSearch() &&
                 !(await waitForSearchIdle())
               )
-                return this.getSnapshot();
+                return retainInterruptedSource(source, sourceFiles, scanned, audioFound, sourceIndex + 1);
               const cooldown = coolDownAfterAudioEntry();
               if (cooldown) await cooldown;
               scanned += 1;
@@ -302,27 +413,32 @@ export class AudioLibraryCache {
                 !file.isDirectory &&
                 (file.type === "audio" || isAudio(file.name))
               ) {
-                sourceFiles.set(file.path, {
+                const audioFile: CachedAudioFile = {
                   ...file,
                   type: "audio",
                   extension: path.extname(file.name).toLowerCase(),
                   sourceId: source.id,
                   sourceLabel: source.label,
-                });
+                };
+                sourceFiles.set(file.path, audioFile);
+                next.set(file.path, audioFile);
                 audioFound += 1;
                 pendingFiles.push(sourceFiles.get(file.path)!);
                 if (audioFound === 1 || pendingFiles.length >= 24)
-                  emitScanProgress(
+                  await emitScanProgress(
                     `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
                   );
               }
               if (scanned % 500 === 0)
-                emitScanProgress(
+                await emitScanProgress(
                   `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
                 );
+              if (this.cancelled) break;
             }
+            if (this.cancelled)
+              return retainInterruptedSource(source, sourceFiles, scanned, audioFound, sourceIndex + 1);
             if (pendingFiles.length > 0)
-              emitScanProgress(
+              await emitScanProgress(
                 `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
               );
           } else {
@@ -457,15 +573,16 @@ export class AudioLibraryCache {
                     sourceLabel: source.label,
                   };
                   sourceFiles.set(fullPath, file);
+                  next.set(fullPath, file);
                   pendingFiles.push(file);
                   audioFound += 1;
                   if (audioFound === 1 || pendingFiles.length >= 24)
-                    emitScanProgress(
+                    await emitScanProgress(
                       `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
                     );
                 }
                 if (scanned % 500 === 0)
-                  emitScanProgress(
+                  await emitScanProgress(
                     `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
                   );
               }
@@ -492,10 +609,11 @@ export class AudioLibraryCache {
                 worker(),
               ),
             );
-            if (this.cancelled) return this.getSnapshot();
+            if (this.cancelled)
+              return retainInterruptedSource(source, sourceFiles, scanned, audioFound, sourceIndex + 1);
             if (traversalError) throw traversalError;
             if (pendingFiles.length > 0)
-              emitScanProgress(
+              await emitScanProgress(
                 `Scanning ${source.label}: ${scanned.toLocaleString()} entries, ${audioFound.toLocaleString()} audio files…`,
               );
             if (!rootOpened)
@@ -570,7 +688,7 @@ export class AudioLibraryCache {
       ).sort((first, second) => first.localeCompare(second));
       this.snapshot = {
         version: 1,
-        sourceIds: sources.map((item) => item.id),
+        sourceIds: retainedSourceIds,
         scannedAt:
           failedSources.size === 0 &&
           sourceIds.every((id) => sourceScannedAt[id])
@@ -582,6 +700,7 @@ export class AudioLibraryCache {
         sourceScannedAt,
         sourceErrors,
         sourceCooldownUntil: Object.fromEntries(this.sourceCooldowns),
+        interrupted: this.snapshot.interrupted ?? false,
       };
       await this.persistSnapshot();
     }
@@ -596,7 +715,7 @@ export class AudioLibraryCache {
     ).sort((first, second) => first.localeCompare(second));
     this.snapshot = {
       version: 1,
-      sourceIds: sources.map((source) => source.id),
+      sourceIds: retainedSourceIds,
       scannedAt:
         failedSources.size === 0 && sourceIds.every((id) => sourceScannedAt[id])
           ? Date.now()
@@ -607,6 +726,7 @@ export class AudioLibraryCache {
       sourceScannedAt,
       sourceErrors,
       sourceCooldownUntil: Object.fromEntries(this.sourceCooldowns),
+      interrupted: false,
     };
     await this.persistSnapshot();
     return this.getSnapshot();

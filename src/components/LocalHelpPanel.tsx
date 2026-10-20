@@ -296,7 +296,7 @@ const ALL_HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Memory story and export controls",
     keywords: "memories stories mood frame duration soundtrack music export download suggestion clear refresh",
     answer:
-      "Refresh updates the current cards; Generate or Find new memories searches the indexed archive when you choose. On a story, review its photos, mood, duration, and soundtrack, then choose Save memory to make an MP4 copy at a location you choose. Saved cards stay in your collection; The newest five memories stay editable; Generate moves finished ones into the Memory Book below, which lists every movie in your memories folder. Remove suggestion removes a card only, while original media is kept.",
+      "Memory stories can use music from available, indexed audio sources. Open Edit movie settings on a card and use the Soundtrack selector; Browse mood soundtracks loads matching local library choices. Selecting a library song saves it to that story and refreshes its preview. Preview the prepared movie and confirm the soundtrack is audible before saving. Original clip audio has its own mix control. If no library choices appear, check that the music source is connected and its audio inventory has finished scanning.",
     section: "memories",
     target: '[data-tour="memory-controls"]',
     fallbackTarget: '[data-tour="memories-overview"]',

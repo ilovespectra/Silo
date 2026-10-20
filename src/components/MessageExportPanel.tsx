@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   FiBattery,
   FiChevronLeft,
@@ -234,6 +234,7 @@ export const MessageExportPanel: React.FC<{
   onScanPhones: () => void;
   scanningPhones: boolean;
   showHiddenMessages: boolean;
+  messagesWorkflowRequest?: number;
 }> = ({
   devicePanel,
   phoneDevices,
@@ -241,6 +242,7 @@ export const MessageExportPanel: React.FC<{
   onScanPhones,
   scanningPhones,
   showHiddenMessages,
+  messagesWorkflowRequest = 0,
 }) => {
   const electronAPI = window.electron;
   const devices = phoneDevices;
@@ -251,6 +253,9 @@ export const MessageExportPanel: React.FC<{
     useState<PhoneMessageBackupMetadata | null>(null);
   const [selectedDeviceKey, setSelectedDeviceKey] = useState("");
   const [mobileWorkflow, setMobileWorkflow] = useState<"devices" | "messages">("devices");
+  useEffect(() => {
+    if (messagesWorkflowRequest > 0) setMobileWorkflow("messages");
+  }, [messagesWorkflowRequest]);
   const [threads, setThreads] = useState<DeviceMessageThread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [query, setQuery] = useState("");

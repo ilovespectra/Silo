@@ -377,6 +377,9 @@ export default function MapPage({
     message: "Loading photo locations…",
     photos: [],
     photosVersion: -1,
+    borrowedLocationsEnabled: true,
+    inferenceWindowMinutes: 15,
+    inferenceSummary: { high: 0, medium: 0, low: 0 },
   });
   const [photosLoaded, setPhotosLoaded] = useState(false);
   const [altitude, setAltitude] = useState(3.2);
@@ -1140,7 +1143,8 @@ export default function MapPage({
       if (
         !cluster.photos.some(
           (photo) => photo.city || photo.region || photo.country,
-        )
+        ) &&
+        !cluster.photos.some((photo) => photo.locationSource === "inferred")
       ) {
         void electronAPI
           ?.reverseGeocode(cluster.latitude, cluster.longitude)
@@ -1179,6 +1183,13 @@ export default function MapPage({
         button.style.touchAction = "manipulation";
         button.draggable = false;
         button.title = `${cluster.label} · ${cluster.photos.length} photos`;
+        if (cluster.photos.some((photo) => photo.locationSource === "inferred")) {
+          button.classList.add("inferred");
+          const inferredCount = cluster.photos.filter(
+            (photo) => photo.locationSource === "inferred",
+          ).length;
+          button.title += ` · ${inferredCount} inferred`;
+        }
         const image = document.createElement("span");
         image.className = "geo-marker-image";
         const thumbnail = cachedClusterThumbnail(cluster);
@@ -1666,7 +1677,7 @@ export default function MapPage({
       <div className="map-globe" ref={containerRef} />
       <div className="map-status" data-tour="map-overview">
         <FiMapPin />
-        <div>
+        <div className="map-status-copy">
           <strong>
             {photosLoaded
               ? `${geoState.geotagged.toLocaleString()} mapped photos`
@@ -1679,6 +1690,36 @@ export default function MapPage({
                 ? geoState.message
                 : "Reading location cache from disk"}
           </span>
+          <button
+            type="button"
+            className="map-inference-toggle"
+            aria-pressed={geoState.borrowedLocationsEnabled}
+            title="Use nearby GPS photos to suggest locations. Suggestions stay in Silo and never write to photo files."
+            onClick={() =>
+              void electronAPI
+                ?.setBorrowedLocationsEnabled(!geoState.borrowedLocationsEnabled)
+                .then(setGeoState)
+            }
+          >
+            Inferred locations {geoState.borrowedLocationsEnabled ? "on" : "off"}
+          </button>
+          <select
+            className="map-inference-window"
+            aria-label="Nearby photo time window"
+            title="How close in time GPS photos must be to suggest a location"
+            value={geoState.inferenceWindowMinutes}
+            onChange={(event) =>
+              void electronAPI
+                ?.setBorrowedLocationWindow(Number(event.target.value))
+                .then(setGeoState)
+            }
+          >
+            {[5, 15, 30, 60].map((minutes) => (
+              <option key={minutes} value={minutes}>
+                ±{minutes} min
+              </option>
+            ))}
+          </select>
         </div>
         {!photosLoaded ? (
           <div
@@ -2202,6 +2243,25 @@ export default function MapPage({
                   >
                     <MapPhotoThumbnail photo={photo} />
                   </button>
+                  {photo.locationSource === "inferred" && (
+                    <div className={`map-inferred-note ${photo.inferenceConfidence || "low"}`}>
+                      <span>
+                        Inferred from {photo.inferenceReferenceCount || 1} nearby photos
+                        <small>{photo.inferenceConfidence || "low"} confidence</small>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void electronAPI
+                            ?.dismissBorrowedLocation(photo.path)
+                            .then(setGeoState)
+                        }
+                        title="Remove this inferred location from Silo's map"
+                      >
+                        Undo
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

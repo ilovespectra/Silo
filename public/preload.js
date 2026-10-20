@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld("electron", {
     captureBugReportScreenshot: () => ipcRenderer.invoke("capture-bug-report-screenshot"),
     submitBugReport: (report) => ipcRenderer.invoke("submit-bug-report", report),
     getMemories: (prepareViews) => ipcRenderer.invoke("get-memories", Boolean(prepareViews)),
+    getMemoryMusicAvailability: () => ipcRenderer.invoke("get-memory-music-availability"),
     generateMemories: (replace, customTopic) => ipcRenderer.invoke("generate-memories", Boolean(replace), customTopic),
     dismissMemory: (id) => ipcRenderer.invoke("dismiss-memory", id),
     renameMemory: (id, title) => ipcRenderer.invoke("rename-memory", id, title),
@@ -296,6 +297,12 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("set-geo-location", files, location),
   clearGeoLocation: (filePaths) =>
     ipcRenderer.invoke("clear-geo-location", filePaths),
+  setBorrowedLocationsEnabled: (enabled) =>
+    ipcRenderer.invoke("set-borrowed-locations-enabled", enabled),
+  setBorrowedLocationWindow: (windowMinutes) =>
+    ipcRenderer.invoke("set-borrowed-location-window", windowMinutes),
+  dismissBorrowedLocation: (filePath) =>
+    ipcRenderer.invoke("dismiss-borrowed-location", filePath),
   onGeoIndexProgress: (callback) => {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on("geo-index-progress", listener);
@@ -606,6 +613,7 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("select-backup-destination", current),
   getIndexStorageRoot: () => ipcRenderer.invoke("get-index-storage-root"),
   getIndexStorageStatus: () => ipcRenderer.invoke("get-index-storage-status"),
+  refreshIndexStorageStatus: () => ipcRenderer.invoke("refresh-index-storage-status"),
   getLocalIndexFallbackEnabled: () =>
     ipcRenderer.invoke("get-local-index-fallback-enabled"),
   setLocalIndexFallbackEnabled: (enabled) =>
@@ -627,6 +635,8 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("save-initial-cache-destinations", sharedPath, roots),
   changeCacheDestination: (id) =>
     ipcRenderer.invoke("change-cache-destination", id),
+  setAllCacheDestinations: () =>
+    ipcRenderer.invoke("set-all-cache-destinations"),
   locateCacheDestination: (id) =>
     ipcRenderer.invoke("locate-cache-destination", id),
   startFaceIndexingForSource: (sourcePath) =>

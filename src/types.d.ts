@@ -44,7 +44,11 @@ interface GeoPhoto extends FileInfo {
   region: string | null;
   country: string | null;
   locationLabel: string;
-  locationSource: "embedded" | "manual";
+  locationSource: "embedded" | "manual" | "inferred";
+  captureTime?: number | null;
+  inferenceConfidence?: "high" | "medium" | "low";
+  inferenceReferenceCount?: number;
+  inferenceTimeOffsetMs?: number;
 }
 
 interface GeoLocationSuggestion {
@@ -77,6 +81,9 @@ interface GeoIndexState {
   message: string;
   photos: GeoPhoto[];
   photosVersion: number;
+  borrowedLocationsEnabled: boolean;
+  inferenceWindowMinutes: number;
+  inferenceSummary: { high: number; medium: number; low: number };
 }
 
 type GeoIndexStatus = Omit<GeoIndexState, "photos">;
@@ -642,6 +649,7 @@ interface AudioLibraryCacheSnapshot {
   files: CachedAudioFile[];
   extensions: string[];
   stale?: boolean;
+  interrupted?: boolean;
   failedSources?: string[];
   sourceScannedAt?: Record<string, number>;
   sourceCooldownUntil?: Record<string, number>;
@@ -655,7 +663,7 @@ interface AudioLibraryScanProgress {
   audioFound: number;
   sourceIndex: number;
   sourceCount: number;
-  phase: "scanning" | "retrying" | "cooldown" | "source-complete";
+  phase: "scanning" | "retrying" | "cooldown" | "source-complete" | "interrupted";
   message: string;
   files?: FileInfo[];
 }
@@ -794,6 +802,8 @@ interface PersistedAppState {
   searchFeedback: Record<string, "confirmed" | "removed">;
   messageFlags: Record<string, MessageDisplayFlags>;
   geoOverrides: Record<string, GeoOverride>;
+  borrowedLocationsEnabled?: boolean;
+  borrowedLocationWindowMinutes?: number;
   indexProgress?: IndexProgress;
 }
 
@@ -1013,6 +1023,7 @@ interface Window {
       signature: string,
     ): Promise<import("./lifetimePayment").LifetimePaymentVerification>;
     getMemories: import("./memoryTypes").MemoriesAPI["getMemories"];
+    getMemoryMusicAvailability: import("./memoryTypes").MemoriesAPI["getMemoryMusicAvailability"];
     generateMemories: import("./memoryTypes").MemoriesAPI["generateMemories"];
     dismissMemory: import("./memoryTypes").MemoriesAPI["dismissMemory"];
     renameMemory: import("./memoryTypes").MemoriesAPI["renameMemory"];
@@ -1338,6 +1349,9 @@ interface Window {
       location: GeoLocationSuggestion,
     ): Promise<GeoAssignmentResult>;
     clearGeoLocation(filePaths: string[]): Promise<GeoAssignmentResult>;
+    setBorrowedLocationsEnabled(enabled: boolean): Promise<GeoIndexState>;
+    setBorrowedLocationWindow(windowMinutes: number): Promise<GeoIndexState>;
+    dismissBorrowedLocation(filePath: string): Promise<GeoIndexState>;
     onGeoIndexProgress(callback: (state: GeoIndexStatus) => void): () => void;
     onFileScanProgress(
       callback: (progress: FileScanProgress) => void,
@@ -1583,6 +1597,7 @@ interface Window {
     getPhoneBackupDestination(): Promise<string | null>;
     getIndexStorageRoot(): Promise<string>;
     getIndexStorageStatus(): Promise<IndexStorageStatus>;
+    refreshIndexStorageStatus(): Promise<IndexStorageStatus>;
     getLocalIndexFallbackEnabled(): Promise<boolean>;
     setLocalIndexFallbackEnabled(enabled: boolean): Promise<{
       enabled: boolean;
@@ -1626,6 +1641,12 @@ interface Window {
       roots: CacheDestinationRoots,
     ): Promise<{ restarting?: boolean }>;
     changeCacheDestination(id: CacheDestinationId): Promise<{
+      canceled: boolean;
+      restarting?: boolean;
+      path?: string;
+      error?: string;
+    }>;
+    setAllCacheDestinations(): Promise<{
       canceled: boolean;
       restarting?: boolean;
       path?: string;

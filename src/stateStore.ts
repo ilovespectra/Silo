@@ -126,6 +126,8 @@ export interface PersistedAppState {
   searchFeedback: Record<string, "confirmed" | "removed">;
   messageFlags: Record<string, MessageDisplayFlags>;
   geoOverrides: Record<string, GeoOverride>;
+  borrowedLocationsEnabled: boolean;
+  borrowedLocationWindowMinutes: number;
   /** Sources are enabled by default, so only exclusions are stored. */
   disabledSourceIds: string[];
   /** Explicitly enabled IDs override context-dependent defaults for snapshots. */
@@ -154,6 +156,8 @@ const defaultState: PersistedAppState = {
   searchFeedback: {},
   messageFlags: {},
   geoOverrides: {},
+  borrowedLocationsEnabled: true,
+  borrowedLocationWindowMinutes: 15,
   disabledSourceIds: [],
   enabledSourceIds: [],
 };
@@ -259,6 +263,12 @@ export class StateStore {
           stored.geoOverrides && typeof stored.geoOverrides === "object"
             ? stored.geoOverrides
             : {},
+        borrowedLocationsEnabled: stored.borrowedLocationsEnabled !== false,
+        borrowedLocationWindowMinutes: [5, 15, 30, 60].includes(
+          Number(stored.borrowedLocationWindowMinutes),
+        )
+          ? Number(stored.borrowedLocationWindowMinutes)
+          : 15,
         disabledSourceIds: Array.isArray(stored.disabledSourceIds)
           ? stored.disabledSourceIds
           : [],
@@ -798,6 +808,22 @@ export class StateStore {
 
   async clearGeoOverrides(filePaths: string[]) {
     for (const filePath of filePaths) delete this.state.geoOverrides[filePath];
+    await this.write();
+    return this.getState();
+  }
+
+  async setBorrowedLocationsEnabled(enabled: boolean) {
+    this.state.borrowedLocationsEnabled = enabled === true;
+    await this.write();
+    return this.getState();
+  }
+
+  async setBorrowedLocationWindow(windowMinutes: number) {
+    this.state.borrowedLocationWindowMinutes = [5, 15, 30, 60].includes(
+      windowMinutes,
+    )
+      ? windowMinutes
+      : 15;
     await this.write();
     return this.getState();
   }

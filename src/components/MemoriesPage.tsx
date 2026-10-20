@@ -1,7 +1,7 @@
 import React, { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { IconBaseProps } from "react-icons";
-import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiEdit3 as Edit3, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiLock as Lock, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
+import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiEdit3 as Edit3, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiLock as Lock, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
 import type { MemoriesAPI, MemoryAudioBrowseFile, MemoryAudioBrowseResult, MemoryAudioSort, MemoryExportOptions, MemoryExportProgress, MemoryGenerationStatus, MemoryPreviewStatus, MemoryState, MemorySuggestion, MemorySoundtrack, SavedMemoryMovie } from "../memoryTypes";
 import {
   MEMORY_DEFAULT_SELECTION_COUNT,
@@ -14,9 +14,9 @@ import "../styles/Memories.css";
 // react-icons uses the newer ReactNode component signature; this project uses TS 4.9.
 export const MemoryIcons = {
   FiArrowRight: ArrowRight, FiCheck: Check, FiChevronRight: ChevronRight, FiDownload: Download, FiEdit3: Edit3, FiFilm: Film, FiLock: Lock, FiFolder: Folder,
-  FiImage: Image, FiMaximize: Maximize, FiMinimize: Minimize, FiMusic: Music, FiPause: Pause, FiPlay: Play, FiRefreshCw: RefreshCw, FiSearch: Search, FiTrash2: Trash2, FiX: X,
-} as unknown as Record<"FiArrowRight" | "FiCheck" | "FiChevronRight" | "FiDownload" | "FiEdit3" | "FiFilm" | "FiLock" | "FiFolder" | "FiImage" | "FiMaximize" | "FiMinimize" | "FiMusic" | "FiPause" | "FiPlay" | "FiRefreshCw" | "FiSearch" | "FiTrash2" | "FiX", React.FC<IconBaseProps>>;
-const { FiArrowRight, FiCheck, FiChevronRight, FiDownload, FiEdit3, FiFilm, FiLock, FiFolder, FiImage, FiMaximize, FiMinimize, FiMusic, FiPause, FiPlay, FiRefreshCw, FiSearch, FiTrash2, FiX } = MemoryIcons;
+  FiImage: Image, FiMaximize: Maximize, FiMinimize: Minimize, FiMusic: Music, FiPause: Pause, FiPlay: Play, FiSearch: Search, FiTrash2: Trash2, FiX: X,
+} as unknown as Record<"FiArrowRight" | "FiCheck" | "FiChevronRight" | "FiDownload" | "FiEdit3" | "FiFilm" | "FiLock" | "FiFolder" | "FiImage" | "FiMaximize" | "FiMinimize" | "FiMusic" | "FiPause" | "FiPlay" | "FiSearch" | "FiTrash2" | "FiX", React.FC<IconBaseProps>>;
+const { FiArrowRight, FiCheck, FiChevronRight, FiDownload, FiEdit3, FiFilm, FiLock, FiFolder, FiImage, FiMaximize, FiMinimize, FiMusic, FiPause, FiPlay, FiSearch, FiTrash2, FiX } = MemoryIcons;
 
 export interface MemoriesPageProps {
   api: MemoriesAPI;
@@ -455,8 +455,8 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
     const next = Math.max(minimum, Math.min(maximum, Math.round(nextCount)));
     setCount(next);
   };
-  const loadTracks = (): Promise<MemorySoundtrack[] | null> => {
-    if (trackStatus === "loaded") return Promise.resolve(tracks);
+  const loadTracks = (refresh = false): Promise<MemorySoundtrack[] | null> => {
+    if (trackStatus === "loaded" && !refresh) return Promise.resolve(tracks);
     // Focus, browse and export share one in-flight request.
     if (trackRequest.current) return trackRequest.current;
     setTrackStatus("loading"); setTrackError("");
@@ -540,7 +540,10 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
         <select id={`${fieldId}-soundtrack`} value={selectedTrack.id} disabled={disabled || trackStatus === "loading"} onFocus={() => { void loadTracks(); }} onChange={(event) => { const next = availableTracks.find((track) => track.id === event.target.value); if (next) void chooseTrack(next); }}>
           {availableTracks.map((track) => <option key={track.id} value={track.id}>{track.name}{track.source === "original" ? " · original" : " · library"}</option>)}
         </select>
-        {trackStatus !== "loaded" && <button type="button" className="memories-text-button" disabled={disabled || trackStatus === "loading"} onClick={() => { void loadTracks(); }}>{trackStatus === "loading" ? "Finding soundtracks…" : trackStatus === "error" ? "Retry soundtracks" : "Browse mood soundtracks"}</button>}
+        <button type="button" className="memories-text-button" disabled={disabled || trackStatus === "loading"} onClick={() => { void loadTracks(trackStatus === "loaded"); }}>
+          {trackStatus === "loading" ? "Finding soundtracks…" : trackStatus === "error" ? "Retry mood soundtracks" : trackStatus === "loaded" ? "Refresh mood soundtracks" : "Browse mood soundtracks"}
+        </button>
+        {trackStatus === "loaded" && !tracks.some((track) => track.source === "library") && <p className="memories-hint" role="status">No library songs are indexed yet. Browse your audio library or wait for the music scan to reach its source.</p>}
         {api.browseMemoryAudio && <button type="button" className="memories-text-button" disabled={disabled} onClick={() => setBrowsing(true)}><FiFolder aria-hidden="true" />Browse your audio library…</button>}
         {trackError && <p className="memories-error" role="alert">{trackError}</p>}
         {selectedTrack.source === "library" && <p className="memories-hint memories-rights">

@@ -29,7 +29,7 @@ const {
   MEMORY_EXPORT_LIMITS,
   selectMemoryPhotoCandidates,
 } = require("../src/memoryTypes.ts");
-const { MemoryManager } = require("../src/memoryManager.ts");
+const { MemoryManager, isMemoryMusicTrack } = require("../src/memoryManager.ts");
 const {
   hasValidPromptedMemoryFolderContext,
   isMemoryVisualContentExplicit,
@@ -245,6 +245,7 @@ function evaluate(source) {
 for (const name of [
   "memoryFileMetadata", "memoryObviousNonPhotoPath", "memoryAllowed", "memoryContentAllowed", "memorySearchImageEligible", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
   "memoryTopCounts", "memoryPersonalRejectionSummary", "memoryErrorDetails",
+  "safeRuntimeDiagnosticText", "safeRuntimeDiagnosticStack", "memoryAudioErrorDetails",
   "memoryDot", "memoryImageContentFactor", "memoryImageIsObviousNonPhoto", "filterMemoryPhotos", "normalizeMemoryName", "memoryNameMatches", "memoryPathInRoots", "memoryPromptContext", "applyMemoryPromptContext", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
   "promptedVideoPhotoCandidate", "searchPromptedMemoryMedia", "memoryVideoMatchesForPhotos", "memoryMusicDirectories",
   "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
@@ -273,6 +274,12 @@ async function test(name, body) {
 }
 
 async function run() {
+  await test("Memory music accepts large lossless songs and excludes temporary exports", async () => {
+    assert.equal(isMemoryMusicTrack({ name: "Yugoslavia 80s Rock.aif", path: "/Music/Unknown Artist/Unknown Album/Yugoslavia 80s Rock.aif", size: 681_111_782 }), true);
+    assert.equal(isMemoryMusicTrack({ name: "short-effect.wav", path: "/Music/SFX/short-effect.wav", size: 800_000 }), false);
+    assert.equal(isMemoryMusicTrack({ name: "original-score.wav", path: "/tmp/silo-memory-export-123/original-score.wav", size: 4_000_000 }), false);
+  });
+
   await test("memory profile refresh cannot be postponed by steady indexing notifications", async () => {
     const timers = [];
     let finishFirstRun;
@@ -343,7 +350,7 @@ async function run() {
     }
   });
 
-  await test("memory source roots keep offline local indexes and ready added sources", async () => {
+  await test("memory source roots ignore offline indexes and include ready added sources", async () => {
     const originalFullAccess = context.__fullAccess;
     try {
       context.__fullAccess = true;
@@ -353,14 +360,14 @@ async function run() {
         { id: "phone", rootPath: "/__phone__/ios/ready", available: true, enabled: true },
         { id: "disconnected-phone", rootPath: "/__phone__/ios/gone", available: false, enabled: true },
       ]);
-      assert.deepEqual(plain(roots), ["/offline-drive/Photos", "/added/Camera", "/__phone__/ios/ready"]);
+      assert.deepEqual(plain(roots), ["/added/Camera", "/__phone__/ios/ready"]);
       context.__fullAccess = false;
       const selectedRoots = await context.getIndexableRootsFromSources([
         { id: "/offline-drive/Photos", rootPath: "/offline-drive/Photos", available: false, enabled: false },
         { id: "/added/Camera", rootPath: "/added/Camera", available: true, enabled: true },
         { id: "/locked", rootPath: "/locked", available: true, enabled: true, demoLocked: true },
       ]);
-      assert.deepEqual(plain(selectedRoots), ["/offline-drive/Photos", "/added/Camera"],
+      assert.deepEqual(plain(selectedRoots), ["/added/Camera"],
         "Memories includes all configured roots regardless of source selection state");
     } finally {
       context.__fullAccess = originalFullAccess;
@@ -502,6 +509,12 @@ async function run() {
       "spaced screenshot folder names are also excluded");
     assert.equal(context.memoryAllowed(path.join(library, "Assets", "hero.jpg")), false,
       "application asset folders are excluded from Memories");
+    for (const cachePath of [
+      path.join(library, "silo-cache", "thumbnail-cache", "generated.jpg"),
+      path.join(library, "SILOCACHE", "thumbnail-cache", "generated.jpg"),
+      path.join(library, "thumbnail-cache", "generated.jpg"),
+    ]) assert.equal(context.memoryAllowed(cachePath), false,
+      "Silo-generated thumbnail cache images are not source photos");
     assert.equal(context.memoryAllowed("/Applications/Example.app/Contents/Resources/icon.png"), false,
       "application bundle artwork is excluded");
     assert.equal(context.memoryAllowed(path.join(library, "app-icon.png")), false,
@@ -525,7 +538,7 @@ async function run() {
     context.hiddenPaths = new Set(); context.banned = new Set(); context.semanticUnsafePaths = new Set();
   });
 
-  await test("Live Photo companion respects every casing and remote paths", async () => {
+  await test("Live Photo companion resolves local and phone siblings safely", async () => {
     const dir = path.join(library, "live");
     await fsp.mkdir(dir, { recursive: true });
     await fsp.writeFile(path.join(dir, "IMG_1.HEIC"), "");
@@ -536,7 +549,22 @@ async function run() {
     context.hiddenPaths = new Set([path.join(dir, "IMG_1.MOV")]);
     assert.equal(await context.memoryLiveVideo(still), undefined, "hidden under another casing");
     context.hiddenPaths = new Set();
-    assert.equal(await context.memoryLiveVideo({ ...still, path: "/__phone__/ios/ready/IMG_1.HEIC" }), undefined);
+    const remoteStill = { ...still, path: "/__phone__/ios/ready/DCIM/IMG_2.HEIC", name: "IMG_2.HEIC" };
+    const remoteClip = "/__phone__/ios/ready/DCIM/IMG_2.MOV";
+    const originalListPhoneFiles = context.phoneManager.listPhoneFiles;
+    context.phoneManager.listPhoneFiles = async (directory) => directory === path.dirname(remoteStill.path)
+      ? [{ path: remoteClip, name: "IMG_2.MOV", isDirectory: false }]
+      : [];
+    try {
+      assert.equal(await context.memoryLiveVideo(remoteStill), remoteClip,
+        "same-stem MOV companions in phone-backed folders are discoverable");
+      context.hiddenPaths = new Set([remoteClip]);
+      assert.equal(await context.memoryLiveVideo(remoteStill), undefined,
+        "hidden phone companions remain excluded");
+    } finally {
+      context.hiddenPaths = new Set();
+      context.phoneManager.listPhoneFiles = originalListPhoneFiles;
+    }
     assert.equal(await context.memoryLiveVideo({ ...still, type: "video" }), undefined);
   });
 
@@ -1165,7 +1193,7 @@ async function run() {
       assert.throws(() => update(null, bad), /Invalid memory settings/);
     for (const name of ["dismiss-memory", "get-memory-soundtracks"]) {
       const fn = handler(name);
-      for (const bad of [undefined, 1, "", "x".repeat(201)]) assert.throws(() => fn(null, bad), /Invalid memory/);
+      for (const bad of [undefined, 1, "", "x".repeat(201)]) await assert.rejects(fn(null, bad), /Invalid memory/);
       assert.equal(await fn(null, "s1"), "s1");
     }
   });
