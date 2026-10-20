@@ -2,9 +2,10 @@ import { createReadStream } from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 import * as readline from "readline";
+import type { IndexableFile } from "./semanticIndexer";
 
 // Bump when the raw measurements change so cached results are recomputed.
-const METRICS_VERSION = 2;
+const METRICS_VERSION = 3;
 const ANALYSIS_CONCURRENCY = 1;
 const BACKGROUND_COOLDOWN_MIN_MS = 250;
 const BACKGROUND_COOLDOWN_MAX_MS = 3000;
@@ -25,8 +26,23 @@ const PROMPTS = [
   "a photo of a document, receipt or text", // 9
   "an accidental photo of the floor, ceiling or inside of a pocket", // 10
   "a boring snapshot with a cluttered background", // 11
+  "a screenshot of a web browser showing a website", // 12
+  "a software application icon or logo", // 13
+  "a screenshot of text messages or a chat conversation", // 14
 ];
 const NEGATIVE = [6, 7, 8, 9, 10, 11];
+const PEOPLE_FILTER_PROMPTS = [
+  "a natural photograph of a person or people",
+  "a candid family or group portrait photograph",
+  "a real photograph of a person in a real scene",
+  "a screenshot of a web browser showing a website",
+  "a screenshot of a phone screen, text messages, or a chat conversation",
+  "a document or image mostly filled with text",
+  "a small software application icon or logo on a plain background",
+  "a tiny thumbnail, low-resolution preview, or icon",
+];
+const PEOPLE_FILTER_PHOTO_PROMPTS = [0, 1, 2];
+const PEOPLE_FILTER_NONPHOTO_PROMPTS = [3, 4, 5, 6, 7];
 
 export type MagicPresetId = "balanced" | "people" | "landscapes" | "variety";
 
@@ -165,6 +181,7 @@ export interface AestheticDeps {
   }>;
   imageVectors(paths: string[]): Promise<Map<string, Float32Array>>;
   embedPrompts(prompts: string[]): Promise<Float32Array[]>;
+  imageDimensions?(filePath: string): Promise<{ width: number; height: number } | null>;
   onProgress(progress: {
     analyzed: number;
     total: number;
@@ -210,6 +227,7 @@ export class AestheticScorer {
   >();
   private loaded: Promise<void> | null = null;
   private promptVectors: Float32Array[] | null = null;
+  private peopleFilterPromptVectors: Promise<Float32Array[]> | null = null;
   private queue: MagicItem[] = [];
   private backgroundQueue: MagicItem[] = [];
   private libraryTotal = 0;
@@ -221,6 +239,84 @@ export class AestheticScorer {
   private requestPaths = new Set<string>();
 
   constructor(private readonly deps: AestheticDeps) {}
+
+  /** Local, conservative exclusion for screenshots, text images, icons and tiny files. */
+  async classifyNonPhotoPeopleImages(
+    items: IndexableFile[],
+  ): Promise<Set<string>> {
+    const excluded = new Set<string>();
+    const uncertain: MagicItem[] = [];
+    const obviousName =
+      /(?:^|[\s_.-])(?:screen ?shot|screen ?capture|screen ?recording|snip(?:ping)?|browser ?shot|app ?icon)(?:[\s_.-]|$)/i;
+    const obviousPath = /(?:^|[\\/])(?:app[-_ ]?icons?|browser[-_ ]?(?:screenshots?|captures?)|thumbnails?)(?:[\\/]|$)/i;
+
+    for (const item of items) {
+      if (
+        obviousName.test(item.name) ||
+        obviousPath.test(item.path) ||
+        (item.size > 0 && item.size < 24_000)
+      ) {
+        excluded.add(item.path);
+        continue;
+      }
+      if (this.deps.imageDimensions) {
+        const dimensions = await this.deps
+          .imageDimensions(item.path)
+          .catch(() => null);
+        if (
+          dimensions &&
+          dimensions.width > 0 &&
+          dimensions.height > 0 &&
+          (Math.max(dimensions.width, dimensions.height) < 420 ||
+            Math.min(dimensions.width, dimensions.height) < 280)
+        ) {
+          excluded.add(item.path);
+          continue;
+        }
+      }
+      uncertain.push(item);
+    }
+
+    if (uncertain.length === 0) return excluded;
+    this.peopleFilterPromptVectors ??= Promise.resolve().then(() =>
+      this.deps.embedPrompts(PEOPLE_FILTER_PROMPTS),
+    );
+    let promptVectors: Float32Array[];
+    try {
+      promptVectors = await this.peopleFilterPromptVectors;
+    } catch {
+      // A rejected model load should not erase deterministic filename, path,
+      // size, or dimension exclusions; allow a later attempt to retry.
+      this.peopleFilterPromptVectors = null;
+      return excluded;
+    }
+    if (promptVectors.length !== PEOPLE_FILTER_PROMPTS.length) return excluded;
+
+    for (let offset = 0; offset < uncertain.length; offset += 96) {
+      const batch = uncertain.slice(offset, offset + 96);
+      let vectors: Map<string, Float32Array>;
+      try {
+        vectors = await this.deps.imageVectors(batch.map((item) => item.path));
+      } catch {
+        // Preserve deterministic exclusions even when model inference fails.
+        continue;
+      }
+      for (const item of batch) {
+        const vector = vectors.get(item.path);
+        if (!vector) continue;
+        const scores = promptVectors.map((prompt) => dot(vector, prompt));
+        const photoScore = Math.max(
+          ...PEOPLE_FILTER_PHOTO_PROMPTS.map((index) => scores[index]),
+        );
+        const nonPhotoScore = Math.max(
+          ...PEOPLE_FILTER_NONPHOTO_PROMPTS.map((index) => scores[index]),
+        );
+        if (nonPhotoScore >= 0.24 && nonPhotoScore >= photoScore + 0.025)
+          excluded.add(item.path);
+      }
+    }
+    return excluded;
+  }
 
   /** Pause library-wide work while keeping user-requested ranking work available. */
   async setBackgroundPaused(paused: boolean) {

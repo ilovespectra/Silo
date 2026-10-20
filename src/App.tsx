@@ -117,6 +117,60 @@ import GuidedTour, {
 import LocalHelpPanel from "./components/LocalHelpPanel";
 import InteractiveTooltip from "./components/InteractiveTooltip";
 
+function FirstRunMapServiceConsent() {
+  const [visible, setVisible] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const api = window.electron;
+    if (!api) return;
+    let active = true;
+    void api.getMapServiceConsent().then((allowed) => {
+      if (active && allowed === null) setVisible(true);
+    }).catch(() => {
+      if (!active) return;
+      setError("Silo could not read the saved choice. Online map services remain off until you choose.");
+      setVisible(true);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const choose = async (allowed: boolean) => {
+    const api = window.electron;
+    if (!api) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.setMapServiceConsent(allowed);
+      setVisible(false);
+    } catch {
+      setError("Silo could not save this privacy choice. Online map services remain off.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!visible) return null;
+  return createPortal(
+    <div className="map-privacy-backdrop">
+      <section className="map-privacy-dialog" role="dialog" aria-modal="true" aria-labelledby="first-run-map-privacy-title">
+        <h2 id="first-run-map-privacy-title">Choose whether to use online map services</h2>
+        <p>Photo locations stay on this device unless you allow online map services. If enabled, selecting an unlabeled location can send its exact coordinates to Nominatim; place searches send your query to Photon; and close-up imagery requests send tile coordinates to Esri. These services can also see your public IP address and request timing. Their log retention is not known.</p>
+        <p>With services off, local location groups and the offline globe remain available. You can change this choice later from the Map page.</p>
+        {error && <p className="map-privacy-error" role="alert">{error}</p>}
+        <div className="map-privacy-actions">
+          <button type="button" onClick={() => void choose(false)} disabled={busy}>Keep services off</button>
+          <button type="button" className="primary" onClick={() => void choose(true)} disabled={busy}>Allow online map services</button>
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 const MapPage = React.lazy(() => import("./components/MapPage"));
 const MemoriesPage = React.lazy(() => import("./components/MemoriesPage"));
 const MemoriesLauncher = React.lazy(() => import("./components/MemoriesLauncher"));
@@ -6210,6 +6264,7 @@ function App() {
         setSelectedFilePaths((current) => (current.size ? new Set() : current));
       }}
     >
+      <FirstRunMapServiceConsent />
       {showConstructionBanner && (
         <div className="preview-construction-banner" role="note">
           <div>
@@ -8529,6 +8584,16 @@ function App() {
                 </span>
               </summary>
               <div className="cloud-accounts-content">
+              {googleState?.configured && (
+                <p className="google-scope-disclosure">
+                  Before connecting: Google will be asked for full Drive access, access to items you choose in Photos Picker, and permission to modify Gmail messages for reclaim. Silo saves a verified local copy before moving selected items to Trash. “Delete forever” empties everything in this account’s Drive trash after a separate confirmation.
+                </p>
+              )}
+              {googleState?.storageWarning && (
+                <p className="google-storage-warning" role="alert">
+                  {googleState.storageWarning}
+                </p>
+              )}
               {!googleState?.configured ? (
                 <p className="sidebar-empty tooling-hint">
                   Google sources are not configured in this build. Local folders,
