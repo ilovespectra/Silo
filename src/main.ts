@@ -4173,7 +4173,8 @@ function memoryMusicDirectories(): Set<string> {
 /**
  * Mines story ideas from every available indexed source: prevalent subjects (CLIP),
  * time (this week N years ago, seasons, years, trips), places, people, pets and
- * user-named folders. Candidates need enough personal photos for a full memory.
+ * user-named folders. Personal photos seed stories; eligible clips can complete
+ * the fourteen-item total when a story has fewer photos.
  */
 async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   if (!semanticIndexer) throw new Error("Memory search is not ready yet.");
@@ -4191,9 +4192,9 @@ async function discoverMemoryIdeas(): Promise<MemoryStoryCandidate[]> {
   const rejection = images.length < Math.max(40, indexedImages.length * 0.2)
     ? memoryPersonalRejectionSummary(indexedImages, memoryMusicDirectories())
     : {};
-  if (images.length < MEMORY_MIN_SELECTION_COUNT) {
+  if (images.length === 0) {
     runtimeLog("memory-discover-trace", { roots: roots.length, indexedImages: indexedImages.length,
-      personalImages: images.length, ideas: 0, reason: "fewer-than-14-personal-photos", ...rejection });
+      personalImages: images.length, ideas: 0, reason: "no-personal-photo-seeds", ...rejection });
     return [];
   }
   const modified = new Map(images.map((image) => [image.path, image.captured ?? image.modified]));

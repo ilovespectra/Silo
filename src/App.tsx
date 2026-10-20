@@ -9079,9 +9079,7 @@ function App() {
                   {sortIndicatorError ||
                     (metadataIndicatorProgress
                       ? `Checking people and locations · ${metadataIndicatorProgress.processed.toLocaleString()} of ${metadataIndicatorProgress.total.toLocaleString()} photos`
-                      : needsRecursiveBrowse && loading
-                        ? `Scanning photos · ${(fileScanProgress?.scanned ?? 0).toLocaleString()} files found`
-                        : "Updating people and location sort…")}
+                      : "Updating people and location sort…")}
                 </div>
               </div>
             )}
