@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const packageJson = require('../package.json');
-const { parseSemver, compareVersions, bumpPatchVersion } = require('./release-version.cjs');
+const { nextPublishedReleaseVersion } = require('./release-version.cjs');
 
 const projectRoot = path.resolve(__dirname, '..');
 const repository = 'ilovespectra/Silo';
@@ -14,104 +14,20 @@ const workflow = 'windows-exe.yml';
 const branch = 'main';
 const product = packageJson.build.productName;
 
-function expectedReleaseFiles(version) {
-  return [
-    `${product}-${version}-x64.dmg`,
-    `${product}-${version}-x64.zip`,
-    `${product}-${version}-arm64.dmg`,
-    `${product}-${version}-arm64.zip`,
-    `${product}-${version}-x64-Setup.exe`,
-    'latest-mac.yml',
-  ];
-}
-
-function hasCompleteReleaseBundle(folder, version) {
-  if (!folder || !fs.existsSync(folder)) return false;
-  const candidates = [folder, path.join(folder, version)];
-  for (const candidate of candidates) {
-    if (!fs.existsSync(candidate)) continue;
-    const complete = expectedReleaseFiles(version).every((fileName) => {
-      const filePath = path.join(candidate, fileName);
-      return fs.existsSync(filePath) && fs.statSync(filePath).size > 0;
-    });
-    if (complete) return true;
-  }
-  return false;
-}
-
-function findLatestVersionInFolder(folder) {
-  if (!folder || !fs.existsSync(folder)) return null;
-
-  let latest = null;
-  for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
-    if (entry.isFile()) {
-      const match = /Silo-([0-9]+\.[0-9]+(?:\.[0-9]+)?)/.exec(entry.name);
-      if (!match) continue;
-      const candidateVersion = match[1];
-      if (!latest || compareVersions(candidateVersion, latest) > 0) {
-        latest = candidateVersion;
-      }
-      continue;
-    }
-    if (!entry.isDirectory()) continue;
-    const match = /^([0-9]+\.[0-9]+\.[0-9]+)$/.exec(entry.name);
-    if (!match) continue;
-    const candidateVersion = match[1];
-    if (!hasCompleteReleaseBundle(path.join(folder, candidateVersion), candidateVersion)) continue;
-    if (!latest || compareVersions(candidateVersion, latest) > 0) {
-      latest = candidateVersion;
-    }
-  }
-  return latest;
-}
-
-function readLatestGitHubReleaseTag() {
-  try {
-    const output = capture('gh', ['api', 'repos/ilovespectra/silo-downloads/releases/latest', '--jq', '.tag_name']);
-    return output || null;
-  } catch {
-    return null;
-  }
-}
-
 const explicitDestination = process.env.SILO_RELEASE_DEST
   ? path.resolve(process.env.SILO_RELEASE_DEST)
   : '';
-const explicitVersion = process.env.SILO_RELEASE_VERSION
-  ? String(process.env.SILO_RELEASE_VERSION).trim()
-  : '';
-const rebuildCurrent = process.env.SILO_RELEASE_REBUILD_CURRENT === 'true';
 // With an explicit output root, each release gets its own <root>/<version> folder.
 const defaultDestinationFor = (value) => (explicitDestination
   ? path.join(explicitDestination, value)
   : path.join(os.homedir(), 'Downloads', `SILO ${value} TEST`));
 
 function resolveReleaseVersion() {
-  if (explicitVersion) {
-    const parsed = parseSemver(explicitVersion);
-    if (!parsed) throw new Error(`Invalid SILO_RELEASE_VERSION: ${explicitVersion}`);
-    return explicitVersion;
-  }
-
-  const current = packageJson.version;
-  const remoteVersion = readLatestGitHubReleaseTag();
-  const latestKnownVersion = remoteVersion && compareVersions(remoteVersion, current) > 0
-    ? remoteVersion
-    : current;
-
-  const existingFolders = [...new Set(
-    [explicitDestination, defaultDestinationFor(current)].filter(Boolean),
-  )];
-  const alreadyPackaged = existingFolders.some((folder) => hasCompleteReleaseBundle(folder, current));
-  const remoteIsNewerOrSame = remoteVersion && compareVersions(remoteVersion, current) >= 0;
-  if (!alreadyPackaged && !remoteIsNewerOrSame) return latestKnownVersion;
-
-  const base = latestKnownVersion;
-  let next = bumpPatchVersion(base);
-  for (const folder of existingFolders) {
-    const folderVersion = findLatestVersionInFolder(folder);
-    while (folderVersion && compareVersions(folderVersion, next) >= 0) next = bumpPatchVersion(next);
-  }
+  const release = JSON.parse(capture('gh', [
+    'api', 'repos/ilovespectra/silo-downloads/releases/latest',
+  ]));
+  const next = nextPublishedReleaseVersion(release);
+  console.log(`Published silo-downloads release: ${release.tag_name}; building ${next}.`);
   return next;
 }
 
@@ -260,22 +176,11 @@ async function repackage() {
   }
 
   assertCleanReleaseInputs();
-  if (rebuildCurrent) {
-    if (!explicitVersion || version !== packageJson.version) {
-      throw new Error('Rebuilding requires the current source package version.');
-    }
-    const releases = JSON.parse(capture('gh', [
-      'api', 'repos/ilovespectra/silo-downloads/releases', '--paginate', '--slurp',
-    ])).flat();
-    if (releases.some((release) => release.tag_name === `v${version}` && !release.draft)) {
-      throw new Error(`Version ${version} is already published. Build the next release instead.`);
-    }
-  }
   if (version !== packageJson.version) {
     if (suppliedWindowsInstaller) {
-      throw new Error(`Version ${packageJson.version} is already packaged; bump package.json before supplying a Windows installer.`);
+      throw new Error(`Set the source package to published-release target ${version} and rebuild the supplied Windows installer from that pushed commit.`);
     }
-    console.log(`\nBumping Silo ${packageJson.version} -> ${version} and pushing to ${branch}…`);
+    console.log(`\nSetting Silo ${packageJson.version} -> ${version} from the published release and pushing to ${branch}…`);
     run('npm', ['version', version, '--no-git-tag-version']);
     run('git', ['add', 'package.json', 'package-lock.json']);
     run('git', ['commit', '-m', `Release v${version}`]);
@@ -365,13 +270,15 @@ async function repackage() {
     if (stagedFiles.size !== expected.length || expected.some((name) => !stagedFiles.has(name))) {
       throw new Error(`Expected release files ${expected.join(', ')}; staged ${[...stagedFiles.keys()].join(', ')}.`);
     }
+    const releases = JSON.parse(capture('gh', [
+      'api', 'repos/ilovespectra/silo-downloads/releases', '--paginate', '--slurp',
+    ])).flat();
+    if (releases.some((release) => release.tag_name === `v${version}` && !release.draft)) {
+      throw new Error(`Version ${version} was published during this build. Refusing to replace its local assets.`);
+    }
     for (const name of expected) {
       const source = stagedFiles.get(name);
       const target = path.join(destination, name);
-      // latest-mac.yml is unversioned and always describes the newest build.
-      if (fs.existsSync(target) && name !== 'latest-mac.yml' && !rebuildCurrent) {
-        throw new Error(`Refusing to replace an existing test artifact: ${target}`);
-      }
       pendingInstalls.push(stageFile(source, target));
     }
 

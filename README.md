@@ -96,7 +96,7 @@ The script builds both Mac DMGs and updater ZIPs locally, merges their
 `latest-mac.yml` manifests, and dispatches the Windows installer workflow for
 the same `main` commit. It stages the three installable builds and Mac updater
 metadata in `~/Downloads/SILO 2.0.6 TEST/` only after every build succeeds. It
-refuses to replace an existing file in that test folder. Upload the two ZIPs and
+replaces an unpublished local bundle only after all fresh assets are staged. Upload the two ZIPs and
 `latest-mac.yml` with the DMGs to a release before testing in-app Mac updates.
 
 Automatic release increments roll patch 9 into the next minor version:
@@ -111,12 +111,15 @@ script rejects a mismatched commit. Without those two variables, GitHub CLI
 (`gh`) must be installed and authenticated with permission to run this
 repository's Actions workflow. `SILO_RELEASE_STAGE_DIR` selects the temporary
 staging parent, and `SILO_RELEASE_DEST` overrides the default Downloads folder.
-`SILO_RELEASE_VERSION` pins the exact version to package and build; when set, the
-script skips the automatic bump-and-push loop and uses that version exactly. If
-it is unset, the script treats the latest release in
-`ilovespectra/silo-downloads` as the canonical baseline for the next build.
+The latest published stable release from `ilovespectra/silo-downloads/releases/latest`
+is the only version baseline. Source package versions, local bundles, drafts,
+`SILO_RELEASE_VERSION`, and saved build history cannot advance or pin it.
+Published `v2.2.9` always builds `2.3.0`, including retries, until `v2.3.0` is published.
+The script sets and pushes the package version before building both platforms,
+even when correcting an accidentally higher source version. GitHub lookup failures
+stop the build instead of falling back to local state.
 The script refuses a non-`main` branch, tracked or staged changes, unexpected
-untracked files, existing destination assets, or a local commit that does not
+untracked files, published destination versions, or a local commit that does not
 match GitHub `main`. It prints SHA-256 hashes after copying. It does not publish
 a GitHub release; Mac builds remain ad-hoc signed and are not notarized.
 

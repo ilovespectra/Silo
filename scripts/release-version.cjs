@@ -26,4 +26,12 @@ function bumpPatchVersion(value) {
   return patch >= 9 ? `${major}.${minor + 1}.0` : `${major}.${minor}.${patch + 1}`;
 }
 
-module.exports = { parseSemver, compareVersions, bumpPatchVersion };
+function nextPublishedReleaseVersion(release) {
+  if (!release || release.draft !== false || release.prerelease !== false ||
+      !/^v?\d+\.\d+\.\d+$/.test(release.tag_name || '')) {
+    throw new Error('Cannot determine the next version: a valid published stable silo-downloads release is required.');
+  }
+  return bumpPatchVersion(release.tag_name);
+}
+
+module.exports = { parseSemver, compareVersions, bumpPatchVersion, nextPublishedReleaseVersion };
