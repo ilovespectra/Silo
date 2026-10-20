@@ -2922,7 +2922,7 @@ label.settings-row {
 
 .volume-item {
   display: grid;
-  grid-template-columns: max-content max-content minmax(0, 1fr) 22px max-content;
+  grid-template-columns: minmax(0, 1fr) max-content max-content;
   align-items: center;
   gap: 7px;
   padding: 7px 8px;
@@ -5418,7 +5418,33 @@ input[type="range"]::-moz-range-progress {
 
 .source-enable-toggle {
   display: grid;
-  flex: 0 0 24px;
+  grid-template-columns: 24px max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.source-enable-toggle:focus-visible {
+  outline: 2px solid var(--orange-bright);
+  outline-offset: 2px;
+}
+
+.source-enable-toggle:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.source-enable-mark {
+  display: grid;
   width: 24px;
   height: 24px;
   place-items: center;
@@ -5427,7 +5453,7 @@ input[type="range"]::-moz-range-progress {
   color: var(--muted);
 }
 
-.source-enable-toggle.active {
+.source-enable-toggle.active .source-enable-mark {
   border-color: var(--orange);
   background: rgba(255, 122, 26, 0.14);
   color: var(--orange);

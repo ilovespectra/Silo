@@ -1630,10 +1630,16 @@ function logIndexingDiagnostic(event: string, details: Record<string, unknown> =
   ) {
     const phase = typeof details.phase === "string" ? details.phase : "";
     const status = typeof details.status === "string" ? details.status : "";
-    if (phase && status === "started")
+    if (phase && status === "started") {
       semanticRuntimeProgress.message = `${phase}…`;
-    else if (phase && status === "failed")
+      if (searchIndexReadiness.status === "preparing")
+        updateSearchIndexReadiness({
+          ...searchIndexReadiness,
+          message: `Warming the offline search model · ${phase}…`,
+        });
+    } else if (phase && status === "failed") {
       semanticRuntimeProgress.message = `${phase} failed; recovery is queued.`;
+    }
   }
 
   const safe: Record<string, string | number | boolean> = {
@@ -1645,6 +1651,7 @@ function logIndexingDiagnostic(event: string, details: Record<string, unknown> =
     "signal",
     "requestType",
     "pendingCount",
+    "timeoutMs",
     "phase",
     "status",
     "durationMs",
@@ -1825,7 +1832,11 @@ ${workerEvents.join("\n")}`
   });
 }
 
-function createSemanticPreloadDiagnosticReport(attempts: number, message: string) {
+function createSemanticPreloadDiagnosticReport(
+  attempts: number,
+  message: string,
+  timedOut = false,
+) {
   const workerEvents = indexingDiagnosticEvents.slice(-12).map((entry) => {
     const details = Object.entries(entry)
       .filter(([key]) => key !== "at")
@@ -1838,7 +1849,9 @@ function createSemanticPreloadDiagnosticReport(attempts: number, message: string
     "semantic-preload-failed",
     [
       "Silo offline search model recovery report — please review before sending.",
-      `Trigger: semantic preload failed repeatedly (${attempts} attempts).`,
+      timedOut
+        ? `Trigger: offline semantic model preload timed out on attempt ${attempts}.`
+        : `Trigger: semantic preload failed repeatedly (${attempts} attempts).`,
       `Latest error: ${safeRuntimeDiagnosticText(message) || "Details withheld."}`,
       `App version: ${app.getVersion()}`,
       `System: ${process.platform} ${os.release()} (${process.arch})`,
@@ -10793,6 +10806,7 @@ app.whenReady().then(async () => {
         } catch (error) {
           const rawMessage =
             error instanceof Error ? error.message : String(error);
+          const timedOut = /timed out/i.test(rawMessage);
           const safeMessage =
             safeRuntimeDiagnosticText(rawMessage) ||
             "Offline search model preload failed.";
@@ -10810,8 +10824,8 @@ app.whenReady().then(async () => {
             attempt: attempts,
             message: safeMessage,
           });
-          if (attempts >= 3)
-            createSemanticPreloadDiagnosticReport(attempts, rawMessage);
+          if (timedOut || attempts >= 3)
+            createSemanticPreloadDiagnosticReport(attempts, rawMessage, timedOut);
           throw error;
         }
       },

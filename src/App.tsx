@@ -5564,7 +5564,12 @@ function App() {
     const filtered = contentFiles.filter((file) => {
       if (!pathIsVisibleForSelectedSources(file.path, enabledSourcePaths, allSourcePaths)) return false;
       if (file.isDirectory)
-        return !exploded && peopleFilter === "all" && locationFilter === "all";
+        return (
+          !searchQuery.trim() &&
+          !exploded &&
+          peopleFilter === "all" &&
+          locationFilter === "all"
+        );
       if (
         !matchesMetadataFilters(
           sortIndicators[file.path],
@@ -6794,18 +6799,20 @@ function App() {
                     );
                   })()}
               </div>
-              <button
-                className={`btn explode-button header-tool-explode ${exploded ? "active" : ""}`}
-                onClick={() => changeExploded(!exploded)}
-                title={
-                  audioOnlySelected
-                    ? "Flatten audio into a single list"
-                    : "Flatten every nested file into one view"
-                }
-                data-help="Temporarily flatten nested folders into one list view; it does not move files."
-              >
-                <FiZap /> {exploded ? "Exploded" : "Explode"}
-              </button>
+              {!searchQuery.trim() && (
+                <button
+                  className={`btn explode-button header-tool-explode ${exploded ? "active" : ""}`}
+                  onClick={() => changeExploded(!exploded)}
+                  title={
+                    audioOnlySelected
+                      ? "Flatten audio into a single list"
+                      : "Flatten every nested file into one view"
+                  }
+                  data-help="Temporarily flatten nested folders into one list view; it does not move files."
+                >
+                  <FiZap /> {exploded ? "Exploded" : "Explode"}
+                </button>
+              )}
             </div>
           ) : appSection === "people" ? (
             <div className="face-header-progress">
@@ -8509,13 +8516,13 @@ function App() {
                 <>
                   <div className="source-toggle-row">
                     <button
-                      disabled={sources.some((source) => source.ejectableVolume?.ejecting)}
+                      type="button"
                       onClick={() => setEverySource(true)}
                     >
                       Select all
                     </button>
                     <button
-                      disabled={sources.some((source) => source.ejectableVolume?.ejecting)}
+                      type="button"
                       onClick={() => setEverySource(false)}
                     >
                       Select none
@@ -8546,31 +8553,41 @@ function App() {
                       title={source.message || source.detail}
                     >
                       <button
+                        type="button"
                         className={`source-enable-toggle ${source.enabled ? "active" : ""}`}
-                        disabled={sources.some((item) => item.ejectableVolume?.ejecting)}
+                        disabled={Boolean(
+                          source.ejectableVolume?.ejecting ||
+                          (source.ejectableVolume && ejectingDeviceIds.has(source.ejectableVolume.wholeDeviceIdentifier))
+                        )}
                         aria-pressed={source.enabled}
                         onClick={() => toggleSource(source.id, !source.enabled)}
                         title={
-                          source.enabled ? "Exclude source" : "Include source"
+                          source.enabled
+                            ? `Exclude ${source.label}`
+                            : `Include ${source.label}`
                         }
-                        aria-label={source.enabled ? "Exclude source" : "Include source"}
+                        aria-label={source.enabled
+                          ? `Exclude ${source.label}`
+                          : `Include ${source.label}`}
                       >
-                        <FiCheck />
+                        <span className="source-enable-mark" aria-hidden="true">
+                          <FiCheck />
+                        </span>
+                        <span className={`volume-badge ${source.kind}`}>
+                          {sourceKindLabels[source.kind]}
+                        </span>
+                        <span className="volume-name">
+                          {source.label}
+                          {source.lastClonedAt && (
+                            <small
+                              className="volume-clone-status"
+                              title={`Last verified clone: ${new Date(source.lastClonedAt).toLocaleString()}${source.lastCloneDestination ? ` · ${source.lastCloneDestination}` : ""}`}
+                            >
+                              <FiCopy aria-hidden="true" /> Cloned {new Date(source.lastClonedAt).toLocaleString()}
+                            </small>
+                          )}
+                        </span>
                       </button>
-                      <span className={`volume-badge ${source.kind}`}>
-                        {sourceKindLabels[source.kind]}
-                      </span>
-                      <span className="volume-name">
-                        {source.label}
-                        {source.lastClonedAt && (
-                          <small
-                            className="volume-clone-status"
-                            title={`Last verified clone: ${new Date(source.lastClonedAt).toLocaleString()}${source.lastCloneDestination ? ` · ${source.lastCloneDestination}` : ""}`}
-                          >
-                            <FiCopy aria-hidden="true" /> Cloned {new Date(source.lastClonedAt).toLocaleString()}
-                          </small>
-                        )}
-                      </span>
                       {source.ejectableVolume?.volumeUUID && (
                         <button
                           className="source-eject-button"

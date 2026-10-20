@@ -21,6 +21,7 @@ import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
 const SLOW_EMBEDDING_REQUEST_WARNING_MS = 90_000;
+const SEMANTIC_PRELOAD_TIMEOUT_MS = 5 * 60_000;
 
 class UnreadableImageError extends Error {
   constructor() {
@@ -361,6 +362,7 @@ export class SemanticIndexer {
     {
       type: "preload" | "text" | "image";
       timer: NodeJS.Timeout | null;
+      timeoutTimer: NodeJS.Timeout | null;
       resolve: (values: number[]) => void;
       reject: (error: Error) => void;
     }
@@ -3423,6 +3425,7 @@ export class SemanticIndexer {
       if (!request) return;
       this.embeddingRequests.delete(message.id);
       if (request.timer) clearTimeout(request.timer);
+      if (request.timeoutTimer) clearTimeout(request.timeoutTimer);
       if (typeof message.error === "string") {
         const diagnosticMessage = sanitizeWorkerDiagnosticText(
           message.error,
@@ -3546,6 +3549,7 @@ export class SemanticIndexer {
     this.clipRuntimePromise = null;
     for (const request of this.embeddingRequests.values()) {
       if (request.timer) clearTimeout(request.timer);
+      if (request.timeoutTimer) clearTimeout(request.timeoutTimer);
       request.reject(error);
     }
     this.embeddingRequests.clear();
@@ -3577,7 +3581,30 @@ export class SemanticIndexer {
           thresholdMs: SLOW_EMBEDDING_REQUEST_WARNING_MS,
         });
       }, SLOW_EMBEDDING_REQUEST_WARNING_MS);
-      this.embeddingRequests.set(id, { type, timer, resolve, reject });
+      const timeoutTimer =
+        type === "preload"
+          ? setTimeout(() => {
+              if (
+                this.embeddingWorker !== worker ||
+                !this.embeddingRequests.has(id)
+              )
+                return;
+              this.onDiagnostic("semantic-worker-request-timeout", {
+                requestType: type,
+                pendingCount: this.embeddingRequests.size,
+                timeoutMs: SEMANTIC_PRELOAD_TIMEOUT_MS,
+              });
+              // A preload that never answers can otherwise keep startup search
+              // readiness pending forever. Kill this worker and let recovery retry.
+              this.failEmbeddingWorker(
+                worker,
+                new EmbeddingProcessError(
+                  `Offline semantic model preload timed out after ${Math.round(SEMANTIC_PRELOAD_TIMEOUT_MS / 60000)} minutes.`,
+                ),
+              );
+            }, SEMANTIC_PRELOAD_TIMEOUT_MS)
+          : null;
+      this.embeddingRequests.set(id, { type, timer, timeoutTimer, resolve, reject });
       try {
         worker.send({ id, type, ...payload }, (error) => {
           if (error && worker.connected)
