@@ -10736,10 +10736,11 @@ app.whenReady().then(async () => {
     },
     {
       id: "audio",
-      // Audio inventory is a throttled disk walk that should run alongside
-      // long photo-indexing work. Sharing the background lane let search hold
-      // this recovery stage indefinitely, leaving Memories with no music index.
+      // Audio discovery starts independently of semantic indexing, including
+      // on startup, and uses a throttled disk walk that yields to interactive work.
       lane: "disk",
+      needsInitialCheck: true,
+      checkOnStartup: true,
       progress: () => ({
         status: audioInventoryRunning ? "scanning" : "idle",
         message: "Source-aware retry coverage",
@@ -10756,8 +10757,6 @@ app.whenReady().then(async () => {
       ready: () =>
         indexStorageAvailable &&
         startupIndexReconciliationSettled &&
-        // The one-worker audio walk is throttled and yields during interactive
-        // searches. Do not hold music discovery until long-running photo work ends.
         !audioInventoryRunning,
       start: async () => {
         const requestId = pendingAudioRefreshRequestId;
@@ -12376,6 +12375,12 @@ async function refreshAudioInventory(requestId: number, force = false) {
       return needsScan && (cached.sourceCooldownUntil?.[source.id] ?? 0) <= now;
     });
     if (!pending) {
+      runtimeLog("audio-inventory-cache-reused", {
+        files: cached.files.length,
+        cachedSources: cached.sourceIds.length,
+        availableSources: sources.length,
+        failedSources: cached.failedSources?.length ?? 0,
+      });
       // Existing cards may have been generated while the library was empty. A
       // fresh cached inventory still needs to backfill their soundtrack IDs.
       runtimeLog("memory-audio-inventory-cache-hit", {

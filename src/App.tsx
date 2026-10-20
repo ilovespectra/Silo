@@ -6445,24 +6445,21 @@ function App() {
               <FiSmartphone aria-hidden="true" />
               <span>Mobile</span>
             </button>
-          </nav>
-          <nav className="primary-nav-utilities" aria-label="Support and settings">
             <button
               type="button"
               className={appSection === "stats" ? "active" : ""}
               aria-current={appSection === "stats" ? "page" : undefined}
-              onClick={() => {
-                setShowSettings(false);
-                setAppSection("stats");
-              }}
-              title="Library Statistics"
-              aria-label="Library Statistics"
-              data-tour="stats-tab"
-              data-help="Review library inventory totals, source coverage, backup health, and live indexing progress."
+              onClick={() => setAppSection("stats")}
+              title="Stats"
+              aria-label="Stats"
+              data-tour="library-statistics"
+              data-help="Review library inventory, source coverage, indexing, and backup health."
             >
               <FiBarChart2 aria-hidden="true" />
               <span>Stats</span>
             </button>
+          </nav>
+          <nav className="primary-nav-utilities" aria-label="Support and settings">
             <button
               type="button"
               className={showSettings ? "active" : ""}
@@ -6472,7 +6469,7 @@ function App() {
               aria-haspopup="dialog"
               aria-expanded={showSettings}
               data-tour="settings-button"
-              data-help="Open appearance, content protection, memory storage, configuration backup, bug reporting, and Library Statistics."
+              data-help="Open appearance, content protection, memory storage, configuration backup, and bug reporting."
             >
               <FiSettings aria-hidden="true" />
               <span>Settings</span>
