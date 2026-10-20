@@ -245,6 +245,7 @@ function evaluate(source) {
 for (const name of [
   "memoryFileMetadata", "memoryObviousNonPhotoPath", "memoryAllowed", "memoryContentAllowed", "memorySearchImageEligible", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
   "memoryTopCounts", "memoryPersonalRejectionSummary", "memoryErrorDetails",
+  "safeRuntimeDiagnosticText", "safeRuntimeDiagnosticStack", "memoryAudioErrorDetails",
   "memoryDot", "memoryImageContentFactor", "memoryImageIsObviousNonPhoto", "filterMemoryPhotos", "normalizeMemoryName", "memoryNameMatches", "memoryPathInRoots", "memoryPromptContext", "applyMemoryPromptContext", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
   "promptedVideoPhotoCandidate", "searchPromptedMemoryMedia", "memoryVideoMatchesForPhotos", "memoryMusicDirectories",
   "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
@@ -349,7 +350,7 @@ async function run() {
     }
   });
 
-  await test("memory source roots keep offline local indexes and ready added sources", async () => {
+  await test("memory source roots ignore offline indexes and include ready added sources", async () => {
     const originalFullAccess = context.__fullAccess;
     try {
       context.__fullAccess = true;
@@ -359,14 +360,14 @@ async function run() {
         { id: "phone", rootPath: "/__phone__/ios/ready", available: true, enabled: true },
         { id: "disconnected-phone", rootPath: "/__phone__/ios/gone", available: false, enabled: true },
       ]);
-      assert.deepEqual(plain(roots), ["/offline-drive/Photos", "/added/Camera", "/__phone__/ios/ready"]);
+      assert.deepEqual(plain(roots), ["/added/Camera", "/__phone__/ios/ready"]);
       context.__fullAccess = false;
       const selectedRoots = await context.getIndexableRootsFromSources([
         { id: "/offline-drive/Photos", rootPath: "/offline-drive/Photos", available: false, enabled: false },
         { id: "/added/Camera", rootPath: "/added/Camera", available: true, enabled: true },
         { id: "/locked", rootPath: "/locked", available: true, enabled: true, demoLocked: true },
       ]);
-      assert.deepEqual(plain(selectedRoots), ["/offline-drive/Photos", "/added/Camera"],
+      assert.deepEqual(plain(selectedRoots), ["/added/Camera"],
         "Memories includes all configured roots regardless of source selection state");
     } finally {
       context.__fullAccess = originalFullAccess;
@@ -1192,7 +1193,7 @@ async function run() {
       assert.throws(() => update(null, bad), /Invalid memory settings/);
     for (const name of ["dismiss-memory", "get-memory-soundtracks"]) {
       const fn = handler(name);
-      for (const bad of [undefined, 1, "", "x".repeat(201)]) assert.throws(() => fn(null, bad), /Invalid memory/);
+      for (const bad of [undefined, 1, "", "x".repeat(201)]) await assert.rejects(fn(null, bad), /Invalid memory/);
       assert.equal(await fn(null, "s1"), "s1");
     }
   });

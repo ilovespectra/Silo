@@ -8378,7 +8378,9 @@ function createStartupSplashWindow() {
       frame: false,
       transparent: true,
       backgroundColor: "#00000000",
-      hasShadow: true,
+      // The native shadow outlines the full transparent window on macOS.
+      // Keep the card's CSS shadow instead, which follows the rounded card.
+      hasShadow: false,
       show: false,
       title: "Silo is starting",
       icon: appIconPath(),
@@ -12342,6 +12344,14 @@ async function refreshAudioInventory(requestId: number, force = false) {
     configuredSourceIds.push(source.id);
     if (source.available) sources.push(source);
   }
+  // Music sources need to be indexed before large photo/library roots. A
+  // cancelled scan must not leave Memory soundtracks empty just because a
+  // massive unrelated source was first in the configured source list.
+  const hasDirectMusicFolder = (source: (typeof sources)[number]) => {
+    const segments = source.rootPath.replace(/\\/g, "/").replace(/\/+$/, "").split("/");
+    return segments.some((segment) => /^music$/i.test(segment)) || /\bmusic\b/i.test(source.label);
+  };
+  sources.sort((first, second) => Number(hasDirectMusicFolder(second)) - Number(hasDirectMusicFolder(first)));
   const forceRecoveredSourceScan = recoveredAudioSources.size > 0;
   const inventoryStartedAt = Date.now();
   const initialSnapshot = audioLibraryCache.getSnapshot();
