@@ -720,7 +720,11 @@ const fileListKey = (file: { path: string; relativePath?: string; siloAlias?: bo
 const MAX_THUMBNAIL_SIZE = 500;
 
 function App() {
-  const electronAPI = window.electron;
+  // Electron exposes a contextBridge proxy whose identity can change between reads.
+  // Keep one bridge reference so effects that subscribe to IPC do not tear down and
+  // re-register on every render (which can replay events and create update loops).
+  const electronAPIRef = useRef(window.electron);
+  const electronAPI = electronAPIRef.current;
   const searchFeedbackApiReady =
     typeof electronAPI?.updateSearchFeedback === "function";
   const appRootRef = useRef<HTMLDivElement | null>(null);
@@ -7034,8 +7038,7 @@ function App() {
             </span>
             {accessIdentity?.isDev && (
               <span className="permission-hint">
-                In development the entry may still be listed as “Electron”. Run{" "}
-                <code>npm run brand-dev</code> to rename it.
+                In development, grant access to the Silo app shown by “Reveal App”, then restart Silo.
               </span>
             )}
           </div>
@@ -7295,11 +7298,6 @@ function App() {
               )}
             </div>
           </div>
-          {needsRecursiveBrowse && loading && (
-            <div className="filter-inventory-status" role="status" aria-live="polite">
-              Scanning photos as they are found · {(fileScanProgress?.scanned ?? 0).toLocaleString()} files discovered
-            </div>
-          )}
           <div className="filter-section">
             <h3>Year</h3>
             <select

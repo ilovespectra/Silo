@@ -10,6 +10,7 @@ const fs = require("fs");
 const path = require("path");
 
 const APP_NAME = "Silo";
+const APP_BUNDLE_IDENTIFIER = "com.solosilo.app.dev";
 const PLIST_BUDDY = "/usr/libexec/PlistBuddy";
 
 const appPath = path.join(
@@ -48,12 +49,15 @@ function resign() {
     execFileSync("codesign", ["--force", "--deep", "--sign", "-", appPath], {
       stdio: "pipe",
     });
-    console.log("Re-signed the bundle.");
+    console.log("Re-signed the Silo development bundle.");
+    return true;
   } catch (error) {
-    console.warn(
-      "Could not re-sign the bundle. If Electron refuses to launch, run:\n" +
-        `  codesign --force --deep --sign - "${appPath}"`,
+    console.error(
+      "Could not re-sign the Silo development bundle. Refusing to launch it with an ambiguous app identity.",
     );
+    if (error && typeof error === "object" && "stderr" in error && error.stderr)
+      console.error(String(error.stderr));
+    return false;
   }
 }
 
@@ -64,8 +68,8 @@ if (restoring) {
   }
   fs.copyFileSync(backupPath, plistPath);
   fs.unlinkSync(backupPath);
-  resign();
-  console.log('Restored the development bundle to "Electron".');
+  if (!resign()) process.exit(1);
+  console.log('Restored the original Electron development bundle.');
   console.log("Remove the old entry from Full Disk Access and re-add it.");
   process.exit(0);
 }
@@ -83,8 +87,10 @@ function readPlistValue(key) {
 }
 
 // The launcher calls this on every start; nothing changes (or re-signs) when already branded.
-if (!restoring && readPlistValue("CFBundleName") === APP_NAME && readPlistValue("CFBundleIconFile") === "silo.icns"
-  && fs.existsSync(iconTarget)) {
+if (!restoring && readPlistValue("CFBundleName") === APP_NAME
+  && readPlistValue("CFBundleDisplayName") === APP_NAME
+  && readPlistValue("CFBundleIdentifier") === APP_BUNDLE_IDENTIFIER
+  && readPlistValue("CFBundleIconFile") === "silo.icns" && fs.existsSync(iconTarget)) {
   if (!quiet) console.log(`Development bundle is already named "${APP_NAME}".`);
   process.exit(0);
 }
@@ -95,18 +101,19 @@ if (!fs.existsSync(backupPath)) {
 
 setPlistValue("CFBundleName", APP_NAME);
 setPlistValue("CFBundleDisplayName", APP_NAME);
+setPlistValue("CFBundleIdentifier", APP_BUNDLE_IDENTIFIER);
 if (fs.existsSync(iconSource)) {
   fs.copyFileSync(iconSource, iconTarget);
   setPlistValue("CFBundleIconFile", "silo.icns");
 }
-resign();
+if (!resign()) process.exit(1);
 
-console.log(`Development bundle is now named "${APP_NAME}".`);
+console.log(`Development bundle is now named "${APP_NAME}" (${APP_BUNDLE_IDENTIFIER}).`);
 console.log("\nNext steps:");
-console.log("  1. Quit any running Electron instance.");
+console.log("  1. Quit any running Silo development instance.");
 console.log(
   "  2. Open System Settings > Privacy & Security > Full Disk Access.",
 );
-console.log(`  3. Remove any stale "Electron" entry, then add "${APP_NAME}".`);
+console.log(`  3. Select "${APP_NAME}" in Full Disk Access. Remove an obsolete dev entry if one remains.`);
 console.log(`     Bundle: ${appPath}`);
 console.log("  4. Start the app again with npm run dev.");

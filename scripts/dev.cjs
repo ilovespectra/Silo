@@ -129,12 +129,17 @@ async function stopGroup(child, label) {
 
 async function main() {
   await stopPreviousRun();
-  log("Compiling the Electron main process…");
+  log("Compiling the Silo main process…");
   const compiled = spawnSync(path.join(root, "node_modules/.bin/tsc"), [], { cwd: root, stdio: "inherit" });
   if (compiled.status !== 0) process.exit(compiled.status || 1);
   // macOS shows the dev bundle's name and icon in the Dock and menu bar ("Silo", not "Electron").
-  if (process.platform === "darwin")
-    spawnSync(process.execPath, [path.join(__dirname, "brand-dev-app.js"), "--quiet"], { cwd: root, stdio: "inherit" });
+  if (process.platform === "darwin") {
+    const branded = spawnSync(process.execPath, [path.join(__dirname, "brand-dev-app.js"), "--quiet"], { cwd: root, stdio: "inherit" });
+    if (branded.error || branded.status !== 0) {
+      log("Could not apply the Silo development app identity; stopping before launch.");
+      process.exit(branded.status || 1);
+    }
+  }
 
   let electron = null;
   let shuttingDown = false;

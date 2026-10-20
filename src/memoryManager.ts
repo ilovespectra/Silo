@@ -211,7 +211,6 @@ function customTopicMood(topic: string): MemoryMood {
   return "gentle";
 }
 
-<<<<<<< HEAD
 /** Songs only: no voice memos, ringtones, podcasts or temporary export audio. */
 export function isMemoryMusicTrack(file: MemoryAudioFile): boolean {
   if (!MUSIC_EXTENSION.test(file.path) || NOT_MUSIC.test(file.path)
@@ -219,12 +218,6 @@ export function isMemoryMusicTrack(file: MemoryAudioFile): boolean {
   // Short/low-bitrate songs are valid too; classify by format and known
   // effects/voice-memo paths instead of imposing an arbitrary size threshold.
   return true;
-=======
-/** Songs only: no voice memos, ringtones, podcasts or tiny sound effects. */
-export function isMemoryMusicTrack(file: MemoryAudioFile): boolean {
-  if (!MUSIC_EXTENSION.test(file.path) || NOT_MUSIC.test(file.path)) return false;
-  return !Number.isFinite(file.size) || ((file.size as number) >= 1.5 * 1024 * 1024 && (file.size as number) <= 60 * 1024 * 1024);
->>>>>>> origin/codex/help-messages-spotlight
 }
 
 function storyWords(card: Pick<MemorySuggestion, "title" | "query" | "description" | "media">): string[] {
