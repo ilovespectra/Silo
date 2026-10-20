@@ -203,5 +203,8 @@
       "argparse": "^2.0.1"
     },
     "underscore": "^1.13.8"
+  },
+  "optionalDependencies": {
+    "@img/sharp-win32-x64": "^0.35.5"
   }
 }
