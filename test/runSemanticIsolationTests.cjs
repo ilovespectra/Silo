@@ -107,7 +107,7 @@ function makeIndexer(
     fakeTimers
       ? {
           setTimeout: (callback, ms) => {
-            assert.ok(ms === 90_000 || ms === 250);
+            assert.ok(ms === 90_000 || ms === 5 * 60_000 || ms === 250);
             const timer = { callback, cleared: false, ms };
             timers.push(timer);
             return timer;
@@ -359,7 +359,8 @@ test("90-second slow-request warning preserves the pending request and worker", 
     fakeTimers: true,
   });
   const runtime = await indexer.loadClipRuntime();
-  assert.ok(timers[0].cleared);
+  assert.equal(timers.length, 2);
+  assert.ok(timers.every((timer) => timer.cleared));
   const pending = indexer.requestWorkerEmbedding(
     "text",
     { text: "hold" },
@@ -369,7 +370,9 @@ test("90-second slow-request warning preserves the pending request and worker", 
     (values) => ({ values }),
     (error) => ({ error }),
   );
-  timers[1].callback();
+  const warning = timers.find((timer) => timer.ms === 90_000 && !timer.cleared);
+  assert.ok(warning);
+  warning.callback();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(indexer.embeddingRequests.size, 1);
   assert.equal(children[0].exitCode, null);
@@ -386,6 +389,29 @@ test("90-second slow-request warning preserves the pending request and worker", 
   assert.equal(result.values.length, 512);
   assert.equal(indexer.embeddingRequests.size, 0);
   assert.ok(timers.every((timer) => timer.cleared));
+});
+
+test("five-minute preload timeout retires an unresponsive worker and allows retry", async (t) => {
+  const { indexer, children, timers, diagnostics } = makeIndexer(t, { fakeTimers: true });
+  const runtime = await indexer.loadClipRuntime();
+  const pending = indexer.requestWorkerEmbedding(
+    "preload",
+    { text: "hold" },
+    runtime.child,
+  );
+  const rejected = assert.rejects(pending, /preload timed out after 5 minutes/);
+  const timeout = timers.find((timer) => timer.ms === 5 * 60_000 && !timer.cleared);
+  assert.ok(timeout);
+  const exited = once(children[0], "exit");
+  timeout.callback();
+  await rejected;
+  await exited;
+  assert.equal(indexer.embeddingRequests.size, 0);
+  assert.ok(timers.every((timer) => timer.cleared));
+  assert.ok(diagnostics.some((entry) => entry.event === "semantic-worker-request-timeout"));
+  const recovered = await indexer.loadClipRuntime();
+  assert.equal(children.length, 2);
+  assert.equal((await indexer.embedText("retry", recovered)).length, 512);
 });
 
 test("malformed vectors retire the child instead of corrupting the index", async (t) => {
