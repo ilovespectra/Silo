@@ -6412,18 +6412,31 @@ function App() {
               <FiSmartphone aria-hidden="true" />
               <span>Mobile</span>
             </button>
+            <button
+              type="button"
+              className={appSection === "stats" ? "active" : ""}
+              aria-current={appSection === "stats" ? "page" : undefined}
+              onClick={() => setAppSection("stats")}
+              title="Stats"
+              aria-label="Stats"
+              data-tour="library-statistics"
+              data-help="Review library inventory, source coverage, indexing, and backup health."
+            >
+              <FiBarChart2 aria-hidden="true" />
+              <span>Stats</span>
+            </button>
           </nav>
           <nav className="primary-nav-utilities" aria-label="Support and settings">
             <button
               type="button"
-              className={showSettings || appSection === "stats" ? "active" : ""}
+              className={showSettings ? "active" : ""}
               onClick={() => setShowSettings(true)}
               title="Settings"
               aria-label="Settings"
               aria-haspopup="dialog"
               aria-expanded={showSettings}
               data-tour="settings-button"
-              data-help="Open appearance, content protection, memory storage, configuration backup, bug reporting, and Library Statistics."
+              data-help="Open appearance, content protection, memory storage, configuration backup, and bug reporting."
             >
               <FiSettings aria-hidden="true" />
               <span>Settings</span>
@@ -9684,10 +9697,6 @@ function App() {
             setSettingsTourTarget(null);
           }}
           onOpenBugReport={() => setShowBugReport(true)}
-          onOpenStatistics={() => {
-            setAppSection("stats");
-            setShowSettings(false);
-          }}
           hideSettingsForScreenshot={selectingBugReportScreenshot}
           lifetimePromptRequest={lifetimePromptRequest}
           onLifetimePromptHandled={acknowledgeLifetimePrompt}

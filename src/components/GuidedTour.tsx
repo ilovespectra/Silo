@@ -27,7 +27,7 @@ const ALL_GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "sections",
     title: "Find your way around Silo",
-    body: "These tabs open Memories for story videos, Files for sources and search, People for face clusters, Map for geotagged photos, Duplicates for review, and Mobile for device copies and messages. Settings covers membership access, trusted-network sharing, content protection, storage destinations, appearance, configuration backup, and Library Statistics. Help searches this built-in guide and lets you replay the tour.",
+    body: "These tabs open Memories for story videos, Files for sources and search, People for face clusters, Map for geotagged photos, Duplicates for review, Mobile for device copies and messages, and Stats for library inventory and indexing. Settings covers membership access, trusted-network sharing, content protection, storage destinations, appearance, and configuration backup. Help searches this built-in guide and lets you replay the tour.",
     target: '[data-tour="app-tabs"]',
     section: "files",
   },
@@ -304,9 +304,9 @@ const ALL_GUIDED_TOUR_STEPS: GuidedTourStep[] = [
   {
     id: "statistics",
     title: "Check library statistics",
-    body: "Open Settings and choose Library statistics in the sidebar to access the full dashboard. It summarizes inventory, source coverage, indexing, and backup health so you can confirm what Silo can currently see and which work is still in progress.",
+    body: "Open Stats in the main sidebar to access the full dashboard. It summarizes inventory, source coverage, indexing, and backup health so you can confirm what Silo can currently see and which work is still in progress.",
     target: '[data-tour="library-statistics"]',
-    section: "settings",
+    section: "stats",
   },
   {
     id: "fallout-shelter",

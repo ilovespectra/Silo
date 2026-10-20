@@ -10493,7 +10493,11 @@ app.whenReady().then(async () => {
     },
     {
       id: "audio",
-      lane: "background",
+      // Keep music discovery independent from long-running semantic indexing.
+      // The scanner has its own pause and cooldown handling for source disks.
+      lane: "disk",
+      needsInitialCheck: true,
+      checkOnStartup: true,
       progress: () => ({
         status: audioInventoryRunning ? "scanning" : "idle",
         message: "Source-aware retry coverage",
@@ -10501,9 +10505,6 @@ app.whenReady().then(async () => {
       ready: () =>
         indexStorageAvailable &&
         startupIndexReconciliationSettled &&
-        // Audio discovery must remain available when search has retryable errors
-        // or the user paused search; it does not depend on embeddings.
-        analysisIdle() &&
         !audioInventoryRunning,
       start: async () => {
         const requestId = pendingAudioRefreshRequestId;
@@ -11970,6 +11971,12 @@ async function refreshAudioInventory(requestId: number, force = false) {
       return needsScan && (cached.sourceCooldownUntil?.[source.id] ?? 0) <= now;
     });
     if (!pending) {
+      runtimeLog("audio-inventory-cache-reused", {
+        files: cached.files.length,
+        cachedSources: cached.sourceIds.length,
+        availableSources: sources.length,
+        failedSources: cached.failedSources?.length ?? 0,
+      });
       // Existing cards may have been generated while the library was empty. A
       // fresh cached inventory still needs to backfill their soundtrack IDs.
       await refreshMemorySoundtracksAfterAudioIndexing();
