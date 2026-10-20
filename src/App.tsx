@@ -8384,6 +8384,8 @@ function App() {
           state={duplicateState}
           onStateChange={setDuplicateState}
           tourView={tourDuplicateView}
+          thumbnailSize={thumbnailSize}
+          onThumbnailSizeChange={setThumbnailSize}
         />
       ) : appSection === "mobile" ? (
         <main className="mobile-page" data-retained-scroll="mobile" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">

@@ -21,6 +21,11 @@ export interface MemoryAudioFile {
   sourceId?: string;
   /** Path relative to its source root, used for folder browsing. */
   relativePath?: string;
+  memoryMetadataVersion?: number;
+  durationSeconds?: number;
+  genres?: string[];
+  mood?: string;
+  spokenWord?: boolean;
 }
 
 /** Main supplies ready, safety-filtered, all-source search and the cached audio index.
@@ -38,6 +43,8 @@ export interface MemoryManagerDependencies {
   filterImages?(paths: string[]): Promise<string[]>;
   thumb(path: string): string | null | undefined | Promise<string | null | undefined>;
   listAudio(): MemoryAudioFile[] | Promise<MemoryAudioFile[]>;
+  /** Parses only bounded Memory soundtracks and persists tags in the audio index. */
+  enrichAudioMetadata?(files: MemoryAudioFile[]): Promise<MemoryAudioFile[]>;
   isAllowed(path: string, media?: MemoryMedia): boolean | Promise<boolean>;
   /** Audio files must use audio availability checks, never the visual photo-safety classifier. */
   isAudioAvailable?(file: MemoryAudioFile): boolean | Promise<boolean>;
@@ -218,9 +225,43 @@ function customTopicMood(topic: string): MemoryMood {
 export function isMemoryMusicTrack(file: MemoryAudioFile): boolean {
   if (!MUSIC_EXTENSION.test(file.path) || NOT_MUSIC.test(file.path)
     || /(?:^|[\\/])(?:silo-)?\.?memory-export-[^\\/]*(?:[\\/]|$)/i.test(file.path)) return false;
+  if (typeof file.durationSeconds === "number" && file.durationSeconds > 15 * 60) return false;
+  const labels = [...(file.genres ?? []), file.mood ?? ""].join(" ");
+  if (file.spokenWord === true || /\b(?:podcast|spoken\s+word|audiobook|audio\s+book|talk\s+radio|voice\s+memo|speech)\b/i.test(labels))
+    return false;
   // Short/low-bitrate songs are valid too; classify by format and known
   // effects/voice-memo paths instead of imposing an arbitrary size threshold.
   return true;
+}
+
+function memoryMoodMetadataScore(file: MemoryAudioFile, mood: MemoryMood): number {
+  const moodText = (file.mood ?? "").toLocaleLowerCase();
+  const genreText = (file.genres ?? []).join(" ").toLocaleLowerCase();
+  const words = new Set(`${moodText} ${genreText}`.split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+  const hasAny = (values: string[]) => values.some((value) => words.has(value));
+  const positive: Record<MemoryMood, string[]> = {
+    gentle: ["gentle", "calm", "peaceful", "soothing", "mellow", "soft", "ambient", "acoustic", "piano", "folk", "classical"],
+    bright: ["happy", "cheerful", "joyful", "upbeat", "optimistic", "bright", "sunny", "pop"],
+    energetic: ["energetic", "lively", "driving", "dance", "intense", "electronic", "rock", "upbeat"],
+    dramatic: ["dramatic", "cinematic", "epic", "orchestral", "tense", "powerful", "soundtrack"],
+  };
+  const negative: Record<MemoryMood, string[]> = {
+    gentle: ["aggressive", "angry", "hostile", "violent", "abrasive", "screamo", "metalcore", "deathcore", "grindcore", "hardcore", "thrash", "metal"],
+    bright: ["sad", "gloomy", "dark", "somber", "melancholy", "depressing"],
+    energetic: ["sleepy", "sleep", "meditation", "lullaby", "ambient"],
+    dramatic: ["cheerful", "playful", "comedy", "novelty"],
+  };
+  let score = hasAny(positive[mood]) ? 6 : 0;
+  if (moodText && hasAny(negative[mood])) score -= 10;
+  if (mood === "gentle" && hasAny(["screamo", "metalcore", "deathcore", "grindcore", "hardcore", "thrash", "metal"]))
+    score -= 40;
+  return score;
+}
+
+function memoryMoodCompatible(file: MemoryAudioFile, mood: MemoryMood): boolean {
+  if (mood !== "gentle") return true;
+  const labels = [...(file.genres ?? []), file.mood ?? ""].join(" ");
+  return !/\b(?:screamo|metalcore|deathcore|grindcore|hardcore|thrash|metal|aggressive|angry|hostile|violent)\b/i.test(labels);
 }
 
 function storyWords(card: Pick<MemorySuggestion, "title" | "query" | "description" | "media">): string[] {
@@ -1220,18 +1261,31 @@ export class MemoryManager {
       for (const word of words) if (entry.haystack.includes(word)) score += 3;
       for (const word of moods) if (entry.haystack.includes(word)) score += 1;
       if (usedArtists.has(entry.artist)) score -= 4;
-      if (ranked.length < 24 || score > ranked[ranked.length - 1].score) {
-        ranked.push({ file: entry.file, artist: entry.artist, score });
-        ranked.sort((a, b) => b.score - a.score);
-        if (ranked.length > 24) ranked.pop();
-      }
+      ranked.push({ file: entry.file, artist: entry.artist, score });
     }
-    for (const { file, artist } of ranked) {
-      const id = audioId(file.path);
-      if (usedTracks.has(id) || !await this.audioAvailable(file)) continue;
-      usedTracks.add(id);
-      usedArtists.add(artist);
-      return id;
+    ranked.sort((first, second) => second.score - first.score);
+    // Keep the old top-24 filename/random shortlist. Only parse another batch
+    // when every track in the previous batch was too long, spoken word, or gone.
+    for (let start = 0; start < ranked.length; start += 24) {
+      let batch = ranked.slice(start, start + 24);
+      if (this.deps.enrichAudioMetadata) {
+        try {
+          const enriched = await this.deps.enrichAudioMetadata(batch.map((item) => item.file));
+          const byPath = new Map(enriched.map((file) => [file.path, file]));
+          batch = batch.map((item) => ({ ...item, file: byPath.get(item.file.path) ?? item.file }));
+        } catch { /* Metadata is a ranking hint; preserve ordinary selection if parsing fails. */ }
+      }
+      const moodRanked = batch
+        .filter(({ file }) => isMemoryMusicTrack(file))
+        .map((item) => ({ ...item, score: item.score + memoryMoodMetadataScore(item.file, card.mood) }))
+        .sort((first, second) => second.score - first.score);
+      for (const { file, artist } of moodRanked) {
+        const id = audioId(file.path);
+        if (usedTracks.has(id) || !await this.audioAvailable(file)) continue;
+        usedTracks.add(id);
+        usedArtists.add(artist);
+        return id;
+      }
     }
     return undefined;
   }
@@ -1362,10 +1416,21 @@ export class MemoryManager {
       top.sort((a, b) => b.score - a.score);
       if (top.length > 24) top.pop();
     }
+    if (this.deps.enrichAudioMetadata && top.length) {
+      try {
+        const enriched = await this.deps.enrichAudioMetadata(top.map(({ file }) => file));
+        const byPath = new Map(enriched.map((file) => [file.path, file]));
+        for (const entry of top) entry.file = byPath.get(entry.file.path) ?? entry.file;
+      } catch { /* Keep the filename based choices if optional tag reads fail. */ }
+    }
+    top.sort((first, second) =>
+      (second.score + memoryMoodMetadataScore(second.file, card.mood)) -
+      (first.score + memoryMoodMetadataScore(first.file, card.mood)));
     const picked = card.soundtrackId ? await this.resolveSoundtrack(card.soundtrackId, card.id) : undefined;
     if (picked) result.push(picked);
     for (const { file } of top) {
       if (result.length >= 13) break;
+      if (!isMemoryMusicTrack(file) || !memoryMoodCompatible(file, card.mood)) continue;
       const trackId = audioId(file.path);
       if (trackId === picked?.id || !await this.audioAvailable(file)) continue;
       result.push({ id: trackId, name: file.name, path: file.path, source: "library",
@@ -1393,7 +1458,8 @@ export class MemoryManager {
       return card ? this.original(card) : undefined;
     }
     if (!/^library:[a-f0-9]{64}$/.test(soundtrackId)) return undefined;
-    if (suggestionId !== undefined && !await this.getSuggestion(suggestionId)) return undefined;
+    const suggestion = suggestionId === undefined ? undefined : await this.getSuggestion(suggestionId);
+    if (suggestionId !== undefined && !suggestion) return undefined;
     let files: MemoryAudioFile[];
     try { files = await this.deps.listAudio(); } catch (error) {
       this.trace("memory-audio-resolve-error", {
@@ -1409,8 +1475,20 @@ export class MemoryManager {
       for (const file of files) if (file && text(file.path) && text(file.name)) ids.set(audioId(file.path), file);
       this.audioIndex = { files, ids };
     }
-    const file = this.audioIndex.ids.get(soundtrackId);
-    if (!file || !await this.audioAvailable(file)) return undefined;
+    let file = this.audioIndex.ids.get(soundtrackId);
+    if (!file) return undefined;
+    if (file.memoryMetadataVersion !== 1 && this.deps.enrichAudioMetadata) {
+      try {
+        const [enriched] = await this.deps.enrichAudioMetadata([file]);
+        if (enriched) {
+          file = enriched;
+          this.audioIndex.ids.set(soundtrackId, enriched);
+        }
+      } catch { /* Preserve legacy playback if metadata cannot be read. */ }
+    }
+    if (!isMemoryMusicTrack(file) ||
+      (suggestion && !memoryMoodCompatible(file, suggestion.mood)) ||
+      !await this.audioAvailable(file)) return undefined;
     return { id: soundtrackId, name: file.name, path: file.path, source: "library", rights: RIGHTS };
   }
 }

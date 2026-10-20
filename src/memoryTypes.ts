@@ -226,6 +226,11 @@ export interface SavedMemoryMovie {
   title: string;
   modified: number;
   size: number;
+  /** Story creation time; falls back to movie creation time for legacy saves. */
+  createdAt?: number;
+  /** Earliest and latest media capture times in this story, when available. */
+  oldestContentAt?: number;
+  newestContentAt?: number;
   /** A story retired by Generate whose movie is still being prepared; `path` is empty until it is. */
   pending?: MemorySuggestion;
 }

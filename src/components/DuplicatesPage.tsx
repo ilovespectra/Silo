@@ -48,6 +48,8 @@ interface DuplicatesPageProps {
   state: DuplicateState;
   onStateChange: (state: DuplicateState) => void;
   tourView?: "duplicates" | "trash" | null;
+  thumbnailSize: number;
+  onThumbnailSizeChange: (size: number) => void;
 }
 
 function formatBytes(bytes: number) {
@@ -114,6 +116,8 @@ export default function DuplicatesPage({
   state,
   onStateChange,
   tourView = null,
+  thumbnailSize,
+  onThumbnailSizeChange,
 }: DuplicatesPageProps) {
   const electronAPI = window.electron;
   const [selectedTrash, setSelectedTrash] = useState<Set<string>>(new Set());
@@ -138,8 +142,7 @@ export default function DuplicatesPage({
     if (tourView) setView(tourView);
   }, [tourView]);
 
-  // Thumbnail zoom and view mode
-  const [thumbnailSize, setThumbnailSize] = useState(120);
+  // Thumbnail size is shared with the rest of Silo and persisted by App.
   const [gridViewMode, setGridViewMode] = useState<"grid" | "list">("grid");
   const [listSortBy, setListSortBy] = useState<
     "name" | "size" | "date" | "count"
@@ -580,13 +583,11 @@ export default function DuplicatesPage({
                     Size:
                     <input
                       type="range"
-                      min="60"
-                      max="240"
+                      min="120"
+                      max="500"
                       step="10"
                       value={thumbnailSize}
-                      onChange={(e) =>
-                        setThumbnailSize(parseInt(e.target.value, 10))
-                      }
+                      onChange={(e) => onThumbnailSizeChange(parseInt(e.target.value, 10))}
                       style={{ width: "100px" }}
                     />
                     {thumbnailSize}px

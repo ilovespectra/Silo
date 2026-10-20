@@ -18,6 +18,22 @@ export interface CachedAudioFile {
   extension: string;
   sourceId?: string;
   sourceLabel?: string;
+  memoryMetadataVersion?: number;
+  durationSeconds?: number;
+  genres?: string[];
+  mood?: string;
+  spokenWord?: boolean;
+}
+
+export interface CachedMemoryAudioMetadata {
+  path: string;
+  size: number;
+  modified: number;
+  memoryMetadataVersion: number;
+  durationSeconds?: number;
+  genres?: string[];
+  mood?: string;
+  spokenWord?: boolean;
 }
 
 export interface AudioLibraryCacheSnapshot {
@@ -58,6 +74,8 @@ export class AudioLibraryCache {
   private scanPromise: Promise<AudioLibraryCacheSnapshot> | null = null;
   private cancelled = false;
   private sourceCooldowns = new Map<string, number>();
+  private memoryMetadata = new Map<string, CachedMemoryAudioMetadata>();
+  private persistQueue: Promise<void> = Promise.resolve();
 
   constructor(userDataPath: string) {
     this.cachePath = path.join(userDataPath, "audio-library-index.json");
@@ -89,6 +107,20 @@ export class AudioLibraryCache {
       this.sourceCooldowns = new Map(
         Object.entries(this.snapshot.sourceCooldownUntil ?? {}),
       );
+      this.memoryMetadata = new Map(
+        this.snapshot.files
+          .filter((file) => file.memoryMetadataVersion === 1)
+          .map((file) => [file.path, {
+            path: file.path,
+            size: file.size,
+            modified: file.modified,
+            memoryMetadataVersion: file.memoryMetadataVersion!,
+            durationSeconds: file.durationSeconds,
+            genres: file.genres,
+            mood: file.mood,
+            spokenWord: file.spokenWord,
+          }]),
+      );
     } catch {
       // First launch: an empty cache will be populated on the audio screen.
     }
@@ -102,6 +134,35 @@ export class AudioLibraryCache {
       extensions: [...this.snapshot.extensions],
       failedSources: [...(this.snapshot.failedSources ?? [])],
     };
+  }
+
+  async updateMemoryMetadata(updates: CachedMemoryAudioMetadata[]) {
+    if (!updates.length) return;
+    const filesByPath = new Map(this.snapshot.files.map((file) => [file.path, file]));
+    let changed = false;
+    for (const update of updates) {
+      const current = filesByPath.get(update.path);
+      if (!current || current.isDirectory || current.size !== update.size || current.modified !== update.modified)
+        continue;
+      this.memoryMetadata.set(update.path, update);
+      changed = true;
+    }
+    if (!changed) return;
+    this.snapshot = {
+      ...this.snapshot,
+      files: this.snapshot.files.map((file) => this.withMemoryMetadata(file)),
+    };
+    await this.persistSnapshot();
+  }
+
+  private withMemoryMetadata(file: CachedAudioFile): CachedAudioFile {
+    const metadata = this.memoryMetadata.get(file.path);
+    if (!metadata) return file;
+    if (metadata.size !== file.size || metadata.modified !== file.modified) {
+      this.memoryMetadata.delete(file.path);
+      return file;
+    }
+    return { ...file, ...metadata };
   }
 
   cancelScan() {
@@ -201,7 +262,9 @@ export class AudioLibraryCache {
     for (const id of this.sourceCooldowns.keys())
       if (!retainedSourceIdSet.has(id)) this.sourceCooldowns.delete(id);
     const snapshotFiles = () => {
-      const files = Array.from(next.values()).sort(
+      const files = Array.from(next.values())
+        .map((file) => this.withMemoryMetadata(file))
+        .sort(
         (first, second) =>
           (second.modified || 0) - (first.modified || 0) ||
           first.path.localeCompare(second.path),
@@ -413,13 +476,13 @@ export class AudioLibraryCache {
                 !file.isDirectory &&
                 (file.type === "audio" || isAudio(file.name))
               ) {
-                const audioFile: CachedAudioFile = {
+                const audioFile: CachedAudioFile = this.withMemoryMetadata({
                   ...file,
                   type: "audio",
                   extension: path.extname(file.name).toLowerCase(),
                   sourceId: source.id,
                   sourceLabel: source.label,
-                };
+                });
                 sourceFiles.set(file.path, audioFile);
                 next.set(file.path, audioFile);
                 audioFound += 1;
@@ -560,7 +623,7 @@ export class AudioLibraryCache {
                 if (stats.isDirectory()) {
                   enqueueDirectory({ directory: fullPath, relativePath });
                 } else if (stats.isFile() && isAudio(entry.name)) {
-                  const file: CachedAudioFile = {
+                  const file: CachedAudioFile = this.withMemoryMetadata({
                     name: entry.name,
                     path: fullPath,
                     relativePath,
@@ -571,7 +634,7 @@ export class AudioLibraryCache {
                     extension: path.extname(entry.name).toLowerCase(),
                     sourceId: source.id,
                     sourceLabel: source.label,
-                  };
+                  });
                   sourceFiles.set(fullPath, file);
                   next.set(fullPath, file);
                   pendingFiles.push(file);
@@ -680,7 +743,7 @@ export class AudioLibraryCache {
       }
 
       // Checkpoint each completed source; a later source failure no longer discards prior work.
-      const checkpointFiles = Array.from(next.values());
+      const checkpointFiles = Array.from(next.values()).map((file) => this.withMemoryMetadata(file));
       const checkpointExtensions = Array.from(
         new Set(
           checkpointFiles.map((file) => file.extension || "(no extension)"),
@@ -705,7 +768,9 @@ export class AudioLibraryCache {
       await this.persistSnapshot();
     }
 
-    const files = Array.from(next.values()).sort(
+    const files = Array.from(next.values())
+      .map((file) => this.withMemoryMetadata(file))
+      .sort(
       (first, second) =>
         (second.modified || 0) - (first.modified || 0) ||
         first.path.localeCompare(second.path),
@@ -733,8 +798,12 @@ export class AudioLibraryCache {
   }
 
   private async persistSnapshot() {
-    const temporary = `${this.cachePath}.tmp`;
-    await fsPromises.writeFile(temporary, JSON.stringify(this.snapshot));
-    await fsPromises.rename(temporary, this.cachePath);
+    const persist = this.persistQueue.catch(() => undefined).then(async () => {
+      const temporary = `${this.cachePath}.tmp`;
+      await fsPromises.writeFile(temporary, JSON.stringify(this.snapshot));
+      await fsPromises.rename(temporary, this.cachePath);
+    });
+    this.persistQueue = persist;
+    await persist;
   }
 }

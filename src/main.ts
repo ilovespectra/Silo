@@ -56,7 +56,7 @@ import { MessageExportCoordinator } from "./messageExportCoordinator";
 import { ContactManager } from "./contactManager";
 import { GeoIndexer, type GeoPhoto } from "./geoIndexer";
 import { ThumbnailPregenerator } from "./thumbnailPregenerator";
-import { AudioLibraryCache, CachedAudioFile } from "./audioLibraryCache";
+import { AudioLibraryCache, CachedAudioFile, CachedMemoryAudioMetadata } from "./audioLibraryCache";
 import { LibraryStatsManager } from "./libraryStats";
 import { InventoryFingerprint } from "./inventoryFingerprint";
 import { isAudioFile } from "./utils/audioTypes";
@@ -3350,13 +3350,21 @@ function memoryPromptContext(query: string, roots: string[]): MemoryPromptContex
 }
 
 function applyMemoryPromptContext(media: ScoredMemoryMedia[], context: MemoryPromptContext): ScoredMemoryMedia[] {
+  const requestedPeople = context.groups.filter((group) => group.kind === "person");
   return media.map((item) => {
     const matchedGroups = context.groups.filter((group) => group.paths.has(item.path));
+    const matchedGroupIds = new Set(matchedGroups.map((group) => group.id));
     const groupIds = Array.from(new Set([
       ...(item.memoryGroups ?? []),
       ...matchedGroups.map((group) => group.id),
     ]));
-    const cooccurrenceBoost = matchedGroups.length > 1 ? 28 + (matchedGroups.length - 2) * 12 : 0;
+    const matchedPeople = requestedPeople.filter((group) => matchedGroupIds.has(group.id)).length;
+    // A photo containing every explicitly named person must outrank single-person
+    // matches. The prior small co-occurrence bonus let semantic confidence win.
+    const allRequestedPeopleTogether = requestedPeople.length > 1 && matchedPeople === requestedPeople.length;
+    const cooccurrenceBoost = allRequestedPeopleTogether
+      ? 500 + requestedPeople.length * 25
+      : matchedGroups.length > 1 ? 28 + (matchedGroups.length - 2) * 12 : 0;
     const score = item.score + matchedGroups.length * 24 + cooccurrenceBoost;
     const folderId = item.type === "image" ? context.promptedFolderIdsByPath.get(item.path) : undefined;
     const hasNamedEntity = matchedGroups.some((group) => group.kind !== "folder");
@@ -10537,6 +10545,68 @@ app.whenReady().then(async () => {
     if (result.status === "rejected")
       runtimeLog("startup-load-error", { message: String(result.reason) });
   }
+  type MemoryAudioMetadataParser = {
+    parseFile(filePath: string, options?: { duration?: boolean }): Promise<{
+      format: { duration?: number };
+      common: { genre?: unknown; mood?: unknown; podcast?: unknown };
+    }>;
+  };
+  let metadataParserPromise: Promise<MemoryAudioMetadataParser> | null = null;
+  const getMetadataParser = () => {
+    if (!metadataParserPromise) {
+      // Preserve native ESM loading while the Electron main bundle is CommonJS.
+      const dynamicImport = new Function("specifier", "return import(specifier)") as
+        (specifier: string) => Promise<MemoryAudioMetadataParser>;
+      metadataParserPromise = dynamicImport("music-metadata").catch((error) => {
+        metadataParserPromise = null;
+        throw error;
+      });
+    }
+    return metadataParserPromise;
+  };
+  const enrichMemoryAudioMetadata = async (files: CachedAudioFile[]): Promise<CachedAudioFile[]> => {
+    const pending = files.filter((file) => file && !file.isDirectory && file.memoryMetadataVersion !== 1);
+    if (!pending.length) return files;
+    let parser: MemoryAudioMetadataParser;
+    try { parser = await getMetadataParser(); } catch { return files; }
+    const updates: CachedMemoryAudioMetadata[] = [];
+    for (let start = 0; start < pending.length; start += 4) {
+      const batch = await Promise.all(pending.slice(start, start + 4).map(async (file) => {
+        const update: CachedMemoryAudioMetadata = {
+          path: file.path,
+          size: file.size,
+          modified: file.modified,
+          memoryMetadataVersion: 1,
+        };
+        try {
+          const localPath = await resolveLocalPath(file.path);
+          const metadata = await parser.parseFile(localPath, { duration: true });
+          const duration = metadata.format?.duration;
+          if (typeof duration === "number" && Number.isFinite(duration) && duration >= 0)
+            update.durationSeconds = duration;
+          const genres = Array.isArray(metadata.common?.genre)
+            ? metadata.common.genre.filter((value): value is string => typeof value === "string")
+              .map((value) => value.trim().slice(0, 100)).filter(Boolean).slice(0, 12)
+            : [];
+          if (genres.length) update.genres = genres;
+          if (typeof metadata.common?.mood === "string") update.mood = metadata.common.mood.trim().slice(0, 120);
+          if (typeof metadata.common?.podcast === "boolean") update.spokenWord = metadata.common.podcast;
+        } catch {
+          // Cache the attempt for this file signature; a damaged/unsupported track
+          // must not be reparsed on every Memory generation.
+        }
+        return update;
+      }));
+      updates.push(...batch);
+    }
+    await audioLibraryCache?.updateMemoryMetadata(updates).catch(() => undefined);
+    const byPath = new Map(updates.map((item) => [item.path, item]));
+    return files.map((file) => {
+      const metadata = byPath.get(file.path);
+      return metadata ? { ...file, ...metadata } : file;
+    });
+  };
+
   audioLibraryCache = new AudioLibraryCache(cacheDestinationRoot("audio-library-index.json"));
   if (!indexStorageInitializationDeferred) await audioLibraryCache.initialize();
   geoIndexer.setOverrides(stateStore.getState().geoOverrides);
@@ -10611,6 +10681,7 @@ app.whenReady().then(async () => {
     filterImages: filterMemoryPhotos,
     thumb: async (filePath) => getThumbnail(await resolveLocalPath(filePath), false, 200),
     listAudio: () => audioLibraryCache?.getSnapshot().files ?? [],
+    enrichAudioMetadata: (files) => enrichMemoryAudioMetadata(files as CachedAudioFile[]),
     isAudioAvailable: async (file) => {
       if (!isAudioFile(file.name, mime.getType(file.name))) return false;
       try {
@@ -11315,6 +11386,7 @@ async function retireMemoriesToBook(before: MemorySuggestion[], after: MemorySug
   const retired = before.filter((card) => !kept.has(card.id));
   if (!retired.length) return;
   await rememberMemoryMovieTitles(retired).catch(() => undefined);
+  await rememberMemoryMovieDates(retired).catch(() => undefined);
   const unfinished: MemorySuggestion[] = [];
   for (const card of retired) if (!await findMemoryMovie(card).catch(() => null)) unfinished.push(card);
   for (const card of unfinished) memoryBookPending.set(card.id, card);
@@ -11653,6 +11725,57 @@ function registerMemoryRevealHandlers() {
 registerMemoryRevealHandlers();
 
 const MEMORY_MOVIE_TITLES_PATH = () => path.join(app.getPath("userData"), "memories", "movie-titles.json");
+const MEMORY_MOVIE_DATES_PATH = () => path.join(app.getPath("userData"), "memories", "movie-dates.json");
+
+type MemoryMovieDates = { createdAt: number; oldestContentAt: number; newestContentAt: number };
+
+async function readMemoryMovieDates(): Promise<Record<string, MemoryMovieDates>> {
+  try {
+    const raw = JSON.parse(await fsPromises.readFile(MEMORY_MOVIE_DATES_PATH(), "utf8"));
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+async function memorySuggestionContentDates(suggestion: MemorySuggestion): Promise<Pick<MemoryMovieDates, "oldestContentAt" | "newestContentAt">> {
+  const timestamps = await Promise.all(suggestion.media.map(async (media) => {
+    if (media.type === "image" && !isRemotePath(media.path)) {
+      try {
+        const localPath = await resolveLocalPath(media.path);
+        const takenAt = (await readMemoryExif(localPath))?.takenAt ?? 0;
+        if (takenAt > 0) return takenAt;
+      } catch { /* Keep the indexed media timestamp as the fallback. */ }
+    }
+    return Number.isFinite(media.modified) && media.modified > 0 ? media.modified : 0;
+  }));
+  const known = timestamps.filter((timestamp) => timestamp > 0);
+  const fallback = suggestion.createdAt > 0 ? suggestion.createdAt : Date.now();
+  return {
+    oldestContentAt: known.length ? Math.min(...known) : fallback,
+    newestContentAt: known.length ? Math.max(...known) : fallback,
+  };
+}
+
+async function rememberMemoryMovieDates(suggestions: MemorySuggestion[]): Promise<void> {
+  const dates = await readMemoryMovieDates();
+  let changed = false;
+  for (const suggestion of suggestions) {
+    const name = memoryPreviewFileName(suggestion);
+    const existing = dates[name];
+    if (existing && Number.isFinite(existing.createdAt) && Number.isFinite(existing.oldestContentAt) &&
+      Number.isFinite(existing.newestContentAt)) continue;
+    const content = await memorySuggestionContentDates(suggestion);
+    dates[name] = {
+      createdAt: Number.isFinite(suggestion.createdAt) && suggestion.createdAt > 0 ? suggestion.createdAt : Date.now(),
+      ...content,
+    };
+    changed = true;
+  }
+  if (!changed) return;
+  await fsPromises.mkdir(path.dirname(MEMORY_MOVIE_DATES_PATH()), { recursive: true });
+  await fsPromises.writeFile(MEMORY_MOVIE_DATES_PATH(), JSON.stringify(dates)).catch(() => undefined);
+}
 
 async function readMemoryMovieTitles(): Promise<Record<string, string>> {
   try {
@@ -11713,6 +11836,7 @@ ipcMain.handle("list-saved-memory-movies", async () => {
   const state = await memoryManager.getState();
   const cards = [...state.suggestions, ...await memoryManager.getReserve()];
   await rememberMemoryMovieTitles(cards).catch(() => undefined);
+  await rememberMemoryMovieDates(cards).catch(() => undefined);
   // Editable stories are shown as cards above; any render of them stays out of the book,
   // except prompted memories, which the user asked for and are saved straight away.
   const editableKeys = new Set(state.suggestions.filter((card) => !isCustomMemory(card))
@@ -11723,7 +11847,8 @@ ipcMain.handle("list-saved-memory-movies", async () => {
     return storyKey ? [[storyKey, name] as const] : [];
   }));
   const titles = await readMemoryMovieTitles();
-  const movies = new Map<string, { path: string; title: string; modified: number; size: number }>();
+  const dates = await readMemoryMovieDates();
+  const movies = new Map<string, { path: string; title: string; modified: number; size: number; createdAt: number; oldestContentAt: number; newestContentAt: number }>();
   for (const directory of await memoryMovieDirectories()) {
     const names = await fsPromises.readdir(directory).catch(() => [] as string[]);
     for (const name of names) {
@@ -11739,15 +11864,29 @@ ipcMain.handle("list-saved-memory-movies", async () => {
       const key = storyKey ? `story:${storyKey}` : `file:${name}`;
       const existing = movies.get(key);
       if (existing && existing.modified >= stat.mtimeMs) continue;
-      movies.set(key, { path: moviePath, title: titles[name] || titleFromMemoryMovieName(name), modified: stat.mtimeMs, size: stat.size });
+      const movieDates = dates[name];
+      const createdAt = movieDates?.createdAt || stat.birthtimeMs || stat.ctimeMs || stat.mtimeMs;
+      movies.set(key, {
+        path: moviePath,
+        title: titles[name] || titleFromMemoryMovieName(name),
+        modified: stat.mtimeMs,
+        size: stat.size,
+        createdAt,
+        oldestContentAt: movieDates?.oldestContentAt || createdAt,
+        newestContentAt: movieDates?.newestContentAt || createdAt,
+      });
     }
   }
   const finished = Array.from(movies.values()).sort((a, b) => b.modified - a.modified);
   const editableIds = new Set(state.suggestions.filter((card) => !isCustomMemory(card)).map((card) => card.id));
-  const pending: Array<{ path: string; title: string; modified: number; size: number; pending: MemorySuggestion }> = [];
+  const pending: Array<{ path: string; title: string; modified: number; size: number; createdAt: number; oldestContentAt: number; newestContentAt: number; pending: MemorySuggestion }> = [];
   for (const [id, card] of memoryBookPending) {
     if (editableIds.has(id) || await findMemoryMovie(card).catch(() => null)) { memoryBookPending.delete(id); continue; }
-    pending.push({ path: "", title: card.title, modified: Date.now(), size: 0, pending: card });
+    const movieDates = dates[memoryPreviewFileName(card)];
+    const content = movieDates ?? { ...(await memorySuggestionContentDates(card)), createdAt: card.createdAt };
+    pending.push({ path: "", title: card.title, modified: card.createdAt, size: 0,
+      createdAt: content.createdAt, oldestContentAt: content.oldestContentAt,
+      newestContentAt: content.newestContentAt, pending: card });
   }
   return [...pending, ...finished];
 });

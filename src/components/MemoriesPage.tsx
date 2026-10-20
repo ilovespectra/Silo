@@ -26,6 +26,8 @@ export interface MemoriesPageProps {
   onChooseMusicFolder?: () => Promise<boolean>;
 }
 
+type MemoryBookSort = "created-newest" | "created-oldest" | "content-oldest" | "content-newest";
+
 const errorMessage = (cause: unknown, fallback: string) => cause instanceof Error ? cause.message : typeof cause === "string" && cause.trim() ? cause : fallback;
 // Display-only placeholder matching the manager's `original:<suggestionId>` contract; exports always use API-listed tracks.
 const soundtrackFallback = (suggestionId: string): MemorySoundtrack => ({ id: `original:${suggestionId}`, name: "Original audio", source: "original", rights: "Uses audio from the selected clips." });
@@ -633,6 +635,13 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
   const [state, setState] = useState<MemoryState | null>(null);
   const [demoMode, setDemoMode] = useState(false);
   const [savedMovies, setSavedMovies] = useState<SavedMemoryMovie[]>([]);
+  const [memoryBookSort, setMemoryBookSort] = useState<MemoryBookSort>(() => {
+    try {
+      const saved = localStorage.getItem("silo.memoryBookSort");
+      return saved === "created-oldest" || saved === "content-oldest" || saved === "content-newest"
+        ? saved : "created-newest";
+    } catch { return "created-newest"; }
+  });
   // Cards the user just retired with Generate; shown in the Memory Book until the backend lists them.
   const [retiring, setRetiring] = useState<MemorySuggestion[]>([]);
   const [loading, setLoading] = useState(true);
@@ -667,6 +676,9 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
     return () => window.clearTimeout(timer);
   }, [toast]);
   const cardIds = state?.suggestions.map((memory) => memory.id).join("|") ?? "";
+  useEffect(() => {
+    try { localStorage.setItem("silo.memoryBookSort", memoryBookSort); } catch { /* Sorting still works for this session. */ }
+  }, [memoryBookSort]);
   const readyCount = Object.values(previews).filter((preview) => preview.status === "ready").length;
   useEffect(() => {
     if (!ready || !api.listSavedMemoryMovies) { if (action !== "Finding memories") setRetiring((current) => current.length ? [] : current); return; }
@@ -877,15 +889,54 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
       const editable = new Set(finding ? [] : (state?.suggestions ?? []).map((memory) => memory.id));
       const moving = retiring.filter((memory) => !listedPending.has(memory.id) && !editable.has(memory.id));
       const total = moving.length + savedMovies.length;
+      const memoryContentRange = (memory: MemorySuggestion) => {
+        const timestamps = memory.media.map((media) => media.modified).filter((value) => Number.isFinite(value) && value > 0);
+        return timestamps.length
+          ? { oldestContentAt: Math.min(...timestamps), newestContentAt: Math.max(...timestamps) }
+          : { oldestContentAt: memory.createdAt, newestContentAt: memory.createdAt };
+      };
+      const entries = [
+        ...moving.map((memory) => ({
+          key: `moving:${memory.id}`, memory, movie: undefined as SavedMemoryMovie | undefined,
+          createdAt: memory.createdAt, ...memoryContentRange(memory),
+        })),
+        ...savedMovies.map((movie) => {
+          const pendingMemory = movie.pending;
+          const fallbackRange = pendingMemory ? memoryContentRange(pendingMemory) : {
+            oldestContentAt: movie.createdAt ?? movie.modified,
+            newestContentAt: movie.createdAt ?? movie.modified,
+          };
+          return {
+            key: movie.pending ? `pending:${movie.pending.id}` : movie.path,
+            memory: undefined as MemorySuggestion | undefined,
+            movie,
+            createdAt: movie.createdAt ?? pendingMemory?.createdAt ?? movie.modified,
+            oldestContentAt: movie.oldestContentAt ?? fallbackRange.oldestContentAt,
+            newestContentAt: movie.newestContentAt ?? fallbackRange.newestContentAt,
+          };
+        }),
+      ];
+      const sortValue = (entry: typeof entries[number]) => memoryBookSort === "created-oldest" ? entry.createdAt
+        : memoryBookSort === "content-oldest" ? entry.oldestContentAt
+          : memoryBookSort === "content-newest" ? -entry.newestContentAt : -entry.createdAt;
+      entries.sort((first, second) => sortValue(first) - sortValue(second) ||
+        second.createdAt - first.createdAt || first.key.localeCompare(second.key));
       return <section className="memories-book" aria-label="Memory Book">
         <header className="memories-book-header"><div><h2>Memory Book</h2><span>{total} {total === 1 ? "memory" : "memories"} · saved in your memories folder</span></div>
+          <label className="memories-book-sort"><span>Sort by</span><select aria-label="Sort Memory Book" value={memoryBookSort} onChange={(event) => setMemoryBookSort(event.target.value as MemoryBookSort)}>
+            <option value="created-newest">Date created · newest first</option>
+            <option value="created-oldest">Date created · oldest first</option>
+            <option value="content-oldest">Oldest memory first</option>
+            <option value="content-newest">Newest memory first</option>
+          </select></label>
           <label className="memories-book-size"><span>Thumbnail size</span><input type="range" min={120} max={500} step={10} value={thumbnailSize} disabled={!onThumbnailSizeChange} aria-label="Memory Book thumbnail size" onChange={(event) => onThumbnailSizeChange?.(Number(event.target.value))} /><output>{thumbnailSize}px</output></label>
         </header>
         <div className="memories-grid memories-book-grid" style={{ "--memory-book-thumbnail-size": `${thumbnailSize}px` } as React.CSSProperties}>
-          {moving.map((memory) => <PendingBookCard key={`moving:${memory.id}`} api={api} memory={memory} preview={previews[memory.id]} onState={setState} onRefresh={refreshSavedMovies} />)}
-          {savedMovies.map((movie) => movie.pending
-            ? <PendingBookCard key={`pending:${movie.pending.id}`} api={api} memory={movie.pending} preview={previews[movie.pending.id]} onState={setState} onRefresh={refreshSavedMovies} />
-            : <SavedMovieCard key={movie.path} api={api} movie={movie} onToast={setToast} onRefresh={refreshSavedMovies} />)}
+          {entries.map((entry) => entry.memory
+            ? <PendingBookCard key={entry.key} api={api} memory={entry.memory} preview={previews[entry.memory.id]} onState={setState} onRefresh={refreshSavedMovies} />
+            : entry.movie?.pending
+              ? <PendingBookCard key={entry.key} api={api} memory={entry.movie.pending} preview={previews[entry.movie.pending.id]} onState={setState} onRefresh={refreshSavedMovies} />
+              : entry.movie && <SavedMovieCard key={entry.key} api={api} movie={entry.movie} onToast={setToast} onRefresh={refreshSavedMovies} />)}
         </div>
       </section>;
     })()}
