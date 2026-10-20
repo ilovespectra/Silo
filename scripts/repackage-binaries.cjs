@@ -14,20 +14,52 @@ const workflow = 'windows-exe.yml';
 const branch = 'main';
 const product = packageJson.build.productName;
 
+function expectedReleaseFiles(version) {
+  return [
+    `${product}-${version}-x64.dmg`,
+    `${product}-${version}-x64.zip`,
+    `${product}-${version}-arm64.dmg`,
+    `${product}-${version}-arm64.zip`,
+    `${product}-${version}-x64-Setup.exe`,
+    'latest-mac.yml',
+  ];
+}
+
+function hasCompleteReleaseBundle(folder, version) {
+  if (!folder || !fs.existsSync(folder)) return false;
+  const candidates = [folder, path.join(folder, version)];
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+    const complete = expectedReleaseFiles(version).every((fileName) => {
+      const filePath = path.join(candidate, fileName);
+      return fs.existsSync(filePath) && fs.statSync(filePath).size > 0;
+    });
+    if (complete) return true;
+  }
+  return false;
+}
+
 function findLatestVersionInFolder(folder) {
   if (!folder || !fs.existsSync(folder)) return null;
 
   let latest = null;
   for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
-    const match = entry.isFile()
-      ? /Silo-([0-9]+\.[0-9]+(?:\.[0-9]+)?)/.exec(entry.name)
-      : entry.isDirectory() && fs.existsSync(path.join(folder, entry.name, `${product}-${entry.name}-arm64.dmg`))
-        ? /^([0-9]+\.[0-9]+\.[0-9]+)$/.exec(entry.name)
-        : null;
+    if (entry.isFile()) {
+      const match = /Silo-([0-9]+\.[0-9]+(?:\.[0-9]+)?)/.exec(entry.name);
+      if (!match) continue;
+      const candidateVersion = match[1];
+      if (!latest || compareVersions(candidateVersion, latest) > 0) {
+        latest = candidateVersion;
+      }
+      continue;
+    }
+    if (!entry.isDirectory()) continue;
+    const match = /^([0-9]+\.[0-9]+\.[0-9]+)$/.exec(entry.name);
     if (!match) continue;
-    const candidate = match[1];
-    if (!latest || compareVersions(candidate, latest) > 0) {
-      latest = candidate;
+    const candidateVersion = match[1];
+    if (!hasCompleteReleaseBundle(path.join(folder, candidateVersion), candidateVersion)) continue;
+    if (!latest || compareVersions(candidateVersion, latest) > 0) {
+      latest = candidateVersion;
     }
   }
   return latest;
@@ -69,8 +101,7 @@ function resolveReleaseVersion() {
   const existingFolders = [...new Set(
     [explicitDestination, defaultDestinationFor(current)].filter(Boolean),
   )];
-  const alreadyPackaged = existingFolders.some((folder) =>
-    fs.existsSync(path.join(folder, `${product}-${current}-arm64.dmg`)));
+  const alreadyPackaged = existingFolders.some((folder) => hasCompleteReleaseBundle(folder, current));
   const remoteIsNewerOrSame = remoteVersion && compareVersions(remoteVersion, current) >= 0;
   if (!alreadyPackaged && !remoteIsNewerOrSame) return latestKnownVersion;
 
@@ -134,7 +165,9 @@ function assertCleanReleaseInputs() {
   if (capture('git', ['branch', '--show-current']) !== branch) {
     throw new Error(`Switch to ${branch} before packaging.`);
   }
-  const workingTree = spawnSync('git', ['diff', '--quiet', 'HEAD', '--'], {
+  // Local packaging repairs do not change the application compiled by Windows CI.
+  const applicationPaths = ['--', '.', ':!scripts/dist-mac.cjs', ':!scripts/repackage-binaries.cjs'];
+  const workingTree = spawnSync('git', ['diff', '--quiet', 'HEAD', ...applicationPaths], {
     cwd: projectRoot,
   });
   if (workingTree.error) throw workingTree.error;
@@ -144,7 +177,7 @@ function assertCleanReleaseInputs() {
   if (workingTree.status !== 0) {
     throw new Error('Could not inspect tracked working-tree changes.');
   }
-  const stagedTree = spawnSync('git', ['diff', '--cached', '--quiet'], {
+  const stagedTree = spawnSync('git', ['diff', '--cached', '--quiet', ...applicationPaths], {
     cwd: projectRoot,
   });
   if (stagedTree.error) throw stagedTree.error;

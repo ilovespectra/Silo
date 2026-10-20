@@ -69,8 +69,27 @@ function withTemporaryFfmpegBinary(originalPath, stagedPath, build) {
 // an Apple silicon build host has no Intel NumKong addon unless it is staged here.
 const nativeOptionalPackages = (arch) => [
   { name: `@numkong/darwin-${arch}`, binary: "numkong.node" },
-  { name: `@img/sharp-darwin-${arch}`, binary: `lib/sharp-darwin-${arch}.node` },
+  { name: `@img/sharp-darwin-${arch}`, binary: `lib/sharp-darwin-${arch}.node`, pattern: `sharp-darwin-${arch}` },
 ];
+
+function resolveNativeBinaryPath(packageDirectory, binary, pattern = null) {
+  const directPath = path.join(packageDirectory, binary);
+  if (fs.existsSync(directPath)) return directPath;
+
+  const filePattern = pattern || binary.replace(/\.[^/.]+$/, "");
+  const baseDir = path.dirname(directPath);
+  if (!fs.existsSync(baseDir)) return directPath;
+
+  const matches = fs.readdirSync(baseDir)
+    .filter((entry) => entry.endsWith(".node") && entry.startsWith(filePattern))
+    .sort((left, right) => left.length - right.length);
+
+  if (matches.length) {
+    return path.join(baseDir, matches[0]);
+  }
+
+  return directPath;
+}
 
 function lockedPackage(name) {
   const lock = JSON.parse(fs.readFileSync(path.join(projectRoot, "package-lock.json"), "utf8"));
@@ -82,15 +101,16 @@ function lockedPackage(name) {
 }
 
 function ensureNativeOptionalPackages(arch) {
-  for (const { name, binary } of nativeOptionalPackages(arch)) {
+  for (const { name, binary, pattern } of nativeOptionalPackages(arch)) {
     const packageDirectory = path.join(projectRoot, "node_modules", ...name.split("/"));
-    const binaryPath = path.join(packageDirectory, binary);
+    const binaryPath = resolveNativeBinaryPath(packageDirectory, binary, pattern);
     const locked = lockedPackage(name);
     const installedVersion = fs.existsSync(path.join(packageDirectory, "package.json"))
       ? JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")).version
       : null;
     if (installedVersion === locked.version && fs.existsSync(binaryPath)) {
-      assertMachOArchitecture(fs.readFileSync(binaryPath), arch, name);
+      const extractedBinaryPath = resolveNativeBinaryPath(packageDirectory, binary, pattern);
+      assertMachOArchitecture(fs.readFileSync(extractedBinaryPath), arch, name);
       continue;
     }
     const downloadDirectory = fs.mkdtempSync(path.join(projectRoot, "node_modules", ".silo-native-"));
@@ -117,8 +137,8 @@ function ensureNativeOptionalPackages(arch) {
 
 function assertPackagedNativeAddons(appPath, arch) {
   const unpacked = path.join(appPath, "Contents", "Resources", "app.asar.unpacked", "node_modules");
-  for (const { name, binary } of nativeOptionalPackages(arch)) {
-    const binaryPath = path.join(unpacked, ...name.split("/"), binary);
+  for (const { name, binary, pattern } of nativeOptionalPackages(arch)) {
+    const binaryPath = resolveNativeBinaryPath(path.join(unpacked, ...name.split("/")), binary, pattern);
     if (!fs.existsSync(binaryPath)) {
       throw new Error(`Packaged app is missing ${name}; ${arch} search indexing would fail.`);
     }
@@ -275,6 +295,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  resolveNativeBinaryPath,
   assertMachOArchitecture,
   assertPackagedMacApp,
   readMachOArchitectures,
