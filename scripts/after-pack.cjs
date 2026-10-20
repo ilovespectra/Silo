@@ -25,10 +25,12 @@ function ensureWindowsSharpRuntime(context) {
     '@img',
     'sharp-win32-x64',
   );
+  const sharpPackage = JSON.parse(fs.readFileSync(path.join(sourceDirectory, 'package.json'), 'utf8'));
+  const sharpVersions = JSON.parse(fs.readFileSync(path.join(sourceDirectory, 'versions.json'), 'utf8'));
   const requiredFiles = [
-    'lib/sharp-win32-x64.node',
+    `lib/sharp-win32-x64-${sharpPackage.version}.node`,
     'lib/libvips-42.dll',
-    'lib/libvips-cpp-8.17.3.dll',
+    `lib/libvips-cpp-${sharpVersions.vips}.dll`,
   ];
 
   for (const relativePath of requiredFiles) {

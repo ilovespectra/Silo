@@ -9,16 +9,18 @@ assert.ok(fs.statSync(resources).isDirectory(), "The packaged resources director
 
 const unpackedModules = path.join(resources, "app.asar.unpacked", "node_modules");
 const sharpPackage = path.join(unpackedModules, "sharp");
-const sharpRuntime = path.join(
-  unpackedModules,
-  "@img",
-  "sharp-win32-x64",
-  "lib",
+const sharpPackageDirectory = path.join(unpackedModules, "@img", "sharp-win32-x64");
+const sharpPackageMetadata = JSON.parse(
+  fs.readFileSync(path.join(sharpPackageDirectory, "package.json"), "utf8"),
 );
+const sharpVersions = JSON.parse(
+  fs.readFileSync(path.join(sharpPackageDirectory, "versions.json"), "utf8"),
+);
+const sharpRuntime = path.join(sharpPackageDirectory, "lib");
 for (const file of [
-  path.join(sharpRuntime, "sharp-win32-x64.node"),
+  path.join(sharpRuntime, `sharp-win32-x64-${sharpPackageMetadata.version}.node`),
   path.join(sharpRuntime, "libvips-42.dll"),
-  path.join(sharpRuntime, "libvips-cpp-8.17.3.dll"),
+  path.join(sharpRuntime, `libvips-cpp-${sharpVersions.vips}.dll`),
 ]) {
   assert.ok(fs.statSync(file).size > 0, `Packaged Sharp runtime file exists: ${path.basename(file)}`);
 }

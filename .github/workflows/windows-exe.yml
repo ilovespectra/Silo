@@ -103,7 +103,12 @@ jobs:
         shell: pwsh
         run: |
           $hook = Join-Path $env:RUNNER_TEMP 'silo-installer-progress.nsh'
-          @'
+          $sharpRuntimePackage = 'node_modules/@img/sharp-win32-x64'
+          $sharpPackageMetadata = Get-Content (Join-Path $sharpRuntimePackage 'package.json') -Raw | ConvertFrom-Json
+          $sharpVersions = Get-Content (Join-Path $sharpRuntimePackage 'versions.json') -Raw | ConvertFrom-Json
+          $sharpNativeFile = "sharp-win32-x64-$($sharpPackageMetadata.version).node"
+          $libvipsCppFile = "libvips-cpp-$($sharpVersions.vips).dll"
+          $hookContent = @'
           !macro customInstall
             SetDetailsView show
             SetDetailsPrint both
@@ -163,7 +168,7 @@ jobs:
               MessageBox MB_ICONSTOP "Silo's bundled FFmpeg is missing. Setup will stop rather than install broken Memories export."
               Abort
             ${EndIf}
-            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\@img\sharp-win32-x64\lib\sharp-win32-x64.node"
+            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\@img\sharp-win32-x64\lib\__SHARP_NATIVE_FILE__"
               MessageBox MB_ICONSTOP "Silo's Windows image runtime is missing. Setup will stop rather than install broken image processing."
               Abort
             ${EndIf}
@@ -171,19 +176,23 @@ jobs:
               MessageBox MB_ICONSTOP "Silo's Windows image library is missing. Setup will stop rather than install broken image processing."
               Abort
             ${EndIf}
-            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\@img\sharp-win32-x64\lib\libvips-cpp-8.17.3.dll"
+            ${IfNot} ${FileExists} "$INSTDIR\resources\app.asar.unpacked\node_modules\@img\sharp-win32-x64\lib\__LIBVIPS_CPP_FILE__"
               MessageBox MB_ICONSTOP "Silo's Windows image library is incomplete. Setup will stop rather than install broken image processing."
               Abort
             ${EndIf}
             DetailPrint "Silo's core offline features are in place; your library stays on this PC."
             SetDetailsPrint none
           !macroend
-          '@ | Set-Content -Path $hook -Encoding Ascii
+          '@
+          $hookContent = $hookContent.Replace('__SHARP_NATIVE_FILE__', $sharpNativeFile)
+          $hookContent = $hookContent.Replace('__LIBVIPS_CPP_FILE__', $libvipsCppFile)
+          $hookContent | Set-Content -Path $hook -Encoding Ascii
           $env:SILO_NSIS_INCLUDE = $hook
           npx electron-builder --config config/packaging/electron-builder.windows.config.cjs --win nsis --x64 --publish never
 
           $appExe = 'release/win-unpacked/Silo.exe'
           $resources = 'release/win-unpacked/resources'
+          $sharpRuntimeResource = "$resources/app.asar.unpacked/node_modules/@img/sharp-win32-x64/lib"
           $required = @(
             $appExe,
             "$resources/google.env",
@@ -200,9 +209,9 @@ jobs:
             "$resources/face-wasm/tfjs-backend-wasm-simd.wasm",
             "$resources/face-wasm/tfjs-backend-wasm-threaded-simd.wasm",
             "$resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe",
-            "$resources/app.asar.unpacked/node_modules/@img/sharp-win32-x64/lib/sharp-win32-x64.node",
+            "$sharpRuntimeResource/$sharpNativeFile",
             "$resources/app.asar.unpacked/node_modules/@img/sharp-win32-x64/lib/libvips-42.dll",
-            "$resources/app.asar.unpacked/node_modules/@img/sharp-win32-x64/lib/libvips-cpp-8.17.3.dll",
+            "$sharpRuntimeResource/$libvipsCppFile",
             "$resources/app.asar.unpacked/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm",
             "$resources/app.asar.unpacked/node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs"
           )
