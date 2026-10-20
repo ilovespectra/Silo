@@ -39,9 +39,11 @@
     } else if (startup.ready && search.status === "error") {
       message = "Search needs attention · opening Silo…";
       phase = "Opening with search diagnostics available";
+      percentage = 96;
     } else if (startup.ready && search.status === "unavailable") {
       message = search.message || "Search storage is unavailable · opening Silo…";
       phase = "Opening with search unavailable";
+      percentage = 96;
     }
 
     statusNode.textContent = message;

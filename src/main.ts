@@ -16348,11 +16348,15 @@ ipcMain.handle("submit-bug-report", async (event, input: unknown) => {
       timeoutMs: 15000,
       timeoutMessage: "The report relay request timed out.",
     });
-    if (!response.ok)
+    if (!response.ok) {
+      const relayReason = [response.payload.error, response.payload.message]
+        .find((value): value is string => typeof value === "string" && Boolean(value.trim()));
+      const safeRelayReason = safeRuntimeDiagnosticText(relayReason);
       return {
         ok: false,
-        error: `The report relay returned HTTP ${response.statusCode}.`,
+        error: `The report relay returned HTTP ${response.statusCode}${safeRelayReason ? `: ${safeRelayReason}` : "."}`,
       };
+    }
 
     const devConsoleEndpoint = process.env.SILO_DEV_CONSOLE_BUG_REPORT_ENDPOINT?.trim() || defaultDevConsoleBugReportEndpoint;
     try {

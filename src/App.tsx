@@ -2442,8 +2442,11 @@ function App() {
         setCurrentPath(pathToLoad);
         setNavigationHistory([{ type: "path", value: pathToLoad }]);
         setHistoryIndex(0);
-        await loadDirectory(pathToLoad, nextExploded);
+        // Show the app shell once the saved state and source list are restored.
+        // A slow or unavailable directory scan must not keep the startup window
+        // in front of cache recovery and source controls.
         if (!cancelled) setHydrated(true);
+        await loadDirectory(pathToLoad, nextExploded);
       })
       .catch((error) => {
         if (cancelled) return;

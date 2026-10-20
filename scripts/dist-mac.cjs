@@ -70,6 +70,7 @@ function withTemporaryFfmpegBinary(originalPath, stagedPath, build) {
 const nativeOptionalPackages = (arch) => [
   { name: `@numkong/darwin-${arch}`, binary: "numkong.node" },
   { name: `@img/sharp-darwin-${arch}`, binary: `lib/sharp-darwin-${arch}.node`, pattern: `sharp-darwin-${arch}` },
+  { name: `@img/sharp-libvips-darwin-${arch}`, binaryExport: "./binary" },
 ];
 
 function resolveNativeBinaryPath(packageDirectory, binary, pattern = null) {
@@ -100,15 +101,40 @@ function lockedPackage(name) {
   return entry;
 }
 
+function resolveNativePackageBinaryPath(packageDirectory, nativePackage) {
+  let binary = nativePackage.binary;
+  if (nativePackage.binaryExport) {
+    const packageJsonPath = path.join(packageDirectory, "package.json");
+    if (!fs.existsSync(packageJsonPath)) return null;
+    const packageManifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+    binary = packageManifest.exports?.[nativePackage.binaryExport];
+  }
+  if (typeof binary !== "string") return null;
+  const packageRelativeBinary = binary.startsWith("./") ? binary.slice(2) : binary;
+  const packageRoot = path.resolve(packageDirectory);
+  const binaryPath = path.resolve(packageRoot, packageRelativeBinary);
+  const relativePath = path.relative(packageRoot, binaryPath);
+  if (relativePath.startsWith(`..${path.sep}`) || relativePath === ".." || path.isAbsolute(relativePath)) {
+    throw new Error(`${nativePackage.name} exports a binary outside its package.`);
+  }
+  if (fs.existsSync(binaryPath) || !nativePackage.pattern) return binaryPath;
+  return resolveNativeBinaryPath(
+    packageRoot,
+    packageRelativeBinary,
+    nativePackage.pattern,
+  );
+}
+
 function ensureNativeOptionalPackages(arch) {
-  for (const { name, binary, pattern } of nativeOptionalPackages(arch)) {
+  for (const nativePackage of nativeOptionalPackages(arch)) {
+    const { name } = nativePackage;
     const packageDirectory = path.join(projectRoot, "node_modules", ...name.split("/"));
-    const binaryPath = resolveNativeBinaryPath(packageDirectory, binary, pattern);
+    const binaryPath = resolveNativePackageBinaryPath(packageDirectory, nativePackage);
     const locked = lockedPackage(name);
     const installedVersion = fs.existsSync(path.join(packageDirectory, "package.json"))
       ? JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")).version
       : null;
-    if (installedVersion === locked.version && fs.existsSync(binaryPath)) {
+    if (installedVersion === locked.version && binaryPath && fs.existsSync(binaryPath)) {
       assertMachOArchitecture(fs.readFileSync(binaryPath), arch, name);
       continue;
     }
@@ -130,16 +156,21 @@ function ensureNativeOptionalPackages(arch) {
     } finally {
       fs.rmSync(downloadDirectory, { recursive: true, force: true });
     }
-    const extractedBinaryPath = resolveNativeBinaryPath(packageDirectory, binary, pattern);
+    const extractedBinaryPath = resolveNativePackageBinaryPath(packageDirectory, nativePackage);
+    if (!extractedBinaryPath || !fs.existsSync(extractedBinaryPath)) {
+      throw new Error(`Staged ${name} is missing its exported native binary.`);
+    }
     assertMachOArchitecture(fs.readFileSync(extractedBinaryPath), arch, name);
   }
 }
 
 function assertPackagedNativeAddons(appPath, arch) {
   const unpacked = path.join(appPath, "Contents", "Resources", "app.asar.unpacked", "node_modules");
-  for (const { name, binary, pattern } of nativeOptionalPackages(arch)) {
-    const binaryPath = resolveNativeBinaryPath(path.join(unpacked, ...name.split("/")), binary, pattern);
-    if (!fs.existsSync(binaryPath)) {
+  for (const nativePackage of nativeOptionalPackages(arch)) {
+    const { name } = nativePackage;
+    const packageDirectory = path.join(unpacked, ...name.split("/"));
+    const binaryPath = resolveNativePackageBinaryPath(packageDirectory, nativePackage);
+    if (!binaryPath || !fs.existsSync(binaryPath)) {
       throw new Error(`Packaged app is missing ${name}; ${arch} search indexing would fail.`);
     }
     assertMachOArchitecture(fs.readFileSync(binaryPath), arch, `Packaged ${name}`);
@@ -296,6 +327,7 @@ if (require.main === module) {
 
 module.exports = {
   resolveNativeBinaryPath,
+  resolveNativePackageBinaryPath,
   assertMachOArchitecture,
   assertPackagedMacApp,
   readMachOArchitectures,
