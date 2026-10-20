@@ -109,8 +109,7 @@ function ensureNativeOptionalPackages(arch) {
       ? JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")).version
       : null;
     if (installedVersion === locked.version && fs.existsSync(binaryPath)) {
-      const extractedBinaryPath = resolveNativeBinaryPath(packageDirectory, binary, pattern);
-      assertMachOArchitecture(fs.readFileSync(extractedBinaryPath), arch, name);
+      assertMachOArchitecture(fs.readFileSync(binaryPath), arch, name);
       continue;
     }
     const downloadDirectory = fs.mkdtempSync(path.join(projectRoot, "node_modules", ".silo-native-"));
@@ -131,7 +130,8 @@ function ensureNativeOptionalPackages(arch) {
     } finally {
       fs.rmSync(downloadDirectory, { recursive: true, force: true });
     }
-    assertMachOArchitecture(fs.readFileSync(binaryPath), arch, name);
+    const extractedBinaryPath = resolveNativeBinaryPath(packageDirectory, binary, pattern);
+    assertMachOArchitecture(fs.readFileSync(extractedBinaryPath), arch, name);
   }
 }
 

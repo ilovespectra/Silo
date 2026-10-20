@@ -80,6 +80,7 @@ const explicitDestination = process.env.SILO_RELEASE_DEST
 const explicitVersion = process.env.SILO_RELEASE_VERSION
   ? String(process.env.SILO_RELEASE_VERSION).trim()
   : '';
+const rebuildCurrent = process.env.SILO_RELEASE_REBUILD_CURRENT === 'true';
 // With an explicit output root, each release gets its own <root>/<version> folder.
 const defaultDestinationFor = (value) => (explicitDestination
   ? path.join(explicitDestination, value)
@@ -259,6 +260,17 @@ async function repackage() {
   }
 
   assertCleanReleaseInputs();
+  if (rebuildCurrent) {
+    if (!explicitVersion || version !== packageJson.version) {
+      throw new Error('Rebuilding requires the current source package version.');
+    }
+    const releases = JSON.parse(capture('gh', [
+      'api', 'repos/ilovespectra/silo-downloads/releases', '--paginate', '--slurp',
+    ])).flat();
+    if (releases.some((release) => release.tag_name === `v${version}` && !release.draft)) {
+      throw new Error(`Version ${version} is already published. Build the next release instead.`);
+    }
+  }
   if (version !== packageJson.version) {
     if (suppliedWindowsInstaller) {
       throw new Error(`Version ${packageJson.version} is already packaged; bump package.json before supplying a Windows installer.`);
@@ -357,7 +369,7 @@ async function repackage() {
       const source = stagedFiles.get(name);
       const target = path.join(destination, name);
       // latest-mac.yml is unversioned and always describes the newest build.
-      if (fs.existsSync(target) && name !== 'latest-mac.yml') {
+      if (fs.existsSync(target) && name !== 'latest-mac.yml' && !rebuildCurrent) {
         throw new Error(`Refusing to replace an existing test artifact: ${target}`);
       }
       pendingInstalls.push(stageFile(source, target));
