@@ -8426,11 +8426,6 @@ function App() {
                             <FiCopy aria-hidden="true" /> Cloned {new Date(source.lastClonedAt).toLocaleString()}
                           </small>
                         )}
-                        {source.message && (
-                          <small className="volume-message">
-                            {source.message}
-                          </small>
-                        )}
                       </span>
                       {source.ejectableVolume?.volumeUUID && (
                         <button
