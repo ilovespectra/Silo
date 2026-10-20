@@ -1,4 +1,4 @@
-# silo — Electron App
+# Silo
 
 A local-first file browser built with Electron, React, and TypeScript. Browse drives, Time Machine backups, phones, and Google accounts from one interface — with offline semantic search, face grouping, and non-destructive "digital folders".
 
@@ -198,14 +198,9 @@ To grant it:
 
 ### Development builds
 
-In development the process that macOS sees is `node_modules/electron/dist/Electron.app`, so the permission list shows **Electron**, not silo. To fix that:
+The supported development launch commands (`npm run dev`, `npm start`, and `npm run electron-start`) brand and re-sign the macOS development bundle as **Silo** before Electron starts. Grant Full Disk Access to **Silo**, then quit and reopen the app. If an older **Electron** entry remains from a previous build, remove it and grant access to the current **Silo** entry.
 
-```bash
-npm run brand-dev     # rename the dev bundle to "silo" and re-sign it
-npm run unbrand-dev   # revert
-```
-
-Run it once after `npm install`, then grant access to the renamed entry. If you had already granted access to **Electron**, remove that entry first — the name change is a new identity as far as macOS is concerned.
+For a direct `electron .` launch outside those scripts, run `npm run brand-dev` first. `npm run unbrand-dev` restores Electron's original development bundle metadata.
 
 > macOS does not let an application add itself to Full Disk Access, nor highlight its own row in System Settings. Opening the exact pane and revealing the bundle for dragging is as far as any app can go.
 

@@ -812,6 +812,7 @@ interface SemanticSearchResult extends FileInfo {
   confidence?: number;
   _priority?: 0 | 1 | 2 | 3; // 0=user metadata, 1=name, 2=folder, 3=semantic
   _source?: string; // Human-readable source: "Named as: John", "In folder: yoshimi"
+  _entityMatches?: number; // Number of distinct saved people/place/folder tags matched by the query
 }
 
 interface SemanticSearchProgress {

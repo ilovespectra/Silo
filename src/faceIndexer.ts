@@ -62,6 +62,8 @@ interface FaceBox {
 
 interface FaceEdit {
   box?: FaceBox;
+  imagePath?: string;
+  signature?: string;
   cropPath?: string;
   descriptor?: number[];
   deleted?: boolean;
@@ -928,6 +930,10 @@ export class FaceIndexer {
     person.rejectedPhotoPaths = person.rejectedPhotoPaths.filter(
       (item) => item !== face.imagePath,
     );
+    // Assigning a face in the editor is explicit user confirmation. Persist the
+    // image as confirmed so People search and Memories consume the same decision.
+    if (!person.confirmedPhotoPaths.includes(face.imagePath))
+      person.confirmedPhotoPaths.push(face.imagePath);
     this.updateCentroid(person);
     await this.afterPersonPhotosChanged(person);
     return this.getPerson(personId);
@@ -1393,13 +1399,22 @@ export class FaceIndexer {
     this.state.faceEdits[faceId] = {
       ...this.state.faceEdits[faceId],
       deleted: true,
+      imagePath: face.imagePath,
+      signature: face.signature,
+      box: { ...face.box },
     };
     face.personIds = [];
     for (const person of this.state.people) {
+      const hadFace = person.faceIds.includes(faceId);
       person.faceIds = person.faceIds.filter((id) => id !== faceId);
       person.suggestedFaceIds = (person.suggestedFaceIds ?? []).filter(
         (id) => id !== faceId,
       );
+      if (hadFace && !person.manualPhotoPaths.includes(face.imagePath) &&
+        !person.faceIds.some((otherId) => this.faces.get(otherId)?.imagePath === face.imagePath))
+        person.confirmedPhotoPaths = person.confirmedPhotoPaths.filter(
+          (imagePath) => imagePath !== face.imagePath,
+        );
       this.updateCentroid(person);
     }
     await this.persistState();
@@ -2477,6 +2492,36 @@ export class FaceIndexer {
     return union > 0 ? intersection / union : 0;
   }
 
+  /** Match detector boxes around the same face despite modest crop/position jitter. */
+  private boxesRepresentSameFace(
+    first: FaceRecord["box"],
+    second: FaceRecord["box"],
+    minimumCoverage = 0.55,
+    centerScale = 0.45,
+  ): boolean {
+    const left = Math.max(first.x, second.x);
+    const top = Math.max(first.y, second.y);
+    const right = Math.min(first.x + first.width, second.x + second.width);
+    const bottom = Math.min(first.y + first.height, second.y + second.height);
+    const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
+    const smallerArea = Math.min(
+      first.width * first.height,
+      second.width * second.height,
+    );
+    if (smallerArea <= 0 || intersection / smallerArea < minimumCoverage)
+      return false;
+
+    const firstCenterX = first.x + first.width / 2;
+    const firstCenterY = first.y + first.height / 2;
+    const secondCenterX = second.x + second.width / 2;
+    const secondCenterY = second.y + second.height / 2;
+    const centerDistance = Math.hypot(
+      firstCenterX - secondCenterX,
+      firstCenterY - secondCenterY,
+    );
+    return centerDistance <= Math.sqrt(smallerArea) * centerScale;
+  }
+
   private summarizePerson(person: PersonCluster): PersonSummary {
     const faces = person.faceIds
       .map((id) => this.faces.get(id))
@@ -2595,8 +2640,45 @@ export class FaceIndexer {
     records: FaceRecord[],
     updatePeople = true,
   ) {
-    const nextIds = new Set(records.map((face) => face.id));
-    for (const oldFace of this.facesByImage.get(imagePath) ?? []) {
+    const existingFaces = this.facesByImage.get(imagePath) ?? [];
+    const manualRegions = [...existingFaces, ...records]
+      .filter((face) => face.manual && !this.isFaceDeleted(face))
+      .map((face) => face.box);
+    const indexedSignature = records.find((face) => !face.manual)?.signature ??
+      records[0]?.signature;
+    const dismissedRegions = Object.values(this.state.faceEdits ?? {})
+      .filter((edit) =>
+        edit.deleted &&
+        edit.imagePath === imagePath &&
+        (!edit.signature || !indexedSignature || edit.signature === indexedSignature) &&
+        edit.box,
+      )
+      .map((edit) => edit.box!);
+    const retainedRecords: FaceRecord[] = [];
+    for (const face of records) {
+      if (this.isFaceDeleted(face)) continue;
+      if (face.manual) {
+        retainedRecords.push(face);
+        continue;
+      }
+      if (dismissedRegions.some((box) =>
+        this.boxesRepresentSameFace(box, face.box, 0.5, 0.65),
+      )) continue;
+      if (manualRegions.some((box) =>
+        this.boxesRepresentSameFace(box, face.box, 0.5, 0.65),
+      )) continue;
+
+      const duplicateIndex = retainedRecords.findIndex((other) =>
+        !other.manual && this.boxesRepresentSameFace(other.box, face.box, 0.68, 0.4),
+      );
+      if (duplicateIndex < 0) {
+        retainedRecords.push(face);
+      } else if (face.score > retainedRecords[duplicateIndex].score) {
+        retainedRecords[duplicateIndex] = face;
+      }
+    }
+    const nextIds = new Set(retainedRecords.map((face) => face.id));
+    for (const oldFace of existingFaces) {
       if (nextIds.has(oldFace.id)) continue;
       this.faces.delete(oldFace.id);
       this.baseFaceBoxes.delete(oldFace.id);
@@ -2612,7 +2694,7 @@ export class FaceIndexer {
       }
     }
     this.facesByImage.set(imagePath, []);
-    for (const face of records) this.indexFace(face);
+    for (const face of retainedRecords) this.indexFace(face);
   }
 
   private isFaceDeleted(face: FaceRecord) {

@@ -8,6 +8,10 @@ export interface MemoryMedia {
   liveVideoPath?: string;
   /** Set only for a user-prompted Memory that explicitly names this live virtual folder. */
   promptedMemoryFolderId?: string;
+  /** A saved people, place, keyword, alias, or folder tag matched by this prompt. */
+  userNamed?: boolean;
+  /** Transient entity identifiers used to preserve mixed-tag coverage during selection. */
+  memoryGroups?: string[];
 }
 export interface MemorySuggestion {
   id: string;
@@ -114,17 +118,34 @@ export interface MemoryExportOptions {
   rightsAcknowledged?: boolean;
 }
 export const MEMORY_DURATION_SECONDS = 60;
-export const MEMORY_EXPORT_LIMITS = { minCount: 1, maxCount: 24, minDuration: MEMORY_DURATION_SECONDS, maxDuration: MEMORY_DURATION_SECONDS } as const;
+export const MEMORY_EXPORT_LIMITS = { minCount: 14, maxCount: 24, minDuration: MEMORY_DURATION_SECONDS, maxDuration: MEMORY_DURATION_SECONDS } as const;
 export const MEMORY_DEFAULT_SELECTION_COUNT = 20;
-/** A one-minute memory needs at least this many shots (about 4 seconds each). */
-export const MEMORY_MIN_SELECTION_COUNT = 15;
+/** Every generated memory and rendered movie must contain at least this many distinct media items. */
+export const MEMORY_MIN_SELECTION_COUNT = 14;
 
-/** Slider floor: normally 15, but always below the maximum so the slider stays adjustable. */
+/** Selection floor for the movie's total media item count, including photos and clips. */
 export function getMemorySelectionMinimum(available: number): number {
   const maximum = Math.min(MEMORY_EXPORT_LIMITS.maxCount, Math.max(0, Math.floor(available)));
-  if (maximum <= 1) return maximum;
-  if (maximum > MEMORY_MIN_SELECTION_COUNT) return MEMORY_MIN_SELECTION_COUNT;
-  return Math.max(1, Math.min(maximum - 1, Math.ceil(maximum / 2)));
+  return Math.min(MEMORY_MIN_SELECTION_COUNT, maximum);
+}
+
+/** Prefer images, then fill the requested total with distinct video clips as needed. */
+export function selectMemoryExportMedia(media: MemoryMedia[], count: number): MemoryMedia[] {
+  const target = Math.min(MEMORY_EXPORT_LIMITS.maxCount, Math.floor(count), media.length);
+  if (target < MEMORY_MIN_SELECTION_COUNT) return [];
+  const images = media.filter((item) => item.type === "image");
+  const selected: MemoryMedia[] = [];
+  const selectedPaths = new Set(selected.map((item) => item.path));
+  const add = (item: MemoryMedia) => {
+    if (selected.length >= target || selectedPaths.has(item.path)) return;
+    selected.push(item);
+    selectedPaths.add(item.path);
+  };
+  for (const item of images) add(item);
+  for (const item of media) add(item);
+  if (selected.length < target) return [];
+  return selected.sort((first, second) =>
+    first.modified - second.modified || first.path.localeCompare(second.path));
 }
 export const MEMORY_MAGIC_SCORE_THRESHOLD = 90;
 
@@ -138,7 +159,47 @@ export function selectMemoryPhotoCandidates<T extends { score: number; magicScor
     Number.isFinite(candidate.magicScore) && candidate.magicScore >= MEMORY_MAGIC_SCORE_THRESHOLD);
   const fallback = ranked.filter((candidate) => !preferred.includes(candidate));
   const target = Math.min(MEMORY_EXPORT_LIMITS.maxCount, Math.max(MEMORY_DEFAULT_SELECTION_COUNT, preferred.length));
-  return [...preferred, ...fallback].slice(0, target);
+  const ordered = [...preferred, ...fallback];
+  const groupFrequency = new Map<string, number>();
+  for (const candidate of ordered) {
+    const groups = (candidate as T & { memoryGroups?: unknown }).memoryGroups;
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups)
+      if (typeof group === "string") groupFrequency.set(group, (groupFrequency.get(group) ?? 0) + 1);
+  }
+  const selected: T[] = [];
+  const selectedPaths = new Set<string>();
+  const groupsByPath = new Map<string, Set<string>>();
+  for (const candidate of ordered) {
+    const groups = (candidate as T & { path?: unknown; memoryGroups?: unknown }).memoryGroups;
+    const filePath = (candidate as T & { path?: unknown }).path;
+    if (typeof filePath === "string" && Array.isArray(groups))
+      groupsByPath.set(filePath, new Set(groups.filter((group): group is string => typeof group === "string")));
+  }
+  const groupKeys = Array.from(groupFrequency.keys()).sort((first, second) =>
+    groupFrequency.get(first)! - groupFrequency.get(second)! || first.localeCompare(second));
+  const coveredGroups = new Set<string>();
+  for (const group of groupKeys) {
+    if (coveredGroups.has(group) || selected.length >= target) continue;
+    const candidate = ordered.find((item) => {
+      const filePath = (item as T & { path?: unknown }).path;
+      return typeof filePath === "string" && !selectedPaths.has(filePath) &&
+        (groupsByPath.get(filePath)?.has(group) ?? false);
+    });
+    if (!candidate) continue;
+    selected.push(candidate);
+    const filePath = (candidate as T & { path?: unknown }).path;
+    if (typeof filePath === "string") selectedPaths.add(filePath);
+    for (const member of groupsByPath.get(String(filePath)) ?? []) coveredGroups.add(member);
+  }
+  for (const candidate of ordered) {
+    const filePath = (candidate as T & { path?: unknown }).path;
+    if (typeof filePath === "string" && selectedPaths.has(filePath)) continue;
+    selected.push(candidate);
+    if (typeof filePath === "string") selectedPaths.add(filePath);
+    if (selected.length >= target) break;
+  }
+  return selected.slice(0, target);
 }
 
 export function getMemoryDurationBounds(_count: number): { min: number; max: number } {

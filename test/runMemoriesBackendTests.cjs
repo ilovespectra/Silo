@@ -207,6 +207,7 @@ const context = vm.createContext({
   }),
   memoryExporter: null,
   memoryExportRunning: false,
+  probeMemoryOutputAudioStream: async () => ({ probeStatus: "complete", audioStreamPresent: true }),
   memoryExportCancelRequested: false,
   memoryExportScratch: null,
   memoryPreviewQueue: Promise.resolve(),
@@ -246,7 +247,7 @@ for (const name of [
   "memoryFileMetadata", "memoryObviousNonPhotoPath", "memoryAllowed", "memoryContentAllowed", "memorySearchImageEligible", "memoryLiveVideo", "memoryThumbnailFile", "memoryVideoCandidates",
   "memoryTopCounts", "memoryPersonalRejectionSummary", "memoryErrorDetails",
   "safeRuntimeDiagnosticText", "safeRuntimeDiagnosticStack", "memoryAudioErrorDetails",
-  "memoryDot", "memoryImageContentFactor", "memoryImageIsObviousNonPhoto", "filterMemoryPhotos", "normalizeMemoryName", "memoryNameMatches", "memoryPathInRoots", "memoryPromptContext", "applyMemoryPromptContext", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
+  "memoryDot", "memoryImageContentFactor", "memoryImageIsObviousNonPhoto", "filterMemoryPhotos", "normalizeMemoryName", "memoryNameMatches", "memoryPathInRoots", "memoryPromptContext", "applyMemoryPromptContext", "preserveMemoryGroupCoverage", "namedMemoryMedia", "searchMemoryMedia", "readMemoryExif", "applyMemoryPhotoQuality",
   "promptedVideoPhotoCandidate", "searchPromptedMemoryMedia", "memoryVideoMatchesForPhotos", "memoryMusicDirectories",
   "prepareMemoryExportImage", "memoryExportOptions", "verifyMemoryExport",
   "memoryPreviewOptions", "memoryPreviewFileName", "memoryTitleStem", "memoryMovieDirectory", "findMemoryMovie", "runMemoryRender",
@@ -385,8 +386,8 @@ async function run() {
     assert.deepEqual(selected.slice(8).map((item) => item.path), candidates.slice(8, 20).map((item) => item.path));
     assert.equal(selectMemoryPhotoCandidates(candidates.map((item) => ({ ...item, magicScore: 95 }))).length, 24);
     assert.equal(selectMemoryPhotoCandidates(candidates.slice(0, 12)).length, 12, "uses available distinct photos rather than repeating them");
-    assert.equal(context.memoryPreviewOptions({ id: "full", media: Array.from({ length: 24 }, () => ({})) }).count, 20);
-    assert.equal(context.memoryPreviewOptions({ id: "short", media: Array.from({ length: 12 }, () => ({})) }).count, 12);
+    assert.equal(context.memoryPreviewOptions({ id: "full", media: Array.from({ length: 24 }, (_, index) => ({ type: "image", path: `/preview-${index}.jpg`, modified: index })) }).count, 20);
+    assert.throws(() => context.memoryPreviewOptions({ id: "short", media: Array.from({ length: 12 }, () => ({ type: "image" })) }), /fourteen media items/);
   });
 
   await test("Magic drops any photo over 85% cosine similarity and keeps distinct picks", async () => {
@@ -449,7 +450,7 @@ async function run() {
     }
     const folder = { id: "folder-smutty-art", name: "Smutty Art", filePaths: [explicit] };
     context.__folders = [folder];
-    context.__metadata = { [explicit]: { displayName: "pornographic image", keywords: ["explicit"] } };
+    context.__metadata = { [explicit]: { displayName: "pornographic image", keywords: ["restricted"] } };
     context.semanticUnsafePaths = new Set([explicit]);
     context.memoryContentSafetyCache.clear();
     context.memoryContentSafetyInFlight.clear();
@@ -943,8 +944,8 @@ async function run() {
     const second = await manager.generate(false, "beach summer holiday");
     assert.equal(second.suggestions.length, 1, "the second prompt must not add a short memory");
     assert.equal(second.suggestions[0].id, firstId, "the original prompted memory remains available");
-    assert(traces.some(({ event, details }) => event === "memory-story-thin" && details.photos === 5),
-      "the 15-photo floor should explain why only five fresh photos were not returned");
+    assert(traces.some(({ event, details }) => event === "memory-story-thin" && details.items === 5),
+      "the 14-item floor should explain why only five fresh media items were not returned");
   });
 
   await test("export options validation", () => {
@@ -952,26 +953,26 @@ async function run() {
     assert.equal(getDefaultMemoryDuration(24), 60);
     assert.equal(isMemoryDurationAllowed(1, 60), true);
     assert.equal(isMemoryDurationAllowed(24, 59), false);
-    const base = { suggestionId: "s", soundtrackId: "original:s", count: 12, duration: 60, orientation: "auto", originalAudio: 0.2 };
+    const base = { suggestionId: "s", soundtrackId: "original:s", count: 14, duration: 60, orientation: "auto", originalAudio: 0.2 };
     assert.deepEqual({ ...context.memoryExportOptions({ ...base, extra: "x" }) }, {
-      suggestionId: "s", soundtrackId: "original:s", count: 12, duration: 60,
+      suggestionId: "s", soundtrackId: "original:s", count: 14, duration: 60,
       originalAudio: 0.2, rightsAcknowledged: false,
     });
     assert.equal("orientation" in context.memoryExportOptions({ ...base, orientation: "portrait" }), false, "legacy framing inputs are discarded");
     assert.equal(context.memoryExportOptions({ ...base, rightsAcknowledged: true }).rightsAcknowledged, true);
-    for (const bad of [null, [], "x", { ...base, count: 0 }, { ...base, count: 25 }, { ...base, count: 2.5 },
+    for (const bad of [null, [], "x", { ...base, count: 0 }, { ...base, count: 25 }, { ...base, count: 13 },
       { ...base, count: "12" }, { ...base, duration: 14 }, { ...base, duration: 59 }, { ...base, duration: 61 }, { ...base, duration: NaN },
       { ...base, originalAudio: -0.1 }, { ...base, originalAudio: 1.1 }, { ...base, orientation: "square" },
       { ...base, suggestionId: "" }, { ...base, soundtrackId: 5 }, { ...base, rightsAcknowledged: "yes" },
       { ...base, suggestionId: "x".repeat(201) }])
       assert.equal(context.memoryExportOptions(bad), null, JSON.stringify(bad));
-    for (const ok of [{ ...base, count: 1, duration: 60, originalAudio: 0 }, { ...base, count: 24, duration: 60, originalAudio: 1 }])
+    for (const ok of [{ ...base, count: 14, duration: 60, originalAudio: 0 }, { ...base, count: 24, duration: 60, originalAudio: 1 }])
       assert(context.memoryExportOptions(ok));
   });
 
   const exportPhoto = path.join(library, "export", "a.jpg");
   const suggestion = { id: "s1", title: "Beach / Days!", orientation: "landscape", mood: "bright",
-    media: [{ path: exportPhoto, name: "a.jpg", type: "image", modified: 1 }] };
+    media: Array.from({ length: 14 }, (_, index) => ({ path: `/fake/export-${index}.jpg`, name: `export-${index}.jpg`, type: "image", modified: index })) };
   const library_track = { id: `library:${"a".repeat(64)}`, name: "song", path: path.join(library, "song.mp3"), source: "library", rights: "" };
   await fsp.writeFile(library_track.path, "test soundtrack");
   let soundtrack = library_track;
@@ -999,7 +1000,7 @@ async function run() {
   const exportMemory = handler("export-memory");
   const viewMemory = handler("view-memory");
   const cancel = handler("cancel-memory-export");
-  const options = { suggestionId: "s1", soundtrackId: library_track.id, count: 1, duration: 60, orientation: "auto", originalAudio: 0.2 };
+  const options = { suggestionId: "s1", soundtrackId: library_track.id, count: 14, duration: 60, orientation: "auto", originalAudio: 0.2 };
 
   await test("library soundtracks need no rights checkbox (personal use); malformed flags are still rejected", async () => {
     const before = renderCalls.length;
@@ -1100,7 +1101,7 @@ async function run() {
       renderCount++;
       assert.equal(card.id, suggestion.id);
       assert.equal(track.source, "original");
-      assert.equal(opts.count, 1);
+      assert.equal(opts.count, 14);
       assert.equal(opts.duration, 60, "every preview renders for one minute");
       assert(destination.includes(`${path.sep}memories${path.sep}previews${path.sep}`));
       onProgress({ suggestionId: card.id, phase: "rendering", completed: 1, total: 2, message: "" });

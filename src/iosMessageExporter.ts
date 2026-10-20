@@ -159,10 +159,10 @@ To export your Apple Messages, you need to install imessage-exporter:
 1. Open Terminal and run:
    brew install imessage-exporter
 
-2. Grant Full Disk Access to Electron:
+2. Grant Full Disk Access to Silo:
    - Go to System Settings > Privacy & Security > Full Disk Access
-   - Add "Electron" or "solo: silo" to the list
-   - Restart the app
+   - Add the Silo app shown by “Reveal App”
+   - Remove an obsolete Electron entry if one remains, then restart Silo
 
 3. Then you can export your messages using solo: silo
     `;

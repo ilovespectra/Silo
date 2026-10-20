@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# solo: silo 2.0 Electron - Setup Script
+# Silo - Setup Script
 # This script sets up the development environment
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT" || exit 1
 
-echo "🚀 solo: silo 2.0 Electron - Setup"
+echo "🚀 Silo - Setup"
 echo "=================================="
 
 # Check if Node.js is installed

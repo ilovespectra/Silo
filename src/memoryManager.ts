@@ -74,6 +74,9 @@ interface Theme {
   mood: MemoryMood;
 }
 
+// A useful exact search pool should not be diluted with single-word expansions.
+const CUSTOM_TOPIC_EXPANSION_PHOTO_THRESHOLD = 24;
+
 const THEMES: readonly Theme[] = [
   { title: "Beach Days", query: "sunny beach sand ocean seaside holiday", mood: "bright" },
   { title: "Sweet Treats", query: "cakes desserts ice cream sweet treats", mood: "bright" },
@@ -246,6 +249,7 @@ function mediaValue(value: unknown): MemoryMedia | undefined {
     ...(text(item.liveVideoPath) && item.type === "image" ? { liveVideoPath: item.liveVideoPath } : {}),
     ...(text(item.promptedMemoryFolderId) && item.promptedMemoryFolderId.length <= 200
       ? { promptedMemoryFolderId: item.promptedMemoryFolderId } : {}),
+    ...(item.userNamed === true ? { userNamed: true } : {}),
   };
 }
 
@@ -384,8 +388,8 @@ export class MemoryManager {
     for (const card of cards) {
       if (result.length >= max) break;
       if (this.dismissed.has(card.id)) continue;
-      const media = await this.safeMedia(card.media, MAX_CACHE_MEDIA);
-      if (this.dismissed.has(card.id) || media.filter(item => item.type === "image").length < 4) continue;
+      const media = (await this.safeMedia(card.media, MAX_CACHE_MEDIA)).slice(0, MAX_MEDIA);
+      if (this.dismissed.has(card.id) || media.length < MEMORY_MIN_SELECTION_COUNT) continue;
       const key = signature(media);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -551,7 +555,7 @@ export class MemoryManager {
     return this.generate(false);
   }
 
-  /** Turns ranked hits into one story, or null when fewer than four distinct allowed photos remain. */
+  /** Turns ranked hits into one story, or null when fewer than fourteen distinct allowed media items remain. */
   private async buildCard(
     idea: { title: string; description: string; query: string; mood: MemoryMood; key?: string },
     hits: unknown,
@@ -565,7 +569,7 @@ export class MemoryManager {
       return null;
     };
     if (!Array.isArray(hits)) return reject("search-returned-no-list");
-    const candidates: { media: MemoryMedia; score: number }[] = [];
+    const candidates: { media: MemoryMedia; score: number; groups: Set<string> }[] = [];
     const seen = new Set<string>();
     const limit = Math.min(hits.length, 200);
     let invalid = 0;
@@ -578,8 +582,12 @@ export class MemoryManager {
       if (!await this.allowed(media.path, media)) { blocked++; continue; }
       seen.add(media.path);
       // Main can optionally supply a relevance score without changing the shared contract.
-      const score = (hits[i] as MemoryMedia & { score?: number }).score;
-      candidates.push({ media, score: typeof score === "number" && Number.isFinite(score) ? score : 1 - i / limit });
+      const rawCandidate = hits[i] as MemoryMedia & { score?: number; memoryGroups?: unknown };
+      const groups = Array.isArray(rawCandidate.memoryGroups)
+        ? rawCandidate.memoryGroups.filter((group): group is string => typeof group === "string" && group.length <= 240)
+        : [];
+      const score = rawCandidate.score;
+      candidates.push({ media, groups: new Set(groups), score: typeof score === "number" && Number.isFinite(score) ? score : 1 - i / limit });
     }
     // Remove photos already used by a saved story before checking overlap. A broad search
     // result can overlap an existing story even when its fresh photos form a distinct story.
@@ -587,14 +595,37 @@ export class MemoryManager {
     const ranked = pool.filter(item => item.media.type === "image").sort((a, b) => b.score - a.score);
     const counts = { hits: hits.length, allowed: candidates.length, fresh: pool.length, images: ranked.length,
       invalid, duplicate, blocked, videos: pool.length - ranked.length };
-    if (ranked.length < 4) return reject(hits.length ? "too-few-allowed-photos" : "no-search-hits", counts);
     // Best shot of each near-identical cluster survives; unverifiable sets are skipped, not wiped.
-    const distinct = await this.distinctImages(ranked.map(item => item.media.path));
+    const distinct = ranked.length ? await this.distinctImages(ranked.map(item => item.media.path)) : new Set<string>();
     if (!distinct) return reject("duplicate-check-unavailable", counts);
     const photos = ranked.filter(item => distinct.has(item.media.path));
-    if (photos.length < 4) return reject("too-few-distinct-photos", { ...counts, distinct: photos.length });
-    const videos = diverse(pool.filter(item => item.media.type === "video"), Math.min(6, MAX_MEDIA - Math.min(photos.length, 18)));
-    const media = [...diverse(photos, MAX_MEDIA - videos.length), ...videos]
+    const availableVideos = pool.filter(item => item.media.type === "video");
+    const minimumVideos = Math.max(0, MEMORY_MIN_SELECTION_COUNT - photos.length);
+    const videos = diverse(availableVideos, Math.min(MAX_MEDIA, Math.max(6, minimumVideos)));
+    const photoLimit = MAX_MEDIA - videos.length;
+    const rankedPhotos = photos.slice().sort((first, second) => second.score - first.score);
+    const groupFrequency = new Map<string, number>();
+    for (const candidate of rankedPhotos)
+      for (const group of candidate.groups) groupFrequency.set(group, (groupFrequency.get(group) ?? 0) + 1);
+    const groupKeys = Array.from(groupFrequency.keys()).sort((first, second) =>
+      groupFrequency.get(first)! - groupFrequency.get(second)! || first.localeCompare(second));
+    const selectedForCoverage: typeof rankedPhotos = [];
+    const selectedPaths = new Set<string>();
+    const coveredGroups = new Set<string>();
+    for (const group of groupKeys) {
+      if (coveredGroups.has(group) || selectedForCoverage.length >= photoLimit) continue;
+      const candidate = rankedPhotos.find((item) => !selectedPaths.has(item.media.path) && item.groups.has(group));
+      if (!candidate) continue;
+      selectedForCoverage.push(candidate);
+      selectedPaths.add(candidate.media.path);
+      for (const member of candidate.groups) coveredGroups.add(member);
+    }
+    const remainingPhotos = rankedPhotos.filter((item) => !selectedPaths.has(item.media.path));
+    const selectedPhotos = [
+      ...selectedForCoverage.map((item) => item.media),
+      ...diverse(remainingPhotos, Math.max(0, photoLimit - selectedForCoverage.length)),
+    ];
+    const media = [...selectedPhotos, ...videos]
       .sort((a, b) => a.modified - b.modified || a.path.localeCompare(b.path));
     if (signatures.has(signature(media))) return reject("same-photos-as-existing-story", counts);
     if (materiallyOverlapsStory(media, existingStories))
@@ -628,7 +659,9 @@ export class MemoryManager {
     }
     const safe = await this.safeMedia(media, MAX_MEDIA);
     const safeImages = safe.filter(item => item.type === "image").length;
-    if (safeImages < 4) return reject("too-few-safe-photos", { ...counts, distinct: photos.length, safe: safeImages });
+    if (safe.length < MEMORY_MIN_SELECTION_COUNT) return reject("too-few-safe-media-items", {
+      ...counts, distinct: photos.length, safe: safe.length,
+    });
     if (signatures.has(signature(safe))) return reject("same-photos-as-existing-story", counts);
     if (materiallyOverlapsStory(safe, existingStories))
       return reject("overlaps-existing-story", { ...counts, selected: safeImages });
@@ -669,14 +702,14 @@ export class MemoryManager {
         ...[...current, ...reserve].map(card => card.storyKey).filter((key): key is string => Boolean(key))]);
       const usedPaths = new Set(current.flatMap(card => card.media.map(item => item.path)));
       const produced: MemorySuggestion[] = [];
-      // Prompted memories need 15 distinct photos so each shot has enough screen time.
+      // Every generated memory needs at least fourteen distinct media items.
       const thin: MemorySuggestion[] = [];
       const take = (card: MemorySuggestion | null) => {
         if (!card) return;
-        const photoCount = card.media.filter(item => item.type === "image").length;
-        if (customTopic && photoCount < MEMORY_MIN_SELECTION_COUNT) {
+        const itemCount = card.media.length;
+        if (itemCount < MEMORY_MIN_SELECTION_COUNT) {
           thin.push(card);
-          this.trace("memory-story-thin", { story: card.storyKey?.split(":")[0] ?? "theme", photos: photoCount });
+          this.trace("memory-story-thin", { story: card.storyKey?.split(":")[0] ?? "theme", items: itemCount });
           return;
         }
         const cardSignature = signature(card.media);
@@ -708,9 +741,11 @@ export class MemoryManager {
           media: MemoryMedia;
           score: number;
           queryRanks: Map<string, number>;
+          groups: Set<string>;
         }>();
         const queryPaths: string[][] = [];
         let searchErrors = 0;
+        let directImageHitCount = 0;
         const addQueryHits = (query: string, hits: MemoryMedia[], index: number, of: number) => {
           let added = 0;
           const queryKey = query.toLocaleLowerCase().replace(/\s+/g, " ").trim();
@@ -720,11 +755,14 @@ export class MemoryManager {
             const media = mediaValue(candidate);
             if (!media) continue;
             thisQueryPaths.push(media.path);
-            const score = (candidate as MemoryMedia & { score?: number }).score;
-            const candidateScore = typeof score === "number" && Number.isFinite(score) ? score : 0;
+            const rawCandidate = candidate as MemoryMedia & { score?: number; memoryGroups?: unknown };
+            const candidateScore = typeof rawCandidate.score === "number" && Number.isFinite(rawCandidate.score) ? rawCandidate.score : 0;
+            const groups = Array.isArray(rawCandidate.memoryGroups)
+              ? rawCandidate.memoryGroups.filter((group): group is string => typeof group === "string" && group.length <= 240)
+              : [];
             const existing = mergedByPath.get(media.path);
             if (!existing) {
-              mergedByPath.set(media.path, { media, score: candidateScore, queryRanks: new Map([[queryKey, rank]]) });
+              mergedByPath.set(media.path, { media, score: candidateScore, queryRanks: new Map([[queryKey, rank]]), groups: new Set(groups) });
               added++;
             } else {
               if (candidateScore > existing.score) {
@@ -732,6 +770,7 @@ export class MemoryManager {
                 existing.score = candidateScore;
               }
               existing.queryRanks.set(queryKey, rank);
+              for (const group of groups) existing.groups.add(group);
             }
           }
           queryPaths.push(thisQueryPaths);
@@ -754,7 +793,11 @@ export class MemoryManager {
           const hits = this.deps.searchPrompted
             ? await this.deps.searchPrompted(directQuery, customTopic)
             : await this.deps.search(directQuery);
-          if (Array.isArray(hits)) addQueryHits(directQuery, hits, 0, 1);
+          if (Array.isArray(hits)) {
+            directImageHitCount = hits.reduce((count, item) => count +
+              (item && typeof item === "object" && (item as MemoryMedia).type === "image" ? 1 : 0), 0);
+            addQueryHits(directQuery, hits, 0, 1);
+          }
           else {
             this.trace("memory-custom-query", { index: 0, of: 1, words: directQuery.split(/\s+/).length, hits: -1 });
           }
@@ -767,8 +810,10 @@ export class MemoryManager {
         customPlan = await planPromise;
         promptedTopicTitle = customTopicTitle(customTopic, customPlan);
         const directKey = directQuery.toLocaleLowerCase().replace(/\s+/g, " ").trim();
-        broadQueries = customTopicQueries(customTopic, customPlan)
-          .filter((query) => query.toLocaleLowerCase().replace(/\s+/g, " ").trim() !== directKey);
+        broadQueries = directImageHitCount >= CUSTOM_TOPIC_EXPANSION_PHOTO_THRESHOLD
+          ? []
+          : customTopicQueries(customTopic, customPlan)
+            .filter((query) => query.toLocaleLowerCase().replace(/\s+/g, " ").trim() !== directKey);
 
         for (let index = 0; index < broadQueries.length; index++) {
           const query = broadQueries[index];
@@ -819,6 +864,7 @@ export class MemoryManager {
             ...entry.media,
             // Reward both strong per-clause hits and photos found by several clauses.
             score: entry.score + topClauseBoost + overlapBoost,
+            ...(entry.groups.size ? { memoryGroups: Array.from(entry.groups) } : {}),
           }];
         });
         const topicTitle = promptedTopicTitle ?? customTopicTitle(customTopic);
@@ -915,7 +961,7 @@ export class MemoryManager {
           ? `Created a memory for “${promptedTopicTitle ?? customTopicTitle(customTopic)}”.`
           : searchFailed
             ? `Local search could not complete for “${promptedTopicTitle ?? customTopicTitle(customTopic)}”. Try again when indexing is ready.`
-            : `Not enough distinct, strong photos matched “${promptedTopicTitle ?? customTopicTitle(customTopic)}”. Try another phrase or index more photos.`
+            : `Not enough distinct, strong media items matched “${promptedTopicTitle ?? customTopicTitle(customTopic)}”. Try another phrase or index more files.`
         : produced.length
           ? `${Math.min(produced.length, NEW_PER_RUN)} new memor${Math.min(produced.length, NEW_PER_RUN) === 1 ? "y" : "ies"} ready to edit; finished ones moved to your Memory Book.`
           : promoted
@@ -924,7 +970,7 @@ export class MemoryManager {
               ? ""
               : searchFailed
                 ? "Search is not ready or unavailable. Try again when indexing is ready."
-                : "No matching memories yet. Each story needs at least four distinct, allowed photos.";
+                : "No matching memories yet. Each memory needs at least fourteen distinct, allowed media items.";
     } finally {
       this.state.generating = false;
       this.state.generationProgress = undefined;

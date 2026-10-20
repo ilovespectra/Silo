@@ -1,12 +1,12 @@
 @echo off
-REM solo: silo 2.0 Electron - Setup Script for Windows
+REM Silo - Setup Script for Windows
 
 REM Run setup from the repository root even when launched by path.
 cd /d "%~dp0..\.."
 if errorlevel 1 exit /b 1
 
 echo.
-echo 🚀 solo: silo 2.0 Electron - Setup
+echo 🚀 Silo - Setup
 echo ==================================
 
 REM Check if Node.js is installed

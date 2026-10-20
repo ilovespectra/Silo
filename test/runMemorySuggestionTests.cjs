@@ -20,7 +20,7 @@ new Function("require", "module", "exports", compiled)(managerRequire, implement
 const { MemoryManager } = implementation.exports;
 const { getDefaultMemoryDuration, MEMORY_DEFAULT_SELECTION_COUNT } = typeModule.exports;
 
-function photos(prefix, count = 8, offset = 0) {
+function photos(prefix, count = 24, offset = 0) {
   return Array.from({ length: count }, (_, i) => ({
     path: `/fake/${prefix}/${i}.jpg`, name: `${i}.jpg`, type: "image", modified: offset + i * 1000,
   }));
@@ -63,7 +63,7 @@ test("defaults, five cards, lazy covers, detached state, persistent settings and
   for (const card of state.suggestions) {
     assert.equal(card.media.filter(item => item.thumbnailUrl).length, 3);
     assert.ok(card.media.slice(3).every(item => !item.thumbnailUrl));
-    assert.ok(card.media.length >= 4 && card.media.length <= 24);
+    assert.ok(card.media.length >= 14 && card.media.length <= 24);
     assert.equal(card.defaultDuration, getDefaultMemoryDuration(Math.min(MEMORY_DEFAULT_SELECTION_COUNT, card.media.length)));
     assert.equal(card.orientation, undefined, "generated suggestions no longer carry portrait framing metadata");
   }
@@ -135,7 +135,7 @@ test("a broad prompt still searches its people and place names when already retu
     "the combined candidate pool retains the full story selection");
 });
 
-test("prompted memories combine entity searches to reach the 15-photo floor", async t => {
+test("prompted memories combine entity searches to reach the 14-item floor", async t => {
   const searched = [];
   const f = await fixture(t, {
     searchPrompted: async (query, contextQuery) => {
@@ -150,7 +150,7 @@ test("prompted memories combine entity searches to reach the 15-photo floor", as
   assert.equal(state.suggestions.length, 1, state.message);
   assert.ok(["Elliott", "Kat", "Croatia"].every(name =>
     searched.some(([query, context]) => query === name && context === "Elliott and Kat in Croatia")));
-  assert.ok(state.suggestions[0].media.filter(item => item.type === "image").length >= 15);
+  assert.ok(state.suggestions[0].media.length >= 14);
 
   const sparse = await fixture(t, {
     search: async () => photos("only-twelve", 12),
@@ -158,7 +158,7 @@ test("prompted memories combine entity searches to reach the 15-photo floor", as
   });
   const rejected = await sparse.manager.generate(false, "a summer holiday");
   assert.equal(rejected.suggestions.length, 0, "a prompted memory below fifteen photos must not pass as ready");
-  assert.match(rejected.message, /Not enough distinct, strong photos/);
+  assert.match(rejected.message, /Not enough distinct, strong media items/);
 });
 
 test("existing memories receive distinct source-library songs when audio indexing finishes", async t => {
@@ -218,17 +218,52 @@ test("custom topic generation falls back to broader search variants when the exa
   assert.match(state.message, /Created a memory for/);
 });
 
+test("a broad exact multi-keyword result pool is kept intact without single-word dilution", async t => {
+  const queries = [];
+  const f = await fixture(t, {
+    search: async query => {
+      queries.push(query);
+      return photos("festival-season", 40);
+    },
+  });
+  const state = await f.manager.generate(false, "festival season");
+  assert.equal(state.suggestions.length, 1);
+  assert.equal(state.suggestions[0].media.filter(item => item.type === "image").length, 24);
+  assert.deepEqual(queries, ["festival season"], "one exact AND-term search is enough when it has a broad pool");
+});
+
+test("mixed-entity Memories retain photos from every resolved group", async t => {
+  const groups = ["person:kat", "person:elliott", "folder:croatia", "place:slovenia"];
+  const hits = Array.from({ length: 24 }, (_, index) => {
+    const group = groups[index % groups.length];
+    const paired = index === 0 ? groups.slice(0, 2) : [group];
+    return {
+      ...photos(`mixed-${index}-${group.replace(/:/g, "-")}`, 1, index * 1000)[0],
+      score: index === 0 ? 150 : 100 - index,
+      memoryGroups: paired,
+    };
+  });
+  const f = await fixture(t, { searchPrompted: async () => hits });
+  const state = await f.manager.generate(false, "Kat and Elliott in Croatia and Slovenia");
+  assert.equal(state.suggestions.length, 1);
+  const selected = new Set(state.suggestions[0].media.map((item) => item.path));
+  for (const group of groups) {
+    assert(hits.some((hit) => hit.memoryGroups.includes(group) && selected.has(hit.path)),
+      `the generated Memory omitted group ${group}`);
+  }
+});
+
 test("Magic photo filtering removes near-duplicates from generated and persisted stories", async t => {
   const duplicates = new Set(["1.jpg", "3.jpg", "5.jpg", "7.jpg"]);
   const filterImages = async paths => paths.filter(filePath => !duplicates.has(path.basename(filePath)));
-  const f = await fixture(t, { search: async query => photos(query, 8), filterImages });
+  const f = await fixture(t, { search: async query => photos(query, 24), filterImages });
   const generated = await f.manager.generate();
   assert.equal(generated.suggestions.length, 5);
-  assert.ok(generated.suggestions.every(card => card.media.filter(item => item.type === "image").length === 4));
+  assert.ok(generated.suggestions.every(card => card.media.filter(item => item.type === "image").length === 20));
   const restarted = new MemoryManager(f.root, f.deps);
   const loaded = await restarted.getState();
   assert.equal(loaded.suggestions.length, 5);
-  assert.ok(loaded.suggestions.every(card => card.media.filter(item => item.type === "image").length === 4));
+  assert.ok(loaded.suggestions.every(card => card.media.filter(item => item.type === "image").length === 20));
 });
 
 test("legacy suggestions normalize to the fixed one-minute default", async t => {
@@ -237,15 +272,19 @@ test("legacy suggestions normalize to the fixed one-minute default", async t => 
   const legacy = {
     id: "legacy-portrait", title: "Old portrait", description: "Saved story", query: "people",
     mood: "gentle", orientation: "portrait", defaultDuration: 61, createdAt: 10,
-    media: photos("legacy", 4),
+    media: photos("legacy", 14),
   };
   await fs.writeFile(f.statePath, JSON.stringify({ version: 1, cursor: 0, dismissed: [], settings: {}, suggestions: [legacy] }));
   const migrated = await new MemoryManager(f.root, f.deps).getState();
   assert.equal(migrated.suggestions[0].orientation, undefined);
-  assert.equal(migrated.suggestions[0].defaultDuration, getDefaultMemoryDuration(4));
+  assert.equal(migrated.suggestions[0].defaultDuration, getDefaultMemoryDuration(14));
   const persisted = JSON.parse(await fs.readFile(f.statePath, "utf8"));
   assert.equal(persisted.suggestions[0].orientation, undefined);
-  assert.equal(persisted.suggestions[0].defaultDuration, getDefaultMemoryDuration(4));
+  assert.equal(persisted.suggestions[0].defaultDuration, getDefaultMemoryDuration(14));
+  await fs.writeFile(f.statePath, JSON.stringify({ version: 2, cursor: 0, dismissed: [], settings: {},
+    suggestions: [{ ...legacy, media: photos("legacy-short", 13) }] }));
+  assert.deepEqual((await new MemoryManager(f.root, f.deps).getState()).suggestions, [],
+    "saved suggestions below the 14-item floor are no longer shown as valid memories");
 });
 
 test("single-flight searches, generating state, and concurrent dismiss/settings writes", async t => {
@@ -284,7 +323,7 @@ test("single-flight searches, generating state, and concurrent dismiss/settings 
 });
 
 test("dismiss persists by ID but themes and photos can generate again", async t => {
-  const f = await fixture(t, { search: async () => photos("same", 4) });
+  const f = await fixture(t, { search: async () => photos("same", 14) });
   const first = await f.manager.generate();
   assert.equal(first.suggestions.length, 1, "identical sets across themes are not separate stories");
   const id = first.suggestions[0].id;
@@ -306,8 +345,8 @@ test("getState and cached lookup hide unsafe photos, Live Photo videos and dismi
   f.blocked.add(card.media[0].liveVideoPath);
   const safe = await f.manager.getSuggestion(card.id);
   assert.equal(safe.media[0].liveVideoPath, undefined);
-  for (const item of card.media.slice(0, 5)) f.blocked.add(item.path);
-  assert.equal(await f.manager.getSuggestion(card.id), undefined, "under four remaining photos must hide the card");
+  for (const item of card.media.filter(item => item.type === "image").slice(0, 11)) f.blocked.add(item.path);
+  assert.equal(await f.manager.getSuggestion(card.id), undefined, "under fourteen remaining media items must hide the card");
   assert.equal((await f.manager.getState()).suggestions.length, 4);
   const cache = JSON.parse(await fs.readFile(f.statePath, "utf8"));
   cache.dismissed = [generated.suggestions[1].id];
@@ -323,9 +362,9 @@ test("empty, sparse, videos-only and failed search honestly return fewer; attemp
   let state = await f.manager.generate();
   assert.deepEqual(state.suggestions, []);
   assert.equal(count, 5);
-  assert.match(state.message, /four distinct, allowed photos/);
+  assert.match(state.message, /fourteen distinct, allowed media items/);
   assert.equal(JSON.parse(await fs.readFile(f.statePath, "utf8")).cursor, 5);
-  f.deps.search = async () => photos("sparse", 3);
+  f.deps.search = async () => photos("sparse", 13);
   assert.deepEqual((await f.manager.generate()).suggestions, []);
   f.deps.search = async () => photos("videos", 10).map(item => ({ ...item, type: "video" }));
   assert.deepEqual((await f.manager.generate()).suggestions, []);
@@ -417,29 +456,30 @@ test("movie destination accepts absolute folders or null only", async t => {
 
 test("Generate replaces old stories with fresh photos when enough results exist", async t => {
   let count = 0;
-  const common = photos("common", 4);
-  const f = await fixture(t, { search: async () => [...common, ...photos(`unique-${count++}`, 4)] });
+  const f = await fixture(t, { search: async query => photos(`${query}-${count++}`, 24) });
   const state = await f.manager.generate();
   assert.equal(state.suggestions.length, 5);
   const first = new Set(state.suggestions[0].media.map(item => item.path));
   assert.ok(state.suggestions.slice(1).every(card => card.media.every(item => !first.has(item.path))));
-  f.deps.search = async () => photos(`replacement-${count++}`, 5);
+  f.deps.search = async () => photos(`replacement-${count++}`, 24);
   const replacement = await f.manager.generate(true);
   assert.equal(replacement.suggestions.length, 5, "Generate fills the editable set from fresh results");
-  assert.ok(replacement.suggestions.every(card => card.media.length === 5));
+  assert.ok(replacement.suggestions.every(card => card.media.length >= 14 && card.media.length <= 24));
   assert.ok(replacement.suggestions.every(card => card.media.every(item => !first.has(item.path))));
 });
 
-test("Live Photo failures and denied companions are optional; mixed stories still need four photos", async t => {
+test("Live Photo failures and denied companions are optional; mixed stories still need fourteen items", async t => {
   const f = await fixture(t, {
-    search: async query => [...photos(query, 4), ...photos(`${query}-videos`, 40).map(item => ({ ...item, type: "video" }))],
+    search: async query => [...photos(query, 8), ...photos(`${query}-videos`, 40).map(item => ({ ...item, type: "video" }))],
     findLiveVideo: async file => { if (file.name === "1.jpg") throw new Error("missing"); return `${file.path}.mov`; },
     isAllowed: file => !file.endsWith(".mov"),
     thumb: async () => { throw new Error("private thumbnail failure"); },
   });
   const state = await f.manager.generate();
   assert.equal(state.suggestions.length, 5);
-  assert.ok(state.suggestions.every(card => card.media.filter(item => item.type === "image").length === 4));
+  assert.ok(state.suggestions.every(card => card.media.length === 14));
+  assert.ok(state.suggestions.every(card => card.media.filter(item => item.type === "image").length === 8));
+  assert.ok(state.suggestions.every(card => card.media.filter(item => item.type === "video").length === 6));
   assert.ok(state.suggestions.every(card => card.media.every(item => !item.liveVideoPath && !item.thumbnailUrl)));
   assert.ok(!state.message.includes("private"));
 });

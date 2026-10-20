@@ -10,6 +10,7 @@ import {
   MemoryExportProgress,
   MemorySuggestion,
   MemorySoundtrack,
+  selectMemoryExportMedia,
 } from "./memoryTypes";
 
 export interface MemoryExporterDependencies {
@@ -134,7 +135,7 @@ export class MemoryExporter {
       if (options.suggestionId !== suggestion.id) throw new Error("Memory suggestion does not match export options");
       const { minCount, maxCount } = MEMORY_EXPORT_LIMITS;
       if (!Number.isInteger(options.count) || options.count < minCount || options.count > maxCount) {
-        throw new Error(`Invalid memory export count: choose ${minCount} to ${maxCount} photos or clips`);
+        throw new Error(`Invalid memory export count: choose ${minCount} to ${maxCount} media items`);
       }
       if (!isMemoryDurationAllowed(options.count, options.duration)) {
         throw new Error(`Invalid memory export duration: memories must be ${MEMORY_DURATION_SECONDS} seconds long`);
@@ -142,7 +143,10 @@ export class MemoryExporter {
       if (!Number.isFinite(options.originalAudio) || options.originalAudio < 0 || options.originalAudio > 1) {
         throw new Error("Invalid original audio level");
       }
-      const selected = suggestion.media.slice(0, options.count);
+      const selected = selectMemoryExportMedia(suggestion.media, options.count);
+      if (selected.length !== options.count || selected.length < MEMORY_EXPORT_LIMITS.minCount) {
+        throw new Error("A memory movie must contain at least fourteen distinct media items.");
+      }
       const configuredDimensions = this.deps.dimensions;
       const { width, height } = configuredDimensions
         ? configuredDimensions.width >= configuredDimensions.height

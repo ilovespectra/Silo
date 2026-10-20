@@ -286,7 +286,7 @@ async function handleRequest(request: WorkerRequest) {
   // Decode in this disposable process with an explicit pixel ceiling, then
   // downsample before creating a raw buffer for CLIP. Modern phone originals
   // can exceed 40 MP while CLIP itself only consumes a small square image.
-  const sharp = require("sharp") as typeof import("sharp");
+  const sharp = require("sharp") as typeof import("sharp").default;
   sharp.concurrency(2);
   const decoder = sharp(request.filePath!, {
     limitInputPixels: MAX_INPUT_PIXELS,

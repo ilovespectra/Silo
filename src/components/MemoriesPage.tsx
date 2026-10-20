@@ -434,6 +434,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
   const playable = !preview || preview.status === "ready";
   const maximum = Math.min(MEMORY_EXPORT_LIMITS.maxCount, memory.media.length);
   const minimum = getMemorySelectionMinimum(maximum);
+  const canExport = maximum >= MEMORY_EXPORT_LIMITS.minCount;
   const initialCount = Math.min(MEMORY_DEFAULT_SELECTION_COUNT, maximum);
   const [count, setCount] = useState(initialCount);
   const [originalAudio, setOriginalAudio] = useState(0.18);
@@ -534,7 +535,7 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
         <summary>Edit movie settings <span>{selectedCount} files · 1 min</span></summary>
       <div className="memories-card-controls">
         <label htmlFor={`${fieldId}-count`}>Photos & clips <output>{selectedCount} / {memory.media.length} · {(MEMORY_DURATION_SECONDS / Math.max(1, selectedCount)).toFixed(1)}s each</output></label>
-        <input id={`${fieldId}-count`} type="range" min={minimum} max={maximum} step={1} value={selectedCount} disabled={disabled || maximum <= 2 || maximum <= minimum} onChange={(event) => changeCount(Number(event.target.value))} />
+        <input id={`${fieldId}-count`} type="range" min={minimum} max={maximum} step={1} value={selectedCount} disabled={disabled || !canExport || maximum <= minimum} onChange={(event) => changeCount(Number(event.target.value))} />
         <small className="memories-hint">{maximum < MEMORY_DEFAULT_SELECTION_COUNT ? `Up to ${maximum} available items; shots never repeat.` : "More shots means quicker cuts."}</small>
         <div className="memories-fixed-length"><span>Movie length</span><output>1 minute · {MEMORY_DURATION_SECONDS} seconds</output></div>
         <label htmlFor={`${fieldId}-soundtrack`}><span><FiMusic aria-hidden="true" />Soundtrack · {memory.mood}</span></label>
@@ -555,8 +556,8 @@ function MemoryCard({ api, memory, disabled, preview, onBlockedView, onDismiss, 
       </div>
       </details>
       <div className="memories-card-actions">
-        <button type="button" className="memories-button memories-primary" disabled={disabled || trackStatus === "loading" || maximum === 0} onClick={() => { void prepareExport(); }}>Save memory</button>
-        <button type="button" className="memories-icon-button memories-reveal-button" disabled={disabled || trackStatus === "loading" || maximum === 0} onClick={() => { void revealSavedMovie(); }} aria-label={`Show saved movie for ${memory.title}`} title={memory.downloadedAt ? `Open saved movie in Finder` : "Movie is already saved in your chosen memory folder"}><FiFolder aria-hidden="true" /></button>
+        <button type="button" className="memories-button memories-primary" disabled={disabled || !canExport || trackStatus === "loading"} onClick={() => { void prepareExport(); }}>Save memory</button>
+        <button type="button" className="memories-icon-button memories-reveal-button" disabled={disabled || !canExport || trackStatus === "loading"} onClick={() => { void revealSavedMovie(); }} aria-label={`Show saved movie for ${memory.title}`} title={memory.downloadedAt ? `Open saved movie in Finder` : "Movie is already saved in your chosen memory folder"}><FiFolder aria-hidden="true" /></button>
       </div>
     </div>
     {viewing && <MemoryViewDialog api={api} memory={memory} onClose={() => setViewing(false)} />}

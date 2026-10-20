@@ -280,6 +280,30 @@ export class GeoIndexer {
     );
   }
 
+  /** Find tagged photos by saved place names without cloning the full geo index. */
+  searchPhotosByLocationName(matchesName: (name: string) => boolean): GeoPhoto[] {
+    const mergedPhotos = this.mergedPhotos();
+    for (const override of this.overrides.values())
+      mergedPhotos.set(override.file.path, {
+        ...override.file,
+        latitude: override.location.latitude,
+        longitude: override.location.longitude,
+        city: override.location.city,
+        region: override.location.region,
+        country: override.location.country,
+        locationLabel: override.location.label,
+        locationSource: "manual",
+      });
+
+    return Array.from(mergedPhotos.values()).filter((photo) => {
+      if (this.activeSources.size > 0 && !this.activeSources.has(photo.sourcePath)) return false;
+      const names = [photo.locationLabel, photo.city, photo.region, photo.country]
+        .flatMap((value) => typeof value === "string" ? value.split(/[,;|\n]+/) : [])
+        .map((value) => value.trim()).filter(Boolean);
+      return names.some(matchesName);
+    });
+  }
+
   getState(): GeoIndexState {
     const mergedPhotos = this.mergedPhotos();
     for (const override of this.overrides.values()) {
