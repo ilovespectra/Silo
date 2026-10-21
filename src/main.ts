@@ -8958,9 +8958,9 @@ async function runSourceClone(
       Number.isFinite(entry.sourceModified) ? entry.sourceModified! : 0,
     );
   }
-  const sourceProgress = plan.sourceProgress.map((source) => ({
+  const sourceProgress: SourceCloneSourceProgress[] = plan.sourceProgress.map((source) => ({
     ...source,
-    phase: "copying" as const,
+    phase: "copying",
     completedFiles: 0,
     verifiedFiles: 0,
     failedFiles: 0,

@@ -16,6 +16,7 @@
     "rootDir": "./src"
   },
   "include": [
+    "src/types.d.ts",
     "src/main.ts",
     "src/semanticWorker.ts",
     "src/documentPreviewWorker.ts",
