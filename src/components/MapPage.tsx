@@ -10,19 +10,14 @@ import * as THREE from "three";
 import {
   FiCheck,
   FiCircle,
-  FiCompass,
   FiEdit3,
   FiFolderPlus,
   FiHeart,
   FiMapPin,
-  FiMoon,
-  FiPause,
-  FiPlay,
   FiPlus,
   FiRefreshCw,
   FiSearch,
   FiSquare,
-  FiSun,
   FiTag,
   FiUserPlus,
   FiX,
@@ -65,7 +60,8 @@ interface MapPageProps {
   fileMetadata: Record<string, FileMetadata>;
   redundantPaths: Set<string>;
   hiddenPaths?: Set<string>;
-  autoplay: boolean;
+  mapServicesAllowed: boolean;
+  active: boolean;
   onOpenFile: (file: FileInfo, clusterFiles: FileInfo[]) => void;
   onStateChanged: (state: PersistedAppState) => void;
   onOpenFiles?: () => void;
@@ -258,58 +254,6 @@ function cachedClusterThumbnail(cluster: { photos: GeoPhoto[] }) {
   return null;
 }
 
-function utcHourNow() {
-  const now = new Date();
-  return (
-    now.getUTCHours() + now.getUTCMinutes() / 60 + now.getUTCSeconds() / 3600
-  );
-}
-
-function solarDeclination() {
-  const now = new Date();
-  const start = Date.UTC(now.getUTCFullYear(), 0, 0);
-  const dayOfYear = Math.floor(
-    (Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) -
-      start) /
-      86400000,
-  );
-  return (
-    23.44 * Math.sin(THREE.MathUtils.degToRad((360 / 365) * (dayOfYear - 81)))
-  );
-}
-
-function solarDirection(utcHour: number) {
-  const longitude = (12 - utcHour) * 15;
-  const phi = THREE.MathUtils.degToRad(90 - solarDeclination());
-  const theta = THREE.MathUtils.degToRad(90 - longitude);
-  return new THREE.Vector3(
-    Math.sin(phi) * Math.cos(theta),
-    Math.cos(phi),
-    Math.sin(phi) * Math.sin(theta),
-  ).normalize();
-}
-
-function normalizeHour(hour: number) {
-  return ((hour % 24) + 24) % 24;
-}
-
-function viewedSolarHour(utcHour: number, longitude: number) {
-  return normalizeHour(utcHour + longitude / 15);
-}
-
-function utcHourForView(desiredSolarHour: number, longitude: number) {
-  return normalizeHour(desiredSolarHour - longitude / 15);
-}
-
-function formatSolarTime(hour: number) {
-  const totalMinutes = Math.round(hour * 60) % (24 * 60);
-  const hours = Math.floor(totalMinutes / 60)
-    .toString()
-    .padStart(2, "0");
-  const minutes = (totalMinutes % 60).toString().padStart(2, "0");
-  return `${hours}:${minutes}`;
-}
-
 function createGeographicGuides(globe: any) {
   const guides = new THREE.Group();
   const createLine = (
@@ -358,7 +302,8 @@ export default function MapPage({
   fileMetadata,
   redundantPaths,
   hiddenPaths,
-  autoplay,
+  mapServicesAllowed,
+  active,
   onOpenFile,
   onStateChanged,
   onOpenFiles,
@@ -367,13 +312,9 @@ export default function MapPage({
   const electronAPI = window.electron;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const globeRef = useRef<any>(null);
-  const sunDirectionRef = useRef<THREE.Vector3 | null>(null);
   const markerClickTimerRef = useRef<number | null>(null);
   const surfaceResolutionUpdaterRef = useRef<((altitude: number) => void) | null>(null);
   const mapServicesAllowedRef = useRef(false);
-  const [mapServicesAllowed, setMapServicesAllowed] = useState(false);
-  const [showMapPrivacyDialog, setShowMapPrivacyDialog] = useState(false);
-  const [mapPrivacyError, setMapPrivacyError] = useState("");
   const [geoState, setGeoState] = useState<GeoIndexState>({
     status: "idle",
     scanned: 0,
@@ -396,14 +337,8 @@ export default function MapPage({
   const [busy, setBusy] = useState(false);
   const [regionSort, setRegionSort] = useState<RegionSort>("date");
   const [regionSortAscending, setRegionSortAscending] = useState(false);
-  const [heading, setHeading] = useState(0);
-  const [autoRotate, setAutoRotate] = useState(autoplay);
-  const [utcHour, setUtcHour] = useState(utcHourNow);
-  const [solarHour, setSolarHour] = useState(() =>
-    viewedSolarHour(utcHourNow(), -20),
-  );
-  const utcHourRef = useRef(utcHour);
-  const manualSolarTimeRef = useRef(false);
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const [detailSurfaceActive, setDetailSurfaceActive] = useState(false);
   const [metadataName, setMetadataName] = useState("");
   const [metadataKeywords, setMetadataKeywords] = useState("");
@@ -461,61 +396,21 @@ export default function MapPage({
       remove: boolean,
     ) => void;
   } | null>(null);
-  const autoRotateRef = useRef(autoRotate);
-  autoRotateRef.current = autoRotate;
   const altitudeRef = useRef(altitude);
-
-  const chooseMapServices = useCallback(
-    async (allowed: boolean) => {
-      if (!electronAPI) return;
-      setMapPrivacyError("");
-      try {
-        await electronAPI.setMapServiceConsent(allowed);
-        mapServicesAllowedRef.current = allowed;
-        setMapServicesAllowed(allowed);
-        setShowMapPrivacyDialog(false);
-        surfaceResolutionUpdaterRef.current?.(
-          globeRef.current?.pointOfView().altitude ?? altitudeRef.current,
-        );
-      } catch {
-        setMapPrivacyError("Silo couldn't save this privacy choice.");
-      }
-    },
-    [electronAPI],
-  );
-
-  useEffect(() => {
-    if (!electronAPI) return;
-    let active = true;
-    void electronAPI
-      .getMapServiceConsent()
-      .then((allowed) => {
-        if (!active) return;
-        const enabled = allowed === true;
-        mapServicesAllowedRef.current = enabled;
-        setMapServicesAllowed(enabled);
-      })
-      .catch(() => {
-        if (active) {
-          mapServicesAllowedRef.current = false;
-          setMapServicesAllowed(false);
-          setMapPrivacyError("Online map services are off because the saved choice couldn't be read.");
-        }
-      });
-    return () => {
-      active = false;
-    };
-  }, [electronAPI]);
+  mapServicesAllowedRef.current = mapServicesAllowed;
   altitudeRef.current = altitude;
 
   // Clustering only depends on the altitude band, so zooming within a band costs nothing.
   const cellSize = cellSizeForAltitude(altitude);
   const mappedPhotos = useMemo(
-    () =>
-      geoState.photos.filter(
-        (photo) =>
-          !redundantPaths.has(photo.path) && !hiddenPaths?.has(photo.path),
-      ),
+    () => Array.from(new Map(
+      geoState.photos
+        .filter(
+          (photo) =>
+            !redundantPaths.has(photo.path) && !hiddenPaths?.has(photo.path),
+        )
+        .map((photo) => [photo.path, photo]),
+    ).values()),
     [geoState.photos, hiddenPaths, redundantPaths],
   );
   const clusters = useMemo(
@@ -756,9 +651,6 @@ export default function MapPage({
     const dayTexture = textureLoader.load(
       mapAssetUrl("earth-blue-marble.jpg"),
     );
-    const nightTexture = textureLoader.load(
-      mapAssetUrl("earth-night.jpg"),
-    );
     let detailedBorders: any[] | null = null;
     let detailedBordersLoading = false;
     let baseBorders: any[] = [];
@@ -766,43 +658,7 @@ export default function MapPage({
     let bordersHidden = false;
     let tileEngineActive = false;
     dayTexture.colorSpace = THREE.SRGBColorSpace;
-    nightTexture.colorSpace = THREE.SRGBColorSpace;
-    const sunDirection = solarDirection(utcHourRef.current);
-    sunDirectionRef.current = sunDirection;
-    const globeMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        dayTexture: { value: dayTexture },
-        nightTexture: { value: nightTexture },
-        sunDirection: { value: sunDirection },
-      },
-      vertexShader: `
-        varying vec2 vUv;
-        varying vec3 vWorldNormal;
-        void main() {
-          vUv = uv;
-          vWorldNormal = normalize(mat3(modelMatrix) * normal);
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform sampler2D dayTexture;
-        uniform sampler2D nightTexture;
-        uniform vec3 sunDirection;
-        varying vec2 vUv;
-        varying vec3 vWorldNormal;
-        void main() {
-          float daylight = smoothstep(-0.16, 0.24, dot(normalize(vWorldNormal), sunDirection));
-          vec3 day = texture2D(dayTexture, vUv).rgb;
-          vec3 cityLights = texture2D(nightTexture, vUv).rgb;
-          vec3 nightSurface = day * vec3(0.38, 0.43, 0.52) + vec3(0.008, 0.012, 0.02);
-          vec3 cityGlow = pow(cityLights, vec3(0.72)) * 3.6;
-          vec3 visibleNight = max(nightSurface, cityGlow);
-          vec3 visibleDay = min(pow(day, vec3(0.62)) * 1.32, vec3(1.0));
-          vec3 color = mix(visibleNight, visibleDay, daylight);
-          gl_FragColor = vec4(color, 1.0);
-        }
-      `,
-    });
+    const globeMaterial = new THREE.MeshBasicMaterial({ map: dayTexture });
     const globe = new (Globe as any)(containerRef.current)
       .globeMaterial(globeMaterial)
       .backgroundColor("#050709")
@@ -835,67 +691,14 @@ export default function MapPage({
     });
     const stars = new THREE.Points(starGeometry, starMaterial);
     globe.scene().add(stars);
-    const nightOverlayMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        nightTexture: { value: nightTexture },
-        sunDirection: { value: sunDirection },
-      },
-      vertexShader: `
-        varying vec3 vLocal;
-        varying vec3 vWorldNormal;
-        void main() {
-          vLocal = normalize(position);
-          vWorldNormal = normalize(mat3(modelMatrix) * normal);
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform sampler2D nightTexture;
-        uniform vec3 sunDirection;
-        varying vec3 vLocal;
-        varying vec3 vWorldNormal;
-        const float PI = 3.141592653589793;
-        void main() {
-          // Same lat/lng convention as globe.getCoords, so lights match tiles and markers.
-          vec3 p = normalize(vLocal);
-          float lat = asin(clamp(p.y, -1.0, 1.0));
-          float lng = atan(p.x, p.z);
-          float u = lng / (2.0 * PI) + 0.5;
-          // Pick the seam-free parameterisation per pixel to avoid a mip seam at the antimeridian.
-          float u1 = fract(u);
-          float u2 = fract(u + 0.5) - 0.5;
-          float uSafe = fwidth(u1) <= fwidth(u2) + 1e-6 ? u1 : u2;
-          vec2 uv = vec2(uSafe, lat / PI + 0.5);
-          float daylight = smoothstep(-0.16, 0.24, dot(normalize(vWorldNormal), sunDirection));
-          float night = 1.0 - daylight;
-          vec3 lights = pow(texture2D(nightTexture, uv).rgb, vec3(0.72)) * 2.8;
-          vec3 nightColor = max(vec3(0.012, 0.02, 0.034), lights);
-          gl_FragColor = vec4(nightColor, night * 0.78);
-        }
-      `,
-      transparent: true,
-      depthWrite: false,
-      // Tiles are faceted spheres that intersect any nearby shell; draw as a pure screen overlay instead.
-      depthTest: false,
-    });
-    nightTexture.wrapS = THREE.RepeatWrapping;
-    const nightOverlay = new THREE.Mesh(
-      new THREE.SphereGeometry(globe.getGlobeRadius() * 1.0005, 192, 96),
-      nightOverlayMaterial,
-    );
-    nightOverlay.visible = false;
-    nightOverlay.renderOrder = 10;
-    globe.scene().add(nightOverlay);
     const maximumAnisotropy = globe.renderer().capabilities.getMaxAnisotropy();
     dayTexture.anisotropy = maximumAnisotropy;
-    nightTexture.anisotropy = maximumAnisotropy;
     globe.pointOfView({ lat: 22, lng: -20, altitude: 3.2 }, 0);
     globe.controls().enableDamping = true;
     globe.controls().dampingFactor = 0.16;
     globe.controls().rotateSpeed = 0.72;
     globe.controls().minDistance = globe.getGlobeRadius() * (1 + MIN_ALTITUDE);
-    globe.controls().autoRotate = autoplay;
-    globe.controls().autoRotateSpeed = 0.08;
+    globe.controls().autoRotate = false;
     const tuneCameraForAltitude = () => {
       const camera = globe.camera();
       const surfaceDistance = camera.position.length() - globe.getGlobeRadius();
@@ -1033,7 +836,6 @@ export default function MapPage({
                 `https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${level}/${y}/${x}`,
             );
           tileEngineActive = true;
-          nightOverlay.visible = true;
           setDetailSurfaceActive(true);
         }
         if (!usingDetailedBorders && detailedBorders) {
@@ -1066,10 +868,8 @@ export default function MapPage({
         globe.globeTileEngineUrl(null);
         globe.globeTileEngineClearCache();
         tileEngineActive = false;
-        nightOverlay.visible = false;
         setDetailSurfaceActive(false);
       }
-      nightOverlay.visible = tileEngineActive && nextAltitude > 0.01;
     };
     surfaceResolutionUpdaterRef.current = updateSurfaceResolution;
     const onControlsChange = () => {
@@ -1080,11 +880,6 @@ export default function MapPage({
         Math.abs(Math.log(nextAltitude / current)) > 0.15
           ? nextAltitude
           : current,
-      );
-      setHeading(Math.round(((pointOfView.lng % 360) + 360) % 360));
-      setSolarHour(
-        Math.round(viewedSolarHour(utcHourRef.current, pointOfView.lng) * 60) /
-          60,
       );
       updateSurfaceResolution(nextAltitude);
     };
@@ -1115,7 +910,6 @@ export default function MapPage({
       globe.controls().removeEventListener("change", scheduleControlsChange);
       globe.controls().removeEventListener("change", tuneCameraForAltitude);
       globe.scene().remove(geographicGuides);
-      globe.scene().remove(nightOverlay);
       globe.scene().remove(stars);
       starGeometry.dispose();
       starMaterial.dispose();
@@ -1126,11 +920,7 @@ export default function MapPage({
         }
       });
       dayTexture.dispose();
-      nightTexture.dispose();
-      nightOverlay.geometry.dispose();
-      nightOverlayMaterial.dispose();
       globeMaterial.dispose();
-      sunDirectionRef.current = null;
       surfaceResolutionUpdaterRef.current = null;
       globe._destructor?.();
       globeRef.current = null;
@@ -1138,38 +928,14 @@ export default function MapPage({
   }, []);
 
   useEffect(() => {
-    if (globeRef.current) globeRef.current.controls().autoRotate = autoRotate;
-  }, [autoRotate]);
+    if (!active) setSelectionArmed(false);
+  }, [active]);
 
   useEffect(() => {
-    utcHourRef.current = utcHour;
-    sunDirectionRef.current?.copy(solarDirection(utcHour));
-    const longitude = globeRef.current?.pointOfView().lng ?? -20;
-    setSolarHour(viewedSolarHour(utcHour, longitude));
-  }, [utcHour]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (!manualSolarTimeRef.current) setUtcHour(utcHourNow());
-    }, 30000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  const setLightingForView = useCallback((mode: "day" | "night") => {
-    const longitude = globeRef.current?.pointOfView().lng ?? 0;
-    manualSolarTimeRef.current = true;
-    setUtcHour(utcHourForView(mode === "day" ? 12 : 0, longitude));
-  }, []);
-
-  const resetOrientation = useCallback(() => {
-    const globe = globeRef.current;
-    if (!globe) return;
-    const current = globe.pointOfView();
-    globe.pointOfView(
-      { lat: 8, lng: current.lng, altitude: Math.max(current.altitude, 1.4) },
-      900,
+    surfaceResolutionUpdaterRef.current?.(
+      globeRef.current?.pointOfView().altitude ?? altitudeRef.current,
     );
-  }, []);
+  }, [mapServicesAllowed]);
 
   const openCluster = useCallback(
     (cluster: GeoCluster) => {
@@ -1255,16 +1021,8 @@ export default function MapPage({
         const paths = cluster.photos.map((photo) => photo.path);
         markerButtonsRef.current.set(cluster.id, { button, paths });
         applyMarkerSelection(button, paths, selectionRef.current.paths);
-        button.addEventListener("pointerenter", () => {
-          if (globeRef.current) globeRef.current.controls().autoRotate = false;
-        });
-        button.addEventListener("pointerleave", () => {
-          if (globeRef.current)
-            globeRef.current.controls().autoRotate = autoRotateRef.current;
-        });
         button.addEventListener("pointerdown", (event) => {
           event.stopPropagation();
-          if (globeRef.current) globeRef.current.controls().autoRotate = false;
         });
         button.addEventListener("click", (event) => {
           event.stopPropagation();
@@ -1544,7 +1302,8 @@ export default function MapPage({
     if (!container) return;
     let start: { x: number; y: number } | null = null;
     let remove = false;
-    const onKey = (event: KeyboardEvent) => setSelectionArmed(event.shiftKey);
+    const onKey = (event: KeyboardEvent) =>
+      setSelectionArmed(activeRef.current && event.shiftKey);
     const onBlur = () => setSelectionArmed(false);
     const onMove = (event: PointerEvent) => {
       if (start)
@@ -1724,20 +1483,6 @@ export default function MapPage({
       data-help="Map browsing and selection do not change source files. Relocate changes Silo's location override and organization metadata after review; it does not write GPS/EXIF into photos or move them."
     >
       <div className="map-globe" ref={containerRef} />
-      {showMapPrivacyDialog && (
-        <div className="map-privacy-backdrop">
-          <section className="map-privacy-dialog" role="dialog" aria-modal="true" aria-labelledby="map-privacy-title">
-            <h2 id="map-privacy-title">Online map privacy</h2>
-            <p>Photo locations stay on this device unless you allow online map services. If enabled, selecting an unlabeled location can send its exact coordinates to Nominatim; place searches send your query to Photon; and close-up imagery requests send tile coordinates to Esri. These services can also see your public IP address and request timing. Their log retention is not known.</p>
-            <p>You can keep local location groups and the offline globe available with online services off. You can change this choice here later.</p>
-            {mapPrivacyError && <p className="map-privacy-error" role="alert">{mapPrivacyError}</p>}
-            <div className="map-privacy-actions">
-              <button type="button" onClick={() => void chooseMapServices(false)}>Keep services off</button>
-              <button type="button" className="primary" onClick={() => void chooseMapServices(true)}>Allow online map services</button>
-            </div>
-          </section>
-        </div>
-      )}
       <div className="map-top-controls">
         <div className="map-status" data-tour="map-overview">
           <FiMapPin />
@@ -1811,21 +1556,6 @@ export default function MapPage({
           >
             <FiRefreshCw />
           </button>
-          {electronAPI && (
-            <div className="map-privacy-status">
-              <span>Online map services {mapServicesAllowed ? "on" : "off"}</span>
-              <button
-                type="button"
-                onClick={() => {
-                  if (mapServicesAllowed) void chooseMapServices(false);
-                  else setShowMapPrivacyDialog(true);
-                }}
-                aria-label={mapServicesAllowed ? "Turn off online map services" : "Review online map services"}
-              >
-                {mapServicesAllowed ? "Turn off" : "Review"}
-              </button>
-            </div>
-          )}
         </div>
         <section className="map-selection-toolbar" aria-label="Map selection" data-tour="map-selection-tools" data-help="Choose rectangle or circle selection and whether to select individual place bubbles or whole regions. Use Shift-drag or Shift-click to add and Option to subtract.">
           <div className="map-selection-modes">
@@ -2009,61 +1739,6 @@ export default function MapPage({
             />
           );
         })()}
-      <div className="map-compass-controls" data-tour="map-globe-controls" data-help="Pause or resume globe rotation and use the compass to reset the view north-up.">
-        <button
-          className="map-rotation-toggle"
-          onClick={() => setAutoRotate((current) => !current)}
-          title={autoRotate ? "Pause globe rotation" : "Resume globe rotation"}
-        >
-          {autoRotate ? <FiPause /> : <FiPlay />}
-        </button>
-        <button
-          className="map-compass"
-          onClick={resetOrientation}
-          title="Orient north up"
-          aria-label={`Compass, heading ${Math.round(heading)} degrees`}
-        >
-          <FiCompass style={{ transform: `rotate(${-heading}deg)` }} />
-          <span>N</span>
-        </button>
-      </div>
-      <section className="map-solar-controls" aria-label="Globe lighting" data-tour="map-solar-controls" data-help="Adjust the globe’s displayed local solar time or move the daylight/night boundary into the current view.">
-        <header>
-          <span>
-            <FiSun /> View solar time
-          </span>
-          <strong>
-            {formatSolarTime(solarHour)} local · {formatSolarTime(utcHour)} UTC
-          </strong>
-        </header>
-        <input
-          type="range"
-          min="0"
-          max="24"
-          step="0.25"
-          value={solarHour}
-          onChange={(event) => {
-            const longitude = globeRef.current?.pointOfView().lng ?? 0;
-            manualSolarTimeRef.current = true;
-            setUtcHour(utcHourForView(Number(event.target.value), longitude));
-          }}
-          aria-label="Viewed solar time"
-        />
-        <div>
-          <button
-            onClick={() => setLightingForView("day")}
-            title="Move daylight to the current view"
-          >
-            <FiSun /> Day here
-          </button>
-          <button
-            onClick={() => setLightingForView("night")}
-            title="Move nighttime to the current view"
-          >
-            <FiMoon /> Night here
-          </button>
-        </div>
-      </section>
       {detailSurfaceActive && (
         <div className="map-detail-attribution">
           High-resolution imagery © Esri
@@ -2220,7 +1895,7 @@ export default function MapPage({
                 </button>
               )}
             </label>
-            {showLocationPicker && selectedPhotos.length > 0 && (
+            {active && showLocationPicker && selectedPhotos.length > 0 && (
               <LocationPicker
                 files={selectedPhotos}
                 mapServicesAllowed={mapServicesAllowed}
@@ -2349,7 +2024,7 @@ export default function MapPage({
           </aside>
         </div>
       )}
-      {personPicker && (
+      {active && personPicker && (
         <PersonPicker
           photoPaths={personPicker.paths}
           anchor={personPicker}

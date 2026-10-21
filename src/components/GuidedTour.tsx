@@ -137,22 +137,6 @@ const ALL_GUIDED_TOUR_STEPS: GuidedTourStep[] = [
     section: "map",
   },
   {
-    id: "map-globe-tools",
-    title: "Orient the globe",
-    body: "Pause or resume automatic rotation, or use the compass to reset the view north-up. These controls affect the map presentation only; they do not edit photo locations.",
-    target: '[data-tour="map-globe-controls"]',
-    fallbackTarget: '[data-tour="map-overview"]',
-    section: "map",
-  },
-  {
-    id: "map-solar-tools",
-    title: "Adjust globe lighting",
-    body: "Drag the solar-time control to view daylight at another local time, or choose Day here/Night here to align the light with the current view. This changes the map display only.",
-    target: '[data-tour="map-solar-controls"]',
-    fallbackTarget: '[data-tour="map-overview"]',
-    section: "map",
-  },
-  {
     id: "map-relocate",
     title: "Relocate selected photos",
     body: "After opening a map region and selecting photos, Relocate lets you search for a place or use the embedded location. Review your selection and the chosen place before applying.",

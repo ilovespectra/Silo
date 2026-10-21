@@ -50,8 +50,9 @@ import {
   PhoneManager,
   PhonePlatform,
   PhoneRestoreArchive,
+  PhoneFileInfo,
 } from "./phoneManager";
-import { GoogleManager, loadGoogleEnv } from "./googleManager";
+import { GoogleManager, loadGoogleEnv, type CloudFileInfo } from "./googleManager";
 import { MessageExportCoordinator } from "./messageExportCoordinator";
 import { ContactManager } from "./contactManager";
 import { GeoIndexer, type GeoPhoto } from "./geoIndexer";
@@ -180,6 +181,8 @@ import {
 import {
   CLONE_ARCHIVE_EXTENSION,
   extractCloneArchive,
+  listCloneArchiveDirectory,
+  readCloneArchiveManifest,
   writeCloneArchive,
 } from "./cloneArchive";
 import {
@@ -2762,6 +2765,8 @@ function reportStartupDetail(label: string) {
 interface SearchIndexReadiness {
   status: "preparing" | "ready" | "unavailable" | "error";
   percentage: number;
+  phase?: string;
+  phaseProgress?: number | null;
   records: number;
   message: string;
 }
@@ -2774,6 +2779,8 @@ let cacheSetupResolve: ((complete: boolean) => void) | null = null;
 let searchIndexReadiness: SearchIndexReadiness = {
   status: "preparing",
   percentage: 0,
+  phase: "Preparing saved search index",
+  phaseProgress: null,
   records: 0,
   message: "Preparing the saved search index…",
 };
@@ -4817,8 +4824,6 @@ function getDefaultContentSettings(): ContentPreferences & { parentalPasswordSet
     showNsfw: false,
     safeSearch: true,
     theme: "system",
-    autoplayGlobe: false,
-    preloadMapTextures: false,
     showBannedPeople: false,
     parentalPasswordSet: false,
   };
@@ -5880,12 +5885,15 @@ type SourceClonePhase =
   | "error"
   | "cancelled";
 
-type SourceCloneExcludedKind = "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "permission-denied" | "unsupported";
+type SourceCloneExcludedKind = "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "permission-denied" | "unsupported" | "node-modules" | "missing-virtual-folder-file" | "silo-data-managed" | "nested-shelter";
 
 interface SourceCloneExcludedPath {
   kind: SourceCloneExcludedKind;
+  sourceId?: string;
   sourceLabel: string;
   path: string;
+  isDirectory?: boolean;
+  scope?: "file" | "subtree" | "path";
   reason: string;
   errorCode?: string;
 }
@@ -5893,6 +5901,8 @@ interface SourceCloneExcludedPath {
 interface SourceCloneExcludedEntry {
   kind: SourceCloneExcludedKind;
   path: string;
+  isDirectory?: boolean;
+  scope?: "file" | "subtree" | "path";
   reason: string;
   errorCode?: string;
 }
@@ -5910,6 +5920,10 @@ function sourceCloneOmissionNotice(excludedPaths: SourceCloneExcludedPath[]) {
     device: "device nodes",
     "permission-denied": "permission-restricted paths or folders",
     unsupported: "other unsupported filesystem objects",
+    "node-modules": "reproducible node_modules folders",
+    "missing-virtual-folder-file": "unavailable virtual-folder references",
+    "silo-data-managed": "Silo data handled in its own backup area",
+    "nested-shelter": "nested Fallout Shelter copies",
   };
   const summary = [...counts.entries()].map(([kind, count]) => `${count.toLocaleString()} ${labels[kind]}`).join(", ");
   const pathLabel = excludedPaths.length === 1 ? "source path or subtree was" : "source paths or subtrees were";
@@ -5927,12 +5941,15 @@ interface SourceCloneErrorDetails {
 
 interface SourceCloneProgress {
   operationId: string;
+  mode?: SourceCloneSessionMode;
   phase: SourceClonePhase;
   destination: string;
   totalSources: number;
   totalFiles: number;
   discoveredFiles?: number;
   omittedPaths?: number;
+  sourceProgress?: SourceCloneSourceProgress[];
+  cancelRequested?: boolean;
   completedFiles: number;
   totalBytes: number;
   copiedBytes: number;
@@ -5941,6 +5958,24 @@ interface SourceCloneProgress {
   currentFile: string;
   message: string;
   errorDetails?: SourceCloneErrorDetails;
+}
+
+interface SourceCloneSourceProgress {
+  sourceId: string;
+  label: string;
+  phase: "waiting" | "scanning" | "checking" | "copying" | "verifying" | "complete" | "cancelled" | "error";
+  discoveredFiles: number;
+  checkedFiles: number;
+  checkedBytes?: number;
+  totalFiles?: number;
+  omittedFiles: number;
+  omittedSubtrees: number;
+  omittedPaths: number;
+  completedFiles: number;
+  verifiedFiles: number;
+  failedFiles: number;
+  copiedBytes: number;
+  totalBytes?: number;
 }
 
 interface SourceClonePlanEntry {
@@ -5953,6 +5988,8 @@ interface SourceClonePlanEntry {
   sourceSize?: number;
   sourceModified?: number;
   localPath?: string;
+  /** Repository files are copied and verified, but never content-deduplicated. */
+  deduplicate?: boolean;
   size: number;
   modified: number;
   isDirectory: boolean;
@@ -5968,6 +6005,7 @@ interface SourceClonePlan {
   duplicateFiles: number;
   sourceLabels: string[];
   sourceIds: string[];
+  sourceProgress: SourceCloneSourceProgress[];
   excludedPaths: SourceCloneExcludedPath[];
   configDirectory: string;
   replicaOf?: string;
@@ -5983,7 +6021,8 @@ interface ShelterReusableFile {
 }
 
 const sourceClonePlans = new Map<string, SourceClonePlan>();
-const sourceCloneOperations = new Map<string, { cancelled: boolean }>();
+const sourceCloneOperations = new Map<string, { cancelled: boolean; cancelCurrentIo?: () => void }>();
+const sourceCloneProgressSnapshots = new Map<string, SourceCloneProgress>();
 function reserveSourceCloneOperation(operationId: string) {
   if (ejectingWholeDevices.size)
     throw new Error("Silo is safely ejecting a drive. Wait until it is ready before starting Fallout Shelter work.");
@@ -6034,6 +6073,8 @@ interface SourceCloneSessionProgressSnapshot {
   totalFiles: number;
   discoveredFiles?: number;
   omittedPaths?: number;
+  sourceProgress?: SourceCloneSourceProgress[];
+  cancelRequested?: boolean;
   completedFiles: number;
   totalBytes: number;
   copiedBytes: number;
@@ -6049,6 +6090,7 @@ interface SourceCloneSessionLogEvent {
   totalFiles?: number;
   discoveredFiles?: number;
   omittedPaths?: number;
+  sourceProgress?: SourceCloneSourceProgress[];
   completedFiles?: number;
   totalBytes?: number;
   copiedBytes?: number;
@@ -6119,6 +6161,8 @@ function appendSourceCloneSessionEvent(
       totalFiles: progress.totalFiles,
       ...(progress.discoveredFiles === undefined ? {} : { discoveredFiles: progress.discoveredFiles }),
       ...(progress.omittedPaths === undefined ? {} : { omittedPaths: progress.omittedPaths }),
+      ...(progress.sourceProgress === undefined ? {} : { sourceProgress: progress.sourceProgress.map((source) => ({ ...source })) }),
+      ...(progress.cancelRequested ? { cancelRequested: true } : {}),
       completedFiles: progress.completedFiles,
       totalBytes: progress.totalBytes,
       copiedBytes: progress.copiedBytes,
@@ -6285,6 +6329,8 @@ function recordSourceCloneSessionProgress(progress: SourceCloneProgress) {
     totalFiles: progress.totalFiles,
     ...(progress.discoveredFiles === undefined ? {} : { discoveredFiles: progress.discoveredFiles }),
     ...(progress.omittedPaths === undefined ? {} : { omittedPaths: progress.omittedPaths }),
+    ...(progress.sourceProgress === undefined ? {} : { sourceProgress: progress.sourceProgress.map((source) => ({ ...source })) }),
+    ...(progress.cancelRequested === undefined ? {} : { cancelRequested: progress.cancelRequested }),
     completedFiles: progress.completedFiles,
     totalBytes: progress.totalBytes,
     copiedBytes: progress.copiedBytes,
@@ -7461,8 +7507,56 @@ function cloneSafeRelativePath(value: string) {
 }
 
 function sendSourceCloneProgress(progress: SourceCloneProgress) {
-  recordSourceCloneSessionProgress(progress);
-  sendToRenderer("source-clone-progress", progress);
+  const previous = sourceCloneProgressSnapshots.get(progress.operationId);
+  const mode = sourceCloneSessionsByOperation.get(progress.operationId)?.log.mode ?? previous?.mode;
+  const terminalPhase = progress.phase === "complete" || progress.phase === "error" || progress.phase === "cancelled"
+    ? progress.phase
+    : null;
+  const current: SourceCloneProgress = {
+    ...previous,
+    ...progress,
+    ...(mode ? { mode } : {}),
+    ...(progress.sourceProgress === undefined && previous?.sourceProgress
+      ? { sourceProgress: previous.sourceProgress.map((source) => ({ ...source })) }
+      : {}),
+  };
+  if (terminalPhase && current.sourceProgress)
+    current.sourceProgress = current.sourceProgress.map((source) => ({ ...source, phase: terminalPhase }));
+  if (current.phase === "complete" || current.phase === "error" || current.phase === "cancelled")
+    sourceCloneProgressSnapshots.delete(current.operationId);
+  else
+    sourceCloneProgressSnapshots.set(current.operationId, current);
+  recordSourceCloneSessionProgress(current);
+  sendToRenderer("source-clone-progress", current);
+}
+
+function finishSourceCloneProgress(
+  operationId: string,
+  phase: "error" | "cancelled",
+  message: string,
+  destination: string,
+  totalSources: number,
+  errorDetails?: SourceCloneErrorDetails,
+) {
+  const previous = sourceCloneProgressSnapshots.get(operationId);
+  sendSourceCloneProgress({
+    operationId,
+    phase,
+    destination: previous?.destination || destination,
+    totalSources: previous?.totalSources ?? totalSources,
+    totalFiles: previous?.totalFiles ?? 0,
+    ...(previous?.discoveredFiles === undefined ? {} : { discoveredFiles: previous.discoveredFiles }),
+    ...(previous?.omittedPaths === undefined ? {} : { omittedPaths: previous.omittedPaths }),
+    ...(previous?.sourceProgress ? { sourceProgress: previous.sourceProgress } : {}),
+    completedFiles: previous?.completedFiles ?? 0,
+    totalBytes: previous?.totalBytes ?? 0,
+    copiedBytes: previous?.copiedBytes ?? 0,
+    verifiedFiles: previous?.verifiedFiles ?? 0,
+    failedFiles: previous?.failedFiles ?? 0,
+    currentFile: previous?.currentFile ?? "",
+    message,
+    ...(errorDetails ? { errorDetails } : {}),
+  });
 }
 
 function sourceCloneErrorDetails(error: unknown): SourceCloneErrorDetails {
@@ -7495,7 +7589,11 @@ function sourceClonePermissionExclusion(targetPath: string, error: unknown, acti
     : action === "read"
       ? "The operating system denied Silo access while reading this file. It is omitted; review file or macOS privacy permissions before treating the clone as complete."
       : "The operating system denied Silo access while inspecting this path. It and any contents that could not be inventoried are omitted; review permissions before treating the clone as complete.";
-  return { kind: "permission-denied", path: targetPath, reason, ...(code ? { errorCode: code } : {}) };
+  return { kind: "permission-denied", path: targetPath,
+    ...(action === "list" ? { isDirectory: true, scope: "subtree" as const }
+      : action === "read" ? { isDirectory: false, scope: "file" as const }
+        : { scope: "path" as const }),
+    reason, ...(code ? { errorCode: code } : {}) };
 }
 
 function ensureCloneActive(operationId: string) {
@@ -7503,9 +7601,25 @@ function ensureCloneActive(operationId: string) {
     throw new Error("Source clone cancelled.");
 }
 
-async function hashFile(filePath: string) {
+async function hashFile(filePath: string, operationId?: string, onBytesRead?: (bytes: number) => void) {
   const hash = createHash("sha256");
-  for await (const chunk of originalFs.createReadStream(filePath)) hash.update(chunk);
+  const stream = originalFs.createReadStream(filePath);
+  const operation = operationId ? sourceCloneOperations.get(operationId) : undefined;
+  if (operation?.cancelled) {
+    stream.destroy();
+    ensureCloneActive(operationId!);
+  }
+  const cancelStream = () => stream.destroy(new Error("Source clone cancelled."));
+  if (operation) operation.cancelCurrentIo = cancelStream;
+  try {
+    for await (const chunk of stream) {
+      if (operationId) ensureCloneActive(operationId);
+      hash.update(chunk);
+      onBytesRead?.(chunk.length);
+    }
+  } finally {
+    if (operation?.cancelCurrentIo === cancelStream) operation.cancelCurrentIo = undefined;
+  }
   return hash.digest("hex");
 }
 
@@ -7516,6 +7630,9 @@ async function listLocalCloneEntries(
   options: {
     allowMarkedRoot?: boolean;
     skipRootManifest?: boolean;
+    allowSiloAppData?: boolean;
+    allowFileRoot?: boolean;
+    repositoryRoots?: Set<string>;
     onExcludedPath?: (excluded: SourceCloneExcludedEntry) => void;
   } = {},
 ) {
@@ -7538,8 +7655,16 @@ async function listLocalCloneEntries(
   const machineDevice = machineRoot ? await getMacDataVolumeDeviceId(root) : null;
   if (machineRoot && machineDevice === null)
     throw new Error("Could not verify the internal data-volume boundary; this machine source was not cloned.");
-  if (isSiloAppData(root)) return;
-  if (!options.allowMarkedRoot && await isSiloCloneDirectory(root)) return;
+  if (!options.allowSiloAppData && isSiloAppData(root)) {
+    options.onExcludedPath?.({ kind: "silo-data-managed", path: root, isDirectory: true, scope: "subtree",
+      reason: "Silo app data is not copied a second time inside this source. Durable configuration and indexes are included under Silo/Configuration, and configured cache roots are included under Silo/Caches; review other app-specific files here for anything you want to archive manually." });
+    return;
+  }
+  if (!options.allowMarkedRoot && await isSiloCloneDirectory(root)) {
+    options.onExcludedPath?.({ kind: "nested-shelter", path: root, isDirectory: true, scope: "subtree",
+      reason: "A Fallout Shelter clone nested inside this source is not recursively copied. Browse or replicate that verified shelter separately if it should be part of this archive." });
+    return;
+  }
   let rootStats: fs.Stats;
   try {
     rootStats = await originalFs.promises.lstat(root);
@@ -7552,6 +7677,7 @@ async function listLocalCloneEntries(
     options.onExcludedPath?.({
       kind: "symbolic-link",
       path: root,
+      scope: "path",
       reason: "The selected source root is a symbolic link. Fallout Shelter does not follow or recreate symbolic links, so this source was not traversed.",
     });
     return;
@@ -7567,12 +7693,19 @@ async function listLocalCloneEntries(
     options.onExcludedPath?.({
       kind,
       path: root,
+      isDirectory: false,
+      scope: "file",
       reason: "The selected source root is a special filesystem object and has no copyable regular-file contents.",
     });
     return;
   }
-  if (rootStats.isFile())
-    throw new Error(`The selected source is a file rather than a folder: ${root}`);
+  if (rootStats.isFile()) {
+    if (!options.allowFileRoot)
+      throw new Error(`The selected source is a file rather than a folder: ${root}`);
+    onEntry({ sourcePath: root, destinationRelativePath: path.basename(root), localPath: root,
+      size: rootStats.size, modified: rootStats.mtimeMs, isDirectory: false });
+    return;
+  }
   const stack = [{ directory: root, relativePath: "" }];
   while (stack.length > 0) {
     ensureCloneActive(operationId);
@@ -7581,6 +7714,8 @@ async function listLocalCloneEntries(
       options.onExcludedPath?.({
         kind: "macos-trash",
         path: current.directory,
+        isDirectory: true,
+        scope: "subtree",
         reason: "macOS Trash is intentionally excluded; deleted items are not included in this backup.",
       });
       continue;
@@ -7590,9 +7725,17 @@ async function listLocalCloneEntries(
       const directoryStats = await originalFs.promises.stat(current.directory).catch(() => null);
       if (!directoryStats || directoryStats.dev !== machineDevice) continue;
     }
-    if (isSiloAppData(current.directory)) continue;
+    if (!options.allowSiloAppData && isSiloAppData(current.directory)) {
+      options.onExcludedPath?.({ kind: "silo-data-managed", path: current.directory, isDirectory: true, scope: "subtree",
+        reason: "Silo app data is not copied a second time inside this source. Durable configuration and indexes are included under Silo/Configuration, and configured cache roots are included under Silo/Caches; review other app-specific files here for anything you want to archive manually." });
+      continue;
+    }
     if (!(options.allowMarkedRoot && current.directory === root) &&
-      await isSiloCloneDirectory(current.directory)) continue;
+      await isSiloCloneDirectory(current.directory)) {
+      options.onExcludedPath?.({ kind: "nested-shelter", path: current.directory, isDirectory: true, scope: "subtree",
+        reason: "A Fallout Shelter clone nested inside this source is not recursively copied. Browse or replicate that verified shelter separately if it should be part of this archive." });
+      continue;
+    }
     let dir: fs.Dir;
     try {
       dir = await originalFs.promises.opendir(current.directory);
@@ -7605,18 +7748,39 @@ async function listLocalCloneEntries(
       for await (const entry of dir) {
         ensureCloneActive(operationId);
         const absolutePath = path.join(current.directory, entry.name);
+        if (entry.name.toLowerCase() === "node_modules" && entry.isDirectory()) {
+          options.onExcludedPath?.({
+            kind: "node-modules",
+            path: absolutePath,
+            isDirectory: true,
+            scope: "subtree",
+            reason: "node_modules contains installed dependencies that can be recreated from the repository's package manifests. It is intentionally excluded to avoid copying large generated dependency trees; reinstall dependencies manually if needed.",
+          });
+          continue;
+        }
         if (options.skipRootManifest && current.directory === root && entry.name === "silo-clone-manifest.json") continue;
         if (isMacTrashPath(absolutePath, root)) {
           options.onExcludedPath?.({
             kind: "macos-trash",
             path: absolutePath,
+            isDirectory: true,
+            scope: "subtree",
             reason: "macOS Trash is intentionally excluded; deleted items are not included in this backup.",
           });
           continue;
         }
         if (isMacDataVolumePathExcluded(absolutePath, root)) continue;
-        if (isSiloAppData(absolutePath)) continue;
-        if (entry.isDirectory() && await isSiloCloneDirectory(absolutePath)) continue;
+        if (!options.allowSiloAppData && isSiloAppData(absolutePath)) {
+          options.onExcludedPath?.({ kind: "silo-data-managed", path: absolutePath,
+            isDirectory: entry.isDirectory(), scope: entry.isDirectory() ? "subtree" : "file",
+            reason: "Silo app data is not copied a second time inside this source. Durable configuration and indexes are included under Silo/Configuration, and configured cache roots are included under Silo/Caches; review other app-specific files here for anything you want to archive manually." });
+          continue;
+        }
+        if (entry.isDirectory() && await isSiloCloneDirectory(absolutePath)) {
+          options.onExcludedPath?.({ kind: "nested-shelter", path: absolutePath, isDirectory: true, scope: "subtree",
+            reason: "A Fallout Shelter clone nested inside this source is not recursively copied. Browse or replicate that verified shelter separately if it should be part of this archive." });
+          continue;
+        }
         const relativePath = path.join(current.relativePath, entry.name);
         let stats: fs.Stats;
         try {
@@ -7627,10 +7791,23 @@ async function listLocalCloneEntries(
           continue;
         }
         if (machineDevice !== null && stats.dev !== machineDevice) continue;
+        if (entry.name.toLowerCase() === "node_modules" && stats.isDirectory()) {
+          options.onExcludedPath?.({
+            kind: "node-modules",
+            path: absolutePath,
+            isDirectory: true,
+            scope: "subtree",
+            reason: "node_modules contains installed dependencies that can be recreated from the repository's package manifests. It is intentionally excluded to avoid copying large generated dependency trees; reinstall dependencies manually if needed.",
+          });
+          continue;
+        }
+        if (entry.name === ".git" && (stats.isDirectory() || stats.isFile()))
+          options.repositoryRoots?.add(current.relativePath);
         if (stats.isSymbolicLink()) {
           options.onExcludedPath?.({
             kind: "symbolic-link",
             path: absolutePath,
+            scope: "path",
             reason: "Symbolic links are not followed or recreated by this backup, so their targets are not included through this path.",
           });
         } else if (stats.isDirectory()) {
@@ -7666,6 +7843,8 @@ async function listLocalCloneEntries(
           options.onExcludedPath?.({
             kind,
             path: absolutePath,
+            isDirectory: false,
+            scope: "file",
             reason: `${typeLabel}s do not contain copyable regular-file data and are excluded from this backup.`,
           });
         }
@@ -7684,6 +7863,7 @@ async function prepareSourceClone(
   sourceOverrides?: BrowseSource[],
   prepareOptions: {
     includeConfig?: boolean;
+    includeVirtualFolders?: boolean;
     allowMarkedRoot?: boolean;
     skipRootManifest?: boolean;
     prefixSources?: boolean;
@@ -7734,7 +7914,6 @@ async function prepareSourceClone(
   }
 
   const entries: SourceClonePlanEntry[] = [];
-  const sourcePrefixes = new Map<string, string>();
   const excludedPaths: SourceCloneExcludedPath[] = [];
   const inheritedExcludedPaths = prepareOptions.sourceManifest?.excludedPaths;
   if (Array.isArray(inheritedExcludedPaths)) {
@@ -7745,32 +7924,96 @@ async function prepareSourceClone(
           typeof record.sourceLabel !== "string") continue;
       const kind: SourceCloneExcludedKind = record.kind === "macos-trash" || record.kind === "symbolic-link" ||
         record.kind === "socket" || record.kind === "fifo" || record.kind === "device" ||
-        record.kind === "permission-denied" || record.kind === "unsupported"
+        record.kind === "permission-denied" || record.kind === "unsupported" ||
+        record.kind === "node-modules" || record.kind === "missing-virtual-folder-file" ||
+        record.kind === "silo-data-managed" || record.kind === "nested-shelter"
         ? record.kind
         : "unsupported";
-      excludedPaths.push({ kind, sourceLabel: record.sourceLabel, path: record.path, reason: record.reason,
+      excludedPaths.push({ kind,
+        sourceId: typeof record.sourceId === "string" ? record.sourceId : (selected.length === 1 ? selected[0].id : undefined),
+        sourceLabel: record.sourceLabel, path: record.path, reason: record.reason,
+        ...(typeof record.isDirectory === "boolean" ? { isDirectory: record.isDirectory } : {}),
+        ...(record.scope === "file" || record.scope === "subtree" || record.scope === "path"
+          ? { scope: record.scope }
+          : { scope: record.isDirectory === true ? "subtree" : record.isDirectory === false ? "file" : "path" }),
         ...(typeof record.errorCode === "string" ? { errorCode: record.errorCode } : {}) });
     }
   }
+  const excludedPathKeys = new Set<string>();
+  for (let index = excludedPaths.length - 1; index >= 0; index -= 1) {
+    const excluded = excludedPaths[index];
+    const key = `${excluded.sourceId ?? excluded.sourceLabel}\0${excluded.path}`;
+    if (excludedPathKeys.has(key)) excludedPaths.splice(index, 1);
+    else excludedPathKeys.add(key);
+  }
   let scannedEntries = 0;
   let discoveredFiles = 0;
+  const sourceProgress: SourceCloneSourceProgress[] = selected.map((source) => ({
+    sourceId: source.id,
+    label: source.label,
+    phase: "waiting",
+    discoveredFiles: 0,
+    checkedFiles: 0,
+    checkedBytes: 0,
+    omittedFiles: excludedPaths.filter((excluded) => excluded.sourceId === source.id && excluded.scope === "file").length,
+    omittedSubtrees: excludedPaths.filter((excluded) => excluded.sourceId === source.id && excluded.scope === "subtree").length,
+    omittedPaths: excludedPaths.filter((excluded) => excluded.sourceId === source.id).length,
+    completedFiles: 0,
+    verifiedFiles: 0,
+    failedFiles: 0,
+    copiedBytes: 0,
+  }));
+  const supportSourceId = "silo-support-data";
+  sourceProgress.push({ sourceId: supportSourceId, label: "Silo configuration, indexes & caches",
+    phase: "waiting", discoveredFiles: 0, checkedFiles: 0, checkedBytes: 0, omittedFiles: 0, omittedSubtrees: 0, omittedPaths: 0,
+    completedFiles: 0, verifiedFiles: 0, failedFiles: 0, copiedBytes: 0 });
+  const digitalFolders = (stateStore?.getState().digitalFolders ?? [])
+    .filter((folder) => Array.isArray(folder.filePaths) && folder.filePaths.length > 0 &&
+      prepareOptions.includeVirtualFolders !== false);
+  for (const folder of digitalFolders)
+    sourceProgress.push({ sourceId: `virtual-folder:${folder.id}`, label: `Virtual Folder: ${folder.name}`,
+      phase: "waiting", discoveredFiles: 0, checkedFiles: 0, checkedBytes: 0, omittedFiles: 0, omittedSubtrees: 0, omittedPaths: 0,
+      completedFiles: 0, verifiedFiles: 0, failedFiles: 0, copiedBytes: 0 });
+  const sourceProgressById = new Map(sourceProgress.map((item) => [item.sourceId, item]));
+  const addExcludedPath = (excluded: SourceCloneExcludedPath) => {
+    excluded.scope ??= excluded.isDirectory === true
+      ? "subtree"
+      : excluded.isDirectory === false
+        ? "file"
+        : "path";
+    const key = `${excluded.sourceId ?? excluded.sourceLabel}\0${excluded.path}`;
+    if (excludedPathKeys.has(key)) return false;
+    excludedPathKeys.add(key);
+    excludedPaths.push(excluded);
+    const source = excluded.sourceId ? sourceProgressById.get(excluded.sourceId) : undefined;
+    if (source) {
+      source.omittedPaths += 1;
+      if (excluded.scope === "file") source.omittedFiles += 1;
+      if (excluded.scope === "subtree") source.omittedSubtrees += 1;
+    }
+    return true;
+  };
   const initial: SourceCloneProgress = {
     operationId, phase: "scanning", destination: destinationPlans[0].cloneRoot,
-    totalSources: selected.length, totalFiles: 0, discoveredFiles, omittedPaths: excludedPaths.length, completedFiles: 0,
+    totalSources: sourceProgress.length, totalFiles: 0, discoveredFiles, omittedPaths: excludedPaths.length, completedFiles: 0,
     totalBytes: 0, copiedBytes: 0, verifiedFiles: 0, failedFiles: 0,
     currentFile: "", message: "Preparing a read-only source inventory…",
   };
-  sendSourceCloneProgress(initial);
+  const emitPreflightProgress = (overrides: Partial<SourceCloneProgress> = {}) =>
+    sendSourceCloneProgress({ ...initial, ...overrides,
+      sourceProgress: sourceProgress.map((item) => ({ ...item })) });
+  emitPreflightProgress();
 
   for (const [sourceIndex, source] of selected.entries()) {
     ensureCloneActive(operationId);
-    sendSourceCloneProgress({ ...initial, discoveredFiles, omittedPaths: excludedPaths.length,
+    const sourceState = sourceProgressById.get(source.id)!;
+    sourceState.phase = "scanning";
+    emitPreflightProgress({ discoveredFiles, omittedPaths: excludedPaths.length,
       currentFile: source.label,
       message: `Scanning ${source.label} (${sourceIndex + 1} of ${selected.length})…` });
     const prefix = prepareOptions.prefixSources === false
       ? ""
-      : `${String(sourceIndex + 1).padStart(2, "0")}-${cloneSafeSegment(source.label)}`;
-    sourcePrefixes.set(source.id, prefix);
+      : path.join("Sources", `${String(sourceIndex + 1).padStart(2, "0")}-${cloneSafeSegment(source.label)}`);
     if (prefix)
       entries.push({
         sourcePath: source.rootPath,
@@ -7782,6 +8025,8 @@ async function prepareSourceClone(
         isDirectory: true,
       });
     if (source.kind === "local" || source.kind === "machine") {
+      const repositoryRoots = new Set<string>();
+      const sourceEntryStart = entries.length;
       await listLocalCloneEntries(source.rootPath, operationId, (entry) => {
         entry.sourceId = source.id;
         entry.sourceRelativePath = entry.destinationRelativePath;
@@ -7790,24 +8035,31 @@ async function prepareSourceClone(
         entry.destinationRelativePath = path.join(prefix, cloneSafeRelativePath(entry.destinationRelativePath));
         entries.push(entry);
         scannedEntries += 1;
-        if (!entry.isDirectory) discoveredFiles += 1;
+        if (!entry.isDirectory) {
+          discoveredFiles += 1;
+          sourceState.discoveredFiles += 1;
+        }
         if (scannedEntries % 250 === 0)
-          sendSourceCloneProgress({ ...initial, totalFiles: discoveredFiles, discoveredFiles,
+          emitPreflightProgress({ totalFiles: 0, discoveredFiles,
             omittedPaths: excludedPaths.length,
             currentFile: entry.destinationRelativePath,
             message: "Scanning source files…" });
       }, {
         allowMarkedRoot: prepareOptions.allowMarkedRoot,
         skipRootManifest: prepareOptions.skipRootManifest,
+        repositoryRoots,
         onExcludedPath: (excludedEntry) => {
           const excluded: SourceCloneExcludedPath = {
             kind: excludedEntry.kind,
+            sourceId: source.id,
             sourceLabel: source.label,
             path: excludedEntry.path,
+            ...(excludedEntry.isDirectory === undefined ? {} : { isDirectory: excludedEntry.isDirectory }),
+            ...(excludedEntry.scope === undefined ? {} : { scope: excludedEntry.scope }),
             reason: excludedEntry.reason,
             ...(excludedEntry.errorCode ? { errorCode: excludedEntry.errorCode } : {}),
           };
-          excludedPaths.push(excluded);
+          addExcludedPath(excluded);
           if (excluded.kind === "permission-denied") {
             const excludedPath = path.resolve(excluded.path);
             for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -7816,21 +8068,50 @@ async function prepareSourceClone(
                 entries.splice(index, 1);
             }
           }
+          sourceState.omittedPaths = excludedPaths.filter((item) => item.sourceId === source.id).length;
           if (excludedPaths.length === 1 || excludedPaths.length % 100 === 0)
-            sendSourceCloneProgress({ ...initial, totalFiles: discoveredFiles, discoveredFiles,
+            emitPreflightProgress({ totalFiles: 0, discoveredFiles,
               omittedPaths: excludedPaths.length, currentFile: excluded.path,
               message: "Recording source paths that will be omitted…" });
         },
       });
-      sendSourceCloneProgress({ ...initial, totalFiles: discoveredFiles, discoveredFiles,
+      if (repositoryRoots.size) {
+        const orderedRoots = [...repositoryRoots].sort((left, right) => left.split(path.sep).length - right.split(path.sep).length);
+        const removeEmptySourceRoot = repositoryRoots.has("");
+        for (const entry of entries.slice(sourceEntryStart)) {
+          if (entry.isDirectory && !entry.sourceRelativePath) {
+            if (removeEmptySourceRoot) entry.destinationRelativePath = "";
+            continue;
+          }
+          const sourceRelative = entry.sourceRelativePath ?? "";
+          const repositoryRoot = orderedRoots.find((candidate) =>
+            !candidate || sourceRelative === candidate || sourceRelative.startsWith(`${candidate}${path.sep}`),
+          );
+          if (!repositoryRoot) continue;
+          const repositoryPath = repositoryRoot
+            ? path.relative(repositoryRoot, sourceRelative)
+            : sourceRelative;
+          entry.destinationRelativePath = path.join(
+            "Git Repositories",
+            `${String(sourceIndex + 1).padStart(2, "0")}-${cloneSafeSegment(source.label)}`,
+            ...(repositoryRoot ? [cloneSafeRelativePath(repositoryRoot)] : []),
+            ...(repositoryPath ? [cloneSafeRelativePath(repositoryPath)] : []),
+          );
+          if (!entry.isDirectory) entry.deduplicate = false;
+        }
+        if (removeEmptySourceRoot) {
+          for (let index = entries.length - 1; index >= sourceEntryStart; index -= 1)
+            if (entries[index].isDirectory && entries[index].sourceRelativePath === "") entries.splice(index, 1);
+        }
+      }
+      sourceState.phase = "checking";
+      sourceState.totalFiles = sourceState.discoveredFiles;
+      emitPreflightProgress({ totalFiles: 0, discoveredFiles,
         omittedPaths: excludedPaths.length, currentFile: source.rootPath,
         message: "Source scan complete; checking readable files…" });
       continue;
     }
-    const remoteEntries = phoneManager.isPhonePath(source.rootPath)
-      ? await phoneManager.listPhoneFilesRecursively(source.rootPath)
-      : await googleManager.listFilesRecursively(source.rootPath);
-    for (const remote of remoteEntries) {
+    const addRemoteEntry = (remote: PhoneFileInfo | CloudFileInfo) => {
       ensureCloneActive(operationId);
       const relativePath = cloneSafeRelativePath(remote.relativePath || remote.name);
       entries.push({ sourcePath: remote.path, destinationRelativePath: path.join(prefix, relativePath),
@@ -7838,9 +8119,23 @@ async function prepareSourceClone(
         sourceSize: remote.size, sourceModified: remote.modified,
         size: remote.size, modified: remote.modified, isDirectory: remote.isDirectory });
       scannedEntries += 1;
-      if (!remote.isDirectory) discoveredFiles += 1;
-    }
-    sendSourceCloneProgress({ ...initial, totalFiles: discoveredFiles, discoveredFiles,
+      if (!remote.isDirectory) {
+        discoveredFiles += 1;
+        sourceState.discoveredFiles += 1;
+      }
+      if (scannedEntries % 250 === 0)
+        emitPreflightProgress({ totalFiles: 0, discoveredFiles,
+          omittedPaths: excludedPaths.length, currentFile: relativePath,
+          message: `Scanning ${source.label}…` });
+    };
+    if (phoneManager.isPhonePath(source.rootPath))
+      await phoneManager.listPhoneFilesRecursively(source.rootPath, addRemoteEntry, () => operation.cancelled);
+    else
+      await googleManager.listFilesRecursively(source.rootPath, addRemoteEntry, () => operation.cancelled);
+    ensureCloneActive(operationId);
+    sourceState.phase = "checking";
+    sourceState.totalFiles = sourceState.discoveredFiles;
+    emitPreflightProgress({ totalFiles: 0, discoveredFiles,
       omittedPaths: excludedPaths.length, currentFile: source.rootPath,
       message: "Source scan complete; checking readable files…" });
   }
@@ -7848,6 +8143,165 @@ async function prepareSourceClone(
   const configDirectory = await fsPromises.mkdtemp(path.join(os.tmpdir(), "silo-clone-config-"));
   const configArchive = path.join(configDirectory, "silo-config.tar.gz");
   try {
+    const supportState = sourceProgressById.get(supportSourceId)!;
+    supportState.phase = "scanning";
+    entries.push({ sourcePath: "", destinationRelativePath: "Silo", size: 0, modified: 0,
+      sourceId: supportSourceId, isDirectory: true });
+    entries.push({ sourcePath: "", destinationRelativePath: path.join("Silo", "Configuration"), size: 0,
+      modified: 0, sourceId: supportSourceId, isDirectory: true });
+    entries.push({ sourcePath: "", destinationRelativePath: path.join("Silo", "Caches"), size: 0,
+      modified: 0, sourceId: supportSourceId, isDirectory: true });
+    entries.push({ sourcePath: "", destinationRelativePath: path.join("Silo", "Audit"), size: 0,
+      modified: 0, sourceId: supportSourceId, isDirectory: true });
+    const sourceForExclusion = new Map(sourceProgress.map((item) => [item.sourceId, item]));
+    const addAuxiliaryExclusion = (sourceId: string, excludedEntry: SourceCloneExcludedEntry) => {
+      const source = sourceForExclusion.get(sourceId);
+      if (!source) return;
+      addExcludedPath({ ...excludedEntry, sourceId, sourceLabel: source.label });
+      source.omittedPaths = excludedPaths.filter((item) => item.sourceId === sourceId).length;
+    };
+
+    for (const cache of CACHE_DESTINATIONS) {
+      ensureCloneActive(operationId);
+      const cachePath = getCacheEntryPath(cache.id, cacheDestinationRoots, indexStorageRoot);
+      const archiveRoot = path.join("Silo", "Caches", cloneSafeSegment(cache.id));
+      entries.push({ sourcePath: cachePath, destinationRelativePath: archiveRoot, size: 0,
+        modified: 0, sourceId: supportSourceId, isDirectory: true });
+      await listLocalCloneEntries(cachePath, operationId, (entry) => {
+        entry.sourceId = supportSourceId;
+        entry.sourceRelativePath = path.join("Caches", cache.id, entry.destinationRelativePath);
+        entry.destinationRelativePath = path.join(archiveRoot, cloneSafeRelativePath(entry.destinationRelativePath));
+        entry.sourceSize = entry.size;
+        entry.sourceModified = entry.modified;
+        entries.push(entry);
+        if (!entry.isDirectory) {
+          supportState.discoveredFiles += 1;
+          discoveredFiles += 1;
+        }
+        if (++scannedEntries % 250 === 0)
+          emitPreflightProgress({ discoveredFiles, omittedPaths: excludedPaths.length,
+            currentFile: entry.destinationRelativePath, message: `Scanning Silo ${cache.name.toLowerCase()}…` });
+      }, {
+        allowSiloAppData: true,
+        allowFileRoot: true,
+        onExcludedPath: (excludedEntry) => addAuxiliaryExclusion(supportSourceId, excludedEntry),
+      }).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      });
+    }
+
+    const virtualFolderManifest: Array<{
+      id: string;
+      name: string;
+      archivePath: string;
+      createdAt: number;
+      hidden: boolean;
+      items: Array<{ originalPath: string; archivePath: string }>;
+    }> = [];
+    const usedFolderNames = new Set<string>();
+    if (digitalFolders.length) {
+      entries.push({ sourcePath: "", destinationRelativePath: "Virtual Folders", size: 0,
+        modified: 0, sourceId: supportSourceId, isDirectory: true });
+    }
+    const resolvedSources = await Promise.all(selected
+      .filter((source) => source.kind === "local" || source.kind === "machine")
+      .map(async (source) => ({ source, root: await originalFs.promises.realpath(source.rootPath).catch(() => path.resolve(source.rootPath)) })));
+    for (const folder of digitalFolders) {
+      ensureCloneActive(operationId);
+      const folderSourceId = `virtual-folder:${folder.id}`;
+      const folderState = sourceProgressById.get(folderSourceId)!;
+      folderState.phase = "scanning";
+      const baseName = cloneSafeSegment(folder.name);
+      let folderName = baseName;
+      let collision = 2;
+      while (usedFolderNames.has(folderName.toLocaleLowerCase())) folderName = `${baseName} (${collision++})`;
+      usedFolderNames.add(folderName.toLocaleLowerCase());
+      const archiveFolder = path.join("Virtual Folders", folderName);
+      entries.push({ sourcePath: "", destinationRelativePath: archiveFolder, size: 0,
+        modified: 0, sourceId: folderSourceId, isDirectory: true });
+      const folderManifest = {
+        id: folder.id,
+        name: folder.name,
+        archivePath: archiveFolder,
+        createdAt: folder.createdAt,
+        hidden: folder.hidden === true,
+        items: [] as Array<{ originalPath: string; archivePath: string }>,
+      };
+      const claimedPaths = new Set<string>();
+      for (const originalPath of folder.filePaths) {
+        ensureCloneActive(operationId);
+        try {
+          const localPath = await resolveLocalPath(originalPath);
+          const stats = await originalFs.promises.lstat(localPath);
+          if (!stats.isFile()) throw Object.assign(new Error("Virtual-folder references must resolve to regular files."), { code: "UNSUPPORTED" });
+          let relativePath = path.basename(localPath);
+          const resolvedPath = path.resolve(localPath);
+          for (const { root } of resolvedSources) {
+            const relative = path.relative(root, resolvedPath);
+            if (relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+              relativePath = relative;
+              break;
+            }
+          }
+          let safeRelative = cloneSafeRelativePath(relativePath);
+          let archivePath = path.join(archiveFolder, safeRelative);
+          if (claimedPaths.has(archivePath.toLocaleLowerCase())) {
+            const extension = path.extname(safeRelative);
+            const stem = extension ? safeRelative.slice(0, -extension.length) : safeRelative;
+            let suffix = 2;
+            do {
+              safeRelative = `${stem} (${suffix++})${extension}`;
+              archivePath = path.join(archiveFolder, safeRelative);
+            } while (claimedPaths.has(archivePath.toLocaleLowerCase()));
+          }
+          claimedPaths.add(archivePath.toLocaleLowerCase());
+          entries.push({ sourcePath: originalPath, localPath, destinationRelativePath: archivePath,
+            sourceId: folderSourceId, sourceRelativePath: originalPath,
+            sourceSize: stats.size, sourceModified: stats.mtimeMs,
+            size: stats.size, modified: stats.mtimeMs, isDirectory: false });
+          folderManifest.items.push({ originalPath, archivePath });
+          folderState.discoveredFiles += 1;
+          discoveredFiles += 1;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          const missing = code === "ENOENT" || code === "ENOTDIR";
+          addAuxiliaryExclusion(folderSourceId, {
+            kind: missing ? "missing-virtual-folder-file" : code === "EACCES" || code === "EPERM" ? "permission-denied" : "unsupported",
+            path: originalPath,
+            isDirectory: false,
+            scope: "file",
+            reason: missing
+              ? "This virtual-folder item no longer resolves to an available file. The saved folder still references it; reconnect its source or remove the stale item."
+              : code === "EACCES" || code === "EPERM"
+                ? "The operating system denied access to this virtual-folder item. Restore its permissions before treating the virtual-folder copy as complete."
+                : "This virtual-folder reference did not resolve to a readable regular file and was omitted.",
+            ...(typeof code === "string" ? { errorCode: code } : {}),
+          });
+        }
+        if (folderState.discoveredFiles % 250 === 0)
+          emitPreflightProgress({ discoveredFiles, omittedPaths: excludedPaths.length,
+            currentFile: originalPath, message: `Scanning virtual folder ${folder.name}…` });
+      }
+      virtualFolderManifest.push(folderManifest);
+      folderState.phase = "checking";
+      folderState.totalFiles = folderState.discoveredFiles;
+    }
+    if (digitalFolders.length) {
+      const folderManifestPath = path.join(configDirectory, "virtual-folders.json");
+      await fsPromises.writeFile(folderManifestPath, JSON.stringify({
+        format: "silo-virtual-folders", version: 1, folders: virtualFolderManifest,
+      }, null, 2));
+      const stats = await fsPromises.stat(folderManifestPath);
+      entries.push({ sourcePath: folderManifestPath, localPath: folderManifestPath,
+        destinationRelativePath: path.join("Virtual Folders", "folders.json"),
+        sourceId: supportSourceId, sourceRelativePath: "virtual-folders.json",
+        sourceSize: stats.size, sourceModified: stats.mtimeMs,
+        size: stats.size, modified: stats.mtimeMs, isDirectory: false });
+      supportState.discoveredFiles += 1;
+      discoveredFiles += 1;
+    }
+
     if (prepareOptions.includeConfig !== false) {
       await exportConfig(
         app.getPath("userData"),
@@ -7857,12 +8311,13 @@ async function prepareSourceClone(
         indexStorageRoot,
       );
       const configStats = await fsPromises.stat(configArchive);
-      for (const source of selected) {
-        const prefix = sourcePrefixes.get(source.id)!;
-        entries.push({ sourcePath: configArchive, localPath: configArchive,
-          destinationRelativePath: path.join(prefix, "silo-config.tar.gz"),
-          size: configStats.size, modified: configStats.mtimeMs, isDirectory: false });
-      }
+      entries.push({ sourcePath: configArchive, localPath: configArchive,
+        destinationRelativePath: path.join("Silo", "Configuration", "silo-config.tar.gz"),
+        sourceId: supportSourceId, sourceRelativePath: "Configuration/silo-config.tar.gz",
+        sourceSize: configStats.size, sourceModified: configStats.mtimeMs,
+        size: configStats.size, modified: configStats.mtimeMs, isDirectory: false });
+      supportState.discoveredFiles += 1;
+      discoveredFiles += 1;
     }
     if (prepareOptions.replicaSourceManifestPath) {
       const sourceManifestPath = prepareOptions.replicaSourceManifestPath;
@@ -7871,6 +8326,10 @@ async function prepareSourceClone(
         sourcePath: sourceManifestPath,
         localPath: sourceManifestPath,
         destinationRelativePath: "silo-source-snapshot-manifest.json",
+        sourceId: selected[0].id,
+        sourceRelativePath: "silo-source-snapshot-manifest.json",
+        sourceSize: manifestStats.size,
+        sourceModified: manifestStats.mtimeMs,
         size: manifestStats.size,
         modified: manifestStats.mtimeMs,
         isDirectory: false,
@@ -7905,6 +8364,9 @@ async function prepareSourceClone(
           size: stats.size,
           modified: stats.mtimeMs,
           sha256: alias.sha256,
+          ...(alias.deduplicate === false || alias.path.startsWith(`Git Repositories${path.sep}`)
+            ? { deduplicate: false }
+            : {}),
           // Snapshot-to-snapshot aliases become real files in the replica.
           ...(crossClone ? {} : { duplicateOf: alias.canonicalPath }),
           isDirectory: false,
@@ -7915,9 +8377,34 @@ async function prepareSourceClone(
 
     let files = entries.filter((entry) => !entry.isDirectory);
     if (files.length === 0) throw new Error("The selected sources contain no files to clone.");
+    const initialTotalsBySource = new Map<string, { files: number; bytes: number }>();
+    for (const entry of files) {
+      if (!entry.sourceId) continue;
+      const totals = initialTotalsBySource.get(entry.sourceId) ?? { files: 0, bytes: 0 };
+      totals.files += 1;
+      totals.bytes += Math.max(0, entry.size);
+      initialTotalsBySource.set(entry.sourceId, totals);
+    }
+    for (const source of sourceProgress) {
+      const totals = initialTotalsBySource.get(source.sourceId) ?? { files: 0, bytes: 0 };
+      source.discoveredFiles = totals.files;
+      source.totalFiles = totals.files;
+      source.totalBytes = totals.bytes;
+      source.completedFiles = 0;
+    }
+    const aliasTargetPaths = new Set<string>();
+    for (const entry of files)
+      if (entry.duplicateOf) aliasTargetPaths.add(entry.duplicateOf);
+    const entryByDestinationPath = new Map<string, SourceClonePlanEntry>();
+    if (aliasTargetPaths.size) {
+      for (const entry of entries)
+        if (aliasTargetPaths.has(entry.destinationRelativePath))
+          entryByDestinationPath.set(entry.destinationRelativePath, entry);
+    }
     const canonicalByDigest = new Map<string, SourceClonePlanEntry>();
     const permissionDeniedFiles = new Set<SourceClonePlanEntry>();
     let totalBytes = 0;
+    let lastHashProgressAt = 0;
     for (let index = 0; index < files.length; index += 1) {
       ensureCloneActive(operationId);
       const entry = files[index];
@@ -7927,22 +8414,47 @@ async function prepareSourceClone(
       try {
         localPath = entry.localPath ?? await resolveLocalPath(entry.sourcePath);
         stats = await originalFs.promises.stat(localPath);
-        digest = await hashFile(localPath);
+        digest = await hashFile(localPath, operationId, (bytesRead) => {
+          const sourceState = entry.sourceId ? sourceProgressById.get(entry.sourceId) : undefined;
+          if (sourceState)
+            sourceState.checkedBytes = (sourceState.checkedBytes ?? 0) + bytesRead;
+          const now = Date.now();
+          if (sourceState && now - lastHashProgressAt >= 500) {
+            lastHashProgressAt = now;
+            emitPreflightProgress({ phase: "checking-space", totalFiles: canonicalByDigest.size,
+              discoveredFiles, omittedPaths: excludedPaths.length, completedFiles: index,
+              currentFile: entry.destinationRelativePath,
+              message: `Hashing ${entry.destinationRelativePath} · ${(sourceState.checkedBytes ?? 0).toLocaleString()} bytes read…` });
+          }
+        });
       } catch (error) {
         const source = selected.find((candidate) => candidate.id === entry.sourceId);
         if (!source || (source.kind !== "local" && source.kind !== "machine") ||
             !isSourceClonePermissionError(error)) throw error;
         permissionDeniedFiles.add(entry);
-        excludedPaths.push({
+        addExcludedPath({
           ...sourceClonePermissionExclusion(entry.sourcePath, error, "read"),
+          sourceId: source.id,
           sourceLabel: source.label,
         });
-        if (permissionDeniedFiles.size === 1 || permissionDeniedFiles.size % 100 === 0 || index + 1 === files.length)
-          sendSourceCloneProgress({ ...initial, phase: "checking-space", totalFiles: canonicalByDigest.size,
+        if (entry.sourceId) {
+          const sourceState = sourceProgressById.get(entry.sourceId);
+          if (sourceState) sourceState.checkedFiles += 1;
+        }
+        const now = Date.now();
+        if (permissionDeniedFiles.size === 1 || permissionDeniedFiles.size % 100 === 0 ||
+            index + 1 === files.length || now - lastHashProgressAt >= 500) {
+          lastHashProgressAt = now;
+          emitPreflightProgress({ phase: "checking-space", totalFiles: canonicalByDigest.size,
             discoveredFiles, omittedPaths: excludedPaths.length, completedFiles: index + 1,
             currentFile: entry.destinationRelativePath,
             message: "Recording a source file that could not be read during verification…" });
+        }
         continue;
+      }
+      if (entry.sourceId) {
+        const sourceState = sourceProgressById.get(entry.sourceId);
+        if (sourceState) sourceState.checkedFiles += 1;
       }
       entry.localPath = localPath;
       entry.size = stats.size;
@@ -7951,7 +8463,7 @@ async function prepareSourceClone(
         throw new Error(`Fallout Shelter alias no longer matches its verified source: ${entry.destinationRelativePath}`);
       entry.sha256 = digest;
       if (entry.duplicateOf) {
-        const canonical = entries.find((candidate) => candidate.destinationRelativePath === entry.duplicateOf);
+        const canonical = entryByDestinationPath.get(entry.duplicateOf);
         if (!canonical)
           throw new Error(`Fallout Shelter alias target is missing or has changed: ${entry.destinationRelativePath}`);
         if (permissionDeniedFiles.has(canonical)) entry.duplicateOf = undefined;
@@ -7961,20 +8473,23 @@ async function prepareSourceClone(
           continue;
         }
       }
-      const canonical = canonicalByDigest.get(entry.sha256);
+      const canonical = entry.deduplicate === false ? undefined : canonicalByDigest.get(entry.sha256);
       if (canonical) {
         if (canonical.size !== entry.size)
           throw new Error("SHA-256 collision with mismatched file sizes; aborting duplicate elimination.");
         entry.duplicateOf = canonical.destinationRelativePath;
       } else {
-        canonicalByDigest.set(entry.sha256, entry);
+        if (entry.deduplicate !== false) canonicalByDigest.set(entry.sha256, entry);
         totalBytes += stats.size;
       }
-      if ((index + 1) % 100 === 0 || index + 1 === files.length)
-        sendSourceCloneProgress({ ...initial, phase: "checking-space", totalFiles: canonicalByDigest.size,
+      const now = Date.now();
+      if ((index + 1) % 100 === 0 || index + 1 === files.length || now - lastHashProgressAt >= 500) {
+        lastHashProgressAt = now;
+        emitPreflightProgress({ phase: "checking-space", totalFiles: canonicalByDigest.size,
           discoveredFiles, omittedPaths: excludedPaths.length, completedFiles: index + 1,
           totalBytes, currentFile: entry.destinationRelativePath,
           message: `Hashed ${(index + 1).toLocaleString()} of ${files.length.toLocaleString()} paths · ${canonicalByDigest.size.toLocaleString()} unique files…` });
+      }
     }
     if (permissionDeniedFiles.size) {
       files = files.filter((entry) => !permissionDeniedFiles.has(entry));
@@ -7983,6 +8498,56 @@ async function prepareSourceClone(
       }
       if (files.length === 0)
         throw new Error("No readable files remained after permission-restricted paths were omitted. Review the diagnostic log and source permissions.");
+    }
+    const omissionsAuditPath = path.join(configDirectory, "omissions.json");
+    const omissionAudit = {
+      format: "silo-fallout-shelter-omissions",
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      sourceCoverage: excludedPaths.length ? "partial" : "complete",
+      omittedPathCount: excludedPaths.length,
+      omittedFiles: excludedPaths.filter((item) => item.scope === "file" || item.isDirectory === false).length,
+      omittedSubtrees: excludedPaths.filter((item) => item.scope === "subtree" || item.isDirectory === true).length,
+      paths: excludedPaths.map((item) => ({ ...item })),
+      note: "A subtree omission may contain descendants that could not be inventoried. Review each reason and path manually before treating the backup as a complete source mirror.",
+    };
+    await fsPromises.writeFile(omissionsAuditPath, JSON.stringify(omissionAudit, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    const omissionStats = await fsPromises.stat(omissionsAuditPath);
+    const omissionEntry: SourceClonePlanEntry = {
+      sourcePath: omissionsAuditPath,
+      localPath: omissionsAuditPath,
+      destinationRelativePath: path.join("Silo", "Audit", "omissions.json"),
+      sourceId: supportSourceId,
+      sourceRelativePath: "Audit/omissions.json",
+      sourceSize: omissionStats.size,
+      sourceModified: omissionStats.mtimeMs,
+      sha256: await hashFile(omissionsAuditPath, operationId),
+      size: omissionStats.size,
+      modified: omissionStats.mtimeMs,
+      isDirectory: false,
+    };
+    files.push(omissionEntry);
+    entries.push(omissionEntry);
+    supportState.discoveredFiles += 1;
+    discoveredFiles += 1;
+    totalBytes += omissionStats.size;
+
+    const sourceTotalsById = new Map<string, { files: number; bytes: number }>();
+    for (const entry of files) {
+      if (!entry.sourceId) continue;
+      const totals = sourceTotalsById.get(entry.sourceId) ?? { files: 0, bytes: 0 };
+      totals.files += 1;
+      totals.bytes += Math.max(0, entry.size);
+      sourceTotalsById.set(entry.sourceId, totals);
+    }
+    for (const source of sourceProgress) {
+      const totals = sourceTotalsById.get(source.sourceId) ?? { files: 0, bytes: 0 };
+      source.totalFiles = totals.files;
+      source.totalBytes = totals.bytes;
+      source.phase = "checking";
     }
     const uniqueFiles = files.filter((entry) => !entry.duplicateOf);
     const duplicateFiles = files.length - uniqueFiles.length;
@@ -7993,8 +8558,9 @@ async function prepareSourceClone(
       const reuse = await buildShelterReuseIndex(destination.destination);
       reuseByDestination.set(destination.destination, reuse);
       let reusableBytes = 0;
-      for (const entry of uniqueFiles) {
-        const prior = reuse.get(entry.sha256!);
+    for (const entry of uniqueFiles) {
+      if (entry.deduplicate === false) continue;
+      const prior = reuse.get(entry.sha256!);
         if (prior && prior.size === entry.size) reusableBytes += entry.size;
       }
       destination.reusableBytes = reusableBytes;
@@ -8024,12 +8590,15 @@ async function prepareSourceClone(
     const plan: SourceClonePlan = { id, operationId, destinations: destinationPlans,
       entries, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles,
       sourceLabels: selected.map((source) => source.label), sourceIds: selected.map((source) => source.id),
+      sourceProgress: sourceProgress.map((source) => ({ ...source,
+        phase: "copying", completedFiles: 0, verifiedFiles: 0, failedFiles: 0, copiedBytes: 0 })),
       excludedPaths, configDirectory,
       replicaOf: prepareOptions.replicaOf,
       sourceManifest: prepareOptions.sourceManifest, reuseByDestination };
     sourceClonePlans.set(id, plan);
-    return { planId: id, destinations: destinationPlans, totalSources: selected.length,
-      sourceLabels: plan.sourceLabels, totalFiles: uniqueFiles.length, totalBytes, duplicateFiles,
+    return { planId: id, destinations: destinationPlans, totalSources: sourceProgress.length,
+      sourceLabels: plan.sourceLabels, sourceProgress: sourceProgress.map((source) => ({ ...source })),
+      totalFiles: uniqueFiles.length, totalBytes, duplicateFiles,
       excludedPaths };
   } catch (error) {
     await fsPromises.rm(configDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -8047,12 +8616,7 @@ async function findLatestShelterSnapshot(): Promise<{
   const root = await fsPromises.realpath(destination).catch(() => null);
   if (!root) return null;
   const entries = await fsPromises.readdir(root, { withFileTypes: true }).catch(() => []);
-  const candidates: Array<{
-    rootPath: string;
-    manifestPath: string;
-    manifest: Record<string, unknown>;
-    createdAt: number;
-  }> = [];
+  const candidates: Array<{ rootPath: string; manifestPath: string; createdAt: number }> = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const snapshotPath = path.join(root, entry.name);
@@ -8063,7 +8627,7 @@ async function findLatestShelterSnapshot(): Promise<{
         continue;
       const stats = await fsPromises.stat(snapshotPath);
       const createdAt = typeof manifest.createdAt === "string" ? Date.parse(manifest.createdAt) : 0;
-      candidates.push({ rootPath: snapshotPath, manifestPath, manifest,
+      candidates.push({ rootPath: snapshotPath, manifestPath,
         createdAt: Number.isFinite(createdAt) && createdAt > 0 ? createdAt : stats.mtimeMs });
     } catch {
       // Ignore incomplete, unreadable, or non-Silo directories.
@@ -8071,7 +8635,211 @@ async function findLatestShelterSnapshot(): Promise<{
   }
   candidates.sort((first, second) => second.createdAt - first.createdAt);
   const latest = candidates[0];
-  return latest ? { rootPath: latest.rootPath, manifestPath: latest.manifestPath, manifest: latest.manifest } : null;
+  if (!latest) return null;
+  try {
+    const manifest = JSON.parse(await fsPromises.readFile(latest.manifestPath, "utf8")) as Record<string, unknown>;
+    if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || manifest.complete !== true) return null;
+    return { rootPath: latest.rootPath, manifestPath: latest.manifestPath, manifest };
+  } catch {
+    return null;
+  }
+}
+
+interface ShelterBackupLocation extends ShelterBackupCatalogEntry {
+  path: string;
+}
+
+interface ShelterBackupBrowseTarget {
+  path: string;
+  container: "directory" | "zip";
+  manifest?: Record<string, unknown>;
+}
+
+async function listVerifiedShelterBackups(): Promise<{
+  destination: string | null;
+  available: boolean;
+  backups: ShelterBackupLocation[];
+}> {
+  const storedDestination = await getShelterDestination();
+  if (!storedDestination) return { destination: null, available: false, backups: [] };
+  const destination = await fsPromises.realpath(storedDestination).catch(() => null);
+  if (!destination) return { destination: storedDestination, available: false, backups: [] };
+  const destinationStats = await fsPromises.stat(destination).catch(() => null);
+  if (!destinationStats?.isDirectory())
+    return { destination: storedDestination, available: false, backups: [] };
+
+  const items = await fsPromises.readdir(destination, { withFileTypes: true });
+  const backups: ShelterBackupLocation[] = [];
+  for (const item of items) {
+    const container = item.isDirectory() ? "directory" : item.isFile() && item.name.toLowerCase().endsWith(".zip") ? "zip" : null;
+    if (!container) continue;
+    const backupPath = path.join(destination, item.name);
+    try {
+      let manifest: Record<string, unknown>;
+      let modifiedAt = 0;
+      if (container === "directory") {
+        if (await fsPromises.access(path.join(backupPath, ".silo-clone-in-progress.json")).then(() => true, () => false))
+          continue;
+        manifest = JSON.parse(await fsPromises.readFile(path.join(backupPath, "silo-clone-manifest.json"), "utf8")) as Record<string, unknown>;
+        modifiedAt = (await fsPromises.stat(backupPath)).mtimeMs;
+      } else {
+        manifest = await readCloneArchiveManifest(backupPath);
+        modifiedAt = (await fsPromises.stat(backupPath)).mtimeMs;
+      }
+      if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || manifest.complete !== true)
+        continue;
+      const createdAtValue = typeof manifest.createdAt === "string" ? Date.parse(manifest.createdAt) : NaN;
+      const createdAt = new Date(Number.isFinite(createdAtValue) && createdAtValue > 0 ? createdAtValue : modifiedAt).toISOString();
+      const files = Array.isArray(manifest.files) ? manifest.files.length : 0;
+      const aliases = Array.isArray(manifest.aliases) ? manifest.aliases.length : 0;
+      const omittedPathCount = Array.isArray(manifest.excludedPaths) ? manifest.excludedPaths.length : 0;
+      backups.push({ id: item.name, name: item.name, createdAt, container,
+        fileCount: files + aliases, omittedPathCount, path: backupPath });
+    } catch {
+      // A backup is browseable only when its complete Silo manifest is readable.
+    }
+  }
+  backups.sort((first, second) => second.createdAt.localeCompare(first.createdAt) || first.name.localeCompare(second.name));
+  return { destination: storedDestination, available: true, backups };
+}
+
+/** Resolve just the selected direct child instead of rescanning every backup on each page. */
+async function resolveShelterBackupForBrowse(backupId: string): Promise<ShelterBackupBrowseTarget> {
+  if (backupId === "." || backupId === ".." || backupId.includes("/") || backupId.includes("\\") || backupId.includes("\0"))
+    throw new Error("The selected backup name is invalid.");
+  const storedDestination = await getShelterDestination();
+  if (!storedDestination) throw new Error("The configured Fallout Shelter destination is unavailable.");
+  const destination = await fsPromises.realpath(storedDestination).catch(() => null);
+  if (!destination) throw new Error("The configured Fallout Shelter destination is unavailable. Connect it and refresh the backup list.");
+  const destinationStats = await fsPromises.stat(destination).catch(() => null);
+  if (!destinationStats?.isDirectory())
+    throw new Error("The configured Fallout Shelter destination is not a folder.");
+
+  const candidatePath = path.join(destination, backupId);
+  const candidateStats = await fsPromises.lstat(candidatePath).catch(() => null);
+  if (!candidateStats || candidateStats.isSymbolicLink())
+    throw new Error("That complete Fallout Shelter backup is no longer available at the primary destination.");
+  const resolvedPath = await fsPromises.realpath(candidatePath).catch(() => null);
+  if (!resolvedPath || path.dirname(resolvedPath) !== destination)
+    throw new Error("That backup is no longer a direct child of the primary destination.");
+
+  if (candidateStats.isDirectory()) {
+    if (await fsPromises.access(path.join(resolvedPath, ".silo-clone-in-progress.json")).then(() => true, () => false))
+      throw new Error("That backup is still in progress and cannot be browsed yet.");
+    const manifest = JSON.parse(await fsPromises.readFile(path.join(resolvedPath, "silo-clone-manifest.json"), "utf8")) as Record<string, unknown>;
+    if (manifest.format !== "silo-source-clone" || manifest.version !== 1 || manifest.complete !== true)
+      throw new Error("That Fallout Shelter backup is no longer complete and browseable.");
+    return { path: resolvedPath, container: "directory", manifest };
+  }
+  if (candidateStats.isFile() && backupId.toLowerCase().endsWith(".zip"))
+    return { path: resolvedPath, container: "zip" };
+  throw new Error("That item is not a browseable Fallout Shelter backup.");
+}
+
+function shelterBrowseSegments(relativeDirectory: unknown) {
+  if (typeof relativeDirectory !== "string") throw new Error("The backup folder path is invalid.");
+  const normalized = relativeDirectory.replace(/\\/g, "/");
+  if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized))
+    throw new Error("The backup folder path is invalid.");
+  const segments = normalized ? normalized.split("/") : [];
+  if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\0")))
+    throw new Error("The backup folder path is invalid.");
+  return segments;
+}
+
+async function listShelterDirectoryPage(
+  backup: Pick<ShelterBackupLocation, "path">,
+  manifest: Record<string, unknown>,
+  segments: string[],
+  afterName: string | null,
+  limit: number,
+): Promise<{ entries: ShelterBackupBrowserEntry[]; nextCursor: string | null }> {
+  const root = await fsPromises.realpath(backup.path);
+  let directoryPath = root;
+  for (const segment of segments) {
+    directoryPath = path.join(directoryPath, segment);
+    const stats = await fsPromises.lstat(directoryPath);
+    if (stats.isSymbolicLink() || !stats.isDirectory())
+      throw new Error("That backup folder is unavailable or is not a regular directory.");
+  }
+  const resolvedDirectory = await fsPromises.realpath(directoryPath);
+  if (resolvedDirectory !== root && !resolvedDirectory.startsWith(`${root}${path.sep}`))
+    throw new Error("The requested folder is outside this backup.");
+
+  type Candidate = { name: string; isDirectory: boolean };
+  const heap: Candidate[] = [];
+  const capacity = limit + 1;
+  const compare = (left: Candidate, right: Candidate) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
+  const swap = (first: number, second: number) => { [heap[first], heap[second]] = [heap[second], heap[first]]; };
+  const sink = (index: number) => {
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let largest = index;
+      if (left < heap.length && compare(heap[left], heap[largest]) > 0) largest = left;
+      if (right < heap.length && compare(heap[right], heap[largest]) > 0) largest = right;
+      if (largest === index) return;
+      swap(index, largest);
+      index = largest;
+    }
+  };
+  const consider = (candidate: Candidate) => {
+    if (afterName !== null && candidate.name <= afterName) return;
+    if (heap.length < capacity) {
+      heap.push(candidate);
+      let index = heap.length - 1;
+      while (index > 0) {
+        const parent = Math.floor((index - 1) / 2);
+        if (compare(heap[parent], heap[index]) >= 0) break;
+        swap(parent, index);
+        index = parent;
+      }
+      return;
+    }
+    if (compare(candidate, heap[0]) >= 0) return;
+    heap[0] = candidate;
+    sink(0);
+  };
+
+  const directory = await fsPromises.opendir(resolvedDirectory);
+  for await (const entry of directory) {
+    if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile()) ||
+        entry.name === "silo-clone-manifest.json" || entry.name === ".silo-clone-in-progress.json") continue;
+    consider({ name: entry.name, isDirectory: entry.isDirectory() });
+  }
+  const ordered = heap.sort(compare);
+  const hasMore = ordered.length > limit;
+  const page = ordered.slice(0, limit);
+  const pageNames = new Set(page.map((entry) => entry.name));
+  const aliasByPath = new Map<string, Record<string, unknown>>();
+  if (Array.isArray(manifest.aliases)) {
+    for (const alias of manifest.aliases as Array<Record<string, unknown>>) {
+      if (alias.materialized !== true || typeof alias.path !== "string") continue;
+      const aliasSegments = shelterBrowseSegments(alias.path);
+      if (!aliasSegments || aliasSegments.length !== segments.length + 1 ||
+          !segments.every((segment, index) => aliasSegments[index] === segment) ||
+          !pageNames.has(aliasSegments[aliasSegments.length - 1])) continue;
+      aliasByPath.set(aliasSegments.join("/"), alias);
+    }
+  }
+  const entries = await Promise.all(page.map(async (entry) => {
+    const relativePath = [...segments, entry.name].join("/");
+    let size = 0;
+    if (!entry.isDirectory) {
+      const itemPath = path.join(resolvedDirectory, entry.name);
+      const stats = await fsPromises.lstat(itemPath).catch(() => null);
+      if (!stats || !stats.isFile() || stats.isSymbolicLink())
+        throw new Error(`Backup entry changed while it was being listed: ${entry.name}`);
+      size = stats.size;
+    }
+    const alias = aliasByPath.get(relativePath);
+    const canonicalPath = typeof alias?.canonicalPath === "string"
+      ? alias.canonicalPath.replace(/\\/g, "/")
+      : undefined;
+    return { name: entry.name, relativePath, isDirectory: entry.isDirectory, size,
+      ...(canonicalPath ? { isAlias: true, canonicalPath } : {}) };
+  }));
+  return { entries, nextCursor: hasMore ? page[page.length - 1]?.name ?? null : null };
 }
 
 // Index every physically stored file in earlier complete directory snapshots in a
@@ -8098,6 +8866,7 @@ async function buildShelterReuseIndex(destination: string): Promise<Map<string, 
       for (const record of physical) {
         if (typeof record.sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(record.sha256) ||
             typeof record.path !== "string" || typeof record.size !== "number") continue;
+        if (record.deduplicate === false || record.path.startsWith(`Git Repositories${path.sep}`)) continue;
         const digest = record.sha256.toLowerCase();
         if (reusable.has(digest)) continue;
         const absolutePath = path.resolve(cloneRoot, record.path);
@@ -8142,6 +8911,9 @@ async function prepareShelterReplica(destinations: string[], operationId: string
     [source],
     {
       includeConfig: false,
+      // This replica already contains the virtual-folder tree from its verified
+      // source snapshot. Do not stage the live renderer state over those paths.
+      includeVirtualFolders: false,
       allowMarkedRoot: true,
       skipRootManifest: true,
       prefixSources: false,
@@ -8186,6 +8958,15 @@ async function runSourceClone(
       Number.isFinite(entry.sourceModified) ? entry.sourceModified! : 0,
     );
   }
+  const sourceProgress = plan.sourceProgress.map((source) => ({
+    ...source,
+    phase: "copying" as const,
+    completedFiles: 0,
+    verifiedFiles: 0,
+    failedFiles: 0,
+    copiedBytes: 0,
+  }));
+  const sourceProgressById = new Map(sourceProgress.map((source) => [source.sourceId, source]));
   const persistVerifiedDestinations = async () => {
     if (successfulDestinations.length === 0) return;
     const lastClonedAt = Date.now();
@@ -8225,6 +9006,13 @@ async function runSourceClone(
   try {
     for (const [destinationIndex, destinationPlan] of plan.destinations.entries()) {
       ensureCloneActive(operationId);
+      for (const source of sourceProgress) {
+        source.phase = "copying";
+        source.completedFiles = 0;
+        source.verifiedFiles = 0;
+        source.failedFiles = 0;
+        source.copiedBytes = 0;
+      }
       let completedFiles = 0;
       let copiedBytes = 0;
       let verifiedFiles = 0;
@@ -8236,10 +9024,23 @@ async function runSourceClone(
         const now = Date.now();
         if (!force && now - lastProgressAt < 350) return;
         lastProgressAt = now;
+        if (phase === "verifying") {
+          for (const source of sourceProgress)
+            if (source.phase === "copying") source.phase = "verifying";
+        } else if (phase === "complete" || phase === "cancelled" || phase === "error") {
+          for (const source of sourceProgress) source.phase = phase;
+        }
         sendSourceCloneProgress({ operationId, phase, destination: destinationPlan.cloneRoot,
           totalSources: plan.sourceLabels.length, totalFiles: plan.totalFiles, completedFiles,
           totalBytes: plan.totalBytes, copiedBytes, verifiedFiles, failedFiles, currentFile,
+          omittedPaths: plan.excludedPaths.length,
+          sourceProgress: sourceProgress.map((source) => ({ ...source })),
           message: `Destination ${destinationIndex + 1} of ${plan.destinations.length}: ${message}` });
+      };
+      const updateSource = (sourceId: string | undefined, update: Partial<SourceCloneSourceProgress>) => {
+        if (!sourceId) return;
+        const source = sourceProgressById.get(sourceId);
+        if (source) Object.assign(source, update);
       };
       if (runOptions.compress) {
         const archivePath = `${destinationPlan.cloneRoot}${CLONE_ARCHIVE_EXTENSION}`;
@@ -8247,6 +9048,26 @@ async function runSourceClone(
           throw new Error("Compressed clones cannot reuse earlier snapshots, and this destination does not have enough free space.");
         try {
           const uniqueEntries = plan.entries.filter((item) => !item.isDirectory && !item.duplicateOf);
+          let compressedEntryCursor = 0;
+          let verifiedEntryCursor = 0;
+          const updateCompressedSourceProgress = (
+            entries: SourceClonePlanEntry[],
+            end: number,
+            field: "completedFiles" | "verifiedFiles",
+          ) => {
+            const boundedEnd = Math.min(entries.length, Math.max(0, end));
+            const cursor = field === "completedFiles" ? compressedEntryCursor : verifiedEntryCursor;
+            for (let index = cursor; index < boundedEnd; index += 1) {
+              const entry = entries[index];
+              if (!entry.sourceId) continue;
+              const source = sourceProgressById.get(entry.sourceId);
+              if (!source) continue;
+              source[field] += 1;
+              if (field === "completedFiles") source.copiedBytes += entry.size;
+            }
+            if (field === "completedFiles") compressedEntryCursor = boundedEnd;
+            else verifiedEntryCursor = boundedEnd;
+          };
           for (const entry of uniqueEntries) {
             if (!entry.localPath || !entry.sha256) throw new Error(`Missing staged file for ${entry.sourcePath}`);
             manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size, sha256: entry.sha256,
@@ -8264,6 +9085,7 @@ async function runSourceClone(
             directories: plan.entries.filter((item) => item.isDirectory)
               .map((entry) => ({ archivePath: entry.destinationRelativePath, modified: entry.modified || undefined })),
             isCancelled: () => operation.cancelled,
+            onActiveIo: (cancel) => { operation.cancelCurrentIo = cancel; },
             buildManifest: () => ({
               format: "silo-source-clone", version: 1, container: "zip", createdAt: new Date().toISOString(), complete: true,
               sourceIds: sourceManifest && Array.isArray(sourceManifest.sourceIds) ? sourceManifest.sourceIds : plan.sourceIds,
@@ -8276,10 +9098,14 @@ async function runSourceClone(
             }),
             onProgress: (progress) => {
               if (progress.phase === "compressing") {
+                for (const source of sourceProgress) source.phase = "copying";
+                updateCompressedSourceProgress(uniqueEntries, progress.processedFiles, "completedFiles");
                 copiedBytes = progress.processedBytes;
                 completedFiles = progress.processedFiles;
                 emit("copying", progress.currentFile, `Compressing ${progress.currentFile || "archive"}`);
               } else {
+                for (const source of sourceProgress) source.phase = "verifying";
+                updateCompressedSourceProgress(uniqueEntries, progress.processedFiles, "verifiedFiles");
                 verifiedFiles = progress.processedFiles;
                 emit("verifying", progress.currentFile,
                   `Verifying archive · ${verifiedFiles.toLocaleString()} of ${plan.totalFiles.toLocaleString()} files`);
@@ -8289,21 +9115,19 @@ async function runSourceClone(
           completedFiles = result.storedFiles;
           verifiedFiles = result.verifiedFiles;
           copiedBytes = plan.totalBytes;
-          sendSourceCloneProgress({ operationId, phase: "complete", destination: archivePath,
-            totalSources: plan.sourceLabels.length, totalFiles: plan.totalFiles, completedFiles,
-            totalBytes: plan.totalBytes, copiedBytes, verifiedFiles, failedFiles, currentFile: "",
-            message: `Destination ${destinationIndex + 1} of ${plan.destinations.length}: Compressed clone complete. ` +
-              `${verifiedFiles.toLocaleString()} files verified inside ${path.basename(archivePath)} ` +
-              `(${(result.archiveBytes / 1024 ** 3).toFixed(2)} GB).${sourceCloneOmissionNotice(plan.excludedPaths)}` });
+          for (const source of sourceProgress) {
+            source.completedFiles = source.totalFiles ?? source.completedFiles;
+            source.verifiedFiles = source.totalFiles ?? source.verifiedFiles;
+            source.copiedBytes = source.totalBytes ?? source.copiedBytes;
+          }
+          emit("complete", "", `Compressed clone complete. ${verifiedFiles.toLocaleString()} files verified inside ${path.basename(archivePath)} ` +
+            `(${(result.archiveBytes / 1024 ** 3).toFixed(2)} GB).${sourceCloneOmissionNotice(plan.excludedPaths)}`, true);
           successfulDestinations.push(archivePath);
         } catch (error) {
           const cancelled = operation.cancelled;
-          sendSourceCloneProgress({ operationId, phase: cancelled ? "cancelled" : "error", destination: archivePath,
-            totalSources: plan.sourceLabels.length, totalFiles: plan.totalFiles, completedFiles,
-            totalBytes: plan.totalBytes, copiedBytes, verifiedFiles, failedFiles, currentFile: "",
-            message: cancelled
-              ? "Compressed clone cancelled; the partial archive was removed. Originals were not changed."
-              : error instanceof Error ? error.message : String(error) });
+          emit(cancelled ? "cancelled" : "error", "", cancelled
+            ? "Compressed clone cancelled; the partial archive was removed. Originals were not changed."
+            : error instanceof Error ? error.message : String(error), true);
           throw error;
         }
         continue;
@@ -8338,7 +9162,9 @@ async function runSourceClone(
           const destinationPath = path.resolve(destinationPlan.cloneRoot, entry.destinationRelativePath);
           if (!destinationPath.startsWith(`${destinationPlan.cloneRoot}${path.sep}`)) throw new Error("Unsafe clone file path.");
           await fsPromises.mkdir(path.dirname(destinationPath), { recursive: true });
-          const prior = entry.sha256 ? reuse?.get(entry.sha256) : undefined;
+          const prior = entry.sha256 && entry.deduplicate !== false
+            ? reuse?.get(entry.sha256)
+            : undefined;
           if (prior && prior.size === entry.size) {
             let linked = false;
             try {
@@ -8352,7 +9178,7 @@ async function runSourceClone(
                 const code = (error as NodeJS.ErrnoException).code;
                 if (!code || !hardLinkFallbackCodes.has(code)) throw error;
               }
-              if ((await hashFile(linked ? destinationPath : prior.absolutePath)) !== entry.sha256)
+              if ((await hashFile(linked ? destinationPath : prior.absolutePath, operationId)) !== entry.sha256)
                 throw new Error("Earlier snapshot copy no longer matches.");
               if (linked) {
                 manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size, sha256: entry.sha256,
@@ -8368,6 +9194,10 @@ async function runSourceClone(
               reusedFiles += 1;
               completedFiles += 1;
               copiedBytes += entry.size;
+              updateSource(entry.sourceId, {
+                completedFiles: (sourceProgressById.get(entry.sourceId ?? "")?.completedFiles ?? 0) + 1,
+                ...(!linked ? { verifiedFiles: (sourceProgressById.get(entry.sourceId ?? "")?.verifiedFiles ?? 0) + 1 } : {}),
+              });
               emit("copying", entry.destinationRelativePath, `Already in shelter · ${entry.destinationRelativePath}`);
               continue;
             } catch (error) {
@@ -8387,13 +9217,19 @@ async function runSourceClone(
                 ensureCloneActive(operationId);
                 sourceHash.update(chunk);
                 copiedBytes += chunk.length;
+                updateSource(entry.sourceId, {
+                  copiedBytes: (sourceProgressById.get(entry.sourceId ?? "")?.copiedBytes ?? 0) + chunk.length,
+                });
                 emit("copying", entry.destinationRelativePath, `Copying ${entry.destinationRelativePath}`);
                 callback(null, chunk);
               } catch (error) { callback(error as Error); }
             },
           });
+          const input = originalFs.createReadStream(sourcePath);
+          const cancelInput = () => input.destroy(new Error("Source clone cancelled."));
+          operation.cancelCurrentIo = cancelInput;
           try {
-            await pipeline(originalFs.createReadStream(sourcePath), meter, fs.createWriteStream(partialPath, { flags: "wx" }));
+            await pipeline(input, meter, fs.createWriteStream(partialPath, { flags: "wx" }));
             const hash = sourceHash.digest("hex");
             if (hash !== entry.sha256)
               throw new Error(`Source content changed after hash preflight: ${entry.destinationRelativePath}`);
@@ -8406,27 +9242,48 @@ async function runSourceClone(
             manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size, sha256: hash,
               sourceId: entry.sourceId, sourceRelativePath: entry.sourceRelativePath });
             completedFiles += 1;
+            updateSource(entry.sourceId, {
+              completedFiles: (sourceProgressById.get(entry.sourceId ?? "")?.completedFiles ?? 0) + 1,
+            });
           } catch (error) {
             await fsPromises.rm(partialPath, { force: true }).catch(() => undefined);
             failedFiles += 1;
+            updateSource(entry.sourceId, {
+              failedFiles: (sourceProgressById.get(entry.sourceId ?? "")?.failedFiles ?? 0) + 1,
+            });
             manifestFiles.push({ path: entry.destinationRelativePath, size: entry.size,
               error: error instanceof Error ? error.message : String(error) });
             if (operation.cancelled) throw error;
+          } finally {
+            if (operation.cancelCurrentIo === cancelInput) operation.cancelCurrentIo = undefined;
           }
         }
         for (const record of manifestFiles) {
           ensureCloneActive(operationId);
           if (!record.sha256) continue;
+          const sourceEntry = plan.entries.find((entry) => entry.destinationRelativePath === record.path);
           if (preverifiedPaths.has(record.path)) {
             verifiedFiles += 1;
+            updateSource(record.sourceId ?? sourceEntry?.sourceId, {
+              verifiedFiles: (sourceProgressById.get(record.sourceId ?? sourceEntry?.sourceId ?? "")?.verifiedFiles ?? 0) + 1,
+            });
+            emit("verifying", record.path, `Verified ${verifiedFiles.toLocaleString()} of ${plan.totalFiles.toLocaleString()} files`);
             continue;
           }
-          const copiedHash = await hashFile(path.join(destinationPlan.cloneRoot, record.path));
+          const copiedHash = await hashFile(path.join(destinationPlan.cloneRoot, record.path), operationId);
           if (copiedHash !== record.sha256) {
             record.error = "SHA-256 mismatch during verification.";
             record.sha256 = undefined;
             failedFiles += 1;
-          } else verifiedFiles += 1;
+            updateSource(record.sourceId ?? sourceEntry?.sourceId, {
+              failedFiles: (sourceProgressById.get(record.sourceId ?? sourceEntry?.sourceId ?? "")?.failedFiles ?? 0) + 1,
+            });
+          } else {
+            verifiedFiles += 1;
+            updateSource(record.sourceId ?? sourceEntry?.sourceId, {
+              verifiedFiles: (sourceProgressById.get(record.sourceId ?? sourceEntry?.sourceId ?? "")?.verifiedFiles ?? 0) + 1,
+            });
+          }
           emit("verifying", record.path, `Verified ${verifiedFiles.toLocaleString()} of ${plan.totalFiles.toLocaleString()} files`);
         }
         for (const entry of plan.entries.filter((item) => !item.isDirectory && item.duplicateOf)) {
@@ -8440,6 +9297,11 @@ async function runSourceClone(
             manifestAliases.push({ path: entry.destinationRelativePath, canonicalPath: crossCloneTarget.relativePath,
               canonicalClone: crossCloneTarget.cloneName, size: entry.size, sha256: entry.sha256!, sourceId: entry.sourceId,
               sourceRelativePath: entry.sourceRelativePath, materialized: false });
+            updateSource(entry.sourceId, {
+              completedFiles: (sourceProgressById.get(entry.sourceId ?? "")?.completedFiles ?? 0) + 1,
+              verifiedFiles: (sourceProgressById.get(entry.sourceId ?? "")?.verifiedFiles ?? 0) + 1,
+            });
+            emit("copying", entry.destinationRelativePath, `Linked duplicate path ${entry.destinationRelativePath}`);
             continue;
           }
           const canonicalPath = path.resolve(destinationPlan.cloneRoot, entry.duplicateOf!);
@@ -8470,6 +9332,11 @@ async function runSourceClone(
             sourceRelativePath: entry.sourceRelativePath,
             materialized,
           });
+          updateSource(entry.sourceId, {
+            completedFiles: (sourceProgressById.get(entry.sourceId ?? "")?.completedFiles ?? 0) + 1,
+            verifiedFiles: (sourceProgressById.get(entry.sourceId ?? "")?.verifiedFiles ?? 0) + 1,
+          });
+          emit("copying", entry.destinationRelativePath, `Linked duplicate path ${entry.destinationRelativePath}`);
         }
         const complete = failedFiles === 0 && verifiedFiles === plan.totalFiles;
         const sourceManifest = plan.sourceManifest;
@@ -10240,7 +11107,12 @@ app.whenReady().then(async () => {
   );
   let loadedSearchRecords = 0;
   let lastSavedRecordPercentage = -1;
+  let lastSavedRecordCount = -1;
+  let lastSavedRecordPhase = "";
+  let lastSavedRecordPhaseProgress: number | null = null;
   let searchPreparationFailureMessage = "Search index could not be opened.";
+  let semanticAnnStartedAt = Date.now();
+  let lastSemanticAnnDiagnosticAt = 0;
   const semanticLoad = indexStorageInitializationDeferred
     ? Promise.resolve().then(() => {
         updateSearchIndexReadiness({
@@ -10250,21 +11122,41 @@ app.whenReady().then(async () => {
           message: "Search index storage is unavailable.",
         });
       })
-    : semanticIndexer.initialize((fraction, records) => {
+    : semanticIndexer.initialize((fraction, records, phase, phaseProgress) => {
       loadedSearchRecords = records;
-      const percentage = Math.min(20, Math.round(fraction * 20));
-      if (percentage === lastSavedRecordPercentage) return;
+      const percentage = Math.min(20, Math.round(fraction * 200) / 10);
+      const measuredPhaseProgress = phaseProgress === null
+        ? null
+        : Math.round(phaseProgress * 10000) / 100;
+      if (
+        percentage === lastSavedRecordPercentage &&
+        records === lastSavedRecordCount &&
+        phase === lastSavedRecordPhase &&
+        measuredPhaseProgress === lastSavedRecordPhaseProgress
+      )
+        return;
       lastSavedRecordPercentage = percentage;
+      lastSavedRecordCount = records;
+      lastSavedRecordPhase = phase;
+      lastSavedRecordPhaseProgress = measuredPhaseProgress;
+      const phaseLabel =
+        phase === "reading"
+          ? "Reading saved search records"
+          : phase === "validating"
+            ? "Validating saved search records"
+            : "Finalizing saved search index";
       updateSearchIndexReadiness({
         status: "preparing",
         percentage,
+        phase: phaseLabel,
+        phaseProgress: measuredPhaseProgress,
         records,
-        message: `Reading saved search records · ${percentage}%`,
+        message: `${phaseLabel}…`,
       });
-        reportStartupDetail(
-          `Opening saved search records… ${percentage}% (${records.toLocaleString()} files)`,
-        );
-      });
+      reportStartupDetail(
+        `${phaseLabel}… ${records.toLocaleString()} records`,
+      );
+    });
   const semanticSearchReady = semanticLoad.then(async () => {
     if (indexStorageInitializationDeferred) return;
     // Opening the saved vectors is only half of search preparation. Start the
@@ -10273,6 +11165,8 @@ app.whenReady().then(async () => {
     updateSearchIndexReadiness({
       status: "preparing",
       percentage: 20,
+      phase: "Warming the offline search model",
+      phaseProgress: null,
       records: loadedSearchRecords,
       message: "Warming the offline search model…",
     });
@@ -10289,19 +11183,44 @@ app.whenReady().then(async () => {
     updateSearchIndexReadiness({
       status: "preparing",
       percentage: 30,
+      phase: "Building the fast local search index",
+      phaseProgress: 0,
       records: loadedSearchRecords,
       message: "Building the fast local search index…",
     });
     reportStartupDetail("Building the fast local search index…");
+    semanticAnnStartedAt = Date.now();
+    runtimeLog("search-ann-index-start", {
+      records: loadedSearchRecords,
+      elapsedMs: Date.now() - semanticAnnStartedAt,
+    });
     await semanticIndexer.prepareVectorSearch((fraction, records) => {
       const percentage = Math.min(99, 30 + Math.round(fraction * 69));
+      const phaseProgress = Math.round(fraction * 10000) / 100;
       updateSearchIndexReadiness({
         status: "preparing",
         percentage,
+        phase: "Building the fast local search index",
+        phaseProgress,
         records: Math.max(loadedSearchRecords, records),
-        message: `Building the fast local search index · ${percentage}%`,
+        message: "Building the fast local search index…",
       });
-      reportStartupDetail(`Building the fast local search index… ${percentage}%`);
+      reportStartupDetail(
+        `Building the fast local search index… ${records.toLocaleString()} records`,
+      );
+      const now = Date.now();
+      if (now - lastSemanticAnnDiagnosticAt >= 15000) {
+        lastSemanticAnnDiagnosticAt = now;
+        runtimeLog("search-ann-index-progress", {
+          records,
+          fraction: Math.round(fraction * 1000) / 10,
+          elapsedMs: now - semanticAnnStartedAt,
+        });
+      }
+    });
+    runtimeLog("search-ann-index-ready", {
+      records: loadedSearchRecords,
+      elapsedMs: Date.now() - semanticAnnStartedAt,
     });
   });
   const faceModelPath = app.isPackaged
@@ -10592,6 +11511,11 @@ app.whenReady().then(async () => {
     },
     (error) => {
       runtimeLog("startup-load-error", { message: String(error) });
+      runtimeLog("search-ann-index-failure", {
+        elapsedMs: Date.now() - semanticAnnStartedAt,
+        stage: searchPreparationFailureMessage,
+        annFailed: semanticIndexer?.usesExactVectorSearch() ?? false,
+      });
       if (semanticIndexer?.usesExactVectorSearch()) {
         // The ANN index is only an accelerator; exact vector search still answers queries.
         updateSearchIndexReadiness({
@@ -10997,6 +11921,8 @@ app.whenReady().then(async () => {
         updateSearchIndexReadiness({
           status: "preparing",
           percentage: 20,
+          phase: "Warming the offline search model",
+          phaseProgress: null,
           records: loadedSearchRecords,
           message: semanticRuntimeProgress.message,
         });
@@ -12289,6 +13215,58 @@ ipcMain.handle("save-source-clone-diagnostic-log", async (_event, contents: unkn
 
 ipcMain.handle("get-source-clone-session-logs", async () => getSourceCloneSessionLogs());
 
+ipcMain.handle("get-active-source-clone-progress", () =>
+  [...sourceCloneProgressSnapshots.values()].map((progress) => ({
+    ...progress,
+    mode: sourceCloneSessionsByOperation.get(progress.operationId)?.log.mode ?? progress.mode,
+    ...(progress.sourceProgress
+      ? { sourceProgress: progress.sourceProgress.map((source) => ({ ...source })) }
+      : {}),
+  })),
+);
+
+ipcMain.handle("get-shelter-backup-catalog", async () => {
+  try {
+    const catalog = await listVerifiedShelterBackups();
+    return {
+      destination: catalog.destination,
+      available: catalog.available,
+      backups: catalog.backups.map(({ id, name, createdAt, container, fileCount, omittedPathCount }) =>
+        ({ id, name, createdAt, container, fileCount, omittedPathCount })),
+    };
+  } catch (error) {
+    return {
+      destination: await getShelterDestination(),
+      available: false,
+      backups: [],
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle(
+  "list-shelter-backup-directory",
+  async (_event, backupId: unknown, relativeDirectory: unknown, afterName: unknown, limit: unknown) => {
+    if (typeof backupId !== "string" || !backupId || backupId.length > 1024)
+      return { entries: [], nextCursor: null, error: "Choose a verified Fallout Shelter backup." };
+    try {
+      const segments = shelterBrowseSegments(relativeDirectory === undefined ? "" : relativeDirectory);
+      const cursor = typeof afterName === "string" && afterName.length <= 1024 ? afterName : null;
+      const safeLimit = typeof limit === "number" && Number.isFinite(limit)
+        ? Math.min(250, Math.max(1, Math.floor(limit)))
+        : 100;
+      const backup = await resolveShelterBackupForBrowse(backupId);
+      if (backup.container === "zip") {
+        const page = await listCloneArchiveDirectory(backup.path, segments.join("/"), cursor, safeLimit);
+        return page;
+      }
+      return await listShelterDirectoryPage(backup, backup.manifest!, segments, cursor, safeLimit);
+    } catch (error) {
+      return { entries: [], nextCursor: null, error: error instanceof Error ? error.message : String(error) };
+    }
+  },
+);
+
 ipcMain.handle("dismiss-source-clone-session", async (_event, operationId: unknown) => {
   if (typeof operationId !== "string" || !operationId) return false;
   const active = sourceCloneSessionsByOperation.get(operationId);
@@ -12365,22 +13343,12 @@ ipcMain.handle(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const errorDetails = sourceCloneErrorDetails(error);
+      const cancelled = sourceCloneOperations.get(operationId)?.cancelled === true || message.toLowerCase().includes("cancel");
       sourceCloneOperations.delete(operationId);
-      sendSourceCloneProgress({
-        operationId,
-        phase: message.includes("cancel") ? "cancelled" : "error",
-        destination: Array.isArray(destinations) ? destinations.filter((item) => typeof item === "string").join(" / ") : "",
-        totalSources: cleanIds.length,
-        totalFiles: 0,
-        completedFiles: 0,
-        totalBytes: 0,
-        copiedBytes: 0,
-        verifiedFiles: 0,
-        failedFiles: 0,
-        currentFile: "",
-        message,
-        errorDetails,
-      });
+      finishSourceCloneProgress(operationId, cancelled ? "cancelled" : "error", message,
+        cleanDestinations.join(" / "), cleanIds.length, cancelled ? undefined : errorDetails);
+      await markSourceCloneSessionLog(operationId, cancelled ? "cancelled" : "error",
+        cancelled ? "operation-cancelled" : "operation-error", cancelled ? undefined : errorDetails);
       await finishSourceCloneSessionLog(operationId);
       return { ok: false, error: message, errorDetails };
     }
@@ -12406,22 +13374,12 @@ ipcMain.handle("prepare-shelter-replica", async (_event, destinations: unknown, 
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const errorDetails = sourceCloneErrorDetails(error);
+    const cancelled = sourceCloneOperations.get(operationId)?.cancelled === true || message.toLowerCase().includes("cancel");
     sourceCloneOperations.delete(operationId);
-    sendSourceCloneProgress({
-      operationId,
-      phase: message.toLowerCase().includes("cancel") ? "cancelled" : "error",
-      destination: cleanDestinations.join(" / "),
-      totalSources: 1,
-      totalFiles: 0,
-      completedFiles: 0,
-      totalBytes: 0,
-      copiedBytes: 0,
-      verifiedFiles: 0,
-      failedFiles: 0,
-      currentFile: "",
-      message,
-      errorDetails,
-    });
+    finishSourceCloneProgress(operationId, cancelled ? "cancelled" : "error", message,
+      cleanDestinations.join(" / "), 1, cancelled ? undefined : errorDetails);
+    await markSourceCloneSessionLog(operationId, cancelled ? "cancelled" : "error",
+      cancelled ? "operation-cancelled" : "operation-error", cancelled ? undefined : errorDetails);
     await finishSourceCloneSessionLog(operationId);
     return { ok: false, error: message, errorDetails };
   }
@@ -12478,6 +13436,13 @@ ipcMain.handle("start-source-clone", async (_event, planId: unknown, options: un
       };
     }
   } catch (error) {
+    if (sourceCloneProgressSnapshots.has(operationId)) {
+      const cancelled = sourceCloneOperations.get(operationId)?.cancelled === true;
+      finishSourceCloneProgress(operationId, cancelled ? "cancelled" : "error",
+        cancelled ? "Clone cancelled. Originals were not changed." : error instanceof Error ? error.message : String(error),
+        plan.destinations[0]?.cloneRoot ?? "", plan.sourceIds.length,
+        cancelled ? undefined : sourceCloneErrorDetails(error));
+    }
     await markSourceCloneSessionLog(operationId, "error", "clone-failed", sourceCloneErrorDetails(error));
     await finishSourceCloneSessionLog(operationId);
     return {
@@ -12539,7 +13504,7 @@ ipcMain.handle("extract-source-clone-archive", async (_event, operationId: unkno
   });
   if (destinationChoice.canceled || !destinationChoice.filePaths[0]) return { ok: false, cancelled: true };
   const destinationParent = destinationChoice.filePaths[0];
-  let operation: { cancelled: boolean };
+  let operation: { cancelled: boolean; cancelCurrentIo?: () => void };
   try {
     operation = reserveSourceCloneOperation(operationId);
   } catch (error) {
@@ -12559,6 +13524,7 @@ ipcMain.handle("extract-source-clone-archive", async (_event, operationId: unkno
   try {
     const result = await extractCloneArchive(archivePath, destinationParent, {
       isCancelled: () => operation.cancelled,
+      onActiveIo: (cancel) => { operation.cancelCurrentIo = cancel; },
       onProgress: (progress) => {
         const now = Date.now();
         if (now - lastProgressAt < 350) return;
@@ -12597,6 +13563,14 @@ ipcMain.handle("cancel-source-clone", (_event, operationId: unknown) => {
   const operation = sourceCloneOperations.get(operationId);
   if (!operation) return false;
   operation.cancelled = true;
+  const cancelActiveIo = operation.cancelCurrentIo;
+  cancelActiveIo?.();
+  const progress = sourceCloneProgressSnapshots.get(operationId);
+  if (progress)
+    sendSourceCloneProgress({ ...progress, cancelRequested: true,
+      message: cancelActiveIo
+        ? "Stop requested; interrupting active file I/O…"
+        : "Stop requested; stopping at the next filesystem boundary…" });
   return true;
 });
 
@@ -13038,7 +14012,9 @@ async function refreshAudioInventory(requestId: number, force = false) {
         });
       },
       force,
-      () => semanticIndexer.isSearchActive(),
+      () =>
+        semanticIndexer.isSearchActive() ||
+        PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status),
       configuredSourceIds,
     );
     sendToRenderer("audio-library-cache-changed", snapshot.scannedAt);
@@ -14183,6 +15159,8 @@ ipcMain.handle(
       );
     const sources = await getEnabledIndexSources();
     if (isCancelled()) return [];
+    if (sources.length === 0) return [];
+    const enabledSourceRoots = new Set(sources);
 
     // Read only the search fields here. getState() structured-clones the entire
     // persisted library, which made every keystroke copy hundreds of thousands
@@ -14205,6 +15183,7 @@ ipcMain.handle(
       name?: string,
       file?: IndexableFile,
     ) => {
+      if (!fileIsInEnabledSource(filePath, enabledSourceRoots)) return;
       const previous = priorityMatches.get(filePath);
       if (!previous || priority < previous.priority)
         priorityMatches.set(filePath, {
@@ -14285,7 +15264,7 @@ ipcMain.handle(
 
       const activeResults = filterForEnabledSources(
         Array.from(allResults.values()),
-        new Set(sources),
+        enabledSourceRoots,
       ).filter(
         (result) =>
           state.searchFeedback[result.path] !== "removed" &&
@@ -14307,7 +15286,7 @@ ipcMain.handle(
     let latestSemanticResults: SearchResult[] = [];
     let semanticScanned = 0;
     let semanticTotal = 0;
-    let semanticProgressMode: "ann" | undefined;
+    let semanticProgressMode: "ann" | "exact" | undefined;
     let textScanned = 0;
     let textTotal = 0;
     let textCapped = false;
@@ -14395,7 +15374,8 @@ ipcMain.handle(
       for (const folder of state.digitalFolders) {
         if (!folder.name.toLowerCase().includes(normalizedQuery)) continue;
         for (const filePath of folder.filePaths) {
-          addPriorityMatch(filePath, 2, `In folder: ${folder.name}`);
+          if (fileIsInEnabledSource(filePath, enabledSourceRoots))
+            addPriorityMatch(filePath, 2, `In folder: ${folder.name}`);
           if (!(await yieldPriorityWork())) return [];
         }
       }
@@ -14405,7 +15385,8 @@ ipcMain.handle(
         if (!person.name.toLowerCase().includes(normalizedQuery)) continue;
         const detail = faceIndexer.getPerson(person.id);
         for (const filePath of detail?.confirmedPhotoPaths ?? []) {
-          addPriorityMatch(filePath, 1, `Named as: ${person.name}`);
+          if (fileIsInEnabledSource(filePath, enabledSourceRoots))
+            addPriorityMatch(filePath, 1, `Named as: ${person.name}`);
           if (!(await yieldPriorityWork())) return [];
         }
       }
@@ -14419,8 +15400,10 @@ ipcMain.handle(
           !entry.name.toLowerCase().includes(normalizedQuery)
         ) continue;
         for (const fileEntry of entry.filePaths) {
-          addPriorityMatch(fileEntry.path, 1, `Named as: ${entry.name}`);
-          if (entry.sourceType === "pet") matchingPetPaths.add(fileEntry.path);
+          if (fileIsInEnabledSource(fileEntry.path, enabledSourceRoots)) {
+            addPriorityMatch(fileEntry.path, 1, `Named as: ${entry.name}`);
+            if (entry.sourceType === "pet") matchingPetPaths.add(fileEntry.path);
+          }
           if (!(await yieldPriorityWork())) return [];
         }
       }
@@ -14428,12 +15411,14 @@ ipcMain.handle(
         for (const folder of state.digitalFolders) {
           let containsPetPath = false;
           for (const filePath of folder.filePaths) {
-            if (matchingPetPaths.has(filePath)) containsPetPath = true;
+            if (fileIsInEnabledSource(filePath, enabledSourceRoots) &&
+              matchingPetPaths.has(filePath)) containsPetPath = true;
             if (!(await yieldPriorityWork())) return [];
           }
           if (containsPetPath)
             for (const filePath of folder.filePaths) {
-              addPriorityMatch(filePath, 1, `In folder: ${folder.name}`);
+              if (fileIsInEnabledSource(filePath, enabledSourceRoots))
+                addPriorityMatch(filePath, 1, `In folder: ${folder.name}`);
               if (!(await yieldPriorityWork())) return [];
             }
         }
@@ -14441,6 +15426,10 @@ ipcMain.handle(
 
       // User-authored aliases and keywords are the strongest exact matches.
       for (const filePath in state.fileMetadata) {
+        if (!fileIsInEnabledSource(filePath, enabledSourceRoots)) {
+          if (!(await yieldPriorityWork())) return [];
+          continue;
+        }
         const metadata = state.fileMetadata[filePath];
         const aliasMatches = metadata.displayName
           ?.toLowerCase()
@@ -14622,10 +15611,9 @@ ipcMain.handle("get-digital-folder-files", async (_event, folderId: string) => {
     .getState()
     .digitalFolders.find((item) => item.id === folderId);
   if (!folder) return [];
-  const sources = new Set(await getEnabledIndexSources());
   const files = await readReferencedFiles(folder.filePaths);
   return filterForContentSafety(
-    filterForEnabledSources(files, sources),
+    files,
     folder.hidden ? folder.id : undefined,
   );
 });

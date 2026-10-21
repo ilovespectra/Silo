@@ -176,10 +176,45 @@ export class StateStore {
       const stored = JSON.parse(
         await fsPromises.readFile(this.filePath, "utf8"),
       ) as Partial<PersistedAppState>;
-      const folders = Array.isArray(stored.digitalFolders)
+      const folders: DigitalFolder[] = [];
+      const folderIds = new Set<string>();
+      let repairedFolderIds = false;
+      for (const candidate of Array.isArray(stored.digitalFolders)
         ? stored.digitalFolders
-        : [];
-      const folderIds = new Set(folders.map((folder) => folder.id));
+        : []) {
+        if (
+          !candidate ||
+          typeof candidate !== "object" ||
+          typeof candidate.name !== "string" ||
+          !Array.isArray(candidate.filePaths)
+        ) {
+          repairedFolderIds = true;
+          continue;
+        }
+        const folder = candidate as DigitalFolder;
+        let id = typeof folder.id === "string" && folder.id.trim()
+          ? folder.id
+          : randomUUID();
+        if (folderIds.has(id)) {
+          // Duplicate persisted IDs make React reuse one folder row for another.
+          // Preserve every folder and its saved file references by assigning the
+          // later row a stable new identity, including reserved-ID collisions.
+          do { id = randomUUID(); } while (folderIds.has(id));
+          repairedFolderIds = true;
+        } else if (id !== folder.id) {
+          repairedFolderIds = true;
+        }
+        folderIds.add(id);
+        folders.push({
+          ...folder,
+          id,
+          name: folder.name.slice(0, 100),
+          filePaths: Array.from(new Set(folder.filePaths.filter(
+            (item): item is string => typeof item === "string" && item.length <= 4096,
+          ))),
+          createdAt: Number.isFinite(folder.createdAt) ? folder.createdAt : Date.now(),
+        });
+      }
       this.state = {
         ...structuredClone(defaultState),
         ...stored,
@@ -276,6 +311,7 @@ export class StateStore {
           ? stored.enabledSourceIds
           : [],
       };
+      if (repairedFolderIds) await this.write();
     } catch {
       await this.write();
     }

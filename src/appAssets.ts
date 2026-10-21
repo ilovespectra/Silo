@@ -4,7 +4,6 @@ const APP_ASSETS: Record<string, string> = {
   "countries-50m.geojson": "application/geo+json",
   "countries.geojson": "application/geo+json",
   "earth-blue-marble.jpg": "image/jpeg",
-  "earth-night.jpg": "image/jpeg",
   "us-states.geojson": "application/geo+json",
 };
 

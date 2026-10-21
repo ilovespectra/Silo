@@ -286,7 +286,7 @@ body {
   min-width: 0;
 }
 
-.header-search-group .header-tool-explode {
+.header-directory .header-tool-explode {
   flex: 0 0 auto;
   min-height: 36px;
   padding: 7px 11px;
@@ -1511,6 +1511,11 @@ label.settings-row {
   white-space: nowrap;
 }
 
+.search-timing-counter {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
 .semantic-search.is-preparing .semantic-search-status,
 .semantic-search.is-ready .semantic-search-status {
   color: var(--orange-bright);
@@ -1766,6 +1771,34 @@ label.settings-row {
   border-radius: 4px;
   background: var(--raised);
   color: var(--text);
+}
+
+.year-filter-checklist {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 12px;
+  max-width: 280px;
+  max-height: 190px;
+  overflow-y: auto;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--raised);
+}
+
+.year-filter-checklist label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.year-filter-checklist input {
+  flex: 0 0 auto;
+  accent-color: var(--orange);
 }
 
 .confidence-filter h3 {
@@ -2444,6 +2477,50 @@ label.settings-row {
   overflow-wrap: anywhere;
   color: var(--muted);
   font-size: 9px;
+}
+.source-clone-source-progress {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 2px 3px 2px 0;
+}
+.source-clone-source-progress-row {
+  display: grid;
+  gap: 5px;
+  padding: 8px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--surface-card);
+}
+.source-clone-source-progress-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.source-clone-source-progress-heading strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-clone-source-progress-heading span,
+.source-clone-source-progress-row small {
+  color: var(--muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.source-clone-source-progress-row progress {
+  width: 100%;
+  height: 6px;
+  accent-color: var(--orange);
+}
+.source-clone-source-progress-row small {
+  overflow-wrap: anywhere;
 }
 .source-clone-scan-counts {
   display: grid;
@@ -4436,75 +4513,6 @@ input[type="range"]::-moz-range-progress {
   cursor: pointer;
 }
 
-.map-compass-controls {
-  position: absolute;
-  right: 22px;
-  bottom: 22px;
-  z-index: 4;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.map-compass-controls button {
-  border: 1px solid var(--border-soft);
-  background: var(--surface-popover);
-  color: var(--text);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
-}
-
-.map-rotation-toggle {
-  width: 36px;
-  height: 36px;
-  display: grid;
-  place-items: center;
-}
-
-.map-compass {
-  width: 58px;
-  height: 58px;
-  position: relative;
-  display: grid;
-  place-items: center;
-  border-radius: 50% !important;
-}
-
-.map-compass svg {
-  width: 30px;
-  height: 30px;
-  transition: transform 120ms linear;
-}
-
-.map-compass span {
-  position: absolute;
-  top: 2px;
-  font-size: 9px;
-  font-weight: 800;
-}
-
-.map-solar-controls {
-  position: absolute;
-  right: 22px;
-  bottom: 92px;
-  z-index: 4;
-  width: 244px;
-  padding: 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: 6px;
-  background: var(--surface-popover);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
-  color: var(--text);
-  backdrop-filter: blur(10px);
-}
-
-.map-solar-controls header,
-.map-solar-controls header span,
-.map-solar-controls > div,
-.map-solar-controls button {
-  display: flex;
-  align-items: center;
-}
-
 .map-country-label {
   display: flex;
   align-items: center;
@@ -4533,44 +4541,6 @@ input[type="range"]::-moz-range-progress {
   color: rgba(255, 255, 255, 0.66);
   font-size: 8px;
   pointer-events: none;
-}
-
-.map-solar-controls header {
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 10px;
-}
-
-.map-solar-controls header span,
-.map-solar-controls button {
-  gap: 5px;
-}
-
-.map-solar-controls strong {
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.map-solar-controls input {
-  width: 100%;
-  margin: 9px 0 8px;
-  accent-color: #f0bd5b;
-}
-
-.map-solar-controls > div {
-  gap: 6px;
-}
-
-.map-solar-controls button {
-  flex: 1;
-  justify-content: center;
-  min-height: 30px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 4px;
-  background: rgba(255, 255, 255, 0.08);
-  color: inherit;
-  font-size: 10px;
-  cursor: pointer;
 }
 
 .map-status > svg {
@@ -5520,22 +5490,12 @@ input[type="range"]::-moz-range-progress {
     gap: 10px;
   }
 
-  .map-solar-controls {
-    right: 12px;
-    bottom: 88px;
-    width: min(244px, calc(100vw - 24px));
-  }
-
   .map-detail-attribution {
     right: auto;
     bottom: 12px;
     left: 12px;
   }
 
-  .map-compass-controls {
-    right: 12px;
-    bottom: 18px;
-  }
 }
 
 .face-index-status {
@@ -10330,6 +10290,46 @@ input[type="range"]::-moz-range-progress {
 .stats-shelter-replica small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .stats-shelter-replica time { color: var(--muted); font-size: 9px; text-align: right; }
 
+.stats-shelter-active-operations { display: grid; gap: 9px; margin-top: 12px; }
+.stats-shelter-active-operation { display: grid; gap: 8px; padding: 10px; border: 1px solid color-mix(in srgb, var(--orange) 30%, var(--line)); border-radius: 9px; background: color-mix(in srgb, var(--orange) 5%, var(--surface-card)); }
+.stats-shelter-active-operation > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.stats-shelter-active-operation > header > div { display: grid; min-width: 0; gap: 3px; }
+.stats-shelter-active-operation > header strong { color: var(--text); font-size: 10px; }
+.stats-shelter-active-operation > header span { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.stats-shelter-active-operation > header button { flex: 0 0 auto; }
+.stats-shelter-active-source { display: grid; gap: 4px; }
+.stats-shelter-active-source > div { display: flex; justify-content: space-between; gap: 8px; min-width: 0; }
+.stats-shelter-active-source > div strong { overflow: hidden; color: var(--text); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.stats-shelter-active-source > div span,.stats-shelter-active-source small { color: var(--muted); font-size: 8px; }
+.stats-shelter-active-source progress { width: 100%; height: 6px; accent-color: var(--orange); }
+.stats-shelter-active-source small { line-height: 1.4; }
+.fallout-shelter-browser { max-width: 1500px; margin: 0 auto 15px; }
+.fallout-shelter-browser-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.fallout-shelter-browser-destination { display: grid; gap: 3px; margin: 10px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; }
+.fallout-shelter-browser-destination strong,.fallout-shelter-browser-select > span { color: var(--muted); font-size: 8px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.fallout-shelter-browser-destination span { overflow-wrap: anywhere; color: var(--text); font-size: 9px; }
+.fallout-shelter-browser-select { display: grid; gap: 5px; margin: 10px 0; }
+.fallout-shelter-browser-select select { width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-card); color: var(--text); font: inherit; font-size: 10px; }
+.fallout-shelter-browser-summary { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 10px 0; color: var(--muted); font-size: 9px; }
+.fallout-shelter-browser-summary strong { color: var(--text); font-variant-numeric: tabular-nums; }
+.fallout-shelter-breadcrumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-height: 30px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; background: color-mix(in srgb, var(--raised) 65%, transparent); }
+.fallout-shelter-breadcrumbs svg { width: 11px; height: 11px; color: var(--muted); }
+.fallout-shelter-breadcrumbs button,.fallout-shelter-browser-entry-name { min-width: 0; border: 0; padding: 3px 2px; background: transparent; color: var(--text); font: inherit; font-size: 9px; text-align: left; }
+.fallout-shelter-breadcrumbs button:hover,.fallout-shelter-browser-entry-name:hover { color: var(--orange-bright); }
+.fallout-shelter-parent { margin: 7px 0; }
+.fallout-shelter-parent-icon { transform: rotate(180deg); }
+.fallout-shelter-browser-list { max-height: min(56vh, 620px); overflow: auto; border: 1px solid var(--line); border-radius: 7px; }
+.fallout-shelter-browser-entry { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto auto; align-items: center; gap: 8px; min-height: 34px; padding: 4px 9px; border-bottom: 1px solid color-mix(in srgb, var(--line) 65%, transparent); }
+.fallout-shelter-browser-entry:last-child { border-bottom: 0; }
+.fallout-shelter-browser-entry > svg { width: 13px; height: 13px; color: var(--muted); }
+.fallout-shelter-browser-entry > svg:first-child { color: var(--orange-bright); }
+.fallout-shelter-browser-entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fallout-shelter-browser-entry small,.fallout-shelter-browser-entry-size { color: var(--muted); font-size: 8px; white-space: nowrap; }
+.fallout-shelter-browser-entry-size { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
+.fallout-shelter-browser-more { margin-top: 8px; }
+.fallout-shelter-browser-status,.fallout-shelter-browser-empty { display: flex; align-items: center; gap: 7px; margin: 10px 0; color: var(--muted); font-size: 9px; }
+.fallout-shelter-browser-empty svg { flex: 0 0 auto; }
+.fallout-shelter-browser > .stats-inline-error { margin-top: 9px; }
 .stats-sources-card { max-width: 1500px; margin: 0 auto 15px; padding: 0; overflow: hidden; }
 .stats-source-heading { min-height: 71px; margin: 0; padding: 15px 18px; border-bottom: 1px solid var(--line); }
 .stats-source-heading > div:nth-child(2) { flex: 1; }
@@ -11000,6 +11000,18 @@ input[type="range"]::-moz-range-progress {
 
 .section-workspace > * {
   min-width: 0;
+}
+
+.section-view {
+  display: contents;
+}
+
+.section-view > * {
+  min-width: 0;
+}
+
+.section-view[data-active="false"] {
+  display: none;
 }
 
 @keyframes section-workspace-enter {

@@ -7,8 +7,6 @@ export interface ContentPreferences {
   showNsfw: boolean;
   safeSearch: boolean;
   theme: "system" | "dark" | "light";
-  autoplayGlobe: boolean;
-  preloadMapTextures: boolean;
   showBannedPeople: boolean;
 }
 
@@ -101,8 +99,6 @@ const defaults: StoredContentSettings = {
     showNsfw: false,
     safeSearch: true,
     theme: "system",
-    autoplayGlobe: false,
-    preloadMapTextures: false,
     showBannedPeople: false,
   },
   performance: defaultSearchPerformanceSettings(),
@@ -129,10 +125,37 @@ export class ContentSettingsStore {
       const migrateLowBackgroundDefault =
         stored.performanceSettingsVersion !== 2 &&
         previousPerformance?.backgroundWorkPercent === 10;
+      const previousPreferences = stored.preferences as
+        | (Partial<ContentPreferences> & Record<string, unknown>)
+        | undefined;
+      const removedMapPreferences = Boolean(
+        previousPreferences &&
+        ("autoplayGlobe" in previousPreferences ||
+          "preloadMapTextures" in previousPreferences),
+      );
       this.settings = {
         ...structuredClone(defaults),
         ...stored,
-        preferences: { ...defaults.preferences, ...stored.preferences },
+        preferences: {
+          showNsfw:
+            typeof previousPreferences?.showNsfw === "boolean"
+              ? previousPreferences.showNsfw
+              : defaults.preferences.showNsfw,
+          safeSearch:
+            typeof previousPreferences?.safeSearch === "boolean"
+              ? previousPreferences.safeSearch
+              : defaults.preferences.safeSearch,
+          theme:
+            previousPreferences?.theme === "system" ||
+            previousPreferences?.theme === "dark" ||
+            previousPreferences?.theme === "light"
+              ? previousPreferences.theme
+              : defaults.preferences.theme,
+          showBannedPeople:
+            typeof previousPreferences?.showBannedPeople === "boolean"
+              ? previousPreferences.showBannedPeople
+              : defaults.preferences.showBannedPeople,
+        },
         performance: normalizeSearchPerformanceSettings(
           migrateLowBackgroundDefault
             ? { ...previousPerformance, backgroundWorkPercent: 5 }
@@ -141,7 +164,8 @@ export class ContentSettingsStore {
         ),
         performanceSettingsVersion: 2,
       };
-      if (migrateLowBackgroundDefault) await this.persist();
+      if (migrateLowBackgroundDefault || removedMapPreferences)
+        await this.persist();
     } catch {
       await this.persist();
     }

@@ -62,7 +62,6 @@ type WorkerMessage = {
 const partitions = new Map<string, Partition>();
 let vectorsPath = "";
 let cacheDirectory = "";
-let ready = false;
 let closing = false;
 let saveTimer: NodeJS.Timeout | null = null;
 let messageQueue = Promise.resolve();
@@ -331,7 +330,6 @@ async function initialize(message: WorkerMessage) {
   for (const stale of savedById.values())
     await fsPromises.rm(path.join(cacheDirectory, `${stale.id}.usearch`), { force: true });
   await saveAll();
-  ready = true;
   reportProgress(total, total);
   parentPort?.postMessage({ type: "ready" });
 }
@@ -500,6 +498,20 @@ parentPort?.on("message", (message: WorkerMessage) => {
   }
   if (message.type === "resume") {
     paused = false;
+    return;
+  }
+  // Queries can use partitions that are already loaded while initialization
+  // continues to reconcile and add later partitions. Serializing searches
+  // behind the whole build made the main process fall back to a full vector
+  // scan for every query during startup.
+  if (message.type === "search") {
+    void handle(message).catch((error) => {
+      parentPort?.postMessage({
+        type: "reply",
+        requestId: message.requestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
     return;
   }
   messageQueue = messageQueue

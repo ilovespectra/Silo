@@ -58,7 +58,7 @@ interface SettingsPageDefinition {
 const SETTINGS_PAGES: SettingsPageDefinition[] = [
   { id: "update", label: "Software update", description: "Keep Silo current and manage your license.", icon: FiDownload, tint: "#986b47", keywords: "version upgrade install download release license lifetime demo purchase", section: 0 },
   { id: "bug", label: "Report a bug", description: "Tell us about a problem or a confusing feature.", icon: FaBug, tint: "#806b5b", keywords: "problem feedback issue crash screenshot diagnostics", section: 0 },
-  { id: "appearance", label: "Appearance & behavior", description: "Theme and Map behavior.", icon: FiSliders, tint: "#82756a", keywords: "theme dark light system map globe rotation textures", section: 1 },
+  { id: "appearance", label: "Appearance & behavior", description: "Theme and online map privacy.", icon: FiSliders, tint: "#82756a", keywords: "theme dark light system map online privacy services", section: 1 },
   { id: "share", label: "Share a library", description: "Let family browse and save originals on your local network.", icon: FiShare2, tint: "#8d6549", keywords: "wifi network family link qr phone browse download", section: 1 },
   { id: "backup", label: "Backup & restore", description: "Save Silo's whole setup to one file and restore it later.", icon: FiArchive, tint: "#746c65", keywords: "export import config configuration reinstall restore", section: 1 },
   { id: "privacy", label: "Privacy & safety", description: "Explicit content is hidden and blocked from search by default.", icon: FiShield, tint: "#696560", keywords: "nsfw safe search explicit banned people parental content protection", section: 1 },
@@ -108,6 +108,8 @@ function SettingsIconTile({ page, size = "small" }: { page: SettingsPageDefiniti
 
 interface SettingsPanelProps {
   settings: PublicContentSettings;
+  mapServicesAllowed: boolean;
+  onMapServicesAllowedChange: (allowed: boolean) => Promise<void>;
   showHiddenMessages: boolean;
   onShowHiddenMessagesChange: (show: boolean) => void;
   onChange: (settings: PublicContentSettings) => void;
@@ -881,6 +883,8 @@ export function BugReportDialog({
 
 export default function SettingsPanel({
   settings,
+  mapServicesAllowed,
+  onMapServicesAllowedChange,
   showHiddenMessages,
   onShowHiddenMessagesChange,
   onChange,
@@ -899,6 +903,9 @@ export default function SettingsPanel({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [mapServicesBusy, setMapServicesBusy] = useState(false);
+  const [showMapServicesDisclosure, setShowMapServicesDisclosure] = useState(false);
+  const [mapServicesError, setMapServicesError] = useState("");
   const [configTransferProgress, setConfigTransferProgress] =
     useState<ConfigTransferProgress | null>(null);
   const [pendingImport, setPendingImport] = useState<SiloConfigManifest | null>(
@@ -1314,6 +1321,19 @@ export default function SettingsPanel({
     }
   };
 
+  const changeMapServices = async (allowed: boolean) => {
+    setMapServicesBusy(true);
+    setMapServicesError("");
+    try {
+      await onMapServicesAllowedChange(allowed);
+      setShowMapServicesDisclosure(false);
+    } catch {
+      setMapServicesError("Silo couldn't save this privacy choice. Please try again.");
+    } finally {
+      setMapServicesBusy(false);
+    }
+  };
+
   const savePassword = async () => {
     if (!electronAPI) return;
     if (newPassword !== confirmPassword) {
@@ -1521,7 +1541,7 @@ export default function SettingsPanel({
           <section
             className="settings-card"
             data-tour="settings-appearance"
-            data-help="Choose the app theme and whether the Map globe rotates automatically when the Map page opens."
+            data-help="Choose the app theme and online map service privacy."
           >
             <label className="settings-row">
               <div className="settings-row-text">
@@ -1545,30 +1565,68 @@ export default function SettingsPanel({
             </label>
             <label className="settings-row settings-toggle">
               <div className="settings-row-text">
-                <strong>Automatic globe rotation</strong>
-                <span>Resume slow globe movement when Map opens.</span>
+                <strong>Online map services</strong>
+                <span>
+                  {mapServicesAllowed
+                    ? "Allow online place lookup and detailed satellite imagery."
+                    : "Off. Local location groups and the offline globe remain available."}
+                </span>
               </div>
               <input
                 type="checkbox"
                 className="settings-switch"
-                checked={settings.autoplayGlobe}
-                data-help="Resume slow globe rotation automatically when you open Map."
-                onChange={(event) => void update({ autoplayGlobe: event.target.checked })}
+                checked={mapServicesAllowed}
+                disabled={mapServicesBusy || !electronAPI}
+                data-help="Choose whether Silo can contact online map services for place lookup, search, and detailed imagery."
+                onChange={(event) => {
+                  if (event.target.checked) {
+                    setMapServicesError("");
+                    setShowMapServicesDisclosure(true);
+                  } else {
+                    void changeMapServices(false);
+                  }
+                }}
               />
             </label>
-            <label className="settings-row settings-toggle">
-              <div className="settings-row-text">
-                <strong>Preload Map textures</strong>
-                <span>Load the globe images after Silo opens so Map appears faster.</span>
+            {mapServicesError && !showMapServicesDisclosure && (
+              <p className="map-privacy-error" role="alert">{mapServicesError}</p>
+            )}
+            {showMapServicesDisclosure && (
+              <div className="map-privacy-backdrop">
+                <section
+                  className="map-privacy-dialog"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="settings-map-privacy-title"
+                >
+                  <h2 id="settings-map-privacy-title">Online map privacy</h2>
+                  <p>
+                    Photo locations stay on this device unless you allow online map services. If enabled, selecting an unlabeled location can send its exact coordinates to Nominatim; place searches send your query to Photon; and close-up imagery requests send tile coordinates to Esri. These services can also see your public IP address and request timing. Their log retention is not known.
+                  </p>
+                  <p>
+                    With services off, local location groups and the offline globe remain available.
+                  </p>
+                  {mapServicesError && <p className="map-privacy-error" role="alert">{mapServicesError}</p>}
+                  <div className="map-privacy-actions">
+                    <button
+                      type="button"
+                      disabled={mapServicesBusy}
+                      onClick={() => setShowMapServicesDisclosure(false)}
+                    >
+                      Keep services off
+                    </button>
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={mapServicesBusy}
+                      onClick={() => void changeMapServices(true)}
+                    >
+                      Allow online map services
+                    </button>
+                  </div>
+                </section>
               </div>
-              <input
-                type="checkbox"
-                className="settings-switch"
-                checked={settings.preloadMapTextures}
-                data-help="Load the local day and night globe images in the background after Silo opens so Map can appear sooner on its first visit."
-                onChange={(event) => void update({ preloadMapTextures: event.target.checked })}
-              />
-            </label>
+            )}
           </section>
         );
       case "share":

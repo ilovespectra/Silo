@@ -14,6 +14,7 @@ import {
   FiTerminal,
 } from "react-icons/fi";
 import IndexingPanel from "./IndexingPanel";
+import FalloutShelterBrowser from "./FalloutShelterBrowser";
 import SourceClonePanel from "./SourceClonePanel";
 import {
   formatShelterAge,
@@ -22,6 +23,7 @@ import {
 
 interface StatsDashboardProps {
   api: NonNullable<Window["electron"]>;
+  active?: boolean;
 }
 
 const categoryLabels: Record<LibraryCategory, string> = {
@@ -90,7 +92,7 @@ function shelterLabel(source: LibraryDashboardSource) {
   }
 }
 
-function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
+function RuntimeConsole({ api, active }: { api: NonNullable<Window["electron"]>; active: boolean }) {
   const [entries, setEntries] = useState<Array<Record<string, unknown>>>([]);
   const [error, setError] = useState("");
   const [truncated, setTruncated] = useState(false);
@@ -103,6 +105,7 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
   const followBottom = useRef(true);
 
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let timer: number | undefined;
     let inFlight = false;
@@ -130,7 +133,7 @@ function RuntimeConsole({ api }: { api: NonNullable<Window["electron"]> }) {
       disposed = true;
       window.clearTimeout(timer);
     };
-  }, [api]);
+  }, [active, api]);
 
   useEffect(() => {
     if (followBottom.current && feedRef.current)
@@ -217,7 +220,10 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [showClone, setShowClone] = useState(false);
   const [showReplica, setShowReplica] = useState(false);
+  const [showBrowser, setShowBrowser] = useState(false);
   const [showSessionHistory, setShowSessionHistory] = useState(false);
+  const [activeCloneProgress, setActiveCloneProgress] = useState<SourceCloneProgress[]>([]);
+  const [activeOperationToOpen, setActiveOperationToOpen] = useState<SourceCloneProgress | null>(null);
   const [verifying, setVerifying] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -315,6 +321,39 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
     };
   }, [api, loadSnapshot]);
 
+  useEffect(() => {
+    let disposed = false;
+    const activePhases = new Set(["scanning", "checking-space", "copying", "verifying"]);
+    const applyProgress = (state: SourceCloneProgress) => {
+      if (state.mode !== "sources" && state.mode !== "shelter-replica") return;
+      setActiveCloneProgress((current) => {
+        const remaining = current.filter((item) => item.operationId !== state.operationId);
+        return activePhases.has(state.phase) ? [...remaining, state] : remaining;
+      });
+    };
+    const changedDuringHydration = new Set<string>();
+    const unsubscribe = api.onSourceCloneProgress((state) => {
+      changedDuringHydration.add(state.operationId);
+      applyProgress(state);
+    });
+    void api.getActiveSourceCloneProgress().then((active) => {
+      if (disposed || !Array.isArray(active)) return;
+      setActiveCloneProgress((current) => {
+        const next = new Map(current.map((item) => [item.operationId, item]));
+        for (const state of active) {
+          if (changedDuringHydration.has(state.operationId) ||
+              (state.mode !== "sources" && state.mode !== "shelter-replica")) continue;
+          next.set(state.operationId, state);
+        }
+        return [...next.values()].filter((item) => activePhases.has(item.phase));
+      });
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [api]);
+
   const availableSources = (snapshot?.sources ?? []).filter((source) => source.available && source.rootPath);
   const selectedSources = availableSources.filter((source) => selectedIds.has(source.id));
   const needsRefresh = selectedSources.some((source) => source.shelterState === "changed");
@@ -345,9 +384,45 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
           <button className="stats-button small" onClick={() => void refreshInventory()} disabled={busy || Boolean(snapshot?.running)}><FiRefreshCw className={busy ? "stats-spin" : ""} /> {busy || snapshot?.running ? "Measuring…" : "Refresh readiness"}</button>
         </div>
         <button className="stats-button small fallout-shelter-replica-button" disabled={!snapshot?.shelter.snapshotAvailable} title={snapshot?.shelter.snapshotAvailable ? "Verify the latest complete shelter on another physical volume" : "Create and verify the primary shelter first"} onClick={() => setShowReplica(true)} data-tour="shelter-replica"><FiCopy /> Replicate shelter to another volume</button>
+        <button className="stats-button small fallout-shelter-replica-button" onClick={() => setShowBrowser((current) => !current)} aria-expanded={showBrowser}><FiHardDrive /> {showBrowser ? "Close backup browser" : "Browse Fallout Shelters"}</button>
         <button className="stats-button small fallout-shelter-replica-button" onClick={() => setShowSessionHistory(true)}><FiClock /> View previous session logs</button>
-        {(snapshot?.shelter.replicas ?? []).map((replica) => <div className="stats-shelter-replica" key={`${replica.path}:${replica.verifiedAt}`}><FiCheckCircle /><span><strong>Verified replica</strong><small title={replica.path}>{replica.path}</small></span><time>{formatDate(replica.verifiedAt)}</time></div>)}
+        {(snapshot?.shelter.replicas ?? []).map((replica, index) => <div className="stats-shelter-replica" key={`${replica.path}:${replica.verifiedAt}:${index}`}><FiCheckCircle /><span><strong>Verified replica</strong><small title={replica.path}>{replica.path}</small></span><time>{formatDate(replica.verifiedAt)}</time></div>)}
+        {activeCloneProgress.length > 0 && (
+          <section className="stats-shelter-active-operations" aria-label="Active Fallout Shelter backups" aria-live="polite">
+            {activeCloneProgress.map((operation) => (
+              <article className="stats-shelter-active-operation" key={operation.operationId}>
+                <header>
+                  <div><strong>{operation.mode === "shelter-replica" ? "Shelter replica" : "Fallout Shelter backup"}</strong><span>{operation.message}</span></div>
+                  <button className="stats-button small" onClick={() => setActiveOperationToOpen(operation)}>Open progress</button>
+                </header>
+                {(operation.sourceProgress ?? []).map((source, index) => {
+                  const checking = operation.phase === "checking-space" || source.phase === "checking";
+                  const total = checking ? source.discoveredFiles : source.totalFiles ?? 0;
+                  const current = checking ? source.checkedBytes ?? source.checkedFiles ?? 0
+                    : source.phase === "verifying" ? source.verifiedFiles : source.completedFiles;
+                  const checkingTotal = checking && (source.totalBytes ?? 0) > 0
+                    ? source.totalBytes!
+                    : checking ? source.discoveredFiles : source.totalFiles ?? 0;
+                  const complete = source.phase === "complete";
+                  return (
+                    <div className="stats-shelter-active-source" key={`${operation.operationId}:${source.sourceId}:${index}`}>
+                      <div><strong title={source.label}>{source.label}</strong><span>{checking ? "Checking" : source.phase}</span></div>
+                      {source.phase === "scanning" || checkingTotal <= 0
+                        ? <progress aria-label={`${source.label} progress`} />
+                        : <progress value={complete ? checkingTotal : Math.min(current, checkingTotal)} max={checkingTotal} aria-label={`${source.label} progress`} />}
+                      <small>{source.discoveredFiles.toLocaleString()} found · {checking
+                        ? `${(source.checkedFiles ?? 0).toLocaleString()} / ${source.discoveredFiles.toLocaleString()} paths checked · ${formatBytes(source.checkedBytes ?? 0)} / ${formatBytes(source.totalBytes ?? 0)} hashed`
+                        : `${current.toLocaleString()} / ${total.toLocaleString()} ${source.phase === "verifying" ? "verified" : "processed"}`} · {(source.omittedFiles ?? 0).toLocaleString()} files and {(source.omittedSubtrees ?? 0).toLocaleString()} folders/subtrees omitted</small>
+                    </div>
+                  );
+                })}
+              </article>
+            ))}
+          </section>
+        )}
       </section>
+
+      {showBrowser && <FalloutShelterBrowser api={api} onClose={() => setShowBrowser(false)} />}
 
       {error && <div className="stats-inline-error"><FiAlertCircle /> {error}</div>}
       <section className="stats-card stats-sources-card fallout-shelter-sources">
@@ -360,13 +435,13 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
         </header>
         <div className="stats-source-table-wrap"><table className="stats-source-table">
           <thead><tr><th>Source</th><th>Inventory</th><th>Fallout Shelter status</th></tr></thead>
-          <tbody>{(snapshot?.sources ?? []).map((source) => {
+          <tbody>{(snapshot?.sources ?? []).map((source, sourceIndex) => {
             const icon = source.hasVerifiedCopy ? <FiShield /> : source.shelterState === "offline" ? <FiCloudOff /> : source.shelterState === "changed" ? <FiAlertCircle /> : <FiCheckCircle />;
             const statusFreshness = source.shelterState === "changed" || (source.shelterAuditResult && source.shelterAuditResult !== "verified") ? "red" : getShelterFreshness(source.lastVerifiedAt, clock);
-            return <tr key={source.id}>
+            return <tr key={`${source.id}:${sourceIndex}`}>
               <td className="stats-source-name-cell"><label className="stats-source-select"><input type="checkbox" checked={selectedIds.has(source.id)} disabled={!source.available || !source.rootPath} onChange={() => toggleSource(source.id)} /><span className="stats-source-name"><strong>{source.label}</strong><small>{sourceKindLabel(source.kind)} · {source.rootPath || "No active device path"}</small></span></label>{source.message && <small className="stats-source-overlap">{source.message}</small>}<span className={`stats-source-connection ${source.available ? "online" : "offline"}`}><i />{source.offlineBackup ? "Offline snapshot available" : source.available ? "Connected / available" : "Unavailable"}</span>{source.offlineBackup && source.snapshotAt && <small className="stats-source-overlap">Phone snapshot from {formatDate(source.snapshotAt)}</small>}</td>
               <td><strong>{source.fileCount === null ? "—" : source.fileCount.toLocaleString()}</strong><small>{formatBytes(source.totalBytes)} known logical size</small>{Boolean(source.unknownSizeFiles) && <small className="stats-source-overlap">{source.unknownSizeFiles} file sizes unavailable</small>}{source.status === "scanning" && <small className="stats-source-scan">Measuring…</small>}{source.stale && source.status !== "scanning" && <small className="stats-source-overlap">Last measured {source.scannedAt ? formatDate(source.scannedAt) : "not yet"}</small>}{source.error && <small className="stats-source-error">{source.error}</small>}{source.overlapsAnotherSource && <small className="stats-source-overlap">Overlapping root · deduplicated overall</small>}</td>
-              <td><div className={`stats-shelter-state ${source.shelterState} stats-freshness-${statusFreshness}`}>{icon}<strong>{shelterLabel(source)}</strong></div>{source.lastVerifiedAt && <small title={formatDate(source.lastVerifiedAt)}>Last full SHA-256 match · {formatShelterAge(source.lastVerifiedAt, clock)}</small>}{source.shelterAuditResult && <small>Latest check {source.shelterVerifiedFiles} / {source.shelterTotalFiles} files matched</small>}{source.shelterBackups.length > 0 && <div className="stats-shelter-backups" aria-label={`Verified backup destinations for ${source.label}`}>{source.shelterBackups.map((backup) => { const age = getShelterFreshness(backup.lastVerifiedAt, clock); const driveName = backup.destination.split(/[\/]/).filter(Boolean).pop() || backup.destination; const resultLabel = backup.lastResult === "verified" ? formatShelterAge(backup.lastVerifiedAt, clock) : `${backup.lastResult} · ${formatShelterAge(backup.lastVerifiedAt, clock).toLowerCase()}`; return <div className={`stats-shelter-backup stats-freshness-${backup.lastResult === "verified" ? age : "red"}`} key={backup.destination} title={`${backup.destination}${backup.clonePath ? ` · ${backup.clonePath}` : ""}`} aria-label={`${driveName}: ${resultLabel}; ${age} freshness`}>{backup.lastResult === "verified" ? <FiShield /> : <FiAlertCircle />}<span><strong>{driveName}</strong><small>{resultLabel}</small></span></div>; })}</div>}{source.cloneDestination && <small className="stats-destination-path" title={source.cloneDestination}>At {source.cloneDestination}</small>}{source.shelterAuditMessage && <small className="stats-source-error">{source.shelterAuditMessage}</small>}{source.shelterState === "changed" && <small className="stats-source-error">Select this source and choose Refresh Fallout Shelter to create and verify an updated copy.</small>}</td>
+              <td><div className={`stats-shelter-state ${source.shelterState} stats-freshness-${statusFreshness}`}>{icon}<strong>{shelterLabel(source)}</strong></div>{source.lastVerifiedAt && <small title={formatDate(source.lastVerifiedAt)}>Last full SHA-256 match · {formatShelterAge(source.lastVerifiedAt, clock)}</small>}{source.shelterAuditResult && <small>Latest check {source.shelterVerifiedFiles} / {source.shelterTotalFiles} files matched</small>}{source.shelterBackups.length > 0 && <div className="stats-shelter-backups" aria-label={`Verified backup destinations for ${source.label}`}>{source.shelterBackups.map((backup, backupIndex) => { const age = getShelterFreshness(backup.lastVerifiedAt, clock); const driveName = backup.destination.split(/[\/]/).filter(Boolean).pop() || backup.destination; const resultLabel = backup.lastResult === "verified" ? formatShelterAge(backup.lastVerifiedAt, clock) : `${backup.lastResult} · ${formatShelterAge(backup.lastVerifiedAt, clock).toLowerCase()}`; return <div className={`stats-shelter-backup stats-freshness-${backup.lastResult === "verified" ? age : "red"}`} key={`${backup.destination}:${backupIndex}`} title={`${backup.destination}${backup.clonePath ? ` · ${backup.clonePath}` : ""}`} aria-label={`${driveName}: ${resultLabel}; ${age} freshness`}>{backup.lastResult === "verified" ? <FiShield /> : <FiAlertCircle />}<span><strong>{driveName}</strong><small>{resultLabel}</small></span></div>; })}</div>}{source.cloneDestination && <small className="stats-destination-path" title={source.cloneDestination}>At {source.cloneDestination}</small>}{source.shelterAuditMessage && <small className="stats-source-error">{source.shelterAuditMessage}</small>}{source.shelterState === "changed" && <small className="stats-source-error">Select this source and choose Refresh Fallout Shelter to create and verify an updated copy.</small>}</td>
             </tr>;
           })}{(snapshot?.sources.length ?? 0) === 0 && <tr><td colSpan={3} className="stats-empty-row">{snapshot ? "No sources have been added yet." : "Waiting for the desktop source registry…"}</td></tr>}</tbody>
         </table></div>
@@ -374,12 +449,23 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
       </section>
       {showClone && snapshot?.shelter.destination && <SourceClonePanel electronAPI={api} sources={selectedSources.map(({ id, label, kind }) => ({ id, label, kind }))} initialDestinations={[snapshot.shelter.destination]} onClose={() => { setShowClone(false); setSelectedIds(new Set()); void refreshInventory(); }} />}
       {showReplica && snapshot?.shelter.snapshotAvailable && <SourceClonePanel electronAPI={api} mode="shelter-replica" sources={[{ id: "fallout-shelter", label: "Fallout Shelter", kind: "verified snapshot" }]} onClose={() => { setShowReplica(false); void loadSnapshot(); }} />}
+      {activeOperationToOpen && <SourceClonePanel
+        electronAPI={api}
+        mode={activeOperationToOpen.mode === "shelter-replica" ? "shelter-replica" : "sources"}
+        activeOperationId={activeOperationToOpen.operationId}
+        sources={(activeOperationToOpen.sourceProgress ?? []).map((source) => ({
+          id: source.sourceId,
+          label: source.label,
+          kind: availableSources.find((candidate) => candidate.id === source.sourceId)?.kind ?? "backup-data",
+        }))}
+        onClose={() => setActiveOperationToOpen(null)}
+      />}
       {showSessionHistory && <SourceClonePanel electronAPI={api} sources={[]} historyOnly onClose={() => setShowSessionHistory(false)} />}
     </div>
   );
 }
 
-export default function StatsDashboard({ api }: StatsDashboardProps) {
+export default function StatsDashboard({ api, active = true }: StatsDashboardProps) {
   const [snapshot, setSnapshot] = useState<LibraryDashboardSnapshot | null>(null);
   const [stages, setStages] = useState<IndexingStageProgress[]>([]);
   const [showConsole, setShowConsole] = useState(false);
@@ -413,6 +499,7 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
   }, [api]);
 
   useEffect(() => {
+    if (!active) return;
     mounted.current = true;
     let disposed = false;
     let timer: number | undefined;
@@ -440,7 +527,7 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
       mounted.current = false;
       window.clearTimeout(timer);
     };
-  }, [api, loadSnapshot]);
+  }, [active, api, loadSnapshot]);
 
 
   const currentStage = stages.find((stage) => activeIndexerStatuses.has(stage.status));
@@ -575,8 +662,8 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
           <table className="stats-source-table">
             <thead><tr><th>Source</th><th>Inventory</th><th>Indexed</th></tr></thead>
             <tbody>
-              {(snapshot?.sources ?? []).map((source) => {
-                return <tr key={source.id}>
+              {(snapshot?.sources ?? []).map((source, sourceIndex) => {
+                return <tr key={`${source.id}:${sourceIndex}`}>
                   <td className="stats-source-name-cell">
                     <span className="stats-source-name"><strong>{source.label}</strong><small>{sourceKindLabel(source.kind)} · {source.rootPath || "No active device path"}</small></span>
                     {source.message && <small className="stats-source-overlap">{source.message}</small>}
@@ -598,14 +685,14 @@ export default function StatsDashboard({ api }: StatsDashboardProps) {
 
       <section className="stats-indexing-section">
         <div className="stats-section-intro"><span className="stats-kicker">INDEX HEALTH</span><h2>Running &amp; queued work</h2><p>Each stage reports its own units; no misleading blended percentage.</p></div>
-        <IndexingPanel onStagesChange={setStages} />
+        <IndexingPanel active={active} onStagesChange={setStages} />
       </section>
 
       <section className="stats-console-toggle-card">
         <div><div className="stats-heading-icon"><FiTerminal /></div><div><span className="stats-kicker">DIAGNOSTICS</span><h2>Developer console</h2><p>Structured, bounded runtime events with follow-bottom scrolling.</p></div></div>
         <button className="stats-button quiet" onClick={() => setShowConsole((value) => !value)}><FiTerminal /> {showConsole ? "Hide console" : "Open console"}</button>
       </section>
-      {showConsole && <RuntimeConsole api={api} />}
+      {showConsole && <RuntimeConsole api={api} active={active} />}
 
       <footer className="stats-page-footnote"><FiActivity /> Inventory is measured on first use, when older than 15 minutes on dashboard open, and on demand. Offline sources retain last-known totals and verification matches but are marked stale; overlapping source rows remain separate while headline totals deduplicate nested local roots.</footer>
 

@@ -679,11 +679,11 @@ export class GoogleManager {
     onFile?: (file: CloudFileInfo) => void,
     isCancelled: () => boolean = () => false,
   ): Promise<CloudFileInfo[]> {
-    if (virtualPath === ALL_PHOTOS_PATH) return this.listAllPickedPhotos();
+    if (virtualPath === ALL_PHOTOS_PATH) return this.listAllPickedPhotos(onFile, isCancelled);
     const parsed = this.parseCloudPath(virtualPath);
     if (!parsed) return [];
     if (parsed.segment === PHOTOS_SEGMENT)
-      return this.listPickedPhotos(parsed.accountId);
+      return this.listPickedPhotos(parsed.accountId, onFile, isCancelled);
     if (parsed.segment !== DRIVE_SEGMENT) return [];
 
     const entries: CloudFileInfo[] = [];
@@ -739,10 +739,15 @@ export class GoogleManager {
     return files;
   }
 
-  private listAllPickedPhotos(): CloudFileInfo[] {
+  private listAllPickedPhotos(
+    onFile?: (file: CloudFileInfo) => void,
+    isCancelled: () => boolean = () => false,
+  ): CloudFileInfo[] {
     const files: CloudFileInfo[] = [];
     for (const accountId of this.pickedItems.keys()) {
-      files.push(...this.listPickedPhotos(accountId));
+      if (isCancelled()) break;
+      if (onFile) this.listPickedPhotos(accountId, onFile, isCancelled);
+      else files.push(...this.listPickedPhotos(accountId, undefined, isCancelled));
     }
     return files;
   }
@@ -1328,19 +1333,30 @@ export class GoogleManager {
     } while (pageToken);
   }
 
-  private listPickedPhotos(accountId: string): CloudFileInfo[] {
+  private listPickedPhotos(
+    accountId: string,
+    onFile?: (file: CloudFileInfo) => void,
+    isCancelled: () => boolean = () => false,
+  ): CloudFileInfo[] {
     const bucket = this.pickedItems.get(accountId);
     if (!bucket) return [];
-    return Array.from(bucket.values()).map((item) => ({
-      name: item.name,
-      path: this.buildPath(PHOTOS_SEGMENT, accountId, item.id, item.name),
-      relativePath: item.name,
-      size: 0,
-      modified: item.modified,
-      isDirectory: false,
-      type: classifyCloudFile(item.mimeType, item.name),
-      extension: path.extname(item.name).toLowerCase(),
-    }));
+    const files: CloudFileInfo[] = [];
+    for (const item of bucket.values()) {
+      if (isCancelled()) break;
+      const file: CloudFileInfo = {
+        name: item.name,
+        path: this.buildPath(PHOTOS_SEGMENT, accountId, item.id, item.name),
+        relativePath: item.name,
+        size: 0,
+        modified: item.modified,
+        isDirectory: false,
+        type: classifyCloudFile(item.mimeType, item.name),
+        extension: path.extname(item.name).toLowerCase(),
+      };
+      if (onFile) onFile(file);
+      else files.push(file);
+    }
+    return files;
   }
 
   clearPickedPhotos(accountId?: string): void {

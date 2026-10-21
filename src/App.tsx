@@ -118,7 +118,11 @@ import GuidedTour, {
 import LocalHelpPanel from "./components/LocalHelpPanel";
 import InteractiveTooltip from "./components/InteractiveTooltip";
 
-function FirstRunMapServiceConsent() {
+function FirstRunMapServiceConsent({
+  onConsentChange,
+}: {
+  onConsentChange: (allowed: boolean) => Promise<void>;
+}) {
   const [visible, setVisible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -145,7 +149,7 @@ function FirstRunMapServiceConsent() {
     setBusy(true);
     setError("");
     try {
-      await api.setMapServiceConsent(allowed);
+      await onConsentChange(allowed);
       setVisible(false);
     } catch {
       setError("Silo could not save this privacy choice. Online map services remain off.");
@@ -160,7 +164,7 @@ function FirstRunMapServiceConsent() {
       <section className="map-privacy-dialog" role="dialog" aria-modal="true" aria-labelledby="first-run-map-privacy-title">
         <h2 id="first-run-map-privacy-title">Choose whether to use online map services</h2>
         <p>Photo locations stay on this device unless you allow online map services. If enabled, selecting an unlabeled location can send its exact coordinates to Nominatim; place searches send your query to Photon; and close-up imagery requests send tile coordinates to Esri. These services can also see your public IP address and request timing. Their log retention is not known.</p>
-        <p>With services off, local location groups and the offline globe remain available. You can change this choice later from the Map page.</p>
+        <p>With services off, local location groups and the offline globe remain available. You can change this choice later in Settings → Appearance &amp; behavior.</p>
         {error && <p className="map-privacy-error" role="alert">{error}</p>}
         <div className="map-privacy-actions">
           <button type="button" onClick={() => void choose(false)} disabled={busy}>Keep services off</button>
@@ -240,8 +244,6 @@ const defaultContentSettings: PublicContentSettings = {
   showNsfw: false,
   safeSearch: true,
   theme: "system",
-  autoplayGlobe: false,
-  preloadMapTextures: false,
   showBannedPeople: false,
   parentalPasswordSet: false,
 };
@@ -613,7 +615,7 @@ function SearchTiming({
       ? null
       : Math.max(1, Math.round(firstResultAt - startedAt));
   return (
-    <span title="Elapsed time for this query">
+    <span className="search-timing-counter" title="Elapsed time for this query">
       {first === null
         ? completedAt === null
           ? "Searching"
@@ -657,8 +659,11 @@ function cachedImagePreview(
 
 const GOOGLE_SOURCES_IN_SIDEBAR = GOOGLE_FEATURES_ENABLED;
 const FAST_FILE_SEARCH_RESULT_LIMIT = 5000;
-const FAST_FILE_SEARCH_CHUNK_SIZE = 512;
-const FAST_FILE_SEARCH_CHUNK_DELAY_MS = 24;
+// Scan a few thousand cached entries per task, then yield without adding a
+// fixed delay. The previous 24 ms pause per 512 files made a two-million-file
+// inventory take about 94 seconds to reach its last matching paths.
+const FAST_FILE_SEARCH_CHUNK_SIZE = 4096;
+const FAST_FILE_SEARCH_CHUNK_DELAY_MS = 0;
 const SEARCH_INDEX_PREPARING_HINT =
   "Search works now. Results may be slower while Silo prepares the saved library index; they should be much faster once it is ready.";
 
@@ -758,6 +763,15 @@ const fileListKey = (file: { path: string; relativePath?: string; siloAlias?: bo
   file.siloAlias ? `${file.path}\u0000${file.relativePath ?? ""}` : file.path;
 const MAX_THUMBNAIL_SIZE = 500;
 const LEGACY_THUMBNAIL_SIZE_KEY = "silo.thumbnailSize";
+type AppSection =
+  | "files"
+  | "people"
+  | "map"
+  | "duplicates"
+  | "pets"
+  | "mobile"
+  | "memories"
+  | "stats";
 
 function readThumbnailSizePreference(key: string, fallback = 240) {
   try {
@@ -814,7 +828,7 @@ function App() {
   const [showFilters, setShowFilters] = useState(false);
   const [typeFilterOpen, setTypeFilterOpen] = useState(false);
   const typeFilterRef = useRef<HTMLDivElement>(null);
-  const [yearFilter, setYearFilter] = useState("all");
+  const [yearFilter, setYearFilter] = useState<string[]>([]);
   const [audioYearOptions, setAudioYearOptions] = useState<string[]>([]);
   const [expandedYears, setExpandedYears] = useState<Set<string>>(
     () => new Set(),
@@ -983,6 +997,30 @@ function App() {
   const [contentSettings, setContentSettings] = useState(
     defaultContentSettings,
   );
+  const [mapServicesAllowed, setMapServicesAllowed] = useState(false);
+  const mapServiceConsentVersionRef = useRef(0);
+  useEffect(() => {
+    let active = true;
+    const readVersion = mapServiceConsentVersionRef.current;
+    void electronAPI?.getMapServiceConsent()
+      .then((allowed) => {
+        if (active && readVersion === mapServiceConsentVersionRef.current)
+          setMapServicesAllowed(allowed === true);
+      })
+      .catch(() => {
+        if (active && readVersion === mapServiceConsentVersionRef.current)
+          setMapServicesAllowed(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [electronAPI]);
+  const saveMapServiceConsent = useCallback(async (allowed: boolean) => {
+    if (!electronAPI) throw new Error("Map privacy settings are unavailable.");
+    mapServiceConsentVersionRef.current += 1;
+    await electronAPI.setMapServiceConsent(allowed);
+    setMapServicesAllowed(allowed);
+  }, [electronAPI]);
   const [showHiddenMessages, setShowHiddenMessages] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsTourTarget, setSettingsTourTarget] = useState<string | null>(null);
@@ -1145,7 +1183,10 @@ function App() {
       let capped = false;
       for (; offset < end; offset += 1) {
         const file = candidates[offset];
-        if (bannedHiddenPathsRef.current.has(file.path)) continue;
+        if (
+          bannedHiddenPathsRef.current.has(file.path) ||
+          !pathIsWithinAnySource(file.path, enabledSourcePathsRef.current)
+        ) continue;
         const priority = getFileTextMatchPriority(file, query);
         if (priority === null || matches.has(file.path)) continue;
         if (matches.size >= FAST_FILE_SEARCH_RESULT_LIMIT) {
@@ -1169,14 +1210,20 @@ function App() {
   const [searchProgress, setSearchProgress] = useState<{
     scanned: number;
     total: number;
-    mode?: "ann";
+    mode?: "ann" | "exact";
   }>({ scanned: 0, total: 0 });
   const searchDebounceTimerRef = useRef<number | null>(null);
   const [searching, setSearching] = useState(false);
   const [confidence, setConfidence] = useState(DEFAULT_SEMANTIC_SEARCH_CONFIDENCE);
-  const [appSection, setAppSection] = useState<
-    "files" | "people" | "map" | "duplicates" | "pets" | "mobile" | "memories" | "stats"
-  >("files");
+  const [appSection, setAppSection] = useState<AppSection>("files");
+  const [visitedSections, setVisitedSections] = useState<Set<AppSection>>(
+    () => new Set<AppSection>(["files"]),
+  );
+  useEffect(() => {
+    setVisitedSections((current) =>
+      current.has(appSection) ? current : new Set(current).add(appSection),
+    );
+  }, [appSection]);
   const [faceProgress, setFaceProgress] = useState<FaceIndexProgress>({
     status: "idle",
     total: 0,
@@ -1435,6 +1482,7 @@ function App() {
   );
   const enabledSourcePathsRef = useRef(enabledSourcePaths);
   enabledSourcePathsRef.current = enabledSourcePaths;
+  const searchSourceScopeKeyRef = useRef(enabledSourcePathsKey);
   const [showPhoneBackups, setShowPhoneBackups] = useState(false);
   const hasCachedPhoneBackups = sources.some((source) => source.offlineBackup);
   const [sourceSort, setSourceSort] = useState<"name" | "kind" | "backup">(
@@ -1552,7 +1600,7 @@ function App() {
     !audioOnlySelected &&
     !searchQuery.trim() &&
     !activeDigitalFolderId &&
-    (showFilters || yearFilter !== "all" || needsPhotoMetadata);
+    (showFilters || yearFilter.length > 0 || needsPhotoMetadata);
   const needsRecursiveBrowseRef = useRef(needsRecursiveBrowse);
   needsRecursiveBrowseRef.current = needsRecursiveBrowse;
   const explodedRef = useRef(exploded);
@@ -1958,17 +2006,6 @@ function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = contentSettings.theme;
   }, [contentSettings.theme]);
-
-  useEffect(() => {
-    if (!contentSettings.preloadMapTextures) return;
-    const images = ["earth-blue-marble.jpg", "earth-night.jpg"].map((name) => {
-      const image = new Image();
-      image.decoding = "async";
-      image.src = `${process.env.PUBLIC_URL}/${name}`;
-      return image;
-    });
-    void Promise.all(images.map((image) => image.decode().catch(() => undefined)));
-  }, [contentSettings.preloadMapTextures]);
 
   useEffect(() => {
     if (!hydrated || startupTourChecked.current) return;
@@ -3568,6 +3605,7 @@ function App() {
 
   useEffect(() => {
     if (
+      activeDigitalFolderId ||
       !selectedFile ||
       pathIsVisibleForSelectedSources(
         selectedFile.path,
@@ -3578,7 +3616,12 @@ function App() {
     setSelectedFile(null);
     setFilePreview(null);
     setViewerOpen(false);
-  }, [allSourcePaths, enabledSourcePaths, selectedFile]);
+  }, [
+    activeDigitalFolderId,
+    allSourcePaths,
+    enabledSourcePaths,
+    selectedFile,
+  ]);
 
   const browseAllSources = useCallback(async () => {
     setConnectedPhone(null);
@@ -4764,16 +4807,6 @@ function App() {
     ],
   );
 
-  useEffect(() => {
-    if (appSection === "people") return;
-    setSelectedPersonId(null);
-    setPersonDetail(null);
-    setPersonPhotos([]);
-    setSelectedPersonPhoto(null);
-    setSelectedPhotoFaces([]);
-    clearFileSelection();
-  }, [appSection, clearFileSelection]);
-
   const openPerson = useCallback(
     async (personId: string) => {
       if (!electronAPI) return;
@@ -5200,7 +5233,6 @@ function App() {
     async (_showLoading: boolean) => {
       if (
         !electronAPI ||
-        appSection !== "files" ||
         !searchQuery.trim() ||
         searchIndexReadiness.status === "unavailable" ||
         searchIndexReadiness.status === "error"
@@ -5229,16 +5261,12 @@ function App() {
         if (requestId === searchRequestRef.current) {
           const hidden = bannedHiddenPathsRef.current;
           const visible = results.filter((result) =>
-            !hidden.has(result.path),
+            !hidden.has(result.path) &&
+            pathIsWithinAnySource(result.path, enabledSourcePathsRef.current),
           );
           rememberSearchResultOrder(visible, searchQuery);
           setSearchResults(visible);
-          const priorCoverage = semanticSearchedSourcesRef.current;
-          const roots = priorCoverage.query === query
-            ? new Set(priorCoverage.roots)
-            : new Set<string>();
-          requestRoots.forEach((root) => roots.add(root));
-          semanticSearchedSourcesRef.current = { query, roots };
+          semanticSearchedSourcesRef.current = { query, roots: requestRoots };
         }
       } catch (cause) {
         if (requestId === searchRequestRef.current) {
@@ -5262,7 +5290,6 @@ function App() {
       }
     },
     [
-      appSection,
       electronAPI,
       rememberSearchResultOrder,
       searchIndexReadiness.status,
@@ -5276,7 +5303,8 @@ function App() {
       if (progress.requestId !== searchRequestRef.current) return;
       const hidden = bannedHiddenPathsRef.current;
       const visible = progress.results.filter((result) =>
-        !hidden.has(result.path),
+        !hidden.has(result.path) &&
+        pathIsWithinAnySource(result.path, enabledSourcePathsRef.current),
       );
       rememberSearchResultOrder(visible, searchQueryRef.current);
       const receivedAt = performance.now();
@@ -5332,7 +5360,6 @@ function App() {
     setFastFileSearchCapped(false);
     const query = searchQuery.trim().toLocaleLowerCase();
     if (
-      appSection !== "files" ||
       !query ||
       searchIndexReadiness.status === "unavailable" ||
       searchIndexReadiness.status === "error"
@@ -5344,8 +5371,8 @@ function App() {
       fastFileSearchGenerationRef.current += 1;
     };
   }, [
-    appSection,
     bannedHiddenPaths,
+    enabledSourcePathsKey,
     searchIndexReadiness.status,
     searchQuery,
   ]);
@@ -5368,7 +5395,24 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (appSection !== "files" || !searchQuery.trim()) {
+    if (searchSourceScopeKeyRef.current === enabledSourcePathsKey) return;
+    searchSourceScopeKeyRef.current = enabledSourcePathsKey;
+    const query = searchQueryRef.current.trim();
+    searchRequestRef.current += 1;
+    semanticSearchedSourcesRef.current = { query, roots: new Set() };
+    setSearchResults((current) =>
+      current.filter((result) =>
+        pathIsWithinAnySource(result.path, enabledSourcePaths),
+      ),
+    );
+    setSearchProgress({ scanned: 0, total: 0 });
+    setSearching(false);
+    if (electronAPI)
+      void electronAPI.cancelSemanticSearch().catch(() => undefined);
+  }, [electronAPI, enabledSourcePaths, enabledSourcePathsKey]);
+
+  useEffect(() => {
+    if (!searchQuery.trim()) {
       searchRequestRef.current += 1;
       setSearchResults([]);
       setSearchProgress({ scanned: 0, total: 0 });
@@ -5396,7 +5440,6 @@ function App() {
         void electronAPI.cancelSemanticSearch().catch(() => undefined);
     };
   }, [
-    appSection,
     electronAPI,
     runSemanticSearch,
     searchIndexReadiness.status,
@@ -5406,7 +5449,6 @@ function App() {
   useEffect(() => {
     const query = searchQuery.trim();
     if (
-      appSection !== "files" ||
       !electronAPI ||
       !query ||
       pendingSourceSelectionsRef.current.size > 0 ||
@@ -5426,7 +5468,6 @@ function App() {
     }, 120);
     return () => window.clearTimeout(timer);
   }, [
-    appSection,
     electronAPI,
     enabledSourcePathsKey,
     runSemanticSearch,
@@ -5436,21 +5477,22 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (contentSafetyRevision > 0 && appSection === "files")
-      void runSemanticSearch(false);
-  }, [appSection, contentSafetyRevision, runSemanticSearch]);
+    if (contentSafetyRevision > 0) void runSemanticSearch(false);
+  }, [contentSafetyRevision, runSemanticSearch]);
 
   const rawContentFiles: FileInfo[] = useMemo(() => {
     if (!searchQuery.trim()) return files;
     const resultsByPath = new Map<string, SemanticSearchResult>();
     for (const result of fastFileSearchResults)
       if (
+        pathIsWithinAnySource(result.path, enabledSourcePaths) &&
         searchFeedback[result.path] !== "removed" &&
         !bannedHiddenPaths.has(result.path)
       )
         resultsByPath.set(result.path, result);
     for (const result of searchResults) {
       if (
+        !pathIsWithinAnySource(result.path, enabledSourcePaths) ||
         searchFeedback[result.path] === "removed" ||
         bannedHiddenPaths.has(result.path)
       ) continue;
@@ -5484,6 +5526,7 @@ function App() {
   }, [
     activeDigitalFolderId,
     bannedHiddenPaths,
+    enabledSourcePaths,
     fastFileSearchResults,
     files,
     confidence,
@@ -5803,7 +5846,10 @@ function App() {
         )
       )
         return false;
-      if (viewYearFilter !== "all" && modifiedYear(file) !== viewYearFilter)
+      if (
+        viewYearFilter.length > 0 &&
+        !viewYearFilter.includes(modifiedYear(file))
+      )
         return false;
       if (
         viewFilters.includedType !== "all" &&
@@ -5866,14 +5912,16 @@ function App() {
 
   const filteredAndSortedFiles = useMemo(
     () =>
-      baseFilteredAndSortedFiles.filter((file) =>
-        pathIsVisibleForSelectedSources(
-          file.path,
-          deferredSourceVisibilityInputs.enabledSourcePaths,
-          deferredSourceVisibilityInputs.allSourcePaths,
-        ),
-      ),
-    [baseFilteredAndSortedFiles, deferredSourceVisibilityInputs],
+      activeDigitalFolderId
+        ? baseFilteredAndSortedFiles
+        : baseFilteredAndSortedFiles.filter((file) =>
+            pathIsVisibleForSelectedSources(
+              file.path,
+              deferredSourceVisibilityInputs.enabledSourcePaths,
+              deferredSourceVisibilityInputs.allSourcePaths,
+            ),
+          ),
+    [activeDigitalFolderId, baseFilteredAndSortedFiles, deferredSourceVisibilityInputs],
   );
 
   const hasSelectableFiles = useMemo(
@@ -6525,7 +6573,7 @@ function App() {
         setSelectedFilePaths((current) => (current.size ? new Set() : current));
       }}
     >
-      <FirstRunMapServiceConsent />
+      <FirstRunMapServiceConsent onConsentChange={saveMapServiceConsent} />
       {showConstructionBanner && (
         <div className="preview-construction-banner" role="note">
           <div>
@@ -7008,20 +7056,6 @@ function App() {
                     );
                   })()}
               </div>
-              {!searchQuery.trim() && (
-                <button
-                  className={`btn explode-button header-tool-explode ${exploded ? "active" : ""}`}
-                  onClick={() => changeExploded(!exploded)}
-                  title={
-                    audioOnlySelected
-                      ? "Flatten audio into a single list"
-                      : "Flatten every nested file into one view"
-                  }
-                  data-help="Temporarily flatten nested folders into one list view; it does not move files."
-                >
-                  <FiZap /> {exploded ? "Exploded" : "Explode"}
-                </button>
-              )}
             </div>
           ) : appSection === "people" ? (
             <div className="face-header-progress">
@@ -7114,6 +7148,19 @@ function App() {
                     </button>
                   </div>
                 )}
+                <button
+                  type="button"
+                  className={`btn explode-button header-tool-explode ${exploded ? "active" : ""}`}
+                  onClick={() => changeExploded(!exploded)}
+                  title={
+                    audioOnlySelected
+                      ? "Flatten audio into a single list"
+                      : "Flatten every nested file into one view"
+                  }
+                  data-help="Temporarily flatten nested folders into one list view; it does not move files."
+                >
+                  <FiZap /> {exploded ? "Exploded" : "Explode"}
+                </button>
               </>
             )}
           </div>
@@ -7462,7 +7509,9 @@ function App() {
           <span className="file-count">
             {searchQuery.trim()
               ? searchIndexReadiness.status === "preparing"
-                ? `${filteredAndSortedFiles.length.toLocaleString()} matches · preparing saved search index ${searchIndexReadiness.percentage}%`
+                ? searchProgress.mode === "ann"
+                  ? `${filteredAndSortedFiles.length.toLocaleString()} matches · fast search active, index building ${searchIndexReadiness.percentage}%`
+                  : `${filteredAndSortedFiles.length.toLocaleString()} matches · preparing saved search index ${searchIndexReadiness.percentage}%`
                 : searching && searchProgress.total === 0
                 ? `${filteredAndSortedFiles.length.toLocaleString()} matches · finding first results`
                 : searching && searchProgress.mode === "ann"
@@ -7560,18 +7609,32 @@ function App() {
           </div>
           <div className="filter-section">
             <h3>Year</h3>
-            <select
-              className="type-select"
-              value={yearFilter}
-              onChange={(event) => setYearFilter(event.target.value)}
-            >
-              <option value="all">All years</option>
+            <div className="year-filter-checklist" aria-label="Filter by year">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={yearFilter.length === 0}
+                  onChange={() => setYearFilter([])}
+                />
+                <span>All years</span>
+              </label>
               {yearOptions.map((year) => (
-                <option key={year} value={year}>
-                  {year}
-                </option>
+                <label key={year}>
+                  <input
+                    type="checkbox"
+                    checked={yearFilter.includes(year)}
+                    onChange={() =>
+                      setYearFilter((current) =>
+                        current.includes(year)
+                          ? current.filter((selected) => selected !== year)
+                          : [...current, year],
+                      )
+                    }
+                  />
+                  <span>{year}</span>
+                </label>
               ))}
-            </select>
+            </div>
           </div>
           {!audioOnlySelected && <div className="filter-section">
             <h3>People</h3>
@@ -7644,18 +7707,25 @@ function App() {
         </div>
       )}
 
-      <div className={`section-workspace section-workspace-${appSection}`} key={`workspace-${appSection}`}>
+      <div className={`section-workspace section-workspace-${appSection}`}>
       <React.Suspense fallback={null}>
         <MemoriesLauncher api={electronAPI} ready={startupState.ready && hydrated}
           onExplore={() => setAppSection("memories")} />
       </React.Suspense>
-      {appSection === "memories" ? (
+      {(visitedSections.has("memories") || appSection === "memories") && (
+        <div className="section-view" data-active={appSection === "memories"} aria-hidden={appSection !== "memories"}>
         <React.Suspense fallback={<main className="viewer-status">Loading Memories…</main>}>
-          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={memoryBookThumbnailSize} onThumbnailSizeChange={setMemoryBookThumbnailSize} onChooseMusicFolder={addIndexSource} />
+          <MemoriesPage api={electronAPI} visible={appSection === "memories"} ready={startupState.ready} thumbnailSize={memoryBookThumbnailSize} onThumbnailSizeChange={setMemoryBookThumbnailSize} onChooseMusicFolder={addIndexSource} />
         </React.Suspense>
-      ) : appSection === "stats" ? (
-        electronAPI ? <StatsDashboard api={electronAPI} /> : <main className="viewer-status">Stats services are unavailable.</main>
-      ) : appSection === "people" ? (
+        </div>
+      )}
+      {(visitedSections.has("stats") || appSection === "stats") && (
+        <div className="section-view" data-active={appSection === "stats"} aria-hidden={appSection !== "stats"}>
+          {electronAPI ? <StatsDashboard api={electronAPI} active={appSection === "stats"} /> : <main className="viewer-status">Stats services are unavailable.</main>}
+        </div>
+      )}
+      {(visitedSections.has("people") || appSection === "people") && (
+        <div className="section-view" data-active={appSection === "people"} aria-hidden={appSection !== "people"}>
         <main className="people-page" data-retained-scroll="people" data-tour="people-page" data-help="Review photos and face groups. Naming people, correcting assignments, merging profiles and changing visibility save People records only; source photos are unchanged."
         >
           <section className="face-index-status" data-tour="people-index" data-help="This independent offline index detects and groups faces. It does not move or rename source files.">
@@ -8563,7 +8633,10 @@ function App() {
             </>
           )}
         </main>
-      ) : appSection === "map" ? (
+        </div>
+      )}
+      {(visitedSections.has("map") || appSection === "map") && (
+        <div className="section-view" data-active={appSection === "map"} aria-hidden={appSection !== "map"}>
         <React.Suspense
           fallback={
             <main className="map-page">
@@ -8572,12 +8645,12 @@ function App() {
           }
         >
           <MapPage
-            key={`map-${contentSettings.showNsfw}-${contentSettings.showBannedPeople}-${contentSettings.autoplayGlobe}`}
             digitalFolders={digitalFolders}
             fileMetadata={fileMetadata}
             redundantPaths={redundantDuplicatePaths}
             hiddenPaths={allHiddenPaths}
-            autoplay={contentSettings.autoplayGlobe}
+            mapServicesAllowed={mapServicesAllowed}
+            active={appSection === "map"}
             onOpenFile={(file, clusterFiles) =>
               void openMediaViewer(file, clusterFiles)
             }
@@ -8589,15 +8662,22 @@ function App() {
             }}
           />
         </React.Suspense>
-      ) : appSection === "duplicates" ? (
+        </div>
+      )}
+      {(visitedSections.has("duplicates") || appSection === "duplicates") && (
+        <div className="section-view" data-active={appSection === "duplicates"} aria-hidden={appSection !== "duplicates"}>
         <DuplicatesPage
           state={duplicateState}
           onStateChange={setDuplicateState}
           tourView={tourDuplicateView}
           thumbnailSize={duplicatesThumbnailSize}
           onThumbnailSizeChange={setDuplicatesThumbnailSize}
+          active={appSection === "duplicates"}
         />
-      ) : appSection === "mobile" ? (
+        </div>
+      )}
+      {(visitedSections.has("mobile") || appSection === "mobile") && (
+        <div className="section-view" data-active={appSection === "mobile"} aria-hidden={appSection !== "mobile"}>
         <main className="mobile-page" data-retained-scroll="mobile" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
           <section className="mobile-messages-section" aria-label="Mobile manager">
         <MessageExportPanel
@@ -8641,7 +8721,10 @@ function App() {
             />
           </section>
         </main>
-      ) : (
+        </div>
+      )}
+      {(visitedSections.has("files") || appSection === "files" || appSection === "pets") && (
+        <div className="section-view" data-active={appSection === "files" || appSection === "pets"} aria-hidden={appSection !== "files" && appSection !== "pets"}>
         <div
           className="main-container"
           data-help="Files combines your enabled sources with local indexing, semantic search, filters, virtual folders, and careful file actions. Source status and indexing progress appear in the sidebar."
@@ -9210,6 +9293,7 @@ function App() {
               data-help="Review indexing stages and progress. File indexing prepares local search; face indexing is a separate optional task in People."
             >
               <IndexingPanel
+                active={appSection === "files" || appSection === "pets"}
                 collapsed={sidebarCollapsed.indexing}
                 onToggleCollapsed={() => toggleSidebarSection("indexing")}
               />
@@ -9902,6 +9986,7 @@ function App() {
             </aside>
           )}
         </div>
+        </div>
       )}
       </div>
 
@@ -10054,6 +10139,8 @@ function App() {
       {showSettings && (
         <SettingsPanel
           settings={contentSettings}
+          mapServicesAllowed={mapServicesAllowed}
+          onMapServicesAllowedChange={saveMapServiceConsent}
           showHiddenMessages={showHiddenMessages}
           onShowHiddenMessagesChange={(show) =>
             void updateHiddenMessageVisibility(show)

@@ -30,13 +30,14 @@ const stageDescriptions: Record<string, string> = {
 };
 
 interface IndexingPanelProps {
+  active?: boolean;
   onStagesChange?: (stages: IndexingStageProgress[]) => void;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
 }
 
 /** Count-only polling is isolated here so progress never rerenders the file grid. */
-export default function IndexingPanel({ onStagesChange, collapsed = false, onToggleCollapsed }: IndexingPanelProps) {
+export default function IndexingPanel({ active = true, onStagesChange, collapsed = false, onToggleCollapsed }: IndexingPanelProps) {
   const [stages, setStages] = useState<IndexingStageProgress[]>([]);
   const [error, setError] = useState<
     (ReturnType<typeof describeIndexingConnectionError> & { waiting?: boolean }) | null
@@ -130,6 +131,10 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
     }
   };
   useEffect(() => {
+    if (!active) {
+      retryNow.current = () => undefined;
+      return;
+    }
     let disposed = false;
     let running = false;
     let failures = 0;
@@ -190,7 +195,7 @@ export default function IndexingPanel({ onStagesChange, collapsed = false, onTog
       window.clearTimeout(timer);
       retryNow.current = () => undefined;
     };
-  }, []);
+  }, [active]);
   return (
     <section className="indexing-panel" aria-label="Indexing progress">
       {onToggleCollapsed ? (

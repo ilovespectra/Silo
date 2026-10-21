@@ -114,6 +114,12 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("extract-source-clone-archive", operationId),
   cancelSourceClone: (operationId) =>
     ipcRenderer.invoke("cancel-source-clone", operationId),
+  getActiveSourceCloneProgress: () =>
+    ipcRenderer.invoke("get-active-source-clone-progress"),
+  getShelterBackupCatalog: () =>
+    ipcRenderer.invoke("get-shelter-backup-catalog"),
+  listShelterBackupDirectory: (backupId, relativeDirectory, afterName, limit) =>
+    ipcRenderer.invoke("list-shelter-backup-directory", backupId, relativeDirectory, afterName, limit),
   onSourceCloneProgress: (callback) => {
     const listener = (_event, progress) => callback(progress);
     ipcRenderer.on("source-clone-progress", listener);

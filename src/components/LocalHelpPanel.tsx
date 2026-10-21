@@ -251,26 +251,6 @@ const ALL_HELP_ARTICLES: LocalHelpTopic[] = [
     fallbackTarget: '[data-tour="map-overview"]',
   },
   {
-    id: "map-globe-controls",
-    guidePath: "/guide/05-map",
-    title: "Globe orientation and lighting",
-    keywords: "map globe compass north rotation pause resume solar time daylight night here lighting",
-    answer:
-      "The compass resets the globe north-up, and the rotation button pauses or resumes globe movement. These controls only affect map presentation.",
-    section: "map",
-    target: '[data-tour="map-globe-controls"]',
-  },
-  {
-    id: "map-solar-controls",
-    guidePath: "/guide/05-map",
-    title: "Solar time and globe lighting",
-    keywords: "map solar time daylight night day here night here lighting sun globe",
-    answer:
-      "View solar time adjusts the displayed daylight boundary. Day here and Night here align it with the current globe view. These controls affect the map presentation only, not photo metadata.",
-    section: "map",
-    target: '[data-tour="map-solar-controls"]',
-  },
-  {
     id: "file-toolbar",
     guidePath: "/guide/01-files-and-sources",
     title: "Files toolbar and view controls",
@@ -327,7 +307,7 @@ const ALL_HELP_ARTICLES: LocalHelpTopic[] = [
     title: "Appearance and behavior settings",
     keywords: "settings theme light dark system appearance globe rotate",
     answer:
-      "Settings → Appearance & behavior controls System, Dark, or Light theme, automatic globe rotation, and optional background preloading of Map’s local day and night textures after Silo opens.",
+      "Settings → Appearance & behavior controls System, Dark, or Light theme, online map services, automatic globe rotation, and optional background preloading of Map’s local day and night textures after Silo opens.",
     section: "settings",
     target: '[data-tour="settings-appearance"]',
   },
@@ -438,7 +418,7 @@ const ALL_GUIDE_DOC_SECTIONS: GuideDocSection[] = [
   {"chapterTitle":"Backups and Time Machine","title":"Phone backups","guidePath":"/guide/10-backups","excerpt":"Mobile backups create dated, browseable local copies. Compare device identifiers and dates before restoring or updating. Keep independent copies if the phone is important; a phone backup may not include every protected iOS file.","searchText":"Phone backups Mobile backups create dated, browseable local copies. Compare device identifiers and dates before restoring or updating. Keep independent copies if the phone is important; a phone backup may not include every protected iOS file."},
   {"chapterTitle":"Backups and Time Machine","title":"Library Statistics","guidePath":"/guide/10-backups","excerpt":"Open Stats in the main sidebar to review inventory, source availability, per-stage indexing, and shelter-copy status. Refresh measurements before comparing totals. Use the copy/verification controls only after checking…","searchText":"Library Statistics Open Stats in the main sidebar to review inventory, source availability, per-stage indexing, and shelter-copy status. Refresh measurements before comparing totals. Use the copy/verification controls only after checking the source selection and destination."},
   {"chapterTitle":"Backups and Time Machine","title":"Good backup practice","guidePath":"/guide/10-backups","excerpt":"Keep at least one verified copy on a different physical device or volume. Keep important backup destinations disconnected when not in use to reduce accidental damage. Check age and freshness, not just the “verified” label from a…","searchText":"Good backup practice Keep at least one verified copy on a different physical device or volume. Keep important backup destinations disconnected when not in use to reduce accidental damage. Check age and freshness, not just the “verified” label from a prior run. Never permanently delete duplicate-review items until you confirm a separate backup exists. Keep the Silo cache out of the only copy of your originals; it can be rebuilt, originals may not be."},
-  {"chapterTitle":"Settings, storage and privacy","title":"Appearance and behavior","guidePath":"/guide/11-settings-and-privacy","excerpt":"Settings → Appearance & behavior offers System , Dark and Light themes. System follows macOS appearance. Map options control automatic globe rotation and optional preload of local day/night textures.","searchText":"Appearance and behavior Settings → Appearance & behavior offers System , Dark and Light themes. System follows macOS appearance. Map options control automatic globe rotation and optional preload of local day/night textures."},
+  {"chapterTitle":"Settings, storage and privacy","title":"Appearance and behavior","guidePath":"/guide/11-settings-and-privacy","excerpt":"Settings → Appearance & behavior offers System , Dark and Light themes. System follows macOS appearance. Map options control online map services, automatic globe rotation, and optional preload of local day/night textures.","searchText":"Appearance and behavior Settings → Appearance & behavior offers System , Dark and Light themes. System follows macOS appearance. Map options control online map services, automatic globe rotation, and optional preload of local day/night textures."},
   {"chapterTitle":"Settings, storage and privacy","title":"Silo cache destination","guidePath":"/guide/11-settings-and-privacy","excerpt":"The cache contains generated data such as search/face/location indexes, thumbnails and previews. Choose cache destination lets you select an external folder. Silo verifies the copied cache before removing the prior copy, then…","searchText":"Silo cache destination The cache contains generated data such as search/face/location indexes, thumbnails and previews. Choose cache destination lets you select an external folder. Silo verifies the copied cache before removing the prior copy, then restarts when needed. Keep the destination mounted while using Silo. The fallback option preserves a 10 GB free-space reserve; turn it off if you prefer indexing to pause when the external cache drive is absent. Changing the cache destination does not move your original folders or change Silo settings. Do not manually delete an index folder while Silo is running."},
   {"chapterTitle":"Settings, storage and privacy","title":"Memories storage","guidePath":"/guide/11-settings-and-privacy","excerpt":"The Memories setting selects where generated movies and their support files are written. It does not move source media. Check available disk space before exporting long videos.","searchText":"Memories storage The Memories setting selects where generated movies and their support files are written. It does not move source media. Check available disk space before exporting long videos."},
   {"chapterTitle":"Settings, storage and privacy","title":"Configuration backup and restore","guidePath":"/guide/11-settings-and-privacy","excerpt":"Backup & restore can export Silo configuration and indexed knowledge. The export can contain sign-in tokens, so treat it like a secret and store it privately. Review an import before applying: restoring replaces the current Silo…","searchText":"Configuration backup and restore Backup & restore can export Silo configuration and indexed knowledge. The export can contain sign-in tokens, so treat it like a secret and store it privately. Review an import before applying: restoring replaces the current Silo setup and restarts the app. It does not modify source media; phone backups are not included."},

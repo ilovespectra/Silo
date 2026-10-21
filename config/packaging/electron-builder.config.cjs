@@ -77,6 +77,8 @@ module.exports = {
   },
   dmg: {
     title: packageJson.build.productName,
+    // With a background, dmg-builder derives Finder window size from image pixels.
+    // Keep the art 720x500 at 72 DPI for the intended compact installer layout.
     background: 'public/dmg-background.png',
     window: { width: 720, height: 500 },
     contents: [

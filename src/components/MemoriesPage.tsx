@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useRef, useState } from "react";
+import React, { createContext, useContext, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { IconBaseProps } from "react-icons";
 import { FiArrowRight as ArrowRight, FiCheck as Check, FiChevronRight as ChevronRight, FiDownload as Download, FiEdit3 as Edit3, FiFilm as Film, FiFolder as Folder, FiImage as Image, FiLock as Lock, FiMaximize as Maximize, FiMinimize as Minimize, FiMusic as Music, FiPause as Pause, FiPlay as Play, FiRefreshCw as RefreshCw, FiSearch as Search, FiTrash2 as Trash2, FiX as X } from "react-icons/fi";
@@ -17,9 +17,11 @@ export const MemoryIcons = {
   FiImage: Image, FiMaximize: Maximize, FiMinimize: Minimize, FiMusic: Music, FiPause: Pause, FiPlay: Play, FiSearch: Search, FiTrash2: Trash2, FiX: X,
 } as unknown as Record<"FiArrowRight" | "FiCheck" | "FiChevronRight" | "FiDownload" | "FiEdit3" | "FiFilm" | "FiLock" | "FiFolder" | "FiImage" | "FiMaximize" | "FiMinimize" | "FiMusic" | "FiPause" | "FiPlay" | "FiSearch" | "FiTrash2" | "FiX", React.FC<IconBaseProps>>;
 const { FiArrowRight, FiCheck, FiChevronRight, FiDownload, FiEdit3, FiFilm, FiLock, FiFolder, FiImage, FiMaximize, FiMinimize, FiMusic, FiPause, FiPlay, FiSearch, FiTrash2, FiX } = MemoryIcons;
+const MemoriesPageVisible = createContext(true);
 
 export interface MemoriesPageProps {
   api: MemoriesAPI;
+  visible?: boolean;
   ready?: boolean;
   thumbnailSize?: number;
   onThumbnailSizeChange?: (size: number) => void;
@@ -145,6 +147,7 @@ export function MemoryCover({ memory }: { memory: MemorySuggestion }) {
 export function MemoriesDialog({ title, onClose, children, locked = false }: {
   title: string; onClose: () => void; children: React.ReactNode; locked?: boolean;
 }) {
+  const visible = useContext(MemoriesPageVisible);
   const titleId = useId();
   const panel = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
@@ -152,6 +155,7 @@ export function MemoriesDialog({ title, onClose, children, locked = false }: {
   closeRef.current = onClose;
   lockedRef.current = locked;
   useEffect(() => {
+    if (!visible) return;
     const previous = document.activeElement as HTMLElement | null;
     panel.current?.focus();
     const keydown = (event: KeyboardEvent) => {
@@ -174,10 +178,10 @@ export function MemoriesDialog({ title, onClose, children, locked = false }: {
     };
     document.addEventListener("keydown", keydown);
     return () => { document.removeEventListener("keydown", keydown); if (previous?.isConnected) previous.focus(); };
-  }, []);
+  }, [visible]);
   const content = <div className="memories-modal-backdrop" onClick={(event) => {
     if (event.target === event.currentTarget && !locked) onClose();
-  }}>
+  }} style={{ display: visible ? undefined : "none" }} aria-hidden={!visible}>
     <div className="memories-modal" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} ref={panel}>
       <header className="memories-modal-header"><h2 id={titleId}>{title}</h2>
         <button type="button" className="memories-icon-button" aria-label="Close dialog" onClick={onClose} disabled={locked}><FiX /></button>
@@ -631,7 +635,7 @@ function SavedMovieCard({ api, movie, onToast, onRefresh }: {
   </article>;
 }
 
-export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, onThumbnailSizeChange, onChooseMusicFolder }: MemoriesPageProps) {
+export default function MemoriesPage({ api, visible = true, ready = true, thumbnailSize = 240, onThumbnailSizeChange, onChooseMusicFolder }: MemoriesPageProps) {
   const [state, setState] = useState<MemoryState | null>(null);
   const [demoMode, setDemoMode] = useState(false);
   const [savedMovies, setSavedMovies] = useState<SavedMemoryMovie[]>([]);
@@ -666,10 +670,10 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
   const waiting = Boolean(state?.suggestions.some((memory) => previews[memory.id] && previews[memory.id].status !== "ready" && previews[memory.id].status !== "failed"));
   useEffect(() => {
     // Bridges without progress events still update by polling the cached state.
-    if (!waiting || api.onMemoryPreviewProgress) return;
+    if (!visible || !waiting || api.onMemoryPreviewProgress) return;
     const timer = window.setInterval(() => { void api.getMemories(false).then((next) => { if (mounted.current && next.previews) setPreviews((current) => ({ ...current, ...next.previews })); }).catch(() => undefined); }, 3000);
     return () => window.clearInterval(timer);
-  }, [api, waiting]);
+  }, [api, visible, waiting]);
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 4000);
@@ -681,6 +685,7 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
   }, [memoryBookSort]);
   const readyCount = Object.values(previews).filter((preview) => preview.status === "ready").length;
   useEffect(() => {
+    if (!visible) return;
     if (!ready || !api.listSavedMemoryMovies) { if (action !== "Finding memories") setRetiring((current) => current.length ? [] : current); return; }
     let disposed = false;
     const settled = action !== "Finding memories";
@@ -690,7 +695,7 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
       if (settled) setRetiring([]);
     }).catch(() => { if (!disposed && settled) setRetiring([]); });
     return () => { disposed = true; };
-  }, [api, ready, cardIds, readyCount, action]);
+  }, [api, ready, visible, cardIds, readyCount, action]);
   const renderingTitle = state?.suggestions.find((memory) => previews[memory.id]?.status === "rendering")?.title;
   const blockedView = (memory: MemorySuggestion) => setToast(previews[memory.id]?.status === "failed"
     ? `“${memory.title}” could not be prepared because some of its files are offline. Reconnect them and it will be prepared next time.`
@@ -808,7 +813,7 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
     void requestMemoryGeneration({ replace: false, customTopic: trimmedPrompt });
   };
   const generateMemoriesTitle = demoMode ? "Demo includes 5 automatic memories from your indexed photos. Unlock Silo to generate more on demand." : memoryGenerationDisabled ? "Memory generation is unavailable while this request is in progress." : "Create 5 new editable memories. Finished ones move to your Memory Book below.";
-  return <section className="memories-page" aria-label="Memories" data-retained-scroll="memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
+  return <MemoriesPageVisible.Provider value={visible}><section className="memories-page" aria-label="Memories" data-retained-scroll="memories" data-help="Review local suggestions and previews. Removing suggestions changes the Silo list only. Export creates a separate movie file; original media remains unchanged.">
     <header className="memories-page-header" data-tour="memories-overview">
       <div><span className="memories-eyebrow">silo / little time capsules</span><h2>Your life, in motion<span>.</span></h2>
         <p>Small stories from your library. Made by you, kept by you.</p></div>
@@ -945,5 +950,5 @@ export default function MemoriesPage({ api, ready = true, thumbnailSize = 240, o
       <h2>A little nostalgia goes a long way.</h2>
     </div>}
     {exporting && <ExportDialog api={api} memory={exporting.memory} options={exporting.options} onClose={() => setExporting(null)} onDownloaded={refreshAfterDownload} />}
-  </section>;
+  </section></MemoriesPageVisible.Provider>;
 }

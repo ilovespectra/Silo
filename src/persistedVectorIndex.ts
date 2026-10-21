@@ -104,7 +104,6 @@ export class PersistedVectorIndex {
     documentQuery: Float32Array,
     limit: number,
   ): Promise<VectorSearchHit[]> {
-    await this.ready;
     return (await this.request({
       type: "search",
       sourcePaths,

@@ -47,6 +47,7 @@ const PreviewImage = React.memo(function PreviewImage({
 interface DuplicatesPageProps {
   state: DuplicateState;
   onStateChange: (state: DuplicateState) => void;
+  active?: boolean;
   tourView?: "duplicates" | "trash" | null;
   thumbnailSize: number;
   onThumbnailSizeChange: (size: number) => void;
@@ -115,6 +116,7 @@ const GROUP_PAGE_SIZE = 60;
 export default function DuplicatesPage({
   state,
   onStateChange,
+  active = true,
   tourView = null,
   thumbnailSize,
   onThumbnailSizeChange,
@@ -354,7 +356,7 @@ export default function DuplicatesPage({
 
   // Handle keyboard navigation in preview mode
   useEffect(() => {
-    if (!previewFile) return;
+    if (!active || !previewFile) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setPreviewFile(null);
@@ -374,7 +376,7 @@ export default function DuplicatesPage({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [previewFile, allDuplicateFiles]);
+  }, [active, previewFile, allDuplicateFiles]);
 
   // Update progress indicator based on state
   useEffect(() => {

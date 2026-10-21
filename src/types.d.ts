@@ -377,8 +377,6 @@ interface ContentPreferences {
   showNsfw: boolean;
   safeSearch: boolean;
   theme: "system" | "dark" | "light";
-  autoplayGlobe: boolean;
-  preloadMapTextures: boolean;
   showBannedPeople: boolean;
 }
 
@@ -671,6 +669,7 @@ interface AudioLibraryScanProgress {
 
 interface SourceCloneProgress {
   operationId: string;
+  mode?: SourceCloneSessionMode;
   phase:
     | "scanning"
     | "checking-space"
@@ -684,6 +683,8 @@ interface SourceCloneProgress {
   totalFiles: number;
   discoveredFiles?: number;
   omittedPaths?: number;
+  sourceProgress?: SourceCloneSourceProgress[];
+  cancelRequested?: boolean;
   completedFiles: number;
   totalBytes: number;
   copiedBytes: number;
@@ -694,12 +695,62 @@ interface SourceCloneProgress {
   errorDetails?: SourceCloneErrorDetails;
 }
 
+interface SourceCloneSourceProgress {
+  sourceId: string;
+  label: string;
+  phase: "waiting" | "scanning" | "checking" | "copying" | "verifying" | "complete" | "cancelled" | "error";
+  discoveredFiles: number;
+  checkedFiles?: number;
+  checkedBytes?: number;
+  totalFiles?: number;
+  omittedFiles?: number;
+  omittedSubtrees?: number;
+  omittedPaths: number;
+  completedFiles: number;
+  verifiedFiles: number;
+  failedFiles: number;
+  copiedBytes: number;
+  totalBytes?: number;
+}
+
 interface SourceCloneExcludedPath {
-  kind: "macos-trash" | "symbolic-link" | "socket" | "fifo" | "device" | "permission-denied" | "unsupported";
+  kind:
+    | "macos-trash"
+    | "symbolic-link"
+    | "socket"
+    | "fifo"
+    | "device"
+    | "permission-denied"
+    | "unsupported"
+    | "node-modules"
+    | "missing-virtual-folder-file"
+    | "silo-data-managed"
+    | "nested-shelter";
+  sourceId?: string;
   sourceLabel: string;
   path: string;
+  isDirectory?: boolean;
+  scope?: "file" | "subtree" | "path";
   reason: string;
   errorCode?: string;
+}
+
+interface ShelterBackupCatalogEntry {
+  id: string;
+  name: string;
+  createdAt: string;
+  container: "directory" | "zip";
+  fileCount: number;
+  omittedPathCount: number;
+}
+
+interface ShelterBackupBrowserEntry {
+  name: string;
+  relativePath: string;
+  isDirectory: boolean;
+  size: number;
+  isAlias?: boolean;
+  canonicalPath?: string;
 }
 
 interface SourceCloneErrorDetails {
@@ -731,6 +782,8 @@ interface SourceCloneSessionProgressSnapshot {
   totalFiles: number;
   discoveredFiles?: number;
   omittedPaths?: number;
+  sourceProgress?: SourceCloneSourceProgress[];
+  cancelRequested?: boolean;
   completedFiles: number;
   totalBytes: number;
   copiedBytes: number;
@@ -746,6 +799,7 @@ interface SourceCloneSessionLogEvent {
   totalFiles?: number;
   discoveredFiles?: number;
   omittedPaths?: number;
+  sourceProgress?: SourceCloneSourceProgress[];
   completedFiles?: number;
   totalBytes?: number;
   copiedBytes?: number;
@@ -787,6 +841,7 @@ interface SourceClonePreflight {
   }>;
   totalSources: number;
   sourceLabels: string[];
+  sourceProgress: SourceCloneSourceProgress[];
   totalFiles: number;
   totalBytes: number;
   duplicateFiles: number;
@@ -822,12 +877,14 @@ interface SemanticSearchProgress {
   scanned: number;
   total: number;
   textCapped?: boolean;
-  mode?: "ann";
+  mode?: "ann" | "exact";
 }
 
 interface SearchIndexReadiness {
   status: "preparing" | "ready" | "unavailable" | "error";
   percentage: number;
+  phase?: string;
+  phaseProgress?: number | null;
   records: number;
   message: string;
 }
@@ -1132,6 +1189,23 @@ interface Window {
       errorDetails?: SourceCloneErrorDetails;
     }>;
     cancelSourceClone(operationId: string): Promise<boolean>;
+    getActiveSourceCloneProgress(): Promise<SourceCloneProgress[]>;
+    getShelterBackupCatalog(): Promise<{
+      destination: string | null;
+      available: boolean;
+      backups: ShelterBackupCatalogEntry[];
+      error?: string;
+    }>;
+    listShelterBackupDirectory(
+      backupId: string,
+      relativeDirectory?: string,
+      afterName?: string | null,
+      limit?: number,
+    ): Promise<{
+      entries: ShelterBackupBrowserEntry[];
+      nextCursor: string | null;
+      error?: string;
+    }>;
     onSourceCloneProgress(
       callback: (progress: SourceCloneProgress) => void,
     ): () => void;
@@ -1195,6 +1269,23 @@ interface Window {
       errorDetails?: SourceCloneErrorDetails;
     }>;
     cancelSourceClone(operationId: string): Promise<boolean>;
+    getActiveSourceCloneProgress(): Promise<SourceCloneProgress[]>;
+    getShelterBackupCatalog(): Promise<{
+      destination: string | null;
+      available: boolean;
+      backups: ShelterBackupCatalogEntry[];
+      error?: string;
+    }>;
+    listShelterBackupDirectory(
+      backupId: string,
+      relativeDirectory?: string,
+      afterName?: string | null,
+      limit?: number,
+    ): Promise<{
+      entries: ShelterBackupBrowserEntry[];
+      nextCursor: string | null;
+      error?: string;
+    }>;
     onSourceCloneProgress(
       callback: (progress: SourceCloneProgress) => void,
     ): () => void;

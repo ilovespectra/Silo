@@ -51,6 +51,8 @@ export interface WriteCloneArchiveOptions {
   /** Built after every file was read and hash-checked; stored as the last entry. */
   buildManifest: () => Record<string, unknown>;
   isCancelled?: () => boolean;
+  /** Lets the owning operation interrupt a stalled source or archive read immediately. */
+  onActiveIo?: (cancel: (() => void) | undefined) => void;
   onProgress?: (progress: CloneArchiveProgress) => void;
   compressionLevel?: number;
 }
@@ -64,6 +66,7 @@ export interface WriteCloneArchiveResult {
 
 export interface ExtractCloneArchiveOptions {
   isCancelled?: () => boolean;
+  onActiveIo?: (cancel: (() => void) | undefined) => void;
   onProgress?: (progress: CloneArchiveProgress) => void;
 }
 
@@ -151,28 +154,209 @@ function isSymlinkEntry(entry: yauzl.Entry) {
   return (unixMode & 0o170000) === 0o120000;
 }
 
-async function hashStream(stream: Readable, onBytes?: (bytes: number) => void, isCancelled?: () => boolean) {
+async function hashStream(
+  stream: Readable,
+  onBytes?: (bytes: number) => void,
+  isCancelled?: () => boolean,
+  onActiveIo?: (cancel: (() => void) | undefined) => void,
+) {
   const hash = createHash("sha256");
-  for await (const chunk of stream) {
-    if (isCancelled?.()) {
-      stream.destroy();
-      throw cancelledError();
+  const cancelRead = () => stream.destroy(cancelledError());
+  onActiveIo?.(cancelRead);
+  try {
+    for await (const chunk of stream) {
+      if (isCancelled?.()) {
+        stream.destroy(cancelledError());
+        throw cancelledError();
+      }
+      hash.update(chunk as Buffer);
+      onBytes?.((chunk as Buffer).length);
     }
-    hash.update(chunk as Buffer);
-    onBytes?.((chunk as Buffer).length);
+  } finally {
+    onActiveIo?.(undefined);
   }
   return hash.digest("hex");
 }
 
-async function readManifest(zipfile: yauzl.ZipFile, entry: yauzl.Entry) {
+async function readManifest(
+  zipfile: yauzl.ZipFile,
+  entry: yauzl.Entry,
+  options: { isCancelled?: () => boolean; onActiveIo?: (cancel: (() => void) | undefined) => void } = {},
+) {
   if (entry.uncompressedSize > 512 * 1024 * 1024)
     throw new Error("The archive manifest is unexpectedly large.");
   const chunks: Buffer[] = [];
-  for await (const chunk of await openEntryStream(zipfile, entry)) chunks.push(chunk as Buffer);
+  const stream = await openEntryStream(zipfile, entry);
+  const cancelRead = () => stream.destroy(cancelledError());
+  options.onActiveIo?.(cancelRead);
+  try {
+    for await (const chunk of stream) {
+      if (options.isCancelled?.()) {
+        stream.destroy(cancelledError());
+        throw cancelledError();
+      }
+      chunks.push(chunk as Buffer);
+    }
+  } finally {
+    options.onActiveIo?.(undefined);
+  }
   const manifest = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
   if (manifest.format !== "silo-source-clone" || manifest.version !== 1)
     throw new Error("This zip is not a Silo clone archive.");
   return manifest;
+}
+
+export interface CloneArchiveBrowserEntry {
+  name: string;
+  relativePath: string;
+  isDirectory: boolean;
+  size: number;
+  isAlias?: boolean;
+  canonicalPath?: string;
+}
+
+function safeManifestArchivePath(value: unknown): string[] | null {
+  if (typeof value !== "string" || value.includes("\0"))
+    return null;
+  const normalized = value.replace(/\\/g, "/");
+  if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized)) return null;
+  const segments = normalized.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) return null;
+  return segments;
+}
+
+/** Reads and validates the Silo manifest without extracting archive contents. */
+export async function readCloneArchiveManifest(
+  archivePath: string,
+  options: { isCancelled?: () => boolean; onActiveIo?: (cancel: (() => void) | undefined) => void } = {},
+) {
+  const zipfile = await openZip(archivePath);
+  try {
+    let manifest: Record<string, unknown> | null = null;
+    await forEachZipEntry(zipfile, async (entry) => {
+      if (options.isCancelled?.()) throw cancelledError();
+      if (!manifest && entry.fileName === CLONE_ARCHIVE_MANIFEST_NAME)
+        manifest = await readManifest(zipfile, entry, options);
+    });
+    if (!manifest) throw new Error("This zip does not contain a Silo clone manifest.");
+    return manifest;
+  } finally {
+    zipfile.close();
+  }
+}
+
+/** Reads a bounded, name-sorted page of a clone archive without extracting it. */
+export async function listCloneArchiveDirectory(
+  archivePath: string,
+  relativeDirectory = "",
+  afterName: string | null = null,
+  limit = 250,
+): Promise<{ entries: CloneArchiveBrowserEntry[]; nextCursor: string | null }> {
+  const normalizedDirectory = relativeDirectory.replace(/\\/g, "/");
+  const requested = normalizedDirectory ? normalizedDirectory.split("/") : [];
+  if (normalizedDirectory.startsWith("/") || /^[a-zA-Z]:/.test(normalizedDirectory) ||
+      requested.some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\0")))
+    throw new Error("The archive folder path is invalid.");
+  const safeLimit = Math.min(500, Math.max(1, Math.floor(limit)));
+  let manifest: Record<string, unknown> | null = null;
+  const zipfile = await openZip(archivePath);
+  const selected = new Map<string, CloneArchiveBrowserEntry>();
+  const heap: CloneArchiveBrowserEntry[] = [];
+  const capacity = safeLimit + 1;
+  const compare = (left: CloneArchiveBrowserEntry, right: CloneArchiveBrowserEntry) =>
+    left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
+  const swap = (a: number, b: number) => {
+    [heap[a], heap[b]] = [heap[b], heap[a]];
+  };
+  const sink = (index: number) => {
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let largest = index;
+      if (left < heap.length && compare(heap[left], heap[largest]) > 0) largest = left;
+      if (right < heap.length && compare(heap[right], heap[largest]) > 0) largest = right;
+      if (largest === index) return;
+      swap(index, largest);
+      index = largest;
+    }
+  };
+  const consider = (entry: CloneArchiveBrowserEntry) => {
+    if (afterName !== null && entry.name <= afterName) return;
+    const existing = selected.get(entry.name);
+    if (existing) {
+      if (entry.isDirectory) existing.isDirectory = true;
+      if (!existing.isAlias && entry.isAlias) return;
+      if (existing.isAlias && !entry.isAlias) {
+        Object.assign(existing, entry);
+      } else if (existing.isAlias && entry.isAlias && entry.size > existing.size) {
+        existing.size = entry.size;
+      }
+      return;
+    }
+    if (heap.length < capacity) {
+      selected.set(entry.name, entry);
+      heap.push(entry);
+      let index = heap.length - 1;
+      while (index > 0) {
+        const parent = Math.floor((index - 1) / 2);
+        if (compare(heap[parent], heap[index]) >= 0) break;
+        swap(parent, index);
+        index = parent;
+      }
+      return;
+    }
+    if (compare(entry, heap[0]) >= 0) return;
+    selected.delete(heap[0].name);
+    heap[0] = entry;
+    selected.set(entry.name, entry);
+    sink(0);
+  };
+
+  try {
+    await forEachZipEntry(zipfile, async (entry) => {
+      const raw = entry.fileName;
+      if (raw === CLONE_ARCHIVE_MANIFEST_NAME) {
+        manifest = await readManifest(zipfile, entry);
+        return;
+      }
+      const isExplicitDirectory = raw.endsWith("/");
+      const segments = safeManifestArchivePath(isExplicitDirectory ? raw.slice(0, -1) : raw);
+      if (!segments) throw new Error("The archive contains an unsafe path.");
+      if (segments.length <= requested.length || !requested.every((segment, index) => segments[index] === segment)) return;
+      const name = segments[requested.length];
+      const isDirectory = isExplicitDirectory || segments.length > requested.length + 1;
+      consider({ name, relativePath: [...requested, name].join("/"), isDirectory,
+        size: isDirectory ? 0 : entry.uncompressedSize });
+    });
+  } finally {
+    zipfile.close();
+  }
+
+  if (!manifest || manifest.complete !== true)
+    throw new Error("This zip does not contain a complete Silo clone manifest.");
+  const aliases = Array.isArray(manifest.aliases) ? manifest.aliases as Array<Record<string, unknown>> : [];
+  for (const alias of aliases) {
+    if (alias.materialized === true || typeof alias.canonicalPath !== "string") continue;
+    const segments = safeManifestArchivePath(alias.path);
+    if (!segments || segments.length <= requested.length ||
+        !requested.every((segment, index) => segments[index] === segment)) continue;
+    const name = segments[requested.length];
+    const isDirectory = segments.length > requested.length + 1;
+    consider({
+      name,
+      relativePath: [...requested, name].join("/"),
+      isDirectory,
+      size: isDirectory ? 0 : (typeof alias.size === "number" && Number.isFinite(alias.size) ? alias.size : 0),
+      ...(!isDirectory ? {
+        isAlias: true,
+        canonicalPath: safeManifestArchivePath(alias.canonicalPath)?.join("/"),
+      } : {}),
+    });
+  }
+  const ordered = [...selected.values()].sort(compare);
+  const hasMore = ordered.length > safeLimit;
+  const entries = ordered.slice(0, safeLimit);
+  return { entries, nextCursor: hasMore ? entries[entries.length - 1]?.name ?? null : null };
 }
 
 type ManifestFile = { path: string; size: number; sha256?: string; modified?: number; error?: string };
@@ -193,7 +377,12 @@ function manifestAliases(manifest: Record<string, unknown>) {
 export async function verifyCloneArchive(
   archivePath: string,
   expected: Map<string, string>,
-  options: { isCancelled?: () => boolean; onProgress?: (progress: CloneArchiveProgress) => void; totalBytes?: number } = {},
+  options: {
+    isCancelled?: () => boolean;
+    onActiveIo?: (cancel: (() => void) | undefined) => void;
+    onProgress?: (progress: CloneArchiveProgress) => void;
+    totalBytes?: number;
+  } = {},
 ) {
   const zipfile = await openZip(archivePath);
   const seen = new Set<string>();
@@ -204,7 +393,7 @@ export async function verifyCloneArchive(
       if (options.isCancelled?.()) throw cancelledError();
       if (entry.fileName.endsWith("/")) return;
       if (entry.fileName === CLONE_ARCHIVE_MANIFEST_NAME) {
-        await readManifest(zipfile, entry);
+        await readManifest(zipfile, entry, options);
         manifestFound = true;
         return;
       }
@@ -213,7 +402,7 @@ export async function verifyCloneArchive(
       if (seen.has(entry.fileName)) throw new Error(`Archive contains a duplicate entry: ${entry.fileName}`);
       const digest = await hashStream(await openEntryStream(zipfile, entry), (bytes) => {
         verifiedBytes += bytes;
-      }, options.isCancelled);
+      }, options.isCancelled, options.onActiveIo);
       if (digest !== expectedHash) throw new Error(`SHA-256 mismatch inside archive: ${entry.fileName}`);
       seen.add(entry.fileName);
       options.onProgress?.({ phase: "verifying", processedBytes: verifiedBytes, totalBytes: options.totalBytes ?? 0,
@@ -264,6 +453,11 @@ export async function writeCloneArchive(options: WriteCloneArchiveOptions): Prom
   failed.catch(() => undefined);
   const closed = new Promise<void>((resolve) => output.on("close", () => resolve()));
   archive.pipe(output);
+  const cancelArchive = () => {
+    archive.abort();
+    if (!output.destroyed) output.destroy(cancelledError());
+  };
+  options.onActiveIo?.(cancelArchive);
   // archiver emits "entry" once per fully written entry, in append order.
   let appendedEntries = 0;
   let writtenEntries = 0;
@@ -317,35 +511,45 @@ export async function writeCloneArchive(options: WriteCloneArchiveOptions): Prom
         },
       });
       const source = sourceFs.createReadStream(file.localPath);
+      const cancelSource = () => source.destroy(cancelledError());
       source.on("error", (error) => meter.destroy(error));
       const meterFailed = new Promise<never>((_resolve, reject) => meter.once("error", reject));
       meterFailed.catch(() => undefined);
-      archive.append(source.pipe(meter), {
-        name,
-        date: new Date(file.modified),
-        mode: file.mode !== undefined ? file.mode & 0o777 : 0o644,
-        store: PRECOMPRESSED_EXTENSIONS.has(path.extname(name).toLowerCase()),
+      options.onActiveIo?.(() => {
+        cancelSource();
+        cancelArchive();
       });
-      appendedEntries += 1;
-      await Promise.race([allEntriesWritten(), meterFailed, failed]);
-      if (hash.digest("hex") !== file.sha256)
-        throw new Error(`Source content changed after hash preflight: ${file.archivePath}`);
-      const after = await sourceFs.promises.stat(file.localPath);
-      if (after.size !== file.size || after.mtimeMs !== file.modified)
-        throw new Error(`Source changed during compression: ${file.archivePath}`);
-      processedFiles += 1;
-      report(name);
+      try {
+        archive.append(source.pipe(meter), {
+          name,
+          date: new Date(file.modified),
+          mode: file.mode !== undefined ? file.mode & 0o777 : 0o644,
+          store: PRECOMPRESSED_EXTENSIONS.has(path.extname(name).toLowerCase()),
+        });
+        appendedEntries += 1;
+        await Promise.race([allEntriesWritten(), meterFailed, failed]);
+        if (hash.digest("hex") !== file.sha256)
+          throw new Error(`Source content changed after hash preflight: ${file.archivePath}`);
+        const after = await sourceFs.promises.stat(file.localPath);
+        if (after.size !== file.size || after.mtimeMs !== file.modified)
+          throw new Error(`Source changed during compression: ${file.archivePath}`);
+        processedFiles += 1;
+        report(name);
+      } finally {
+        options.onActiveIo?.(cancelArchive);
+      }
     }
     if (isCancelled()) throw cancelledError();
     archive.append(JSON.stringify(options.buildManifest(), null, 2), { name: CLONE_ARCHIVE_MANIFEST_NAME, date: new Date() });
     report("", true);
     await Promise.race([archive.finalize(), failed]);
     await Promise.race([closed, failed]);
+    options.onActiveIo?.(undefined);
     const handle = await fsPromises.open(partialPath, "r+");
     try { await handle.sync(); } finally { await handle.close(); }
 
     const verifiedFiles = await verifyCloneArchive(partialPath, expected, {
-      isCancelled, totalBytes,
+      isCancelled, totalBytes, onActiveIo: options.onActiveIo,
       onProgress: (progress) => options.onProgress?.(progress),
     });
     await fsPromises.link(partialPath, archivePath);
@@ -353,26 +557,13 @@ export async function writeCloneArchive(options: WriteCloneArchiveOptions): Prom
     const stats = await fsPromises.stat(archivePath);
     return { archivePath, archiveBytes: stats.size, storedFiles: files.length, verifiedFiles };
   } catch (error) {
+    options.onActiveIo?.(undefined);
     archive.abort();
     output.destroy();
+    await closed;
     await fsPromises.rm(partialPath, { force: true }).catch(() => undefined);
     throw error;
   }
-}
-
-/** Reads only the manifest from a Silo clone archive. */
-export async function readCloneArchiveManifest(archivePath: string) {
-  const zipfile = await openZip(archivePath);
-  let manifest: Record<string, unknown> | null = null;
-  try {
-    await forEachZipEntry(zipfile, async (entry) => {
-      if (!manifest && entry.fileName === CLONE_ARCHIVE_MANIFEST_NAME) manifest = await readManifest(zipfile, entry);
-    });
-  } finally {
-    zipfile.close();
-  }
-  if (!manifest) throw new Error("This zip is not a Silo clone archive (no manifest).");
-  return manifest as Record<string, unknown>;
 }
 
 /**
@@ -387,7 +578,8 @@ export async function extractCloneArchive(
   options: ExtractCloneArchiveOptions = {},
 ): Promise<ExtractCloneArchiveResult> {
   const isCancelled = options.isCancelled ?? (() => false);
-  const manifest = await readCloneArchiveManifest(archivePath);
+  const manifest = await readCloneArchiveManifest(archivePath, options);
+  if (isCancelled()) throw cancelledError();
   if (manifest.complete !== true)
     throw new Error("This archive was not marked complete and cannot be restored safely.");
   const expected = new Map<string, ManifestFile>();
@@ -455,7 +647,13 @@ async function extractInto(
         },
       });
       try {
-        await pipeline(await openEntryStream(zipfile, entry), meter, fs.createWriteStream(partial, { flags: "wx" }));
+        const input = await openEntryStream(zipfile, entry);
+        options.onActiveIo?.(() => input.destroy(cancelledError()));
+        try {
+          await pipeline(input, meter, fs.createWriteStream(partial, { flags: "wx" }));
+        } finally {
+          options.onActiveIo?.(undefined);
+        }
         if (hash.digest("hex") !== record.sha256)
           throw new Error(`SHA-256 mismatch while extracting: ${entry.fileName}`);
         const unixMode = (entry.externalFileAttributes >>> 16) & 0o777;

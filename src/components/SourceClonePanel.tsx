@@ -13,6 +13,7 @@ interface SourceClonePanelProps {
   initialDestinations?: string[];
   mode?: "sources" | "shelter-replica";
   historyOnly?: boolean;
+  activeOperationId?: string;
   onClose: () => void;
 }
 
@@ -57,6 +58,72 @@ function formatBytes(value: number) {
     unit += 1;
   }
   return `${size.toFixed(2)} ${units[unit]}`;
+}
+
+function sourceProgressPhaseLabel(phase: SourceCloneSourceProgress["phase"]) {
+  return ({
+    waiting: "Waiting",
+    scanning: "Scanning",
+    checking: "Checking files",
+    copying: "Copying",
+    verifying: "Verifying",
+    complete: "Complete",
+    cancelled: "Stopped",
+    error: "Error",
+  } satisfies Record<SourceCloneSourceProgress["phase"], string>)[phase];
+}
+
+function sourceProgressMeter(source: SourceCloneSourceProgress, operationPhase: SourceCloneProgress["phase"]) {
+  if (source.phase === "complete") return { value: 1, max: 1 };
+  if (source.phase === "scanning") return null;
+  if (operationPhase === "checking-space" || source.phase === "checking") {
+    const totalBytes = source.totalBytes ?? 0;
+    if (totalBytes > 0)
+      return { value: Math.min(source.checkedBytes ?? 0, totalBytes), max: totalBytes };
+    const total = source.discoveredFiles ?? 0;
+    return total > 0 ? { value: Math.min(source.checkedFiles ?? 0, total), max: total } : null;
+  }
+  if (source.phase === "verifying") {
+    const total = source.totalFiles ?? 0;
+    return total > 0 ? { value: Math.min(source.verifiedFiles, total), max: total } : null;
+  }
+  const total = source.totalFiles ?? 0;
+  return total > 0 ? { value: Math.min(source.completedFiles, total), max: total } : null;
+}
+
+function SourceProgressRows({
+  sources,
+  operationPhase,
+}: {
+  sources: SourceCloneSourceProgress[];
+  operationPhase: SourceCloneProgress["phase"];
+}) {
+  if (!sources.length) return null;
+  return (
+    <div className="source-clone-source-progress" aria-label="Progress by source">
+      {sources.map((source, index) => {
+        const meter = sourceProgressMeter(source, operationPhase);
+        const processed = operationPhase === "checking-space" || source.phase === "checking"
+          ? `${(source.checkedFiles ?? 0).toLocaleString()} / ${source.discoveredFiles.toLocaleString()} paths checked · ${formatBytes(source.checkedBytes ?? 0)} / ${formatBytes(source.totalBytes ?? 0)} hashed`
+          : source.phase === "verifying"
+            ? `${source.verifiedFiles.toLocaleString()} / ${(source.totalFiles ?? 0).toLocaleString()} verified`
+            : `${source.completedFiles.toLocaleString()} / ${(source.totalFiles ?? 0).toLocaleString()} files copied`;
+        const omitted = `${(source.omittedFiles ?? 0).toLocaleString()} files · ${(source.omittedSubtrees ?? 0).toLocaleString()} folders/subtrees omitted`;
+        return (
+          <div className={`source-clone-source-progress-row ${source.phase}`} key={`${source.sourceId}:${index}`}>
+            <div className="source-clone-source-progress-heading">
+              <strong title={source.label}>{source.label}</strong>
+              <span>{sourceProgressPhaseLabel(source.phase)}</span>
+            </div>
+            {meter
+              ? <progress value={meter.value} max={meter.max} aria-label={`${source.label}: ${sourceProgressPhaseLabel(source.phase)}`} />
+              : <progress aria-label={`${source.label}: ${sourceProgressPhaseLabel(source.phase)}`} />}
+            <small>{source.discoveredFiles.toLocaleString()} found · {processed} · {omitted} · {source.omittedPaths.toLocaleString()} omission entries</small>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function sourceCloneSessionOutcomeLabel(outcome: SourceCloneSessionOutcome) {
@@ -142,10 +209,14 @@ function excludedKindLabel(kind: SourceCloneExcludedPath["kind"]) {
     device: "device nodes",
     "permission-denied": "permission-restricted paths or folders",
     unsupported: "other unsupported filesystem objects",
+    "node-modules": "reproducible node_modules folders",
+    "missing-virtual-folder-file": "unavailable virtual-folder files",
+    "silo-data-managed": "Silo data managed in its own backup area",
+    "nested-shelter": "nested Fallout Shelter copies",
   } satisfies Record<SourceCloneExcludedPath["kind"], string>)[kind];
 }
 
-export default function SourceClonePanel({ electronAPI, sources, initialDestinations = [], mode = "sources", historyOnly = false, onClose }: SourceClonePanelProps) {
+export default function SourceClonePanel({ electronAPI, sources, initialDestinations = [], mode = "sources", historyOnly = false, activeOperationId, onClose }: SourceClonePanelProps) {
   const [preparing, setPreparing] = useState(false);
   const [running, setRunning] = useState(false);
   const [plan, setPlan] = useState<SourceClonePreflight | null>(null);
@@ -159,7 +230,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
   const [timeMachineMessage, setTimeMachineMessage] = useState("");
   const [timeMachineError, setTimeMachineError] = useState("");
   const [extracting, setExtracting] = useState(false);
-  const operationIdRef = useRef("");
+  const operationIdRef = useRef(activeOperationId ?? "");
   const diagnosticRef = useRef<SourceCloneDiagnosticReport | null>(null);
   const [diagnosticsAvailable, setDiagnosticsAvailable] = useState(false);
   const [diagnosticStatus, setDiagnosticStatus] = useState("");
@@ -170,20 +241,59 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
   const [selectedSessionLogId, setSelectedSessionLogId] = useState("");
   const [sessionLogStatus, setSessionLogStatus] = useState("");
   const [downloadingSessionLog, setDownloadingSessionLog] = useState(false);
+  const [cancelPending, setCancelPending] = useState(false);
   const busy = preparing || running || extracting;
   const supportsTimeMachine = mode === "sources" && sources.length === 1 && sources[0].kind === "machine";
   const timeMachineOnly = supportsTimeMachine && createAppleCompatibleBackup && timeMachineMode === "instead";
+  const sourceIdentity = sources.map((source) => source.id).sort().join("\0");
 
   useEffect(() => {
-    return electronAPI.onSourceCloneProgress((state) => {
+    if (historyOnly) return;
+    if (activeOperationId) operationIdRef.current = activeOperationId;
+    let mounted = true;
+    const liveProgressIds = new Set<string>();
+    const attach = (state: SourceCloneProgress) => {
+      if (!mounted) return;
+      operationIdRef.current = state.operationId;
+      setProgress(state);
+      const activePhase = state.phase === "scanning" || state.phase === "checking-space" ||
+        state.phase === "copying" || state.phase === "verifying";
+      setPreparing(activePhase && (state.phase === "scanning" || state.phase === "checking-space"));
+      setRunning(activePhase && (state.phase === "copying" || state.phase === "verifying"));
+      setExtracting(activePhase && state.mode === "archive-extraction");
+      setCancelPending(state.cancelRequested === true);
+    };
+    const unsubscribe = electronAPI.onSourceCloneProgress((state) => {
       if (state.operationId === operationIdRef.current) {
-        setProgress(state);
+        liveProgressIds.add(state.operationId);
+        attach(state);
         const report = diagnosticRef.current;
         if (report?.operationId === state.operationId)
           addDiagnosticEvent(report, "progress", state);
       }
     });
-  }, [electronAPI]);
+    const expectedMode = mode === "shelter-replica" ? "shelter-replica" : "sources";
+    const expectedSourceIds = sourceIdentity ? sourceIdentity.split("\0") : [];
+    void electronAPI.getActiveSourceCloneProgress().then((active) => {
+      if (!mounted || !Array.isArray(active)) return;
+      const matching = active.filter((state) => {
+        if (activeOperationId) return state.operationId === activeOperationId;
+        if (state.mode === "archive-extraction") return mode === "sources";
+        if (state.mode !== expectedMode) return false;
+        return mode === "shelter-replica" || expectedSourceIds.every((sourceId) =>
+          state.sourceProgress?.some((candidate) => candidate.sourceId === sourceId),
+        );
+      });
+      // Never guess when more than one active job could match this panel.
+      if (matching.length === 1 &&
+          (!operationIdRef.current || matching[0].operationId === operationIdRef.current) &&
+          !liveProgressIds.has(matching[0].operationId)) attach(matching[0]);
+    }).catch(() => undefined);
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, [activeOperationId, electronAPI, historyOnly, mode, sourceIdentity]);
 
   const beginDiagnostics = (operationId: string, selectedDestinations: string[]) => {
     const now = new Date().toISOString();
@@ -290,7 +400,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
 
   const prepare = async () => {
     if (!destinations.length) { setError("Add at least one destination folder."); return; }
-    setError(""); setPlan(null); setProgress(null); setAcknowledged(false); setPreparing(true);
+    setError(""); setPlan(null); setProgress(null); setAcknowledged(false); setCancelPending(false); setPreparing(true);
     const operationId = `clone-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     operationIdRef.current = operationId;
     beginDiagnostics(operationId, destinations);
@@ -339,6 +449,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
         destination: result.plan.destinations[0]?.cloneRoot ?? "",
         totalSources: result.plan.totalSources,
         totalFiles: result.plan.totalFiles,
+        sourceProgress: result.plan.sourceProgress,
         completedFiles: result.plan.totalFiles,
         totalBytes: result.plan.totalBytes,
         copiedBytes: 0,
@@ -353,7 +464,8 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
         report.outcome = "preflight-failed";
         addDiagnosticEvent(report, "preflight-failed", describeError(cause));
       }
-      setError(cause instanceof Error ? cause.message : "Could not prepare this clone.");
+      const message = cause instanceof Error ? cause.message : "Could not prepare this clone.";
+      if (!message.toLowerCase().includes("cancel")) setError(message);
     } finally {
       setPreparing(false);
     }
@@ -361,6 +473,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
 
   const startClone = async () => {
     if (!plan || plan.destinations.some((destination) => destination.shortfallBytes > 0) || !acknowledged) return;
+    setCancelPending(false);
     setRunning(true);
     setError("");
     const report = diagnosticRef.current;
@@ -471,9 +584,18 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
       report.outcome = "cancel-requested";
       addDiagnosticEvent(report, "cancel-requested");
     }
-    if (operationId) await electronAPI.cancelSourceClone(operationId);
-    setPreparing(false);
-    setRunning(false);
+    if (!operationId) return;
+    setCancelPending(true);
+    try {
+      const accepted = await electronAPI.cancelSourceClone(operationId);
+      if (!accepted) {
+        setCancelPending(false);
+        setError("Silo no longer has an active operation to stop. Check the latest progress state.");
+      }
+    } catch (cause) {
+      setCancelPending(false);
+      setError(cause instanceof Error ? cause.message : "Silo could not request cancellation.");
+    }
   };
 
   const extractArchive = async () => {
@@ -661,10 +783,25 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 )}
                 {progress?.phase === "complete" && <div className="source-clone-success"><FiCheckCircle /> {progress.message}</div>}
                 <div className="source-clone-actions">
-                  {extracting
-                    ? <button className="source-clone-cancel" onClick={() => void cancel()}>Cancel extraction</button>
+                {extracting
+                    ? <button className="source-clone-cancel" onClick={() => void cancel()} disabled={cancelPending}>{cancelPending ? "Stopping…" : "Cancel extraction"}</button>
                     : <button onClick={() => { operationIdRef.current = ""; setProgress(null); }}>Back</button>}
+              </div>
+            </div>
+            ) : running && progress ? (
+              <div className="source-clone-preparing">
+                <div className={`source-clone-progress ${progress.phase}`}>
+                  <div className="source-clone-progress-label">
+                    <span>{progress.message}</span>
+                    <strong>{progress.phase === "verifying"
+                      ? `${progress.verifiedFiles.toLocaleString()} / ${progress.totalFiles.toLocaleString()} verified`
+                      : `${formatBytes(progress.copiedBytes)} / ${formatBytes(progress.totalBytes)}`}</strong>
+                  </div>
+                  <progress value={progressValue} max={progressMax} />
+                  <small>{progress.completedFiles.toLocaleString()} copied · {progress.verifiedFiles.toLocaleString()} verified · {progress.failedFiles.toLocaleString()} errors{progress.currentFile ? ` · ${progress.currentFile}` : ""}</small>
                 </div>
+                <SourceProgressRows sources={progress.sourceProgress ?? []} operationPhase={progress.phase} />
+                <button className="source-clone-cancel" onClick={() => void cancel()} disabled={cancelPending}>{cancelPending ? "Stopping…" : "Cancel copy"}</button>
               </div>
             ) : progress?.phase === "scanning" || progress?.phase === "checking-space" || preparing ? (
               <div className="source-clone-preparing">
@@ -680,7 +817,8 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                   <small className="source-clone-scan-note">Omitted paths include unsupported items and files or folders Silo cannot read; they are left out of the clone.</small>
                   {progress?.currentFile && <small className="source-clone-scan-current">Current path: {progress.currentFile}</small>}
                 </div>
-                {preparing && <button className="source-clone-cancel" onClick={() => void cancel()}>Cancel scan</button>}
+                <SourceProgressRows sources={progress?.sourceProgress ?? []} operationPhase={progress?.phase ?? "scanning"} />
+                {preparing && <button className="source-clone-cancel" onClick={() => void cancel()} disabled={cancelPending}>{cancelPending ? "Stopping…" : "Cancel scan"}</button>}
               </div>
             ) : timeMachineOnly ? (
               <>
@@ -725,8 +863,8 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 <small>{exclusionSummary}</small>
                 <details>
                   <summary>Review omitted paths (first 100)</summary>
-                  {excludedPaths.slice(0, 100).map((excluded) => (
-                    <div key={`${excluded.sourceLabel}-${excluded.kind}-${excluded.path}`}>
+                  {excludedPaths.slice(0, 100).map((excluded, index) => (
+                    <div key={`${excluded.sourceId ?? excluded.sourceLabel}\0${excluded.kind}\0${excluded.path}\0${index}`}>
                       {excluded.reason}{excluded.errorCode ? ` (${excluded.errorCode})` : ""} Source: {excluded.sourceLabel} · <code>{excluded.path}</code>
                     </div>
                   ))}
@@ -768,6 +906,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 </div>
                 <progress value={progressValue} max={progressMax} />
                 <small>{progress.completedFiles.toLocaleString()} copied · {progress.verifiedFiles.toLocaleString()} verified · {progress.failedFiles.toLocaleString()} errors{progress.currentFile ? ` · ${progress.currentFile}` : ""}</small>
+                <SourceProgressRows sources={progress.sourceProgress ?? []} operationPhase={progress.phase} />
               </div>
             )}
             {!running && progress?.phase === "complete" && (
@@ -783,7 +922,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             <div className="source-clone-actions">
               <button onClick={() => { if (operationIdRef.current) void electronAPI.dismissSourceCloneSession(operationIdRef.current); setPlan(null); setDestinations([]); }} disabled={busy}>Change destinations</button>
               {running ? (
-                <button className="source-clone-cancel" onClick={() => void cancel()}>Cancel copy</button>
+                <button className="source-clone-cancel" onClick={() => void cancel()} disabled={cancelPending}>{cancelPending ? "Stopping…" : "Cancel copy"}</button>
               ) : progress?.phase === "complete" ? (
               <button className="source-clone-primary" onClick={closePanel}>Done</button>
               ) : (

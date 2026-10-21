@@ -3,9 +3,10 @@ import path from "path";
 import { isAppDataPath, isSiloCloneDirectory } from "./indexingPathPolicy";
 
 const AUDIO_SCAN_DIRECTORY_WORKERS = 1;
-const AUDIO_SCAN_COOLDOWN_EVERY_ENTRIES = 256;
-const AUDIO_SCAN_COOLDOWN_MIN_MS = 20;
-const AUDIO_SCAN_COOLDOWN_MAX_MS = 300;
+const AUDIO_SCAN_COOLDOWN_EVERY_ENTRIES = 128;
+const AUDIO_SCAN_COOLDOWN_MIN_MS = 250;
+const AUDIO_SCAN_COOLDOWN_MAX_MS = 1500;
+const AUDIO_SCAN_COOLDOWN_WORK_MULTIPLIER = 3;
 
 export interface CachedAudioFile {
   name: string;
@@ -414,7 +415,10 @@ export class AudioLibraryCache {
           const workMs = Math.max(0, Date.now() - cooldownWindowStartedAt);
           const cooldownMs = Math.min(
             AUDIO_SCAN_COOLDOWN_MAX_MS,
-            Math.max(AUDIO_SCAN_COOLDOWN_MIN_MS, workMs),
+            Math.max(
+              AUDIO_SCAN_COOLDOWN_MIN_MS,
+              workMs * AUDIO_SCAN_COOLDOWN_WORK_MULTIPLIER,
+            ),
           );
           return new Promise<void>((resolve) =>
             setTimeout(() => {

@@ -46,7 +46,7 @@ interface AudioLibraryProps {
   electronAPI: NonNullable<Window["electron"]>;
   visible: boolean;
   exploded: boolean;
-  yearFilter: string;
+  yearFilter: string[];
   sort: AudioSort;
   favoritePaths: Set<string>;
   playlists: MediaPlaylist[];
@@ -415,7 +415,7 @@ export default function AudioLibrary({
       files
         .filter(
           (file) =>
-            (yearFilter === "all" || yearOf(file) === yearFilter) &&
+            (yearFilter.length === 0 || yearFilter.includes(yearOf(file))) &&
             (!selectedPlaylist || selectedPlaylist.filePaths.includes(file.path)) &&
             (selectedExtensions === null ||
               selectedExtensions.has(
