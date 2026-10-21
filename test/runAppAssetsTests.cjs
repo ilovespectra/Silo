@@ -21,7 +21,6 @@ const packagedFiles = [
   ["countries-50m.geojson", "application/geo+json"],
   ["countries.geojson", "application/geo+json"],
   ["earth-blue-marble.jpg", "image/jpeg"],
-  ["earth-night.jpg", "image/jpeg"],
   ["us-states.geojson", "application/geo+json"],
 ];
 
@@ -48,6 +47,7 @@ for (const url of [
   "silo-asset://local/countries.geojson?download=1",
   "file:///etc/passwd",
   "silo-asset://local/unknown.geojson",
+  "silo-asset://local/earth-night.jpg",
 ]) {
   assert.equal(resolveAppAssetRequest(url, root, true), null, `reject ${url}`);
 }

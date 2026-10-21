@@ -23,7 +23,7 @@
     "test:owner-license": "npm run test:license",
     "owner:keys": "node scripts/owner-license.cjs init",
     "owner:grant": "node scripts/owner-license.cjs grant",
-    "release:check": "npm run test:license && npm run test:mac-update-manifest && node scripts/check-beta-release.cjs",
+    "release:check": "npm run test:license && npm run test:mac-update-manifest && npm run test:app-assets && node scripts/check-beta-release.cjs",
     "react-eject": "react-scripts eject",
     "electron-start": "node scripts/brand-dev-app.js --quiet && wait-on http://localhost:8787 && electron .",
     "start": "concurrently -k \"npm run react-start\" \"npm run electron-start\"",

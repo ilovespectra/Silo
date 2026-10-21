@@ -87,6 +87,9 @@ The main-process TypeScript build explicitly includes `src/types.d.ts` for
 shared renderer/IPC declarations. Keep it in `tsconfig.json` alongside the
 main-process and worker entry points.
 
+`npm run release:check` also verifies bundled map assets and their routing
+allowlist before packaging, using the same asset checks as Windows CI.
+
 ### Building the 2.0.6 test preview
 
 On the release Mac, after the 2.0.6 changes are committed and pushed to GitHub
