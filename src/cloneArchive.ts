@@ -232,12 +232,13 @@ export async function readCloneArchiveManifest(
 ) {
   const zipfile = await openZip(archivePath);
   try {
-    let manifest: Record<string, unknown> | null = null;
+    const manifestState: { value: Record<string, unknown> | null } = { value: null };
     await forEachZipEntry(zipfile, async (entry) => {
       if (options.isCancelled?.()) throw cancelledError();
-      if (!manifest && entry.fileName === CLONE_ARCHIVE_MANIFEST_NAME)
-        manifest = await readManifest(zipfile, entry, options);
+      if (!manifestState.value && entry.fileName === CLONE_ARCHIVE_MANIFEST_NAME)
+        manifestState.value = await readManifest(zipfile, entry, options);
     });
+    const manifest = manifestState.value;
     if (!manifest) throw new Error("This zip does not contain a Silo clone manifest.");
     return manifest;
   } finally {
@@ -258,7 +259,7 @@ export async function listCloneArchiveDirectory(
       requested.some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\0")))
     throw new Error("The archive folder path is invalid.");
   const safeLimit = Math.min(500, Math.max(1, Math.floor(limit)));
-  let manifest: Record<string, unknown> | null = null;
+  const manifestState: { value: Record<string, unknown> | null } = { value: null };
   const zipfile = await openZip(archivePath);
   const selected = new Map<string, CloneArchiveBrowserEntry>();
   const heap: CloneArchiveBrowserEntry[] = [];
@@ -316,7 +317,7 @@ export async function listCloneArchiveDirectory(
     await forEachZipEntry(zipfile, async (entry) => {
       const raw = entry.fileName;
       if (raw === CLONE_ARCHIVE_MANIFEST_NAME) {
-        manifest = await readManifest(zipfile, entry);
+        manifestState.value = await readManifest(zipfile, entry);
         return;
       }
       const isExplicitDirectory = raw.endsWith("/");
@@ -332,6 +333,7 @@ export async function listCloneArchiveDirectory(
     zipfile.close();
   }
 
+  const manifest = manifestState.value;
   if (!manifest || manifest.complete !== true)
     throw new Error("This zip does not contain a complete Silo clone manifest.");
   const aliases = Array.isArray(manifest.aliases) ? manifest.aliases as Array<Record<string, unknown>> : [];
