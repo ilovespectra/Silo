@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const packageJson = require('../package.json');
+const packageLock = require('../package-lock.json');
 const signPackagedMacApp = require('../signing/after-pack.cjs');
 
 const IOS_TOOLS = [
@@ -12,6 +13,54 @@ const IOS_TOOLS = [
   'afcclient',
   'idevicebackup2',
 ];
+
+function verifyPackagedSharpVersions(context) {
+  const platform = context.electronPlatformName;
+  if (platform !== 'darwin' && platform !== 'win32') return;
+
+  const productFilename = context.packager.appInfo.productFilename
+    || packageJson.build.productName;
+  const resourcesDirectory = platform === 'darwin'
+    ? path.join(context.appOutDir, `${productFilename}.app`, 'Contents', 'Resources')
+    : path.join(context.appOutDir, 'resources');
+  const nodeModulesDirectory = path.join(
+    resourcesDirectory,
+    'app.asar.unpacked',
+    'node_modules',
+  );
+  const lockedVersion = (name) => {
+    const version = packageLock.packages?.[`node_modules/${name}`]?.version;
+    if (!version) throw new Error(`${name} is missing from package-lock.json.`);
+    return version;
+  };
+  const verifyPackage = (name, packageDirectory) => {
+    const manifestPath = path.join(packageDirectory, 'package.json');
+    if (!fs.existsSync(manifestPath)) {
+      throw new Error(`Packaged Sharp runtime is missing ${name}/package.json.`);
+    }
+    const actualVersion = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).version;
+    const expectedVersion = lockedVersion(name);
+    if (actualVersion !== expectedVersion) {
+      throw new Error(
+        `Packaged ${name} version ${actualVersion} does not match package-lock.json `
+        + `version ${expectedVersion}. Reinstall dependencies with npm ci before packaging.`,
+      );
+    }
+  };
+
+  verifyPackage('sharp', path.join(nodeModulesDirectory, 'sharp'));
+  const imgDirectory = path.join(nodeModulesDirectory, '@img');
+  if (fs.existsSync(imgDirectory)) {
+    for (const entry of fs.readdirSync(imgDirectory)) {
+      if (!entry.startsWith('sharp-')) continue;
+      const packageDirectory = path.join(imgDirectory, entry);
+      if (!fs.existsSync(path.join(packageDirectory, 'package.json'))) continue;
+      verifyPackage(`@img/${entry}`, packageDirectory);
+    }
+  }
+
+  console.log('  • Silo: verified packaged Sharp JavaScript and native package versions.');
+}
 
 function ensureWindowsSharpRuntime(context) {
   if (context.electronPlatformName !== 'win32') return;
@@ -100,6 +149,7 @@ function verifyPackagedPhoneTools(context) {
 
 module.exports = async function afterPack(context) {
   ensureWindowsSharpRuntime(context);
+  verifyPackagedSharpVersions(context);
   verifyPackagedPhoneTools(context);
   await signPackagedMacApp(context);
 };
