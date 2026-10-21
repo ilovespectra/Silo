@@ -1724,21 +1724,6 @@ export default function MapPage({
       data-help="Map browsing and selection do not change source files. Relocate changes Silo's location override and organization metadata after review; it does not write GPS/EXIF into photos or move them."
     >
       <div className="map-globe" ref={containerRef} />
-      {electronAPI && (
-        <div className="map-privacy-status">
-          <span>Online map services {mapServicesAllowed ? "on" : "off"}</span>
-          <button
-            type="button"
-            onClick={() => {
-              if (mapServicesAllowed) void chooseMapServices(false);
-              else setShowMapPrivacyDialog(true);
-            }}
-            aria-label={mapServicesAllowed ? "Turn off online map services" : "Review online map services"}
-          >
-            {mapServicesAllowed ? "Turn off" : "Review"}
-          </button>
-        </div>
-      )}
       {showMapPrivacyDialog && (
         <div className="map-privacy-backdrop">
           <section className="map-privacy-dialog" role="dialog" aria-modal="true" aria-labelledby="map-privacy-title">
@@ -1753,78 +1738,227 @@ export default function MapPage({
           </section>
         </div>
       )}
-      <div className="map-status" data-tour="map-overview">
-        <FiMapPin />
-        <div className="map-status-copy">
-          <strong>
-            {photosLoaded
-              ? `${geoState.geotagged.toLocaleString()} mapped photos`
-              : "Loading cached locations…"}
-          </strong>
-          <span>
-            {geoState.status === "scanning"
-              ? `Checking new photos · ${geoState.scanned.toLocaleString()} of ${geoState.total.toLocaleString()} (${Math.round((geoState.scanned / Math.max(geoState.total, 1)) * 100)}%)`
-              : photosLoaded
-                ? geoState.message
-                : "Reading location cache from disk"}
-          </span>
-          <button
-            type="button"
-            className="map-inference-toggle"
-            aria-pressed={geoState.borrowedLocationsEnabled}
-            title="Use nearby GPS photos to suggest locations. Suggestions stay in Silo and never write to photo files."
-            onClick={() =>
-              void electronAPI
-                ?.setBorrowedLocationsEnabled(!geoState.borrowedLocationsEnabled)
-                .then(setGeoState)
-            }
-          >
-            Inferred locations {geoState.borrowedLocationsEnabled ? "on" : "off"}
-          </button>
-          <select
-            className="map-inference-window"
-            aria-label="Nearby photo time window"
-            title="How close in time GPS photos must be to suggest a location"
-            value={geoState.inferenceWindowMinutes}
-            onChange={(event) =>
-              void electronAPI
-                ?.setBorrowedLocationWindow(Number(event.target.value))
-                .then(setGeoState)
-            }
-          >
-            {[5, 15, 30, 60].map((minutes) => (
-              <option key={minutes} value={minutes}>
-                ±{minutes} min
-              </option>
-            ))}
-          </select>
-        </div>
-        {!photosLoaded ? (
-          <div
-            className="map-status-indeterminate"
-            role="progressbar"
-            aria-label="Loading locations"
-          />
-        ) : (
-          geoState.status === "scanning" && (
-            <progress
-              value={geoState.scanned}
-              max={Math.max(geoState.total, 1)}
+      <div className="map-top-controls">
+        <div className="map-status" data-tour="map-overview">
+          <FiMapPin />
+          <div className="map-status-copy">
+            <strong>
+              {photosLoaded
+                ? `${geoState.geotagged.toLocaleString()} mapped photos`
+                : "Loading cached locations…"}
+            </strong>
+            <span>
+              {geoState.status === "scanning"
+                ? `Checking new photos · ${geoState.scanned.toLocaleString()} of ${geoState.total.toLocaleString()} (${Math.round((geoState.scanned / Math.max(geoState.total, 1)) * 100)}%)`
+                : photosLoaded
+                  ? geoState.message
+                  : "Reading location cache from disk"}
+            </span>
+            <button
+              type="button"
+              className="map-inference-toggle"
+              aria-pressed={geoState.borrowedLocationsEnabled}
+              title="Use nearby GPS photos to suggest locations. Suggestions stay in Silo and never write to photo files."
+              onClick={() =>
+                void electronAPI
+                  ?.setBorrowedLocationsEnabled(!geoState.borrowedLocationsEnabled)
+                  .then(setGeoState)
+              }
+            >
+              Inferred locations {geoState.borrowedLocationsEnabled ? "on" : "off"}
+            </button>
+            <select
+              className="map-inference-window"
+              aria-label="Nearby photo time window"
+              title="How close in time GPS photos must be to suggest a location"
+              value={geoState.inferenceWindowMinutes}
+              onChange={(event) =>
+                void electronAPI
+                  ?.setBorrowedLocationWindow(Number(event.target.value))
+                  .then(setGeoState)
+              }
+            >
+              {[5, 15, 30, 60].map((minutes) => (
+                <option key={minutes} value={minutes}>
+                  ±{minutes} min
+                </option>
+              ))}
+            </select>
+          </div>
+          {!photosLoaded ? (
+            <div
+              className="map-status-indeterminate"
+              role="progressbar"
+              aria-label="Loading locations"
             />
-          )
-        )}
-        <button
-          onClick={() =>
-            void electronAPI?.refreshGeoState().then((state) => {
-              setGeoState(state);
-              setPhotosLoaded(true);
-            })
-          }
-          title="Check for new photo locations"
-          data-help="Rescan indexed media for updated geotagged photo locations."
-        >
-          <FiRefreshCw />
-        </button>
+          ) : (
+            geoState.status === "scanning" && (
+              <progress
+                value={geoState.scanned}
+                max={Math.max(geoState.total, 1)}
+              />
+            )
+          )}
+          <button
+            onClick={() =>
+              void electronAPI?.refreshGeoState().then((state) => {
+                setGeoState(state);
+                setPhotosLoaded(true);
+              })
+            }
+            title="Check for new photo locations"
+            data-help="Rescan indexed media for updated geotagged photo locations."
+          >
+            <FiRefreshCw />
+          </button>
+          {electronAPI && (
+            <div className="map-privacy-status">
+              <span>Online map services {mapServicesAllowed ? "on" : "off"}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (mapServicesAllowed) void chooseMapServices(false);
+                  else setShowMapPrivacyDialog(true);
+                }}
+                aria-label={mapServicesAllowed ? "Turn off online map services" : "Review online map services"}
+              >
+                {mapServicesAllowed ? "Turn off" : "Review"}
+              </button>
+            </div>
+          )}
+        </div>
+        <section className="map-selection-toolbar" aria-label="Map selection" data-tour="map-selection-tools" data-help="Choose rectangle or circle selection and whether to select individual place bubbles or whole regions. Use Shift-drag or Shift-click to add and Option to subtract.">
+          <div className="map-selection-modes">
+            <div
+              className="map-segmented"
+              role="group"
+              aria-label="Selection shape"
+            >
+              <button
+                className={selectShape === "rectangle" ? "active" : ""}
+                onClick={() => setSelectShape("rectangle")}
+                title="Rectangle selection"
+                aria-label="Rectangle selection"
+                data-help="Drag across the globe to select places or regions inside a rectangle."
+              >
+                <FiSquare />
+              </button>
+              <button
+                className={selectShape === "circle" ? "active" : ""}
+                onClick={() => setSelectShape("circle")}
+                title="Circle selection"
+                aria-label="Circle selection"
+                data-help="Drag on the globe to select places or regions inside a circle."
+              >
+                <FiCircle />
+              </button>
+            </div>
+            <div
+              className="map-segmented"
+              role="group"
+              aria-label="Selection scope"
+            >
+              <button
+                className={selectScope === "places" ? "active" : ""}
+                onClick={() => setSelectScope("places")}
+                title="Select individual location bubbles"
+              >
+                Places
+              </button>
+              <button
+                className={selectScope === "regions" ? "active" : ""}
+                onClick={() => setSelectScope("regions")}
+                title="Select whole countries (states in the US)"
+              >
+                Countries
+              </button>
+            </div>
+          </div>
+          <p className="map-selection-hint">
+            <kbd>Shift</kbd>-drag to select · <kbd>Shift</kbd>-click a bubble or
+            country to add/remove · add <kbd>⌥</kbd> to subtract · double-click a
+            country to open it
+          </p>
+          {selectedPathSet.size > 0 && (
+            <div className="map-selection-summary">
+              <div>
+                <strong>
+                  {selectedPathSet.size.toLocaleString()} photo
+                  {selectedPathSet.size === 1 ? "" : "s"} selected
+                </strong>
+                {selectionRegions.size > 0 && (
+                  <span>
+                    {Array.from(selectionRegions)
+                      .slice(0, 4)
+                      .map((key) => regionsByKey.get(key)?.name ?? key)
+                      .join(", ")}
+                    {selectionRegions.size > 4
+                      ? ` +${selectionRegions.size - 4} more`
+                      : ""}
+                  </span>
+                )}
+              </div>
+              <div className="map-album-actions">
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() => setAlbumMenuOpen((open) => !open)}
+                >
+                  <FiFolderPlus /> Add to album
+                </button>
+                <button
+                  onClick={clearSelection}
+                  title="Clear selection"
+                  aria-label="Clear selection"
+                >
+                  <FiX />
+                </button>
+              </div>
+              {albumMenuOpen && (
+                <div className="map-album-menu">
+                  <form
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void addSelectionToAlbum(null);
+                    }}
+                  >
+                    <input
+                      value={newAlbumName}
+                      onChange={(event) => setNewAlbumName(event.target.value)}
+                      placeholder="New album name"
+                      autoFocus
+                    />
+                    <button
+                      type="submit"
+                      className="primary"
+                      disabled={busy || !newAlbumName.trim()}
+                    >
+                      <FiPlus /> Create
+                    </button>
+                  </form>
+                  {digitalFolders.length > 0 && (
+                    <div className="map-album-list">
+                      <span>Or add to an existing album</span>
+                      {digitalFolders.map((folder) => (
+                        <button
+                          key={folder.id}
+                          disabled={busy}
+                          onClick={() => void addSelectionToAlbum(folder.id)}
+                        >
+                          <span>{folder.name}</span>
+                          <small>
+                            {folder.filePaths.length.toLocaleString()}
+                          </small>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          {mapNotice && <p className="map-selection-notice">{mapNotice}</p>}
+        </section>
       </div>
       {photosLoaded &&
         geoState.geotagged === 0 &&
@@ -1848,138 +1982,6 @@ export default function MapPage({
             )}
           </section>
         )}
-      <section className="map-selection-toolbar" aria-label="Map selection" data-tour="map-selection-tools" data-help="Choose rectangle or circle selection and whether to select individual place bubbles or whole regions. Use Shift-drag or Shift-click to add and Option to subtract.">
-        <div className="map-selection-modes">
-          <div
-            className="map-segmented"
-            role="group"
-            aria-label="Selection shape"
-          >
-            <button
-              className={selectShape === "rectangle" ? "active" : ""}
-              onClick={() => setSelectShape("rectangle")}
-              title="Rectangle selection"
-              aria-label="Rectangle selection"
-              data-help="Drag across the globe to select places or regions inside a rectangle."
-            >
-              <FiSquare />
-            </button>
-            <button
-              className={selectShape === "circle" ? "active" : ""}
-              onClick={() => setSelectShape("circle")}
-              title="Circle selection"
-              aria-label="Circle selection"
-              data-help="Drag on the globe to select places or regions inside a circle."
-            >
-              <FiCircle />
-            </button>
-          </div>
-          <div
-            className="map-segmented"
-            role="group"
-            aria-label="Selection scope"
-          >
-            <button
-              className={selectScope === "places" ? "active" : ""}
-              onClick={() => setSelectScope("places")}
-              title="Select individual location bubbles"
-            >
-              Places
-            </button>
-            <button
-              className={selectScope === "regions" ? "active" : ""}
-              onClick={() => setSelectScope("regions")}
-              title="Select whole countries (states in the US)"
-            >
-              Countries
-            </button>
-          </div>
-        </div>
-        <p className="map-selection-hint">
-          <kbd>Shift</kbd>-drag to select · <kbd>Shift</kbd>-click a bubble or
-          country to add/remove · add <kbd>⌥</kbd> to subtract · double-click a
-          country to open it
-        </p>
-        {selectedPathSet.size > 0 && (
-          <div className="map-selection-summary">
-            <div>
-              <strong>
-                {selectedPathSet.size.toLocaleString()} photo
-                {selectedPathSet.size === 1 ? "" : "s"} selected
-              </strong>
-              {selectionRegions.size > 0 && (
-                <span>
-                  {Array.from(selectionRegions)
-                    .slice(0, 4)
-                    .map((key) => regionsByKey.get(key)?.name ?? key)
-                    .join(", ")}
-                  {selectionRegions.size > 4
-                    ? ` +${selectionRegions.size - 4} more`
-                    : ""}
-                </span>
-              )}
-            </div>
-            <div className="map-album-actions">
-              <button
-                className="primary"
-                disabled={busy}
-                onClick={() => setAlbumMenuOpen((open) => !open)}
-              >
-                <FiFolderPlus /> Add to album
-              </button>
-              <button
-                onClick={clearSelection}
-                title="Clear selection"
-                aria-label="Clear selection"
-              >
-                <FiX />
-              </button>
-            </div>
-            {albumMenuOpen && (
-              <div className="map-album-menu">
-                <form
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    void addSelectionToAlbum(null);
-                  }}
-                >
-                  <input
-                    value={newAlbumName}
-                    onChange={(event) => setNewAlbumName(event.target.value)}
-                    placeholder="New album name"
-                    autoFocus
-                  />
-                  <button
-                    type="submit"
-                    className="primary"
-                    disabled={busy || !newAlbumName.trim()}
-                  >
-                    <FiPlus /> Create
-                  </button>
-                </form>
-                {digitalFolders.length > 0 && (
-                  <div className="map-album-list">
-                    <span>Or add to an existing album</span>
-                    {digitalFolders.map((folder) => (
-                      <button
-                        key={folder.id}
-                        disabled={busy}
-                        onClick={() => void addSelectionToAlbum(folder.id)}
-                      >
-                        <span>{folder.name}</span>
-                        <small>
-                          {folder.filePaths.length.toLocaleString()}
-                        </small>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-        {mapNotice && <p className="map-selection-notice">{mapNotice}</p>}
-      </section>
       {dragShape &&
         (() => {
           const radius = Math.hypot(

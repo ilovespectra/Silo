@@ -142,7 +142,7 @@ export default function DuplicatesPage({
     if (tourView) setView(tourView);
   }, [tourView]);
 
-  // Thumbnail size is shared with the rest of Silo and persisted by App.
+  // This page's thumbnail size is managed and persisted independently by App.
   const [gridViewMode, setGridViewMode] = useState<"grid" | "list">("grid");
   const [listSortBy, setListSortBy] = useState<
     "name" | "size" | "date" | "count"

@@ -1,5 +1,5 @@
 import * as path from "path";
-import type { MemoryMood } from "./memoryTypes";
+import { MEMORY_MIN_SELECTION_COUNT, type MemoryMood } from "./memoryTypes";
 
 /** Pure story mining: no Electron, no file I/O. Main supplies index snapshots. */
 
@@ -17,6 +17,13 @@ export interface DiscoveryPlace {
 }
 export interface DiscoveryGroup {
   name: string;
+  paths: string[];
+}
+export interface DiscoveryPeopleGroup {
+  /** Stable saved-person IDs that are all confirmed in each listed photo. */
+  ids: string[];
+  /** Canonical saved names in the same order as ids. */
+  names: string[];
   paths: string[];
 }
 export interface MemoryConcept {
@@ -50,6 +57,7 @@ export interface DiscoveryInput {
   images: DiscoveryImage[];
   places?: DiscoveryPlace[];
   people?: DiscoveryGroup[];
+  peopleGroups?: DiscoveryPeopleGroup[];
   pets?: DiscoveryGroup[];
   concepts?: DiscoveredConcept[];
   topics?: TopicSignal[];
@@ -57,7 +65,7 @@ export interface DiscoveryInput {
   random?: () => number;
 }
 export type StoryKind =
-  | "on-this-day" | "season" | "year" | "event" | "place" | "person" | "pet" | "concept" | "recent" | "folder";
+  | "on-this-day" | "season" | "year" | "event" | "place" | "person" | "group" | "pet" | "concept" | "recent" | "folder";
 export interface StoryIdea {
   key: string;
   kind: StoryKind;
@@ -162,8 +170,8 @@ const CAMERA_EXTENSIONS = /\.(jpe?g|heic|heif|dng|cr2|cr3|nef|arw|orf|rw2|raf|pe
 // Lower the floor for x64 builds so compressed phone JPEGs remain eligible on
 // Intel Macs and Windows x64. The later resolution and photo-quality checks still apply.
 export const PERSONAL_PHOTO_MIN_BYTES = process.arch === "x64" ? 50 * 1024 : 150 * 1024;
-const NON_PERSONAL_SEGMENT = /(^|[\\/])(node_modules|[^\\/]+\.(app|bundle|framework|plugin|asar)|Library[\\/](Caches|Containers|Application Support|Group Containers)|iTunes|Album ?Art(work)?|Artwork|Covers?|Icons?|Logos?|Thumbnails?|thumbs|\.thumbnails|Fonts?|Wallpapers?|Backgrounds?|Stock|Clip ?art|Emojis?|Stickers|Assets|Resources|Templates|Screenshots?|Screen Shots?|Memes?|Avatars?|Previews?)([\\/]|$)/i;
-const NON_PERSONAL_NAME = /^(cover|folder|front|back|cd\d?|disc\d?|albumart[^.]*|artwork|thumb[^.]*|icon[^.]*|logo[^.]*|avatar[^.]*|screenshot[^.]*|screen shot[^.]*|poster[^.]*|banner[^.]*)\.[a-z0-9]+$/i;
+const NON_PERSONAL_SEGMENT = /(^|[\\/])(node_modules|[^\\/]+\.(app|bundle|framework|plugin|asar)|Library[\\/](Caches|Containers|Application Support|Group Containers)|iTunes|Album[ ._-]*Art(work)?|Artwork|Covers?|Icons?|Logos?|Thumbnails?|thumbs|\.thumbnails|Fonts?|Wallpapers?|Backgrounds?|Stock|Clip ?art|Emojis?|Stickers|Assets|Resources|Templates|Screenshots?|Screen Shots?|Memes?|Avatars?|Previews?)([\\/]|$)/i;
+const NON_PERSONAL_NAME = /^(cover|folder|front|back|cd\d?|disc\d?|album[ ._-]*art(work)?[^.]*|artwork|thumb[^.]*|icon[^.]*|logo[^.]*|avatar[^.]*|screenshot[^.]*|screen shot[^.]*|poster[^.]*|banner[^.]*)\.[a-z0-9]+$/i;
 
 export type PersonalPhotoRejection = "extension" | "small" | "folder" | "name" | "music";
 
@@ -374,7 +382,7 @@ export function discoverMemoryStories(input: DiscoveryInput): StoryIdea[] {
   const ideas: StoryIdea[] = [];
   // Relative appeal per kind; multiplied by sqrt(support) so prevalent subjects lead.
   const KIND_WEIGHT: Record<StoryKind, number> = {
-    person: 3, pet: 2, concept: 2, recent: 2.5, "on-this-day": 2, place: 1.6, event: 1.3, season: 1, year: 0.8, folder: 1,
+    person: 3, group: 4.5, pet: 2, concept: 2, recent: 2.5, "on-this-day": 2, place: 1.6, event: 1.3, season: 1, year: 0.8, folder: 1,
   };
   const add = (idea: Omit<StoryIdea, "paths" | "weight"> & { paths: string[]; support?: number; boost?: number }) => {
     const { support, boost, ...rest } = idea;
@@ -547,6 +555,23 @@ export function discoverMemoryStories(input: DiscoveryInput): StoryIdea[] {
         description: `${named[first].name} and ${named[second].name}, together.`,
         query: `${named[first].name} and ${named[second].name}`, mood: "bright", paths: together });
     }
+  }
+  // Automatic group stories come only from photos where every listed saved
+  // person has a confirmed face assignment. Requiring enough shared photos
+  // keeps the regular 14-item Memory builder from diluting a group story with
+  // unrelated portraits.
+  const confirmedGroups = (input.peopleGroups ?? [])
+    .filter((group) => group.ids.length >= 2 && group.ids.length === group.names.length &&
+      group.paths.length >= MEMORY_MIN_SELECTION_COUNT)
+    .sort((first, second) => second.paths.length - first.paths.length ||
+      first.ids.join("\0").localeCompare(second.ids.join("\0")))
+    .slice(0, 12);
+  for (const group of confirmedGroups) {
+    const names = group.names;
+    const title = `${names.join(" & ")} Together`;
+    add({ key: `people-group:${group.ids.slice().sort().join("+")}`, kind: "group",
+      title, description: `Confirmed photos of ${names.join(", ")} together.`,
+      query: names.join(" and "), mood: "bright", paths: group.paths, support: group.paths.length });
   }
   const pets = (input.pets ?? []).filter((pet) => pet.paths.length >= MIN_STORY_PHOTOS);
   for (const pet of pets) {

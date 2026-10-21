@@ -6,7 +6,7 @@ export interface RecoveryStage {
   progress: () => { status: string; message: string };
   start: () => Promise<unknown>;
   onDiagnostic?: (
-    event: "blocked" | "start" | "complete" | "error",
+    event: "blocked" | "start" | "yield" | "complete" | "error",
     details: Record<string, unknown>,
   ) => void;
   ready: () => boolean;
@@ -15,6 +15,10 @@ export interface RecoveryStage {
   /** Recheck a transient startup stage once for each new process. */
   checkOnStartup?: boolean;
   lane?: "clip" | "analysis" | "disk" | "light" | "background";
+  /** Maximum uninterrupted background turn before a runnable peer gets a turn. */
+  sliceMs?: number;
+  /** Called at a slice boundary before the scheduler decides whether to yield. */
+  onTimeSlice?: () => void;
   blockedReason?: () => string;
   pause?: () => Promise<unknown> | unknown;
   resume?: () => Promise<unknown> | unknown;
@@ -35,6 +39,9 @@ export class IndexingRecovery {
   private stopped = false;
   private tickRunning = false;
   private activeLanes = new Set<string>();
+  private fairYieldedStages = new Set<string>();
+  private fairRequested = new Set<string>();
+  private readonly fairnessQueue: string[];
   private requested = new Set<string>();
   private persistenceError = "";
   private externalBlockReason = "";
@@ -49,6 +56,7 @@ export class IndexingRecovery {
     private now = Date.now,
     private statePath?: string,
   ) {
+    this.fairnessQueue = stages.map((stage) => stage.id);
     this.restore();
   }
 
@@ -133,7 +141,11 @@ export class IndexingRecovery {
     }
   }
 
-  private report(stage: RecoveryStage, event: "blocked" | "start" | "complete" | "error", details: Record<string, unknown>) {
+  private report(
+    stage: RecoveryStage,
+    event: "blocked" | "start" | "yield" | "complete" | "error",
+    details: Record<string, unknown>,
+  ) {
     try {
       stage.onDiagnostic?.(event, details);
     } catch {
@@ -167,7 +179,7 @@ export class IndexingRecovery {
       recoveryError: record?.error ?? "",
       retryAt: record?.retryAt ?? 0,
       retryExhausted: (record?.attempts ?? 0) >= 3 && Boolean(record?.error),
-      resumeQueued: this.requested.has(id),
+      resumeQueued: this.requested.has(id) || this.fairRequested.has(id),
       recoveryRunning: record?.running ?? false,
       userPaused: record?.userPaused ?? false,
       canPause: Boolean(stage?.pause),
@@ -322,6 +334,7 @@ export class IndexingRecovery {
     record.retryAt = 0;
     this.records.set(id, record);
     this.requested.delete(id);
+    this.fairRequested.delete(id);
     this.persist();
   }
 
@@ -357,6 +370,7 @@ export class IndexingRecovery {
     record.error = "";
     record.retryAt = 0;
     this.requested.delete(id);
+    this.fairRequested.delete(id);
     this.persist();
   }
 
@@ -433,7 +447,33 @@ export class IndexingRecovery {
     record.retryAt = 0;
     if (!record.running) record.attempts = 0;
     this.records.set(id, record);
+    this.fairRequested.delete(id);
     this.requested.add(id);
+    this.persist();
+    void this.tick();
+  }
+
+  /** Queue progressive work without clearing its retry backoff or user pause. */
+  requestFairly(id: string) {
+    const stage = this.stages.find((item) => item.id === id);
+    if (!stage) return;
+    if (this.stopped) return;
+    const record = this.records.get(id) ?? {
+      attempts: 0,
+      error: "",
+      retryAt: 0,
+      running: false,
+      checked: false,
+      userPaused: false,
+    };
+    if (
+      record.userPaused ||
+      (record.error && record.retryAt > this.now())
+    )
+      return;
+    record.checked = false;
+    this.records.set(id, record);
+    this.fairRequested.add(id);
     this.persist();
     void this.tick();
   }
@@ -458,6 +498,7 @@ export class IndexingRecovery {
     if (!record.running) record.attempts = 0;
     this.records.set(id, record);
     this.requested.add(id);
+    this.fairRequested.delete(id);
     this.persist();
   }
 
@@ -491,12 +532,16 @@ export class IndexingRecovery {
       return;
     this.tickRunning = true;
     try {
-      const ordered = [...this.stages].sort(
-        (first, second) =>
+      const ordered = [...this.stages].sort((first, second) => {
+        const requestedDifference =
           Number(this.requested.has(second.id)) -
-            Number(this.requested.has(first.id)) ||
-          Number(second.id === "search") - Number(first.id === "search"),
-      );
+          Number(this.requested.has(first.id));
+        if (requestedDifference) return requestedDifference;
+        return (
+          this.fairnessQueue.indexOf(first.id) -
+          this.fairnessQueue.indexOf(second.id)
+        );
+      });
       for (const stage of ordered) {
         if (this.stopped) continue;
         if (this.externalBlockReason) {
@@ -521,6 +566,7 @@ export class IndexingRecovery {
         const manuallyRequested = this.requested.has(stage.id);
         const needed =
           manuallyRequested ||
+          this.fairRequested.has(stage.id) ||
           interrupted ||
           (progress.status === "paused" && !record?.userPaused) ||
           progress.status === "error" ||
@@ -540,12 +586,80 @@ export class IndexingRecovery {
           record.attempts = 0;
         if (record?.userPaused && !manuallyRequested) continue;
         this.requested.delete(stage.id);
+        this.fairRequested.delete(stage.id);
         this.reportedBlockedReasons.delete(stage.id);
+        this.rotateFairness(stage);
         // Reserve the lane immediately; independent lanes can proceed.
         void this.run(stage);
       }
     } finally {
       this.tickRunning = false;
+    }
+  }
+
+  private rotateFairness(stage: RecoveryStage) {
+    if (this.fairnessQueue.length < 2) return;
+    const index = this.fairnessQueue.indexOf(stage.id);
+    if (index < 0) return;
+    this.fairnessQueue.splice(index, 1);
+    this.fairnessQueue.push(stage.id);
+  }
+
+  private hasRunnablePeer(stage: RecoveryStage) {
+    if (!stage.lane) return false;
+    const busyStatuses = new Set([
+      "scanning",
+      "indexing",
+      "loading-model",
+      "clustering",
+      "generating",
+    ]);
+    return this.stages.some((candidate) => {
+      if (candidate.id === stage.id || candidate.lane !== stage.lane) return false;
+      const record = this.records.get(candidate.id);
+      if (record?.running || record?.userPaused) return false;
+      const progress = candidate.progress();
+      const needed =
+        this.requested.has(candidate.id) ||
+        this.fairRequested.has(candidate.id) ||
+        (progress.status === "paused" && !record?.userPaused) ||
+        progress.status === "error" ||
+        Boolean(record?.error) ||
+        (candidate.needsInitialCheck && !record?.checked);
+      return (
+        needed &&
+        (record?.retryAt ?? 0) <= this.now() &&
+        !busyStatuses.has(progress.status) &&
+        candidate.ready()
+      );
+    });
+  }
+
+  private async yieldForRunnablePeer(stage: RecoveryStage) {
+    const record = this.records.get(stage.id);
+    if (
+      this.stopped ||
+      !record?.running ||
+      record.userPaused ||
+      this.externalBlockReason ||
+      this.interactiveSearchActive
+    )
+      return false;
+    try {
+      stage.onTimeSlice?.();
+    } catch (error) {
+      console.error(`[IndexingRecovery] Slice callback failed for ${stage.id}`, error);
+    }
+    if (!this.hasRunnablePeer(stage)) return false;
+    this.fairYieldedStages.add(stage.id);
+    this.report(stage, "yield", { lane: stage.lane, sliceMs: stage.sliceMs });
+    try {
+      await stage.pause?.();
+      return true;
+    } catch (error) {
+      this.fairYieldedStages.delete(stage.id);
+      console.error(`[IndexingRecovery] Could not yield ${stage.id}`, error);
+      return false;
     }
   }
 
@@ -563,12 +677,32 @@ export class IndexingRecovery {
     record.attempts += 1;
     this.records.set(stage.id, record);
     this.report(stage, "start", { attempt: record.attempts });
+    let sliceTimer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleSlice = () => {
+      if (!stage.sliceMs || !stage.pause || this.stopped) return;
+      sliceTimer = setTimeout(() => {
+        sliceTimer = undefined;
+        void this.yieldForRunnablePeer(stage).then((yielded) => {
+          if (!yielded && record.running) scheduleSlice();
+        });
+      }, stage.sliceMs);
+    };
     try {
       this.persist();
+      scheduleSlice();
       await stage.start();
       const progress = stage.progress();
       if (progress.status === "error") throw new Error(progress.message);
       if (progress.status === "paused") {
+        const fairlyYielded = this.fairYieldedStages.delete(stage.id);
+        if (fairlyYielded && !record.userPaused) {
+          record.checked = false;
+          record.error = "";
+          record.retryAt = 0;
+          record.attempts = Math.max(0, record.attempts - 1);
+          this.persist();
+          return;
+        }
         const priorityPaused = this.priorityPausedStages.delete(stage.id);
         if (priorityPaused && !record.userPaused) {
           record.checked = false;
@@ -616,6 +750,8 @@ export class IndexingRecovery {
         message: record.error,
       });
     } finally {
+      if (sliceTimer) clearTimeout(sliceTimer);
+      this.fairYieldedStages.delete(stage.id);
       this.priorityPausedStages.delete(stage.id);
       record.running = false;
       if (stage.lane) this.activeLanes.delete(stage.lane);

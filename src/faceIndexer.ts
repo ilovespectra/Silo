@@ -1016,6 +1016,11 @@ export class FaceIndexer {
       person.rejectedPhotoPaths = person.rejectedPhotoPaths.filter(
         (imagePath) => imagePath !== item.face.imagePath,
       );
+      // Saving an explicit face assignment confirms this person in the photo.
+      // Multiple assigned faces in one image therefore confirm every group
+      // member independently for prompted and automatic Memories.
+      if (!person.confirmedPhotoPaths.includes(item.face.imagePath))
+        person.confirmedPhotoPaths.push(item.face.imagePath);
       affected.add(person);
     }
 

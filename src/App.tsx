@@ -1,5 +1,6 @@
 import React, {
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -697,9 +698,47 @@ function pathIsWithinSourceRoot(filePath: string, root: string) {
   );
 }
 
+function phoneSourceDeviceKey(source: BrowseSource) {
+  if (source.kind !== "ios" && source.kind !== "android") return null;
+  const match = source.rootPath.match(
+    /^\/__(?:phone|phone_backup)__\/(ios|android)\/([^/]+)/,
+  );
+  return match && match[1] === source.kind
+    ? `${match[1]}:${match[2]}`
+    : null;
+}
+
+const normalizedSourceRootCache = new WeakMap<object, Set<string>>();
+
+function normalizedSourceRoots(roots: ReadonlySet<string>) {
+  const cached = normalizedSourceRootCache.get(roots as object);
+  if (cached) return cached;
+  const normalized = new Set(
+    Array.from(roots, (root) =>
+      root.length > 1 ? root.replace(/[\\/]+$/, "") : root,
+    ),
+  );
+  normalizedSourceRootCache.set(roots as object, normalized);
+  return normalized;
+}
+
 function pathIsWithinAnySource(filePath: string, roots: ReadonlySet<string>) {
-  for (const root of roots)
-    if (pathIsWithinSourceRoot(filePath, root)) return true;
+  const normalized = normalizedSourceRoots(roots);
+  if (
+    (normalized.has("/") && filePath.startsWith("/")) ||
+    (normalized.has("\\") && filePath.startsWith("\\"))
+  )
+    return true;
+  if (normalized.has(filePath)) return true;
+  let cursor = filePath.length;
+  while (cursor > 0) {
+    const slash = filePath.lastIndexOf("/", cursor - 1);
+    const backslash = filePath.lastIndexOf("\\", cursor - 1);
+    const separator = Math.max(slash, backslash);
+    if (separator <= 0) break;
+    if (normalized.has(filePath.slice(0, separator))) return true;
+    cursor = separator;
+  }
   return false;
 }
 
@@ -718,6 +757,23 @@ function pathIsVisibleForSelectedSources(
 const fileListKey = (file: { path: string; relativePath?: string; siloAlias?: boolean }) =>
   file.siloAlias ? `${file.path}\u0000${file.relativePath ?? ""}` : file.path;
 const MAX_THUMBNAIL_SIZE = 500;
+const LEGACY_THUMBNAIL_SIZE_KEY = "silo.thumbnailSize";
+
+function readThumbnailSizePreference(key: string, fallback = 240) {
+  try {
+    const saved = localStorage.getItem(key);
+    const legacy =
+      saved === null ? localStorage.getItem(LEGACY_THUMBNAIL_SIZE_KEY) : null;
+    const parsed = Number(saved ?? legacy);
+    const size =
+      Number.isFinite(parsed) && (saved !== null || legacy !== null)
+        ? parsed
+        : fallback;
+    return Math.min(MAX_THUMBNAIL_SIZE, Math.max(120, size));
+  } catch {
+    return fallback;
+  }
+}
 
 function App() {
   // Electron exposes a contextBridge proxy whose identity can change between reads.
@@ -786,11 +842,18 @@ function App() {
       return false;
     }
   });
-  const [thumbnailSize, setThumbnailSize] = useState(() => {
-    const saved = Number(localStorage.getItem("silo.thumbnailSize"));
-    const fallback = 240;
-    return Math.min(MAX_THUMBNAIL_SIZE, Math.max(120, Number.isFinite(saved) ? saved : fallback));
-  });
+  const [filesThumbnailSize, setFilesThumbnailSize] = useState(() =>
+    readThumbnailSizePreference("silo.thumbnailSize.files"),
+  );
+  const [peopleThumbnailSize, setPeopleThumbnailSize] = useState(() =>
+    readThumbnailSizePreference("silo.thumbnailSize.people"),
+  );
+  const [memoryBookThumbnailSize, setMemoryBookThumbnailSize] = useState(() =>
+    readThumbnailSizePreference("silo.thumbnailSize.memoryBook"),
+  );
+  const [duplicatesThumbnailSize, setDuplicatesThumbnailSize] = useState(() =>
+    readThumbnailSizePreference("silo.thumbnailSize.duplicates"),
+  );
   const retainedScrollPositionsRef = useRef<Record<string, number>>({});
   const [viewerOpen, setViewerOpen] = useState(false);
   const viewerOpenRef = useRef(viewerOpen);
@@ -1008,10 +1071,6 @@ function App() {
     query: string;
     startedAt: number;
   } | null>(null);
-  const fastFileSearchFirstResultAtRef = useRef<{
-    query: string;
-    at: number;
-  } | null>(null);
   const filesRef = useRef(files);
   filesRef.current = files;
   const [searchHistory, setSearchHistory] = useState<string[]>(() => {
@@ -1099,11 +1158,6 @@ function App() {
       }
       if (changed) {
         fastFileSearchResultsQueryRef.current = query;
-        if (fastFileSearchFirstResultAtRef.current?.query !== query)
-          fastFileSearchFirstResultAtRef.current = {
-            query,
-            at: performance.now(),
-          };
         setFastFileSearchResults(Array.from(matches.values()));
       }
       if (capped) setFastFileSearchCapped(true);
@@ -1353,27 +1407,34 @@ function App() {
     }
   };
   const [sources, setSources] = useState<BrowseSource[]>([]);
+  const [sourceSelectionRevision, setSourceSelectionRevision] = useState(0);
   const [ejectingDeviceIds, setEjectingDeviceIds] = useState<Set<string>>(() => new Set());
-  const enabledSourcePaths = useMemo(
-    () => new Set(sources
+  const enabledSourcePathsKey = useMemo(
+    () => sources
       .filter((source) => source.enabled && source.available && source.rootPath.trim())
-      .map((source) => source.rootPath)),
+      .map((source) => source.rootPath)
+      .sort()
+      .join("\u0000"),
+    [sources],
+  );
+  const enabledSourcePaths = useMemo(
+    () => new Set(enabledSourcePathsKey.split("\u0000").filter(Boolean)),
+    [enabledSourcePathsKey],
+  );
+  const allSourcePathsKey = useMemo(
+    () => sources
+      .map((source) => source.rootPath.trim())
+      .filter(Boolean)
+      .sort()
+      .join("\u0000"),
     [sources],
   );
   const allSourcePaths = useMemo(
-    () => new Set(sources
-      .filter((source) => source.rootPath.trim())
-      .map((source) => source.rootPath)),
-    [sources],
-  );
-  const enabledSourcePathsKey = useMemo(
-    () => Array.from(enabledSourcePaths).sort().join("\u0000"),
-    [enabledSourcePaths],
+    () => new Set(allSourcePathsKey.split("\u0000").filter(Boolean)),
+    [allSourcePathsKey],
   );
   const enabledSourcePathsRef = useRef(enabledSourcePaths);
   enabledSourcePathsRef.current = enabledSourcePaths;
-  const allSourcePathsRef = useRef(allSourcePaths);
-  allSourcePathsRef.current = allSourcePaths;
   const [showPhoneBackups, setShowPhoneBackups] = useState(false);
   const hasCachedPhoneBackups = sources.some((source) => source.offlineBackup);
   const [sourceSort, setSourceSort] = useState<"name" | "kind" | "backup">(
@@ -1406,6 +1467,24 @@ function App() {
   }, [showPhoneBackups, sourceSort, sources]);
   const sourcesRef = useRef<BrowseSource[]>([]);
   const sourcesRefreshRequestRef = useRef(0);
+  const pendingSourceSelectionsRef = useRef(
+    new Map<string, { enabled: boolean; request: number }>(),
+  );
+  const sourceToggleRequestRef = useRef(0);
+  const applyPendingSourceSelections = useCallback((items: BrowseSource[]) =>
+    items.map((source) => {
+      const pending = pendingSourceSelectionsRef.current.get(source.id);
+      return pending ? { ...source, enabled: pending.enabled } : source;
+    }),
+  []);
+  const refreshSources = useCallback(async () => {
+    if (!electronAPI) return;
+    const request = ++sourcesRefreshRequestRef.current;
+    const latest = applyPendingSourceSelections(await electronAPI.listSources());
+    if (request !== sourcesRefreshRequestRef.current) return;
+    sourcesRef.current = latest;
+    setSources(latest);
+  }, [applyPendingSourceSelections, electronAPI]);
   sourcesRef.current = sources;
   const [allSourcesPath, setAllSourcesPath] =
     useState<string>("/__sources__/all");
@@ -1430,9 +1509,10 @@ function App() {
     field: "name",
     ascending: true,
   });
-  const [sortIndicators, setSortIndicators] = useState<
+  const sortIndicatorsRef = useRef<
     Record<string, { people: boolean; mapped: boolean }>
   >({});
+  const [sortIndicatorDataRevision, setSortIndicatorDataRevision] = useState(0);
   const [sortIndicatorRevision, setSortIndicatorRevision] = useState(0);
   const metadataRevisionRef = useRef(sortIndicatorRevision);
   metadataRevisionRef.current = sortIndicatorRevision;
@@ -1495,6 +1575,10 @@ function App() {
   const preserveScanRequestRef = useRef<number | null>(null);
   const preserveSelectionRequestRef = useRef<number | null>(null);
   const searchRequestRef = useRef(0);
+  const semanticSearchedSourcesRef = useRef<{ query: string; roots: Set<string> }>({
+    query: "",
+    roots: new Set(),
+  });
   const fileGridRef = useRef<HTMLDivElement | null>(null);
   const fileBrowserRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -1559,8 +1643,32 @@ function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
-    localStorage.setItem("silo.thumbnailSize", String(thumbnailSize));
-  }, [thumbnailSize]);
+    localStorage.setItem(
+      "silo.thumbnailSize.files",
+      String(filesThumbnailSize),
+    );
+  }, [filesThumbnailSize]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "silo.thumbnailSize.people",
+      String(peopleThumbnailSize),
+    );
+  }, [peopleThumbnailSize]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "silo.thumbnailSize.memoryBook",
+      String(memoryBookThumbnailSize),
+    );
+  }, [memoryBookThumbnailSize]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "silo.thumbnailSize.duplicates",
+      String(duplicatesThumbnailSize),
+    );
+  }, [duplicatesThumbnailSize]);
 
   useEffect(() => {
     const rememberScroll = (event: Event) => {
@@ -2388,6 +2496,7 @@ function App() {
   useEffect(() => {
     if (!electronAPI) return;
     let cancelled = false;
+    const sourceRequest = ++sourcesRefreshRequestRef.current;
     const removeProgressListener =
       electronAPI.onIndexProgress(setIndexProgress);
     void Promise.all([
@@ -2397,8 +2506,15 @@ function App() {
     ])
       .then(async ([state, availableSources, aggregatePath]) => {
         if (cancelled) return;
+        const activeSources =
+          sourceRequest === sourcesRefreshRequestRef.current
+            ? applyPendingSourceSelections(availableSources)
+            : sourcesRef.current;
+        if (sourceRequest === sourcesRefreshRequestRef.current) {
+          sourcesRef.current = activeSources;
+          setSources(activeSources);
+        }
         applyPersistedState(state);
-        setSources(availableSources);
         setAllSourcesPath(aggregatePath);
         setSort({
           field: state.ui.sortField,
@@ -2422,7 +2538,7 @@ function App() {
         }
         setConfidence(restoredConfidence);
         const persistedPath = state.ui.currentPath;
-        const pathIsAvailable = availableSources.some(
+        const pathIsAvailable = activeSources.some(
           (source) =>
             source.enabled &&
             source.available &&
@@ -2459,7 +2575,7 @@ function App() {
       cancelled = true;
       removeProgressListener();
     };
-  }, [applyPersistedState, electronAPI, loadDirectory]);
+  }, [applyPendingSourceSelections, applyPersistedState, electronAPI, loadDirectory]);
 
   useEffect(() => {
     if (!electronAPI) return;
@@ -2626,7 +2742,7 @@ function App() {
             second,
             sort,
             magicState.ranks,
-            sortIndicators,
+            sortIndicatorsRef.current,
           ),
       );
   }, [
@@ -2635,6 +2751,7 @@ function App() {
     personPhotos,
     redundantDuplicatePaths,
     sort,
+    sortIndicatorDataRevision,
   ]);
 
   const refreshPeople = useCallback(async () => {
@@ -2733,7 +2850,7 @@ function App() {
       ]);
       setPhoneTooling(tooling);
       setPhoneDevices(devices);
-      setSources(await electronAPI.listSources());
+      await refreshSources();
       if (devices.length === 0) {
         const missingTools = [
           ...tooling.ios.missing,
@@ -2760,7 +2877,7 @@ function App() {
     } finally {
       setPhoneScanning(false);
     }
-  }, [electronAPI]);
+  }, [electronAPI, refreshSources]);
 
   const browsePhone = useCallback(
     async (device: PhoneDevice) => {
@@ -2898,11 +3015,11 @@ function App() {
               ? { ...current, name: name.trim() }
               : current,
           );
-          setSources(await electronAPI.listSources());
+          await refreshSources();
         },
       });
     },
-    [electronAPI, openDialog],
+    [electronAPI, openDialog, refreshSources],
   );
 
   const choosePhoneBackupDestination = useCallback(async () => {
@@ -3008,13 +3125,13 @@ function App() {
     });
     const removeDevices = electronAPI.onPhoneDevicesChanged((devices) => {
       setPhoneDevices(devices);
-      void electronAPI.listSources().then(setSources);
+      void refreshSources();
     });
     return () => {
       removeProgress();
       removeDevices();
     };
-  }, [electronAPI]);
+  }, [electronAPI, refreshSources]);
 
   const openCloudRoot = useCallback(
     async (rootPath: string) => {
@@ -3131,18 +3248,9 @@ function App() {
     void electronAPI.getGoogleState().then(setGoogleState);
     return electronAPI.onAudioLibraryCacheChanged?.(() => {
       void electronAPI.getGoogleState().then(setGoogleState);
-      void electronAPI.listSources().then(setSources);
+      void refreshSources();
     });
-  }, [electronAPI]);
-
-  const refreshSources = useCallback(async () => {
-    if (!electronAPI) return;
-    const request = ++sourcesRefreshRequestRef.current;
-    const latest = await electronAPI.listSources();
-    if (request !== sourcesRefreshRequestRef.current) return;
-    sourcesRef.current = latest;
-    setSources(latest);
-  }, [electronAPI]);
+  }, [electronAPI, refreshSources]);
 
   useEffect(() => {
     if (!electronAPI) return;
@@ -3232,12 +3340,49 @@ function App() {
   const toggleSource = useCallback(
     async (sourceId: string, enabled: boolean) => {
       if (!electronAPI) return;
+      const request = ++sourceToggleRequestRef.current;
+      pendingSourceSelectionsRef.current.set(sourceId, { enabled, request });
+      const currentSources = sourcesRef.current;
+      const target = currentSources.find((source) => source.id === sourceId);
+      const deviceKey = target && enabled ? phoneSourceDeviceKey(target) : null;
+      const peerIds = new Set(
+        deviceKey
+          ? currentSources
+              .filter(
+                (source) =>
+                  source.id !== sourceId &&
+                  phoneSourceDeviceKey(source) === deviceKey,
+              )
+              .map((source) => source.id)
+          : [],
+      );
+      for (const peerId of peerIds)
+        pendingSourceSelectionsRef.current.set(peerId, {
+          enabled: false,
+          request,
+        });
+      sourcesRefreshRequestRef.current += 1;
       setBrowseError("");
+      const optimistic = currentSources.map((source) =>
+        source.id === sourceId
+          ? { ...source, enabled }
+          : peerIds.has(source.id)
+            ? { ...source, enabled: false }
+            : source,
+      );
+      sourcesRef.current = optimistic;
+      setSources(optimistic);
       try {
-        const updated = await electronAPI.setSourceEnabled(sourceId, enabled);
+        const response = await electronAPI.setSourceEnabled(sourceId, enabled);
+        for (const [pendingId, pending] of pendingSourceSelectionsRef.current)
+          if (pending.request === request)
+            pendingSourceSelectionsRef.current.delete(pendingId);
+        const updated = applyPendingSourceSelections(response);
         sourcesRefreshRequestRef.current += 1;
         sourcesRef.current = updated;
         setSources(updated);
+        setSourceSelectionRevision((revision) => revision + 1);
+        if (request !== sourceToggleRequestRef.current) return;
         const inAggregateBrowse =
           currentPath === allSourcesPath ||
           (activeDigitalFolderId === null && currentPath === null);
@@ -3258,13 +3403,18 @@ function App() {
           return;
         void loadAggregateSource(source);
       } catch (error) {
-        setBrowseError(error instanceof Error ? error.message : "The source selection could not be changed.");
+        for (const [pendingId, pending] of pendingSourceSelectionsRef.current)
+          if (pending.request === request)
+            pendingSourceSelectionsRef.current.delete(pendingId);
+        if (request === sourceToggleRequestRef.current)
+          setBrowseError(error instanceof Error ? error.message : "The source selection could not be changed.");
         void refreshSources().catch(() => undefined);
       }
     },
     [
       activeDigitalFolderId,
       allSourcesPath,
+      applyPendingSourceSelections,
       currentPath,
       electronAPI,
       loadAggregateSource,
@@ -3305,9 +3455,7 @@ function App() {
     if (!electronAPI || (source.kind !== "local" && source.kind !== "machine")) return;
     try {
       await electronAPI.removeIndexSource(source.rootPath);
-      const updated = await electronAPI.listSources();
-      sourcesRef.current = updated;
-      setSources(updated);
+      await refreshSources();
       allSourcesLoadedRef.current.delete(source.id);
       if (currentPath && pathIsWithinSourceRoot(currentPath, source.rootPath)) {
         setActiveDigitalFolderId(null);
@@ -3319,17 +3467,31 @@ function App() {
     } catch (cause) {
       setBrowseError(`Could not remove “${source.label}”. ${cause instanceof Error ? cause.message : String(cause)}`);
     }
-  }, [activeDigitalFolderId, allSourcesPath, currentPath, electronAPI, loadDirectory]);
+  }, [activeDigitalFolderId, allSourcesPath, currentPath, electronAPI, loadDirectory, refreshSources]);
 
   const setEverySource = useCallback(
     async (enabled: boolean) => {
       if (!electronAPI) return;
+      const request = ++sourceToggleRequestRef.current;
+      const currentSources = sourcesRef.current;
+      for (const source of currentSources)
+        pendingSourceSelectionsRef.current.set(source.id, { enabled, request });
+      sourcesRefreshRequestRef.current += 1;
+      const optimistic = currentSources.map((source) => ({ ...source, enabled }));
+      sourcesRef.current = optimistic;
+      setSources(optimistic);
       setBrowseError("");
       try {
-        const updated = await electronAPI.setAllSourcesEnabled(enabled);
+        const response = await electronAPI.setAllSourcesEnabled(enabled);
+        for (const [pendingId, pending] of pendingSourceSelectionsRef.current)
+          if (pending.request === request)
+            pendingSourceSelectionsRef.current.delete(pendingId);
+        const updated = applyPendingSourceSelections(response);
         sourcesRefreshRequestRef.current += 1;
         sourcesRef.current = updated;
         setSources(updated);
+        setSourceSelectionRevision((revision) => revision + 1);
+        if (request !== sourceToggleRequestRef.current) return;
         const inAggregateBrowse =
           currentPath === allSourcesPath ||
           (activeDigitalFolderId === null && currentPath === null);
@@ -3352,13 +3514,18 @@ function App() {
           void Promise.all(toLoad.map(loadAggregateSource));
         }
       } catch (error) {
-        setBrowseError(error instanceof Error ? error.message : "Source selections could not be changed.");
+        for (const [pendingId, pending] of pendingSourceSelectionsRef.current)
+          if (pending.request === request)
+            pendingSourceSelectionsRef.current.delete(pendingId);
+        if (request === sourceToggleRequestRef.current)
+          setBrowseError(error instanceof Error ? error.message : "Source selections could not be changed.");
         void refreshSources().catch(() => undefined);
       }
     },
     [
       activeDigitalFolderId,
       allSourcesPath,
+      applyPendingSourceSelections,
       currentPath,
       electronAPI,
       loadAggregateSource,
@@ -5041,19 +5208,13 @@ function App() {
         return;
       const requestId = ++searchRequestRef.current;
       const query = searchQuery.trim();
-      const startedAt =
-        searchQueryStartedAtRef.current?.query === query
-          ? searchQueryStartedAtRef.current.startedAt
-          : performance.now();
-      const initialFastResult =
-        fastFileSearchFirstResultAtRef.current?.query === query
-          ? fastFileSearchFirstResultAtRef.current.at
-          : null;
+      const startedAt = performance.now();
+      const requestRoots = new Set(enabledSourcePathsRef.current);
       setSearchTiming({
         query,
         requestId,
         startedAt,
-        firstResultAt: initialFastResult,
+        firstResultAt: null,
         completedAt: null,
       });
       setSearchProgress({ scanned: 0, total: 0 });
@@ -5068,15 +5229,16 @@ function App() {
         if (requestId === searchRequestRef.current) {
           const hidden = bannedHiddenPathsRef.current;
           const visible = results.filter((result) =>
-            !hidden.has(result.path) &&
-            pathIsVisibleForSelectedSources(
-              result.path,
-              enabledSourcePathsRef.current,
-              allSourcePathsRef.current,
-            ),
+            !hidden.has(result.path),
           );
           rememberSearchResultOrder(visible, searchQuery);
           setSearchResults(visible);
+          const priorCoverage = semanticSearchedSourcesRef.current;
+          const roots = priorCoverage.query === query
+            ? new Set(priorCoverage.roots)
+            : new Set<string>();
+          requestRoots.forEach((root) => roots.add(root));
+          semanticSearchedSourcesRef.current = { query, roots };
         }
       } catch (cause) {
         if (requestId === searchRequestRef.current) {
@@ -5102,7 +5264,6 @@ function App() {
     [
       appSection,
       electronAPI,
-      enabledSourcePathsKey,
       rememberSearchResultOrder,
       searchIndexReadiness.status,
       searchQuery,
@@ -5115,12 +5276,7 @@ function App() {
       if (progress.requestId !== searchRequestRef.current) return;
       const hidden = bannedHiddenPathsRef.current;
       const visible = progress.results.filter((result) =>
-        !hidden.has(result.path) &&
-        pathIsVisibleForSelectedSources(
-          result.path,
-          enabledSourcePathsRef.current,
-          allSourcePathsRef.current,
-        ),
+        !hidden.has(result.path),
       );
       rememberSearchResultOrder(visible, searchQueryRef.current);
       const receivedAt = performance.now();
@@ -5155,7 +5311,7 @@ function App() {
         query,
         startedAt: performance.now(),
       };
-    fastFileSearchFirstResultAtRef.current = null;
+    semanticSearchedSourcesRef.current = { query, roots: new Set() };
     searchResultOrderRef.current = { query, paths: [] };
     setSearchResultOrder([]);
     setFreezeSearchResultOrder(true);
@@ -5190,7 +5346,6 @@ function App() {
   }, [
     appSection,
     bannedHiddenPaths,
-    enabledSourcePathsKey,
     searchIndexReadiness.status,
     searchQuery,
   ]);
@@ -5205,16 +5360,6 @@ function App() {
     )
       return;
     rememberSearchResultOrder(fastFileSearchResults, searchQuery);
-    if (fastFileSearchResults.length > 0) {
-      const receivedAt = performance.now();
-      setSearchTiming((current) =>
-        current &&
-        current.query === searchQuery.trim() &&
-        current.firstResultAt === null
-          ? { ...current, firstResultAt: receivedAt }
-          : current,
-      );
-    }
   }, [
     fastFileSearchResults,
     rememberSearchResultOrder,
@@ -5259,40 +5404,55 @@ function App() {
   ]);
 
   useEffect(() => {
+    const query = searchQuery.trim();
+    if (
+      appSection !== "files" ||
+      !electronAPI ||
+      !query ||
+      pendingSourceSelectionsRef.current.size > 0 ||
+      searchIndexReadiness.status === "unavailable" ||
+      searchIndexReadiness.status === "error" ||
+      searchDebounceTimerRef.current !== null
+    )
+      return;
+    const coverage = semanticSearchedSourcesRef.current;
+    if (coverage.query !== query) return;
+    const addedUnsearchedSource = Array.from(enabledSourcePathsRef.current).some(
+      (root) => !coverage.roots.has(root),
+    );
+    if (!addedUnsearchedSource) return;
+    const timer = window.setTimeout(() => {
+      void runSemanticSearch(true);
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [
+    appSection,
+    electronAPI,
+    enabledSourcePathsKey,
+    runSemanticSearch,
+    searchIndexReadiness.status,
+    searchQuery,
+    sourceSelectionRevision,
+  ]);
+
+  useEffect(() => {
     if (contentSafetyRevision > 0 && appSection === "files")
       void runSemanticSearch(false);
   }, [appSection, contentSafetyRevision, runSemanticSearch]);
 
   const rawContentFiles: FileInfo[] = useMemo(() => {
-    if (!searchQuery.trim())
-      return files.filter((file) =>
-        pathIsVisibleForSelectedSources(
-          file.path,
-          enabledSourcePaths,
-          allSourcePaths,
-        ),
-      );
+    if (!searchQuery.trim()) return files;
     const resultsByPath = new Map<string, SemanticSearchResult>();
     for (const result of fastFileSearchResults)
       if (
         searchFeedback[result.path] !== "removed" &&
-        !bannedHiddenPaths.has(result.path) &&
-        pathIsVisibleForSelectedSources(
-          result.path,
-          enabledSourcePaths,
-          allSourcePaths,
-        )
+        !bannedHiddenPaths.has(result.path)
       )
         resultsByPath.set(result.path, result);
     for (const result of searchResults) {
       if (
         searchFeedback[result.path] === "removed" ||
-        bannedHiddenPaths.has(result.path) ||
-        !pathIsVisibleForSelectedSources(
-          result.path,
-          enabledSourcePaths,
-          allSourcePaths,
-        )
+        bannedHiddenPaths.has(result.path)
       ) continue;
       if (
         result._priority === 3 &&
@@ -5327,8 +5487,6 @@ function App() {
     fastFileSearchResults,
     files,
     confidence,
-    enabledSourcePaths,
-    allSourcePaths,
     searchQuery,
     searchResults,
     searchFeedback,
@@ -5485,19 +5643,19 @@ function App() {
             }
             if (Object.keys(snapshot).length) {
               publishPhotoIndicators(snapshot);
-              setSortIndicators((current) => {
-                let nextState = current;
-                for (const [filePath, flags] of Object.entries(next)) {
-                  if (
-                    current[filePath]?.people === flags.people &&
-                    current[filePath]?.mapped === flags.mapped
-                  )
-                    continue;
-                  if (nextState === current) nextState = { ...current };
-                  nextState[filePath] = flags;
-                }
-                return nextState;
-              });
+              let changedFlags = false;
+              for (const [filePath, flags] of Object.entries(next)) {
+                const current = sortIndicatorsRef.current[filePath];
+                if (
+                  current?.people === flags.people &&
+                  current?.mapped === flags.mapped
+                )
+                  continue;
+                sortIndicatorsRef.current[filePath] = flags;
+                changedFlags = true;
+              }
+              if (changedFlags)
+                setSortIndicatorDataRevision((revision) => revision + 1);
             }
             if (missing)
               setSortIndicatorError(
@@ -5563,65 +5721,118 @@ function App() {
     currentPath === allSourcesPath &&
     exploded &&
     !searchQuery.trim();
-  const filteredAndSortedFiles = useMemo(() => {
-    const filtered = contentFiles.filter((file) => {
-      if (!pathIsVisibleForSelectedSources(file.path, enabledSourcePaths, allSourcePaths)) return false;
+  const browseViewInputs = useMemo(
+    () => ({
+      contentFiles,
+      deferBrowseSort,
+      exploded,
+      filters,
+      magicRanks: magicState.ranks,
+      searchQuery,
+      searchFeedback,
+      freezeSearchResultOrder,
+      searchResultPositions,
+      peopleFilter,
+      locationFilter,
+      sort,
+      yearFilter,
+      sortIndicatorRevision:
+        sort.field === "people" ||
+        sort.field === "mapped" ||
+        peopleFilter !== "all" ||
+        locationFilter !== "all"
+          ? sortIndicatorDataRevision
+          : 0,
+    }),
+    [
+      contentFiles,
+      deferBrowseSort,
+      exploded,
+      filters,
+      freezeSearchResultOrder,
+      locationFilter,
+      magicState.ranks,
+      peopleFilter,
+      searchFeedback,
+      searchQuery,
+      searchResultPositions,
+      sort,
+      sortIndicatorDataRevision,
+      yearFilter,
+    ],
+  );
+  const deferredBrowseViewInputs = useDeferredValue(browseViewInputs);
+  const sourceVisibilityInputs = useMemo(
+    () => ({ enabledSourcePaths, allSourcePaths }),
+    [allSourcePaths, enabledSourcePaths],
+  );
+  const deferredSourceVisibilityInputs = useDeferredValue(sourceVisibilityInputs);
+  const browseViewUpdating =
+    browseViewInputs !== deferredBrowseViewInputs ||
+    sourceVisibilityInputs !== deferredSourceVisibilityInputs;
+
+  const baseFilteredAndSortedFiles = useMemo(() => {
+    const {
+      contentFiles: viewContentFiles,
+      deferBrowseSort: viewDeferBrowseSort,
+      exploded: viewExploded,
+      filters: viewFilters,
+      magicRanks,
+      searchQuery: viewSearchQuery,
+      searchFeedback: viewSearchFeedback,
+      freezeSearchResultOrder: viewFreezeSearchResultOrder,
+      searchResultPositions: viewSearchResultPositions,
+      peopleFilter: viewPeopleFilter,
+      locationFilter: viewLocationFilter,
+      sort: viewSort,
+      yearFilter: viewYearFilter,
+    } = deferredBrowseViewInputs;
+    const filtered = viewContentFiles.filter((file) => {
       if (file.isDirectory)
         return (
-          !searchQuery.trim() &&
-          !exploded &&
-          peopleFilter === "all" &&
-          locationFilter === "all"
+          !viewSearchQuery.trim() &&
+          !viewExploded &&
+          viewPeopleFilter === "all" &&
+          viewLocationFilter === "all"
         );
       if (
         !matchesMetadataFilters(
-          sortIndicators[file.path],
-          peopleFilter,
-          locationFilter,
+          sortIndicatorsRef.current[file.path],
+          viewPeopleFilter,
+          viewLocationFilter,
         )
       )
         return false;
-      if (
-        exploded &&
-        currentPath === allSourcesPath &&
-        !searchQuery.trim() &&
-        file.sourceId &&
-        !sources.some(
-          (source) =>
-            source.id === file.sourceId && source.enabled && source.available,
-        )
-      )
-        return false;
-      if (yearFilter !== "all" && modifiedYear(file) !== yearFilter)
+      if (viewYearFilter !== "all" && modifiedYear(file) !== viewYearFilter)
         return false;
       if (
-        filters.includedType !== "all" &&
-        !selectedTypes(filters.includedType).includes(file.type)
+        viewFilters.includedType !== "all" &&
+        !selectedTypes(viewFilters.includedType).includes(file.type)
       )
         return false;
-      return file.size >= filters.sizeMin && file.size <= filters.sizeMax;
+      return file.size >= viewFilters.sizeMin && file.size <= viewFilters.sizeMax;
     });
 
-    if (!deferBrowseSort) filtered.sort((first, second) => {
-      if (searchQuery.trim()) {
-        const firstConfirmed = searchFeedback[first.path] === "confirmed";
-        const secondConfirmed = searchFeedback[second.path] === "confirmed";
+    if (!viewDeferBrowseSort) filtered.sort((first, second) => {
+      if (viewSearchQuery.trim()) {
+        const firstConfirmed = viewSearchFeedback[first.path] === "confirmed";
+        const secondConfirmed = viewSearchFeedback[second.path] === "confirmed";
         if (firstConfirmed !== secondConfirmed)
           return firstConfirmed ? -1 : 1;
       }
-      if (searchQuery.trim()) {
+      if (viewSearchQuery.trim()) {
         const firstEntityMatches = (first as SemanticSearchResult)._entityMatches ?? 0;
         const secondEntityMatches = (second as SemanticSearchResult)._entityMatches ?? 0;
         if (firstEntityMatches !== secondEntityMatches)
           return secondEntityMatches - firstEntityMatches;
       }
       if (
-        searchQuery.trim() &&
-        freezeSearchResultOrder &&
-        searchResultOrderRef.current.query === searchQuery.trim()
+        viewSearchQuery.trim() &&
+        viewFreezeSearchResultOrder &&
+        searchResultOrderRef.current.query === viewSearchQuery.trim()
       ) {
-        const firstPosition = searchResultPositions.get(first.path);
-        const secondPosition = searchResultPositions.get(second.path);
+        const firstPosition = viewSearchResultPositions.get(first.path);
+        const secondPosition = viewSearchResultPositions.get(second.path);
         if (firstPosition !== undefined || secondPosition !== undefined) {
           if (firstPosition === undefined) return 1;
           if (secondPosition === undefined) return -1;
@@ -5629,7 +5840,7 @@ function App() {
             return firstPosition - secondPosition;
         }
       }
-      if (searchQuery.trim()) {
+      if (viewSearchQuery.trim()) {
         const firstPriority = (first as SemanticSearchResult)._priority ?? 3;
         const secondPriority = (second as SemanticSearchResult)._priority ?? 3;
         if (firstPriority !== secondPriority)
@@ -5638,40 +5849,32 @@ function App() {
       return compareFilesBySort(
         first,
         second,
-        sort,
-        magicState.ranks,
-        sortIndicators,
+        viewSort,
+        magicRanks,
+        sortIndicatorsRef.current,
       );
     });
 
-    return exploded || (searchQuery.trim() && freezeSearchResultOrder)
-      ? filtered
-      : [
-          ...filtered.filter((file) => file.isDirectory),
-          ...filtered.filter((file) => !file.isDirectory),
-        ];
-  }, [
-    allSourcesPath,
-    contentFiles,
-    currentPath,
-    deferBrowseSort,
-    enabledSourcePaths,
-    allSourcePaths,
-    exploded,
-    filters,
-    magicState.ranks,
-    searchQuery,
-    searchFeedback,
-    sortIndicators,
-    freezeSearchResultOrder,
-    loading,
-    searchResultPositions,
-    peopleFilter,
-    locationFilter,
-    sort,
-    sources,
-    yearFilter,
-  ]);
+    if (viewExploded || (viewSearchQuery.trim() && viewFreezeSearchResultOrder))
+      return filtered;
+    const folders: FileInfo[] = [];
+    const files: FileInfo[] = [];
+    for (const file of filtered)
+      (file.isDirectory ? folders : files).push(file);
+    return folders.concat(files);
+  }, [deferredBrowseViewInputs]);
+
+  const filteredAndSortedFiles = useMemo(
+    () =>
+      baseFilteredAndSortedFiles.filter((file) =>
+        pathIsVisibleForSelectedSources(
+          file.path,
+          deferredSourceVisibilityInputs.enabledSourcePaths,
+          deferredSourceVisibilityInputs.allSourcePaths,
+        ),
+      ),
+    [baseFilteredAndSortedFiles, deferredSourceVisibilityInputs],
+  );
 
   const hasSelectableFiles = useMemo(
     () => filteredAndSortedFiles.some((file) => !file.isDirectory),
@@ -5693,27 +5896,27 @@ function App() {
   const yearOptions = useMemo(
     () => {
       if (!showFilters) return [];
+      const viewSort = deferredBrowseViewInputs.sort;
       return Array.from(
         new Set([
-          ...contentFiles
+          ...deferredBrowseViewInputs.contentFiles
             .filter((file) => !file.isDirectory)
             .map(modifiedYear),
-          ...(audioOnlySelected ? audioYearOptions : []),
+          ...(deferredBrowseViewInputs.filters.includedType === "audio"
+            ? audioYearOptions
+            : []),
         ]),
       ).sort((first, second) => {
         if (first === "Unknown year") return 1;
         if (second === "Unknown year") return -1;
-        const direction = sort.field === "modified" && sort.ascending ? 1 : -1;
+        const direction = viewSort.field === "modified" && viewSort.ascending ? 1 : -1;
         return (Number(first) - Number(second)) * direction;
       });
     },
     [
-      audioOnlySelected,
       audioYearOptions,
-      contentFiles,
+      deferredBrowseViewInputs,
       showFilters,
-      sort.ascending,
-      sort.field,
     ],
   );
 
@@ -5910,46 +6113,48 @@ function App() {
   }, [allSourcesPath, currentPath, sources]);
 
   const yearSections = useMemo(() => {
-    const allFolders = filteredAndSortedFiles.filter(
-      (file) => file.isDirectory,
-    );
-    const folders = allFolders.slice(0, displayLimit);
+    const allFolders: FileInfo[] = [];
     const byYear = new Map<string, FileInfo[]>();
     const sectionOrder = new Map<string, { year: string; priority: number }>();
-    const indicatorSort = sort.field === "people" || sort.field === "mapped";
-    filteredAndSortedFiles
-      .filter((file) => !file.isDirectory)
-      .forEach((file) => {
-        const year = modifiedYear(file);
-        const metadataKnown = Boolean(sortIndicators[file.path]);
-        const matches =
-          sort.field === "people"
-            ? Boolean(sortIndicators[file.path]?.people)
-            : Boolean(sortIndicators[file.path]?.mapped);
-        const label =
-          sort.field === "people"
-            ? matches
-              ? "Has person"
-              : "No person"
-            : matches
-              ? "Mapped"
-              : "Unmapped";
-        const key = indicatorSort
-          ? `${year} · ${metadataKnown ? label : "Checking metadata"}`
-          : year;
-        const section = byYear.get(key) ?? [];
-        section.push(file);
-        byYear.set(key, section);
-        sectionOrder.set(key, {
-          year,
-          priority:
-            indicatorSort && !metadataKnown
-              ? 2
-              : indicatorSort && matches !== sort.ascending
-                ? 1
-                : 0,
-        });
+    const viewSort = deferredBrowseViewInputs.sort;
+    const indicatorSort = viewSort.field === "people" || viewSort.field === "mapped";
+    for (const file of filteredAndSortedFiles) {
+      if (file.isDirectory) {
+        allFolders.push(file);
+        continue;
+      }
+      const year = modifiedYear(file);
+      const metadata = sortIndicatorsRef.current[file.path];
+      const metadataKnown = Boolean(metadata);
+      const matches =
+        viewSort.field === "people"
+          ? Boolean(metadata?.people)
+          : Boolean(metadata?.mapped);
+      const label =
+        viewSort.field === "people"
+          ? matches
+            ? "Has person"
+            : "No person"
+          : matches
+            ? "Mapped"
+            : "Unmapped";
+      const key = indicatorSort
+        ? `${year} · ${metadataKnown ? label : "Checking metadata"}`
+        : year;
+      const section = byYear.get(key) ?? [];
+      section.push(file);
+      byYear.set(key, section);
+      sectionOrder.set(key, {
+        year,
+        priority:
+          indicatorSort && !metadataKnown
+            ? 2
+            : indicatorSort && matches !== viewSort.ascending
+              ? 1
+              : 0,
       });
+    }
+    const folders = allFolders.slice(0, displayLimit);
     const years = Array.from(byYear.keys()).sort((first, second) => {
       const firstSection = sectionOrder.get(first)!;
       const secondSection = sectionOrder.get(second)!;
@@ -5958,13 +6163,14 @@ function App() {
       if (firstSection.year === secondSection.year) return 0;
       if (firstSection.year === "Unknown year") return 1;
       if (secondSection.year === "Unknown year") return -1;
-      const direction = sort.field === "modified" && sort.ascending ? 1 : -1;
+      const direction =
+        viewSort.field === "modified" && viewSort.ascending ? 1 : -1;
       return (
         (Number(firstSection.year) - Number(secondSection.year)) * direction
       );
     });
     return { allFolders, folders, years, byYear };
-  }, [displayLimit, filteredAndSortedFiles, sort, sortIndicators]);
+  }, [displayLimit, filteredAndSortedFiles, deferredBrowseViewInputs]);
   useEffect(() => {
     const context = JSON.stringify([
       currentPath,
@@ -7265,6 +7471,7 @@ function App() {
                     ? `${filteredAndSortedFiles.length.toLocaleString()} matches · searching ${searchProgress.scanned.toLocaleString()} of ${searchProgress.total.toLocaleString()} indexed files`
                     : `${filteredAndSortedFiles.length.toLocaleString()} matches from ${searchProgress.total.toLocaleString()} indexed files`
               : `${filteredAndSortedFiles.length.toLocaleString()} items`}
+            {browseViewUpdating ? " · Updating results…" : ""}
             {searchQuery.trim() && fastFileSearchCapped
               ? " · showing first 5,000 text matches"
               : ""}
@@ -7444,7 +7651,7 @@ function App() {
       </React.Suspense>
       {appSection === "memories" ? (
         <React.Suspense fallback={<main className="viewer-status">Loading Memories…</main>}>
-          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={thumbnailSize} onThumbnailSizeChange={setThumbnailSize} onChooseMusicFolder={addIndexSource} />
+          <MemoriesPage api={electronAPI} ready={startupState.ready} thumbnailSize={memoryBookThumbnailSize} onThumbnailSizeChange={setMemoryBookThumbnailSize} onChooseMusicFolder={addIndexSource} />
         </React.Suspense>
       ) : appSection === "stats" ? (
         electronAPI ? <StatsDashboard api={electronAPI} /> : <main className="viewer-status">Stats services are unavailable.</main>
@@ -7508,7 +7715,7 @@ function App() {
               className="person-detail"
               style={
                 {
-                  "--people-photo-thumbnail-size": `${thumbnailSize}px`,
+                  "--people-photo-thumbnail-size": `${peopleThumbnailSize}px`,
                 } as React.CSSProperties
               }
             >
@@ -7558,13 +7765,13 @@ function App() {
                       min="120"
                       max={MAX_THUMBNAIL_SIZE}
                       step="10"
-                      value={thumbnailSize}
+                      value={peopleThumbnailSize}
                       onChange={(event) =>
-                        setThumbnailSize(Number(event.target.value))
+                        setPeopleThumbnailSize(Number(event.target.value))
                       }
                       aria-label="Cluster photo thumbnail size"
                     />
-                    <output>{thumbnailSize}px</output>
+                    <output>{peopleThumbnailSize}px</output>
                   </label>
                 </div>
                 <div className="person-actions" data-tour="person-actions" data-help="These actions change person/profile records and assignments only. Rename changes the profile label; Merge combines profiles after confirmation and can be undone. Source photos are unchanged.">
@@ -7760,7 +7967,7 @@ function App() {
                       >
                         <FileThumbnail
                           file={photo}
-                          thumbnailSize={thumbnailSize}
+                          thumbnailSize={peopleThumbnailSize}
                           onOpen={() =>
                             openMediaViewer(photo, personSuggestions)
                           }
@@ -7848,7 +8055,7 @@ function App() {
                           />
                           <FileThumbnail
                             file={photo}
-                            thumbnailSize={thumbnailSize}
+                            thumbnailSize={peopleThumbnailSize}
                             onOpen={() =>
                               openMediaViewer(photo, uniquePersonPhotos)
                             }
@@ -8387,8 +8594,8 @@ function App() {
           state={duplicateState}
           onStateChange={setDuplicateState}
           tourView={tourDuplicateView}
-          thumbnailSize={thumbnailSize}
-          onThumbnailSizeChange={setThumbnailSize}
+          thumbnailSize={duplicatesThumbnailSize}
+          onThumbnailSizeChange={setDuplicatesThumbnailSize}
         />
       ) : appSection === "mobile" ? (
         <main className="mobile-page" data-retained-scroll="mobile" data-tour="mobile-overview" data-help="Mobile manages device discovery, connections, dated browseable copies, iOS restore archives, and message history exports. Check platform and backup scope before starting an operation.">
@@ -8441,7 +8648,7 @@ function App() {
           style={
             {
               "--sidebar-width": `${sidebarWidth}px`,
-              "--thumbnail-size": `${thumbnailSize}px`,
+              "--thumbnail-size": `${filesThumbnailSize}px`,
             } as React.CSSProperties
           }
         >
@@ -9064,13 +9271,13 @@ function App() {
                 min="120"
                 max={MAX_THUMBNAIL_SIZE}
                 step="10"
-                value={thumbnailSize}
+                value={filesThumbnailSize}
                 onChange={(event) =>
-                  setThumbnailSize(Number(event.target.value))
+                  setFilesThumbnailSize(Number(event.target.value))
                 }
                 aria-label="Thumbnail size"
               />
-              <output>{thumbnailSize}px</output>
+              <output>{filesThumbnailSize}px</output>
             </div>
             {loading && !searchQuery.trim() && files.length > 0 && (
               <div className="file-scan-banner">

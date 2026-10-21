@@ -4080,6 +4080,22 @@ input[type="range"]::-moz-range-progress {
   background: #050709;
 }
 
+.map-top-controls {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  left: 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  align-items: start;
+  gap: 12px;
+  pointer-events: none;
+}
+
+.map-top-controls > * {
+  pointer-events: auto;
+}
+
 .map-globe {
   position: absolute;
   z-index: 0;
@@ -4327,15 +4343,14 @@ input[type="range"]::-moz-range-progress {
 }
 
 .map-status {
-  position: absolute;
+  position: relative;
   z-index: 4;
-  top: 18px;
-  left: 20px;
+  justify-self: start;
   display: grid;
-  grid-template-columns: 32px minmax(180px, 1fr) 32px;
+  grid-template-columns: 32px minmax(0, 1fr) 32px;
   align-items: center;
   gap: 10px;
-  width: min(420px, calc(100vw - 40px));
+  width: min(420px, 100%);
   padding: 11px 12px;
   border: 1px solid var(--border-soft);
   border-radius: 6px;
@@ -4510,8 +4525,8 @@ input[type="range"]::-moz-range-progress {
 .map-detail-attribution {
   position: absolute;
   z-index: 4;
-  right: 22px;
-  bottom: 158px;
+  bottom: 22px;
+  left: 22px;
   padding: 3px 6px;
   border-radius: 3px;
   background: rgba(5, 8, 10, 0.7);
@@ -4722,13 +4737,12 @@ input[type="range"]::-moz-range-progress {
 }
 
 .map-selection-toolbar {
-  position: absolute;
+  position: relative;
   z-index: 30;
-  top: 16px;
-  right: 16px;
+  justify-self: end;
   display: grid;
   gap: 8px;
-  width: 300px;
+  width: min(300px, 100%);
   padding: 10px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
@@ -4739,7 +4753,17 @@ input[type="range"]::-moz-range-progress {
 }
 
 .map-page.region-open .map-selection-toolbar {
-  visibility: hidden;
+  display: none;
+}
+
+@media (max-width: 1000px) {
+  .map-top-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .map-selection-toolbar {
+    justify-self: start;
+  }
 }
 
 .map-selection-modes {
@@ -5479,9 +5503,21 @@ input[type="range"]::-moz-range-progress {
   }
 
   .map-status {
+    width: min(420px, 100%);
+    grid-template-columns: 28px minmax(0, 1fr) 32px;
+  }
+
+  .map-selection-toolbar {
+    justify-self: start;
+    width: min(300px, 100%);
+  }
+
+  .map-top-controls {
+    top: 12px;
     right: 12px;
     left: 12px;
-    width: auto;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
   }
 
   .map-solar-controls {
@@ -5491,8 +5527,9 @@ input[type="range"]::-moz-range-progress {
   }
 
   .map-detail-attribution {
-    right: 12px;
-    bottom: 154px;
+    right: auto;
+    bottom: 12px;
+    left: 12px;
   }
 
   .map-compass-controls {
@@ -11863,20 +11900,29 @@ input[type="range"]::-moz-range-progress {
 }
 
 .map-privacy-status {
-  position: absolute;
-  z-index: 5;
-  top: 78px;
-  left: 20px;
+  position: static;
+  grid-column: 2 / 4;
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  padding: 6px 8px 6px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: 6px;
-  background: var(--surface-popover);
+  min-width: 0;
+  padding: 8px 0 0;
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+  border-radius: 0;
+  background: transparent;
   color: var(--text);
   font-size: 11px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+}
+
+.map-privacy-status span {
+  display: inline;
+  flex: 1 1 120px;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .map-privacy-status button,
@@ -11889,9 +11935,19 @@ input[type="range"]::-moz-range-progress {
   cursor: pointer;
 }
 
+.map-privacy-status button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: auto;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
+
 .map-privacy-backdrop {
   position: fixed;
-  z-index: 20;
+  z-index: 40;
   inset: 0;
   display: grid;
   place-items: center;

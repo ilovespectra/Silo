@@ -63,6 +63,8 @@ export interface MemoryPromptPlan {
   title?: string;
   queries?: string[];
   entities?: string[];
+  /** Canonical saved People names resolved locally from the user's prompt. */
+  people?: string[];
 }
 
 export interface MemoryStoryCandidate {
@@ -133,7 +135,7 @@ const NOT_MUSIC = /(voice ?memos?|recordings?|ringtones?|podcasts?|audiobooks?|s
 const STOP_WORDS = new Set(["photo", "photos", "with", "from", "your", "days", "the", "and", "over", "years",
   "year", "this", "week", "ago", "memories", "moments", "story", "inspired", "across", "library", "folder",
   "a", "an", "at", "by", "during", "for", "in", "into", "of", "on", "to"]);
-const MAX_CUSTOM_TOPIC_LENGTH = 120;
+const MAX_CUSTOM_TOPIC_LENGTH = 400;
 const TITLE_CONNECTORS = new Set(["a", "an", "and", "at", "for", "in", "of", "on", "the", "to", "with"]);
 
 function normalizeCustomTopic(value: string): string {
@@ -201,6 +203,40 @@ function customTopicQueries(topic: string, plan?: MemoryPromptPlan | null): stri
 }
 
 function customTopicTitle(topic: string, plan?: MemoryPromptPlan | null): string {
+  const people = Array.from(new Set((plan?.people ?? [])
+    .filter((name): name is string => typeof name === "string")
+    .map((name) => normalizeCustomTopic(name))
+    .filter(Boolean)));
+  if (people.length) {
+    const topicWords = normalizeCustomTopic(topic).split(/\s+/);
+    const normalizedWords = topicWords.map((word) => word.normalize("NFKC").toLocaleLowerCase()
+      .replace(/[’']s$/u, "").replace(/[^\p{L}\p{N}]+/gu, ""));
+    const removed = new Set<number>();
+    const nameWords = people.map((name) => name.normalize("NFKC").toLocaleLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/))
+      .sort((first, second) => second.length - first.length);
+    for (const words of nameWords) {
+      for (let start = 0; start <= normalizedWords.length - words.length; start++) {
+        if (words.every((word, offset) => normalizedWords[start + offset] === word)) {
+          for (let offset = 0; offset < words.length; offset++) removed.add(start + offset);
+          break;
+        }
+      }
+    }
+    const description = topicWords.filter((word, index) => {
+      if (removed.has(index)) return false;
+      const connector = normalizedWords[index];
+      return !(["and", "with", "plus"].includes(connector) &&
+        removed.has(index - 1) && removed.has(index + 1));
+    }).map((word) => word.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+      .filter(Boolean);
+    const titleDescription = description.map((word, index) => {
+      const normalized = word.toLocaleLowerCase();
+      if (index > 0 && TITLE_CONNECTORS.has(normalized)) return normalized;
+      return `${normalized.charAt(0).toLocaleUpperCase()}${normalized.slice(1)}`;
+    }).join(" ");
+    return `${people.join(" & ")}${titleDescription ? ` ${titleDescription}` : ""}`;
+  }
   const planned = typeof plan?.title === "string" ? normalizeCustomTopic(plan.title).slice(0, 72) : "";
   if (planned.length >= 2) return planned;
   return topic.split(" ").map((word, index) => {
@@ -461,7 +497,7 @@ export class MemoryManager {
     const cards: MemorySuggestion[] = [];
     if (!Array.isArray(values)) return cards;
     for (const value of values.slice(0, max)) {
-      if (!value || !text(value.id, 200) || !text(value.title, 200)
+      if (!value || !text(value.id, 200) || !text(value.title, 400)
         || !text(value.description, 1000) || !text(value.query, 1000)
         || !Object.prototype.hasOwnProperty.call(MOOD_WORDS, value.mood)
         || !Number.isFinite(value.createdAt) || !Array.isArray(value.media)) continue;
@@ -924,7 +960,7 @@ export class MemoryManager {
         let ideas: MemoryStoryCandidate[] = [];
         try { ideas = await this.deps.discover(); } catch (error) { searchFailed = true; this.deps.onSearchError?.("discover", error); }
         if (!Array.isArray(ideas)) ideas = [];
-        const valid = ideas.filter(idea => idea && text(idea.key, 1000) && text(idea.title, 200)
+        const valid = ideas.filter(idea => idea && text(idea.key, 1000) && text(idea.title, 400)
           && text(idea.description, 1000) && text(idea.query, 1000)
           && Object.prototype.hasOwnProperty.call(MOOD_WORDS, idea.mood) && typeof idea.load === "function");
         const ordered = [...valid.filter(idea => !usedKeys.has(idea.key)), ...valid.filter(idea => usedKeys.has(idea.key))];
@@ -1169,8 +1205,8 @@ export class MemoryManager {
   async rename(id: string, title: string): Promise<MemoryState> {
     await this.initialize();
     const normalized = title.trim().replace(/\s+/g, " ");
-    if (!text(id, 200) || !normalized || normalized.length > 80 || normalized.includes("\0"))
-      throw new Error("Enter a memory title between 1 and 80 characters.");
+    if (!text(id, 200) || !normalized || normalized.length > 400 || normalized.includes("\0"))
+      throw new Error("Enter a memory title between 1 and 400 characters.");
     const card = [...this.state.suggestions, ...this.reserve].find((item) => item.id === id);
     if (!card) throw new Error("That memory is no longer available.");
     card.title = normalized;
