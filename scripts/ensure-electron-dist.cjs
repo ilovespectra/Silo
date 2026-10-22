@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 
 const packageRoot = path.resolve(__dirname, "..");
 const electronPackageRoot = path.join(packageRoot, "node_modules", "electron");
@@ -33,7 +34,16 @@ if (!fs.existsSync(installScript)) {
 
 console.log("[ensure-electron-dist] Electron bundle missing; downloading it now…");
 try {
-  require(installScript);
+  const result = spawnSync(process.execPath, [installScript], {
+    cwd: packageRoot,
+    stdio: "inherit",
+    env: process.env,
+  });
+
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`Electron install exited with code ${result.status}`);
+  }
   if (!fs.existsSync(bundlePath)) {
     throw new Error(`Electron bundle still missing at ${bundlePath}`);
   }
