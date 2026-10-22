@@ -805,8 +805,10 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               </div>
             ) : progress?.phase === "scanning" || progress?.phase === "checking-space" || preparing ? (
               <div className="source-clone-preparing">
-                <div className="source-clone-progress">
-                  <div><span>{progress?.message || "Choose a destination to begin…"}</span></div>
+                <div className={`source-clone-progress ${progress?.phase ?? ""}`}>
+                  <div className="source-clone-progress-label">
+                    <span>{progress?.message || "Choose a destination to begin…"}</span>
+                  </div>
                   <progress />
                   {progress && (progress.discoveredFiles !== undefined || progress.omittedPaths !== undefined) && (
                     <div className="source-clone-scan-counts" aria-live="polite">

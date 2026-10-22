@@ -2463,6 +2463,22 @@ label.settings-row {
   color: var(--warning-text);
   font-size: 10px;
 }
+.source-clone-progress.checking-space .source-clone-progress-label,
+.source-clone-progress.checking-space .source-clone-scan-current {
+  box-sizing: content-box;
+  height: 1.4em;
+  padding-bottom: 1.4em;
+  overflow: visible;
+  line-height: 1.4;
+}
+.source-clone-progress.checking-space .source-clone-progress-label {
+  align-items: flex-start;
+}
+.source-clone-progress.checking-space .source-clone-progress-label > span,
+.source-clone-progress.checking-space .source-clone-scan-current {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .source-clone-progress-label strong {
   flex: 0 0 auto;
   color: var(--orange-bright);
