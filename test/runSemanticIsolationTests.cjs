@@ -1285,16 +1285,17 @@ test("confidence slider maps higher settings to stricter match thresholds", (t) 
   assert.equal(confidenceSettingToMinimumThreshold(Number.NaN), 23);
 });
 
-test("semantic search marks vector readiness waits so construction can proceed", async (t) => {
+test("semantic search pauses background work without waiting for full vector readiness", async (t) => {
   const { indexer } = makeIndexer(t);
-  let resolveVectorIndex;
+  const pauseStates = [];
   indexer.loaded = Promise.resolve();
-  indexer.vectorIndexReady = new Promise((resolve) => {
-    resolveVectorIndex = resolve;
-  });
+  indexer.vectorIndexReady = new Promise(() => {});
+  let resolveEmbedding;
+  const embedding = new Promise((resolve) => { resolveEmbedding = resolve; });
   indexer.loadClipRuntime = async () => ({});
-  indexer.embedText = async () => new Float32Array(512);
+  indexer.embedText = async () => embedding;
   indexer.persistedVectorIndex = {
+    setPaused: (paused) => pauseStates.push(paused),
     search: async () => [],
     shutdown: async () => {},
   };
@@ -1302,17 +1303,21 @@ test("semantic search marks vector readiness waits so construction can proceed",
   const search = indexer.search("cat", 0, ["/photos"]);
   await new Promise(setImmediate);
   assert.equal(indexer.activeSearchCount, 1);
-  assert.equal(indexer.vectorIndexWaiterCount, 1);
-  assert.equal(
-    indexer.activeSearchCount,
-    indexer.vectorIndexWaiterCount,
-    "vector construction does not wait on searches blocked by vector readiness",
-  );
+  assert.deepEqual(pauseStates, [true]);
 
-  resolveVectorIndex();
-  assert.equal((await search).length, 0);
+  resolveEmbedding(new Float32Array(512));
+  let timeout;
+  try {
+    const results = await Promise.race([
+      search,
+      new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("search waited for full vector readiness")), 1000); }),
+    ]);
+    assert.equal(results.length, 0);
+  } finally {
+    clearTimeout(timeout);
+  }
   assert.equal(indexer.activeSearchCount, 0);
-  assert.equal(indexer.vectorIndexWaiterCount, 0);
+  assert.deepEqual(pauseStates, [true, false]);
 });
 
 test("demo dashboard summaries reuse the bounded selection cache", async (t) => {
@@ -1439,6 +1444,7 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
   indexer.vectorIndexReady = Promise.resolve();
   indexer.vectorIndexReadyState = true;
   indexer.persistedVectorIndex = {
+    setPaused: () => {},
     search: async () => [
       { key: 0, confidence: 60 },
       { key: 1, confidence: 20 },
@@ -1461,8 +1467,9 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
   );
 });
 
-test("semantic search uses loaded vectors while the ANN index is still preparing", async (t) => {
+test("semantic search falls back to loaded vectors when the ANN query fails", async (t) => {
   const { indexer } = makeIndexer(t);
+  await indexer.loaded;
   const vectorBytes = 512 * Float32Array.BYTES_PER_ELEMENT;
   const buffer = Buffer.alloc(vectorBytes * 2);
   buffer.writeFloatLE(0.84, 0);
@@ -1475,8 +1482,7 @@ test("semantic search uses loaded vectors while the ANN index is still preparing
       size: 300_000, modified: 1, type: "image", extension: ".jpg", signature: "fixture",
       vectorOffset: key * vectorBytes,
     };
-    indexer.latestRecords.set(record.path, record);
-    indexer.latestRecordsByVectorKey.set(key, record);
+    indexer.setLatestRecord(record);
   }
   indexer.demoFilePaths = () => null;
   indexer.loadClipRuntime = async () => ({});
@@ -1486,8 +1492,13 @@ test("semantic search uses loaded vectors while the ANN index is still preparing
     return vector;
   };
   indexer.vectorIndexReadyState = false;
+  let annCalls = 0;
   indexer.persistedVectorIndex = {
-    search: async () => assert.fail("partial search must not wait for the ANN worker"),
+    setPaused: () => {},
+    search: async () => {
+      annCalls++;
+      throw new Error("ANN worker unavailable");
+    },
     shutdown: async () => {},
   };
 
@@ -1499,6 +1510,7 @@ test("semantic search uses loaded vectors while the ANN index is still preparing
     ]);
     assert.deepEqual(Array.from(results, (result) => result.path), ["/photos/phone.jpg", "/photos/drive.jpg"]);
     assert.equal(Math.round(results[0].confidence), 84);
+    assert.equal(annCalls, 1);
   } finally {
     clearTimeout(timeout);
   }
@@ -1515,7 +1527,7 @@ test("filtered memory search ranks eligible photos before the 500-result cap", a
     const name = key < 520 ? `asset-${key}.png` : `IMG_${key}.jpg`;
     const record = { path: `/photos/${name}`, sourcePath: "/photos", name, relativePath: name,
       vectorOffset: key * bytes, type: "image", size: 200000, modified: 1, extension: path.extname(name), signature: "fixture" };
-    indexer.latestRecordsByVectorKey.set(key, record);
+    indexer.setLatestRecord(record);
   }
   fs.mkdirSync(path.dirname(indexer.vectorsPath), { recursive: true });
   fs.writeFileSync(indexer.vectorsPath, buffer);
@@ -1525,7 +1537,11 @@ test("filtered memory search ranks eligible photos before the 500-result cap", a
     vector[0] = 1;
     return vector;
   };
-  indexer.persistedVectorIndex = { search: async () => assert.fail("filtered search must not cap unfiltered ANN hits"), shutdown: async () => {} };
+  indexer.persistedVectorIndex = {
+    setPaused: () => {},
+    search: async () => assert.fail("filtered search must not cap unfiltered ANN hits"),
+    shutdown: async () => {},
+  };
   const hits = await indexer.search("holiday", 20, ["/photos"], () => false, undefined,
     (file) => file.type === "image" && file.path.endsWith(".jpg"));
   assert.equal(hits.length, 20);
@@ -1554,6 +1570,7 @@ test("semantic search discards results when cancelled during embedding", async (
     return new Float32Array(512);
   };
   indexer.persistedVectorIndex = {
+    setPaused: () => {},
     search: async () => {
       assert.fail("a cancelled semantic search must not query the vector index");
     },

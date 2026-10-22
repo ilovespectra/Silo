@@ -90,6 +90,12 @@ main-process and worker entry points.
 `npm run release:check` also verifies bundled map assets and their routing
 allowlist before packaging, using the same asset checks as Windows CI.
 
+Run `npm run test:semantic-isolation` for the semantic worker and search
+regressions. With the bundled `.model-test-cache` present, run
+`SILO_REAL_SEMANTIC_SMOKE_LOCAL=1 npm run test:semantic-isolation` to include
+real offline image/document indexing and search on the local platform.
+Windows CI uses `SILO_REAL_SEMANTIC_SMOKE=1` to verify its x64 runtime.
+
 ### Building the 2.0.6 test preview
 
 On the release Mac, after the 2.0.6 changes are committed and pushed to GitHub
