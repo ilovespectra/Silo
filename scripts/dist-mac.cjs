@@ -52,16 +52,23 @@ function assertMachOArchitecture(binary, expectedArchitecture, label = "Binary")
 
 function withTemporaryFfmpegBinary(originalPath, stagedPath, build) {
   const backupPath = path.join(path.dirname(originalPath), `.ffmpeg-silo-backup-${process.pid}`);
-  const originalMode = fs.statSync(originalPath).mode & 0o777;
-  fs.renameSync(originalPath, backupPath);
+  let originalMode;
+  try {
+    originalMode = fs.statSync(originalPath).mode & 0o777;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (originalMode !== undefined) fs.renameSync(originalPath, backupPath);
   try {
     fs.copyFileSync(stagedPath, originalPath);
     fs.chmodSync(originalPath, 0o755);
     return build();
   } finally {
     fs.rmSync(originalPath, { force: true });
-    fs.renameSync(backupPath, originalPath);
-    fs.chmodSync(originalPath, originalMode);
+    if (originalMode !== undefined) {
+      fs.renameSync(backupPath, originalPath);
+      fs.chmodSync(originalPath, originalMode);
+    }
   }
 }
 
