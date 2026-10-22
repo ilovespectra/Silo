@@ -127,10 +127,22 @@ async function stopGroup(child, label) {
   }
 }
 
+function electronBundlePath() {
+  const dist = path.join(root, "node_modules", "electron", "dist");
+  switch (process.platform) {
+    case "darwin":
+      return path.join(dist, "Electron.app", "Contents", "Info.plist");
+    case "win32":
+      return path.join(dist, "electron.exe");
+    default:
+      return path.join(dist, "electron");
+  }
+}
+
 async function main() {
   await stopPreviousRun();
-  const electronPList = path.join(root, "node_modules", "electron", "dist", "Electron.app", "Contents", "Info.plist");
-  if (!fs.existsSync(electronPList)) {
+  const electronBundle = electronBundlePath();
+  if (!fs.existsSync(electronBundle)) {
     log("Electron bundle missing; run npm install or node node_modules/electron/install.js");
     process.exit(1);
   }

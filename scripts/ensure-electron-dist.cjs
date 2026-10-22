@@ -4,15 +4,21 @@ const path = require("node:path");
 
 const packageRoot = path.resolve(__dirname, "..");
 const electronPackageRoot = path.join(packageRoot, "node_modules", "electron");
-const infoPlist = path.join(
-  electronPackageRoot,
-  "dist",
-  "Electron.app",
-  "Contents",
-  "Info.plist",
-);
 
-if (fs.existsSync(infoPlist)) {
+function electronBundlePath() {
+  const dist = path.join(electronPackageRoot, "dist");
+  switch (process.platform) {
+    case "darwin":
+      return path.join(dist, "Electron.app", "Contents", "Info.plist");
+    case "win32":
+      return path.join(dist, "electron.exe");
+    default:
+      return path.join(dist, "electron");
+  }
+}
+
+const bundlePath = electronBundlePath();
+if (fs.existsSync(bundlePath)) {
   console.log("[ensure-electron-dist] Electron bundle present.");
   process.exit(0);
 }
@@ -28,8 +34,8 @@ if (!fs.existsSync(installScript)) {
 console.log("[ensure-electron-dist] Electron bundle missing; downloading it now…");
 try {
   require(installScript);
-  if (!fs.existsSync(infoPlist)) {
-    throw new Error(`Electron bundle still missing at ${infoPlist}`);
+  if (!fs.existsSync(bundlePath)) {
+    throw new Error(`Electron bundle still missing at ${bundlePath}`);
   }
   console.log("[ensure-electron-dist] Electron bundle ready.");
 } catch (error) {
