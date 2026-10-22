@@ -129,6 +129,11 @@ async function stopGroup(child, label) {
 
 async function main() {
   await stopPreviousRun();
+  const electronPList = path.join(root, "node_modules", "electron", "dist", "Electron.app", "Contents", "Info.plist");
+  if (!fs.existsSync(electronPList)) {
+    log("Electron bundle missing; run npm install or node node_modules/electron/install.js");
+    process.exit(1);
+  }
   log("Compiling the Silo main process…");
   const compiled = spawnSync(path.join(root, "node_modules/.bin/tsc"), [], { cwd: root, stdio: "inherit" });
   if (compiled.status !== 0) process.exit(compiled.status || 1);

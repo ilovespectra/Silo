@@ -63,6 +63,7 @@ module.exports = {
     ...(testOutput ? { output: testOutput } : {}),
   },
   extraResources,
+  beforePack: require(path.join(projectRoot, 'scripts', 'validate-build-inputs.cjs')),
   afterPack: require(path.join(projectRoot, 'scripts', 'after-pack.cjs')),
   mac: {
     ...packageJson.build.mac,

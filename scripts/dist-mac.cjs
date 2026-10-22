@@ -179,6 +179,49 @@ function assertPackagedNativeAddons(appPath, arch) {
 
 const phoneTools = ["idevice_id", "ideviceinfo", "idevicepair", "afcclient", "idevicebackup2", "adb"];
 
+function assertRequiredSourceArtifacts(arch) {
+  const requiredLocations = [
+    {
+      label: "Face model directory",
+      path: path.join(projectRoot, "node_modules", "@vladmandic", "face-api", "model"),
+    },
+    {
+      label: "TensorFlow WASM runtime",
+      path: path.join(projectRoot, "node_modules", "@tensorflow", "tfjs-backend-wasm", "dist"),
+    },
+    {
+      label: `Phone tools (${arch})`,
+      path: path.join(projectRoot, "vendor", "phone-tools", `darwin-${arch}`),
+    },
+  ];
+
+  for (const location of requiredLocations) {
+    if (!fs.existsSync(location.path) || !fs.statSync(location.path).isDirectory()) {
+      throw new Error(`${location.label} is missing: ${location.path}. Build cannot continue.`);
+    }
+  }
+
+  const missingPhoneTools = phoneTools.filter((tool) => {
+    const toolPath = path.join(projectRoot, "vendor", "phone-tools", `darwin-${arch}`, tool);
+    return !fs.existsSync(toolPath) || !fs.statSync(toolPath).isFile();
+  });
+  if (missingPhoneTools.length) {
+    throw new Error(
+      `Phone tools are missing from vendor/phone-tools/darwin-${arch}: ${missingPhoneTools.join(", ")}. ` +
+        "The packaged app will be incomplete without them.",
+    );
+  }
+
+  for (const nativePackage of nativeOptionalPackages(arch)) {
+    const packageDirectory = path.join(projectRoot, "node_modules", ...nativePackage.name.split("/"));
+    const binaryPath = resolveNativePackageBinaryPath(packageDirectory, nativePackage);
+    if (!binaryPath || !fs.existsSync(binaryPath)) {
+      throw new Error(`Native dependency ${nativePackage.name} is missing its built binary before packaging.`);
+    }
+    assertMachOArchitecture(fs.readFileSync(binaryPath), arch, nativePackage.name);
+  }
+}
+
 function ensurePhoneTools(arch) {
   run("bash", [path.join(projectRoot, "scripts", "build-phone-tools.sh"), arch]);
 }
@@ -243,6 +286,7 @@ function buildMac() {
 
   ensureNativeOptionalPackages(architecture);
   ensurePhoneTools(architecture);
+  assertRequiredSourceArtifacts(architecture);
   run("npm", ["run", "build"]);
   run("npm", ["run", "release:check"]);
 

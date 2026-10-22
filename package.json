@@ -6,6 +6,7 @@
   "homepage": "./",
   "private": true,
   "scripts": {
+    "postinstall": "node scripts/ensure-electron-dist.cjs",
     "react-start": "PORT=8787 react-scripts start",
     "react-build": "react-scripts build && node scripts/lockdown-built-csp.cjs",
     "react-test": "react-scripts test",

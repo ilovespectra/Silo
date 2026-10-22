@@ -43,11 +43,15 @@ Phone and cloud sources support browsing, previews, Explode, Digital Folders, an
 
 ## Installation
 
+For end users, no extra packages or tools are required beyond the Silo app itself. The distributed installer includes the required native binaries, bundled face-model assets, and bundled phone-tool executables; the app does not expect the user to install anything from the repo or a separate toolchain.
+
 ```bash
 git clone https://github.com/ilovespectra/Silo.git
 cd Silo
 npm install
 ```
+
+If you are building Silo from source, this repository also has a packaging step that builds and validates the bundled runtime assets before a release is created. End users should never need to run `bash scripts/build-phone-tools.sh` or install OEM/phone utilities manually.
 
 ### Opening Silo the first time
 
