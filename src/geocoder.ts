@@ -1,5 +1,6 @@
 import * as fsPromises from "fs/promises";
 import * as path from "path";
+import { safeHttpsFetch } from "./safeHttpsFetch";
 
 export interface GeocodedPlace {
   label: string;
@@ -67,7 +68,7 @@ export class Geocoder {
       url.searchParams.set("q", query.trim());
       url.searchParams.set("limit", "7");
       url.searchParams.set("lang", "en");
-      const response = await fetch(url, { headers: this.requestHeaders() });
+      const response = await safeHttpsFetch(url, { headers: this.requestHeaders() });
       if (!response.ok) return [];
       const payload = (await response.json()) as { features?: any[] };
       const placeRank: Record<string, number> = {
@@ -146,7 +147,7 @@ export class Geocoder {
       url.searchParams.set("lon", String(longitude));
       url.searchParams.set("zoom", "10");
       url.searchParams.set("addressdetails", "1");
-      const response = await fetch(url, { headers: this.requestHeaders() });
+      const response = await safeHttpsFetch(url, { headers: this.requestHeaders() });
       if (!response.ok) return null;
       const result = (await response.json()) as any;
       const address = result.address || {};

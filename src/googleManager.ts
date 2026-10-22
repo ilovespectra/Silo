@@ -4,6 +4,7 @@ import { safeStorage, shell } from "electron";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
 import { isAudioFile } from "./utils/audioTypes";
+import { safeHttpsFetch } from "./safeHttpsFetch";
 
 const CLOUD_PREFIX = "/__cloud__";
 const DRIVE_SEGMENT = "gdrive";
@@ -388,7 +389,7 @@ export class GoogleManager {
       };
     }
 
-    const response = await fetch(TOKEN_ENDPOINT, {
+    const response = await safeHttpsFetch(TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -513,7 +514,7 @@ export class GoogleManager {
   async removeAccount(accountId: string): Promise<GoogleAccountsState> {
     const account = this.accounts.get(accountId);
     if (account?.refreshToken) {
-      await fetch(REVOKE_ENDPOINT, {
+      await safeHttpsFetch(REVOKE_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ token: account.refreshToken }),
@@ -560,7 +561,7 @@ export class GoogleManager {
       throw new Error(`Sign in to ${account.email} again.`);
     }
 
-    const response = await fetch(TOKEN_ENDPOINT, {
+    const response = await safeHttpsFetch(TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -592,7 +593,7 @@ export class GoogleManager {
 
   private async fetchEmail(accessToken: string): Promise<string | null> {
     try {
-      const response = await fetch(
+      const response = await safeHttpsFetch(
         "https://www.googleapis.com/oauth2/v3/userinfo",
         { headers: { Authorization: `Bearer ${accessToken}` } },
       );
@@ -609,7 +610,7 @@ export class GoogleManager {
     init: RequestInit = {},
   ): Promise<Response> {
     const token = await this.accessToken(accountId);
-    return fetch(url, {
+    return safeHttpsFetch(url, {
       ...init,
       headers: {
         ...(init.headers as Record<string, string> | undefined),
@@ -1077,7 +1078,7 @@ export class GoogleManager {
     try {
       const token = await this.accessToken(accountId);
       if (account.scopes) return;
-      const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
+      const response = await safeHttpsFetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
       if (!response.ok) return;
       const { scope } = (await response.json()) as { scope?: string };
       if (!scope) return;
