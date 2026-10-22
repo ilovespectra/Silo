@@ -58,11 +58,38 @@ function run(command, args, options = {}) {
     stdio: 'inherit',
     ...options,
   });
-  if (result.error) throw result.error;
+  if (result.error) {
+    throw describeGitHubFailure(command, args, result.error, result.stderr);
+  }
   if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(' ')} failed with status ${result.status}.`);
+    throw describeGitHubFailure(command, args, null, result.stderr);
   }
   return result;
+}
+
+function describeGitHubFailure(command, args, error, stderr) {
+  const invocation = `${command} ${args.join(' ')}`;
+  const details = [stderr, error && error.message].filter(Boolean).join('\n').trim();
+
+  if (command === 'gh' || args[0] === 'gh' || args.includes('--repo')) {
+    const networkMatch = /can't assign requested address|ECONNREFUSED|ENETUNREACH|timed out|network|socket/i;
+    if (details && networkMatch.test(details)) {
+      return new Error(
+        `${invocation} failed because GitHub is unreachable from this machine. ` +
+        'The clean release flow requires a working GitHub API connection and gh authentication. ' +
+        'If gh is blocked on this host, trigger the Windows workflow from the browser or fix network access before retrying.',
+      );
+    }
+    if (details && /not logged in|authentication|auth/i.test(details)) {
+      return new Error(
+        `${invocation} failed because gh is not authenticated. ` +
+        'Run `gh auth login` or trigger the Windows workflow from the browser with a working GitHub session.',
+      );
+    }
+  }
+
+  if (error) return error;
+  return new Error(details || `${invocation} failed.`);
 }
 
 function capture(command, args) {
@@ -71,9 +98,9 @@ function capture(command, args) {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  if (result.error) throw result.error;
+  if (result.error) throw describeGitHubFailure(command, args, result.error, result.stderr);
   if (result.status !== 0) {
-    throw new Error(result.stderr.trim() || `${command} ${args.join(' ')} failed.`);
+    throw describeGitHubFailure(command, args, null, result.stderr);
   }
   return result.stdout.trim();
 }
@@ -223,27 +250,6 @@ async function repackage() {
   let completed = false;
 
   try {
-    for (const architecture of ['x64', 'arm64']) {
-      const buildOutput = path.join(stageRoot, `mac-${architecture}`);
-      run('npm', [`run`, `dist:mac:${architecture}`], {
-        env: { ...process.env, SILO_RELEASE_OUTPUT_DIR: buildOutput },
-      });
-      for (const extension of ['dmg', 'zip']) {
-        const name = `${product}-${version}-${architecture}.${extension}`;
-        stagedFiles.set(name, findOne(buildOutput, name));
-      }
-      macManifestPaths[architecture] = findOne(buildOutput, 'latest-mac.yml');
-    }
-
-    const mergedManifest = path.join(stageRoot, 'latest-mac.yml');
-    run(process.execPath, [
-      path.join(projectRoot, 'scripts', 'merge-mac-update-manifests.cjs'),
-      macManifestPaths.x64,
-      macManifestPaths.arm64,
-      mergedManifest,
-    ]);
-    stagedFiles.set('latest-mac.yml', mergedManifest);
-
     if (suppliedWindowsInstaller) {
       stagedFiles.set(`${product}-${version}-x64-Setup.exe`, suppliedWindowsInstaller);
     } else {
@@ -266,6 +272,27 @@ async function repackage() {
       const name = `${product}-${version}-x64-Setup.exe`;
       stagedFiles.set(name, findOne(windowsDownload, name));
     }
+
+    for (const architecture of ['x64', 'arm64']) {
+      const buildOutput = path.join(stageRoot, `mac-${architecture}`);
+      run('npm', [`run`, `dist:mac:${architecture}`], {
+        env: { ...process.env, SILO_RELEASE_OUTPUT_DIR: buildOutput },
+      });
+      for (const extension of ['dmg', 'zip']) {
+        const name = `${product}-${version}-${architecture}.${extension}`;
+        stagedFiles.set(name, findOne(buildOutput, name));
+      }
+      macManifestPaths[architecture] = findOne(buildOutput, 'latest-mac.yml');
+    }
+
+    const mergedManifest = path.join(stageRoot, 'latest-mac.yml');
+    run(process.execPath, [
+      path.join(projectRoot, 'scripts', 'merge-mac-update-manifests.cjs'),
+      macManifestPaths.x64,
+      macManifestPaths.arm64,
+      mergedManifest,
+    ]);
+    stagedFiles.set('latest-mac.yml', mergedManifest);
 
     if (stagedFiles.size !== expected.length || expected.some((name) => !stagedFiles.has(name))) {
       throw new Error(`Expected release files ${expected.join(', ')}; staged ${[...stagedFiles.keys()].join(', ')}.`);
