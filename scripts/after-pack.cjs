@@ -147,9 +147,32 @@ function verifyPackagedPhoneTools(context) {
   console.log(`  • Silo: verified ${executableNames.length} packaged ${platform} phone tools.`);
 }
 
+function positionDmgSupportFiles(context) {
+  if (context.electronPlatformName !== 'darwin'
+    || !context.targets.some((target) => target.name === 'dmg')) return;
+
+  const contents = context.packager.config.dmg?.contents;
+  if (!Array.isArray(contents)) return;
+
+  // Finder can show dotfiles when “Show All Files” is enabled. Keep the DMG's
+  // background and volume icon, but place those generated support files beyond
+  // the installer window so they cannot cover the artwork or app icons.
+  const supportFilePositions = [
+    { path: '.VolumeIcon.icns', type: 'position', x: 150, y: 765 },
+    { path: '.background.png', type: 'position', x: 1000, y: 3000 },
+  ];
+
+  for (const position of supportFilePositions) {
+    const existing = contents.find((item) => item.type === 'position' && item.path === position.path);
+    if (existing) Object.assign(existing, position);
+    else contents.push(position);
+  }
+}
+
 module.exports = async function afterPack(context) {
   ensureWindowsSharpRuntime(context);
   verifyPackagedSharpVersions(context);
   verifyPackagedPhoneTools(context);
+  positionDmgSupportFiles(context);
   await signPackagedMacApp(context);
 };

@@ -70,11 +70,23 @@
       }
       .brand-mark img { width: 46px; height: 48px; object-fit: contain; }
       .wordmark {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
         margin: 0 0 8px 82px;
         color: var(--muted);
         font-size: 10px;
         font-weight: 750;
         letter-spacing: 0.19em;
+      }
+      .app-version {
+        flex: 0 0 auto;
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
       }
       h1 { margin: 0; font-size: 21px; font-weight: 650; letter-spacing: -0.035em; }
       .explanation { margin: 7px 0 18px; max-width: 430px; color: var(--muted); }
@@ -134,7 +146,7 @@
       <button class="minimize" id="minimize" type="button" aria-label="Minimize Silo startup window" title="Minimize; click Silo in the Dock or taskbar to return">
         <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
       </button>
-      <p class="wordmark">SOLO · SILO EXPLORER</p>
+      <p class="wordmark"><span>SOLO · SILO EXPLORER</span><span class="app-version" id="app-version" aria-live="polite" aria-atomic="true">Version loading…</span></p>
       <h1 id="title">Opening your library</h1>
       <p class="explanation">Silo is restoring your saved library. The bar shows measured progress for the current search task when available; otherwise it shows activity without guessing a percentage.</p>
       <div class="status-row">

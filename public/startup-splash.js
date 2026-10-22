@@ -2,6 +2,21 @@
   const api = window.electron;
   if (!api) return;
 
+  const appVersionNode = document.getElementById("app-version");
+  if (appVersionNode) {
+    void Promise.resolve()
+      .then(() => api.getAppVersion())
+      .then((version) => {
+        if (typeof version === "string" && version.trim())
+          appVersionNode.textContent = `Silo v${version.trim()}`;
+        else
+          appVersionNode.textContent = "Silo version unavailable";
+      })
+      .catch(() => {
+        appVersionNode.textContent = "Silo version unavailable";
+      });
+  }
+
   const statusNode = document.getElementById("status");
   const countNode = document.getElementById("count");
   const phaseNode = document.getElementById("phase");
