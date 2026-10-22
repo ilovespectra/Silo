@@ -398,6 +398,7 @@ interface SearchPerformanceMachineInfo {
   freeMemoryBytes: number;
   platform: string;
   architecture: string;
+  defaultBackgroundWorkPercent: number;
 }
 
 interface SearchPerformanceSnapshot {

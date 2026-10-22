@@ -2,6 +2,7 @@ import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { getIndexerGovernorProfile } from "./indexerGovernor";
 
 export interface ContentPreferences {
   showNsfw: boolean;
@@ -28,6 +29,7 @@ export interface SearchPerformanceMachineInfo {
   freeMemoryBytes: number;
   platform: string;
   architecture: string;
+  defaultBackgroundWorkPercent: number;
 }
 
 export interface SearchPerformanceSnapshot {
@@ -43,7 +45,7 @@ export function getSearchPerformanceMachineInfo(): SearchPerformanceMachineInfo 
   } catch {
     // Older runtimes may not expose availableParallelism; fall back to logical CPUs.
   }
-  return {
+  const machine = {
     processor: processors[0]?.model.trim() || "Processor information unavailable",
     logicalProcessors: Math.max(1, processors.length),
     availableProcessors,
@@ -51,6 +53,10 @@ export function getSearchPerformanceMachineInfo(): SearchPerformanceMachineInfo 
     freeMemoryBytes: os.freemem(),
     platform: os.platform(),
     architecture: os.arch(),
+  };
+  return {
+    ...machine,
+    defaultBackgroundWorkPercent: getIndexerGovernorProfile(machine).maximumDutyPercent,
   };
 }
 
@@ -62,7 +68,7 @@ export function defaultSearchPerformanceSettings(
     // Keep interactive work responsive on small machines and cap large hosts.
     searchThreads: Math.max(1, Math.min(2, cores - 1)),
     indexThreads: 1,
-    backgroundWorkPercent: 5,
+    backgroundWorkPercent: getSearchPerformanceMachineInfo().defaultBackgroundWorkPercent,
   };
 }
 
@@ -102,7 +108,7 @@ const defaults: StoredContentSettings = {
     showBannedPeople: false,
   },
   performance: defaultSearchPerformanceSettings(),
-  performanceSettingsVersion: 2,
+  performanceSettingsVersion: 3,
   passwordSalt: null,
   passwordHash: null,
 };
@@ -122,9 +128,10 @@ export class ContentSettingsStore {
         await fsPromises.readFile(this.filePath, "utf8"),
       ) as Partial<StoredContentSettings>;
       const previousPerformance = stored.performance;
-      const migrateLowBackgroundDefault =
-        stored.performanceSettingsVersion !== 2 &&
-        previousPerformance?.backgroundWorkPercent === 10;
+      const migrateLegacyBackgroundDefault =
+        stored.performanceSettingsVersion !== 3 &&
+        (previousPerformance?.backgroundWorkPercent === 5 ||
+          previousPerformance?.backgroundWorkPercent === 10);
       const previousPreferences = stored.preferences as
         | (Partial<ContentPreferences> & Record<string, unknown>)
         | undefined;
@@ -157,14 +164,22 @@ export class ContentSettingsStore {
               : defaults.preferences.showBannedPeople,
         },
         performance: normalizeSearchPerformanceSettings(
-          migrateLowBackgroundDefault
-            ? { ...previousPerformance, backgroundWorkPercent: 5 }
+          migrateLegacyBackgroundDefault
+            ? {
+                ...previousPerformance,
+                backgroundWorkPercent:
+                  getSearchPerformanceMachineInfo().defaultBackgroundWorkPercent,
+              }
             : previousPerformance,
           getSearchPerformanceMachineInfo().availableProcessors,
         ),
-        performanceSettingsVersion: 2,
+        performanceSettingsVersion: 3,
       };
-      if (migrateLowBackgroundDefault || removedMapPreferences)
+      if (
+        stored.performanceSettingsVersion !== 3 ||
+        migrateLegacyBackgroundDefault ||
+        removedMapPreferences
+      )
         await this.persist();
     } catch {
       await this.persist();

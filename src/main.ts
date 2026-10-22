@@ -8,6 +8,7 @@ import {
   nativeImage,
   net,
   protocol,
+  powerMonitor,
   session,
   shell,
 } from "electron";
@@ -43,6 +44,7 @@ import {
   type MessageDisplayFlags,
 } from "./stateStore";
 import { FaceIndexer } from "./faceIndexer";
+import { IndexerGovernor, getIndexerGovernorProfile, type IndexerGovernorSignals } from "./indexerGovernor";
 import { PetIndexer } from "./petIndexer";
 import {
   PhoneBackupProgress,
@@ -2888,6 +2890,74 @@ let contactManager: ContactManager;
 let geoIndexer: GeoIndexer;
 let thumbnailPregenerator: ThumbnailPregenerator | null = null;
 let audioLibraryCache: AudioLibraryCache | null = null;
+let indexerGovernor!: IndexerGovernor;
+let previousGovernorCpuSample: ReturnType<typeof os.cpus> | null = null;
+let lastGovernorCpuSampleAt = 0;
+let governorCpuUtilization: number | undefined;
+let governorBusiestCoreUtilization: number | undefined;
+
+function readIndexerGovernorSignals(): IndexerGovernorSignals {
+  const now = Date.now();
+  const currentCpus = os.cpus();
+  if (!previousGovernorCpuSample) {
+    previousGovernorCpuSample = currentCpus;
+    lastGovernorCpuSampleAt = now;
+  } else if (now - lastGovernorCpuSampleAt >= 1000) {
+    let busyTotal = 0;
+    let elapsedTotal = 0;
+    let busiestCore = 0;
+    currentCpus.forEach((cpu, index) => {
+      const previous = previousGovernorCpuSample?.[index];
+      if (!previous) return;
+      const elapsed = Object.keys(cpu.times).reduce(
+        (sum, key) => sum + Math.max(0, cpu.times[key as keyof typeof cpu.times] - previous.times[key as keyof typeof previous.times]),
+        0,
+      );
+      const idle = Math.max(0, cpu.times.idle - previous.times.idle);
+      if (elapsed <= 0) return;
+      const busy = Math.max(0, Math.min(1, (elapsed - idle) / elapsed));
+      busiestCore = Math.max(busiestCore, busy);
+      busyTotal += elapsed - idle;
+      elapsedTotal += elapsed;
+    });
+    if (elapsedTotal > 0) {
+      governorCpuUtilization = busyTotal / elapsedTotal;
+      governorBusiestCoreUtilization = busiestCore;
+    }
+    previousGovernorCpuSample = currentCpus;
+    lastGovernorCpuSampleAt = now;
+  }
+
+  let thermalState: IndexerGovernorSignals["thermalState"] = "unknown";
+  try {
+    const state = powerMonitor.getCurrentThermalState();
+    if (["nominal", "fair", "serious", "critical"].includes(state))
+      thermalState = state as IndexerGovernorSignals["thermalState"];
+  } catch {
+    // Thermal telemetry is not available on every supported platform.
+  }
+  let idleSeconds = 0;
+  try {
+    idleSeconds = powerMonitor.getSystemIdleTime();
+  } catch {
+    // Keep the conservative foreground-idle default when the OS has no signal.
+  }
+  let onBattery = false;
+  try {
+    onBattery = powerMonitor.isOnBatteryPower();
+  } catch {
+    // Desktop hardware and unsupported platforms default to AC power.
+  }
+  const totalMemoryBytes = os.totalmem();
+  return {
+    cpuUtilization: governorCpuUtilization,
+    busiestCoreUtilization: governorBusiestCoreUtilization,
+    freeMemoryRatio: totalMemoryBytes > 0 ? os.freemem() / totalMemoryBytes : undefined,
+    idleSeconds,
+    onBattery,
+    thermalState,
+  };
+}
 let audioInventoryRetryTimer: NodeJS.Timeout | null = null;
 let audioInventoryRunning = false;
 let audioSourceAvailabilityCache = new Map<string, boolean>();
@@ -10997,6 +11067,14 @@ app.whenReady().then(async () => {
   contentSettingsStore = new ContentSettingsStore(app.getPath("userData"));
   console.error("[startup-debug] before contentSettingsStore.initialize");
   await contentSettingsStore.initialize();
+  const machineInfo = contentSettingsStore.getSearchPerformanceSnapshot().machine;
+  indexerGovernor = new IndexerGovernor(
+    getIndexerGovernorProfile(machineInfo),
+    readIndexerGovernorSignals,
+  );
+  indexerGovernor.setPaceLimitPercent(
+    contentSettingsStore.getSearchPerformanceSnapshot().settings.backgroundWorkPercent,
+  );
   console.error("[startup-debug] after contentSettingsStore.initialize");
   registerMediaProtocols();
   mainStartupWindowAllowed = true;
@@ -11249,7 +11327,12 @@ app.whenReady().then(async () => {
     cacheDestinationRoot("face-index"),
     contentSettingsStore.getSearchPerformanceSnapshot().settings
       .backgroundWorkPercent,
-    () => activeInteractiveSearches > 0,
+    () =>
+      activeInteractiveSearches > 0 ||
+      semanticIndexer.isSearchActive() ||
+      PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status),
+    undefined,
+    indexerGovernor,
   );
   faceIndexer.setRecognitionListener(({ added, removed }) => {
     const showBanned = Boolean(
@@ -11607,7 +11690,7 @@ app.whenReady().then(async () => {
     });
   };
 
-  audioLibraryCache = new AudioLibraryCache(cacheDestinationRoot("audio-library-index.json"));
+  audioLibraryCache = new AudioLibraryCache(cacheDestinationRoot("audio-library-index.json"), indexerGovernor);
   if (!indexStorageInitializationDeferred) {
     try {
       await audioLibraryCache.initialize();
@@ -11620,7 +11703,7 @@ app.whenReady().then(async () => {
       // A removable cache can disappear or become unwritable after the startup
       // probe. This derived index is rebuildable, so use a local copy for this
       // session and let the normal storage monitor expose the reconnect flow.
-      audioLibraryCache = new AudioLibraryCache(app.getPath("userData"));
+      audioLibraryCache = new AudioLibraryCache(app.getPath("userData"), indexerGovernor);
       try {
         await audioLibraryCache.initialize();
       } catch (fallbackError) {
@@ -14519,7 +14602,7 @@ ipcMain.handle("get-search-performance-settings", () =>
     settings: {
       searchThreads: 1,
       indexThreads: 1,
-      backgroundWorkPercent: 5,
+      backgroundWorkPercent: 20,
     },
     machine: {
       processor: "Processor information unavailable",
@@ -14529,6 +14612,7 @@ ipcMain.handle("get-search-performance-settings", () =>
       freeMemoryBytes: 0,
       platform: process.platform,
       architecture: process.arch,
+      defaultBackgroundWorkPercent: 20,
     },
   },
 );
@@ -14539,6 +14623,7 @@ ipcMain.handle(
       throw new Error("Content settings are still initializing.");
     const snapshot = await contentSettingsStore.updateSearchPerformanceSettings(update);
     semanticIndexer?.setPerformanceSettings(snapshot.settings);
+    indexerGovernor?.setPaceLimitPercent(snapshot.settings.backgroundWorkPercent);
     faceIndexer?.setBackgroundWorkPercent(snapshot.settings.backgroundWorkPercent);
     return snapshot;
   },

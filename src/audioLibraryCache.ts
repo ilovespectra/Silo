@@ -1,12 +1,10 @@
 import { promises as fsPromises } from "fs";
 import path from "path";
 import { isAppDataPath, isSiloCloneDirectory } from "./indexingPathPolicy";
+import { IndexerGovernor } from "./indexerGovernor";
 
 const AUDIO_SCAN_DIRECTORY_WORKERS = 1;
-const AUDIO_SCAN_COOLDOWN_EVERY_ENTRIES = 128;
-const AUDIO_SCAN_COOLDOWN_MIN_MS = 250;
-const AUDIO_SCAN_COOLDOWN_MAX_MS = 1500;
-const AUDIO_SCAN_COOLDOWN_WORK_MULTIPLIER = 3;
+const AUDIO_SCAN_GOVERNOR_EVERY_ENTRIES = 128;
 
 export interface CachedAudioFile {
   name: string;
@@ -78,7 +76,10 @@ export class AudioLibraryCache {
   private memoryMetadata = new Map<string, CachedMemoryAudioMetadata>();
   private persistQueue: Promise<void> = Promise.resolve();
 
-  constructor(userDataPath: string) {
+  constructor(
+    userDataPath: string,
+    private readonly governor: IndexerGovernor = new IndexerGovernor(),
+  ) {
     this.cachePath = path.join(userDataPath, "audio-library-index.json");
   }
 
@@ -198,6 +199,7 @@ export class AudioLibraryCache {
     this.cancelled = false;
     if (force)
       for (const source of sources) this.sourceCooldowns.delete(source.id);
+    const releaseGovernorLane = this.governor.enterLane("audio");
     const pending = this.scanImpl(
       sources,
       isRemotePath,
@@ -208,6 +210,7 @@ export class AudioLibraryCache {
       shouldPauseForSearch,
       configuredSourceIds,
     ).finally(() => {
+      releaseGovernorLane();
       this.scanPromise = null;
     });
     this.scanPromise = pending;
@@ -410,22 +413,15 @@ export class AudioLibraryCache {
         let entriesSinceCooldown = 0;
         const coolDownAfterAudioEntry = () => {
           entriesSinceCooldown += 1;
-          if (entriesSinceCooldown < AUDIO_SCAN_COOLDOWN_EVERY_ENTRIES)
+          if (entriesSinceCooldown < AUDIO_SCAN_GOVERNOR_EVERY_ENTRIES)
             return null;
-          const workMs = Math.max(0, Date.now() - cooldownWindowStartedAt);
-          const cooldownMs = Math.min(
-            AUDIO_SCAN_COOLDOWN_MAX_MS,
-            Math.max(
-              AUDIO_SCAN_COOLDOWN_MIN_MS,
-              workMs * AUDIO_SCAN_COOLDOWN_WORK_MULTIPLIER,
-            ),
-          );
-          return new Promise<void>((resolve) =>
-            setTimeout(() => {
-              entriesSinceCooldown = 0;
-              cooldownWindowStartedAt = Date.now();
-              resolve();
-            }, cooldownMs),
+          const workMs = Math.max(1, Date.now() - cooldownWindowStartedAt);
+          entriesSinceCooldown = 0;
+          cooldownWindowStartedAt = Date.now();
+          return this.governor.paceAfterWork(
+            workMs,
+            shouldPauseForSearch,
+            () => this.cancelled,
           );
         };
         const pendingFiles: CachedAudioFile[] = [];

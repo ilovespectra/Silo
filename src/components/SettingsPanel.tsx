@@ -183,7 +183,7 @@ function PerformanceSettingsSection() {
     setDraft({
       searchThreads: Math.max(1, Math.min(2, available - 1)),
       indexThreads: 1,
-      backgroundWorkPercent: 5,
+      backgroundWorkPercent: snapshot.machine.defaultBackgroundWorkPercent,
     });
     setMessage("");
     setError("");
@@ -291,18 +291,18 @@ function PerformanceSettingsSection() {
               }}
             />
             <small>
-              Sets the CPU work-time budget for source scans and background index
-              preparation. The operating system still schedules CPU use, so this
-              is not a whole-computer CPU percentage cap.
+              Sets a ceiling for adaptive audio and face work. Silo lowers its
+              budget under CPU, memory, battery, or thermal pressure and yields
+              while Search is active.
             </small>
           </label>
         </>
       )}
 
       <p className="settings-footnote">
-        Search gets priority over source scans and background index preparation.
-        Thread limits apply to vector-search operations; other app work and the
-        operating system can affect total CPU use.
+        Search gets priority over audio and face work. Thread limits apply to
+        vector-search operations; other app work and the operating system can
+        affect total CPU use.
       </p>
       {error && <p className="settings-message error" role="alert">{error}</p>}
       {message && <p className="settings-message" role="status">{message}</p>}

@@ -4,6 +4,7 @@ import * as path from "path";
 import * as readline from "readline";
 import * as fsPromises from "fs/promises";
 import { IndexableFile } from "./semanticIndexer";
+import { IndexerGovernor, getIndexerGovernorProfile } from "./indexerGovernor";
 
 const AUTO_CLUSTER_DISTANCE = 0.48;
 const COMBINE_CLUSTER_DISTANCE = 0.4;
@@ -223,7 +224,6 @@ export class FaceIndexer {
     () => false;
   private peopleChangeListener: () => void = () => undefined;
   private photoPeopleCache: Map<string, string[]> | null = null;
-  private backgroundWorkPercent = 5;
 
   constructor(
     userDataPath: string,
@@ -235,6 +235,7 @@ export class FaceIndexer {
     backgroundWorkPercent = 5,
     private readonly hasActiveInteractiveSearch: () => boolean = () => false,
     private readonly resolveImagePath: (filePath: string) => Promise<string> = async (filePath) => filePath,
+    private readonly governor: IndexerGovernor = new IndexerGovernor(getIndexerGovernorProfile()),
   ) {
     this.directory = path.join(indexStoragePath, "face-index");
     this.recordsPath = path.join(this.directory, "faces.jsonl");
@@ -249,11 +250,7 @@ export class FaceIndexer {
   }
 
   setBackgroundWorkPercent(percent: number) {
-    if (!Number.isFinite(percent)) return;
-    this.backgroundWorkPercent = Math.max(
-      5,
-      Math.min(100, Math.round(percent)),
-    );
+    this.governor.setPaceLimitPercent(percent);
   }
 
   async initialize() {
@@ -643,7 +640,9 @@ export class FaceIndexer {
   start(images?: IndexableFile[]) {
     if (this.runPromise) return this.runPromise;
     this.pauseRequested = false;
+    const releaseGovernorLane = this.governor.enterLane("face");
     this.runPromise = this.run(images).finally(() => {
+      releaseGovernorLane();
       this.runPromise = null;
     });
     return this.runPromise;
@@ -2925,23 +2924,11 @@ export class FaceIndexer {
   }
 
   private async paceBackgroundWork(workMs: number) {
-    const dutyPercent = this.backgroundWorkPercent;
-    let cooldownRemaining = Math.ceil(
-      Math.max(1, workMs) * ((100 - dutyPercent) / dutyPercent),
+    await this.governor.paceAfterWork(
+      workMs,
+      () => this.hasActiveInteractiveSearch(),
+      () => this.pauseRequested,
     );
-
-    while (
-      cooldownRemaining > 0 &&
-      !this.pauseRequested &&
-      !this.hasActiveInteractiveSearch()
-    ) {
-      const sliceMs = Math.min(50, cooldownRemaining);
-      await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
-      cooldownRemaining -= sliceMs;
-    }
-    // Let an active search take priority before beginning another face image.
-    while (this.hasActiveInteractiveSearch() && !this.pauseRequested)
-      await new Promise<void>((resolve) => setTimeout(resolve, 40));
   }
 
   private emitProgress() {
