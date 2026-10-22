@@ -171,6 +171,16 @@ function ensureNativeOptionalPackages(arch) {
   }
 }
 
+function ensureNumkongBuildInputs() {
+  const directory = path.join(projectRoot, "node_modules", "numkong");
+  if (fs.existsSync(path.join(directory, "nk_probes.h"))) return;
+  console.log("Restoring NumKong compiler probes skipped during dependency installation.");
+  run(process.execPath, [path.join(directory, "probes", "probe.js")], { cwd: directory });
+  if (!fs.statSync(path.join(directory, "nk_probes.h")).isFile()) {
+    throw new Error("NumKong compiler probes did not produce nk_probes.h.");
+  }
+}
+
 function assertPackagedNativeAddons(appPath, arch) {
   const unpacked = path.join(appPath, "Contents", "Resources", "app.asar.unpacked", "node_modules");
   for (const nativePackage of nativeOptionalPackages(arch)) {
@@ -292,6 +302,7 @@ function buildMac() {
   }
 
   ensureNativeOptionalPackages(architecture);
+  ensureNumkongBuildInputs();
   ensurePhoneTools(architecture);
   assertRequiredSourceArtifacts(architecture);
   run("npm", ["run", "build"]);
@@ -377,6 +388,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  ensureNumkongBuildInputs,
   resolveNativeBinaryPath,
   resolveNativePackageBinaryPath,
   assertMachOArchitecture,
