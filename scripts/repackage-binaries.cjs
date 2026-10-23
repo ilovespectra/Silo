@@ -203,6 +203,8 @@ async function repackage() {
   }
 
   assertCleanReleaseInputs();
+  console.log('\nChecking semantic search before versioning or dispatching Windows packaging…');
+  run('npm', ['run', 'test:semantic-isolation']);
   if (version !== packageJson.version) {
     if (suppliedWindowsInstaller) {
       throw new Error(`Set the source package to published-release target ${version} and rebuild the supplied Windows installer from that pushed commit.`);

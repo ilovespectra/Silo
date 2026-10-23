@@ -1296,7 +1296,7 @@ test("semantic search pauses background work without waiting for full vector rea
   indexer.embedText = async () => embedding;
   indexer.persistedVectorIndex = {
     setPaused: (paused) => pauseStates.push(paused),
-    search: async () => [],
+    search: async () => ({ hits: [] }),
     shutdown: async () => {},
   };
 
@@ -1445,12 +1445,12 @@ test("semantic search applies confidence and excludes unfinished or inactive rec
   indexer.vectorIndexReadyState = true;
   indexer.persistedVectorIndex = {
     setPaused: () => {},
-    search: async () => [
+    search: async () => ({ hits: [
       { key: 0, confidence: 60 },
       { key: 1, confidence: 20 },
       { key: 2, confidence: 90 },
       { key: 3, confidence: 99 },
-    ],
+    ] }),
     shutdown: async () => {},
   };
 
