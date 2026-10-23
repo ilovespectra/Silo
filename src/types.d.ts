@@ -587,15 +587,6 @@ interface RuntimeDiagnosticRead {
   truncated: boolean;
 }
 
-interface ThumbnailPregenProgress {
-  status: "idle" | "waiting" | "scanning" | "generating" | "complete" | "error";
-  total: number;
-  processed: number;
-  generated: number;
-  failed: number;
-  message: string;
-}
-
 interface IndexProgress {
   status:
     | "idle"
@@ -1310,7 +1301,6 @@ interface Window {
       >
     >;
     onPhotoIndicatorsChanged(callback: () => void): () => void;
-    getThumbnailPregenProgress(): Promise<ThumbnailPregenProgress | null>;
     getIndexingOverview(): Promise<IndexingStageProgress[]>;
     getLibraryDashboard(): Promise<LibraryDashboardSnapshot>;
     refreshLibraryStats(): Promise<LibraryDashboardSnapshot>;
@@ -1328,9 +1318,6 @@ interface Window {
     }>;
     retryIndexingStage(id: string): Promise<{ ok: boolean }>;
     pauseIndexingStage(id: string): Promise<{ ok: boolean }>;
-    onThumbnailPregenProgress(
-      callback: (progress: ThumbnailPregenProgress) => void,
-    ): () => void;
     createFolder(
       parentPath: string,
       folderName: string,

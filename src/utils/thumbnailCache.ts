@@ -26,6 +26,10 @@ export class LRUCache {
     }
   }
 
+  delete(key: string): void {
+    this.cache.delete(key);
+  }
+
   has(key: string): boolean {
     return this.cache.has(key);
   }
@@ -92,15 +96,15 @@ export function getThumbnailRetryDelay(
 }
 
 /** Regenerates a thumbnail, bypassing failure memory on both sides (used when a file is opened). */
-export async function refreshThumbnail(filePath: string) {
-  failedAt.delete(thumbnailCacheKey(filePath, 480));
-  try {
-    const url = await window.electron?.getThumbnail(filePath, true, true, 480);
-    if (url) publish(filePath, url, 480);
-    return url ?? null;
-  } catch {
-    return null;
-  }
+export async function refreshThumbnail(
+  filePath: string,
+  size = 480,
+) {
+  const key = thumbnailCacheKey(filePath, size);
+  thumbnailCache.delete(key);
+  failedAt.delete(key);
+  failedAttempts.delete(key);
+  return loadThumbnail(filePath, true, size, true);
 }
 
 /** Shared loader: one IPC request per path, cached successes, and remembered failures. */
@@ -111,16 +115,21 @@ export function loadThumbnail(
   retryFailed = false,
 ): Promise<string | null> {
   const key = thumbnailCacheKey(filePath, size);
-  const cached = thumbnailCache.get(key);
-  if (cached) return Promise.resolve(cached);
-  if (retryFailed) failedAt.delete(key);
-  if (hasThumbnailFailed(filePath, size) || !window.electron)
-    return Promise.resolve(null);
   const pending = inFlight.get(key);
   if (pending) {
-    if (urgent) void window.electron.getThumbnail(filePath, true, false, size);
+    if (urgent || retryFailed)
+      void window.electron?.getThumbnail(filePath, true, retryFailed, size);
     return pending;
   }
+  const cached = retryFailed ? undefined : thumbnailCache.get(key);
+  if (cached) return Promise.resolve(cached);
+  if (retryFailed) {
+    thumbnailCache.delete(key);
+    failedAt.delete(key);
+    failedAttempts.delete(key);
+  }
+  if (hasThumbnailFailed(filePath, size) || !window.electron)
+    return Promise.resolve(null);
   const request = (async () => {
     const delays = [500, 1500];
     for (let attempt = 0; attempt <= delays.length; attempt += 1) {

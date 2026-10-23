@@ -9,7 +9,12 @@ import {
   getSearchPerformanceMachineInfo,
   SearchPerformanceSettings,
 } from "./contentSettings";
-import { VectorSearchGroup, VectorSearchKind } from "./persistedVectorIndex";
+import {
+  VectorSearchDiagnostics,
+  VectorSearchGroup,
+  VectorSearchKind,
+  VectorSearchResponse,
+} from "./persistedVectorIndex";
 
 const VECTOR_SIZE = 512;
 const VECTOR_BYTES = VECTOR_SIZE * Float32Array.BYTES_PER_ELEMENT;
@@ -75,7 +80,7 @@ const indexConfig = {
   quantization: ScalarKind.F16,
   connectivity: 16,
   expansion_add: 128,
-  expansion_search: 96,
+  expansion_search: 48,
   multi: false,
 };
 
@@ -334,34 +339,101 @@ async function initialize(message: WorkerMessage) {
   parentPort?.postMessage({ type: "ready" });
 }
 
-async function search(message: WorkerMessage) {
+async function search(message: WorkerMessage): Promise<VectorSearchResponse> {
+  const searchStartedAt = performance.now();
   const sourcePaths = new Set(message.sourcePaths ?? []);
   const imageQuery = message.imageQuery;
   const documentQuery = message.documentQuery;
-  if (!imageQuery || !documentQuery) return [];
-  const candidates: Array<{ key: number; kind: VectorSearchKind; query: Float32Array }> = [];
   const perPartitionLimit = Math.max(1, Math.min(INDEX_LIMIT_PER_KIND, message.limit ?? INDEX_LIMIT_PER_KIND));
+  const partitionTimings: VectorSearchDiagnostics["slowestPartitions"] = [];
+  let indexedRecords = 0;
+  let partitionSearchMs = 0;
+  let candidateSortMs = 0;
+  let vectorOpenMs = 0;
+  let vectorReadMs = 0;
+  let vectorBytesRead = 0;
+  let rerankMs = 0;
+  let yieldMs = 0;
+  let finalSortMs = 0;
+  let vectorsAvailable = false;
+  const diagnostics = (
+    candidateCount: number,
+    partitionCount: number,
+  ): VectorSearchDiagnostics => {
+    const durationMs = Math.round((performance.now() - searchStartedAt) * 10) / 10;
+    const measuredMs =
+      partitionSearchMs + candidateSortMs + vectorOpenMs + vectorReadMs +
+      rerankMs + yieldMs + finalSortMs;
+    return {
+      durationMs,
+      sourceCount: sourcePaths.size,
+      partitionCount,
+      indexedRecords,
+      candidateCount,
+      searchThreads: performanceSettings.searchThreads,
+      perPartitionLimit,
+      expansionSearch: indexConfig.expansion_search,
+      partitionSearchMs: Math.round(partitionSearchMs * 10) / 10,
+      candidateSortMs: Math.round(candidateSortMs * 10) / 10,
+      vectorOpenMs: Math.round(vectorOpenMs * 10) / 10,
+      vectorReadMs: Math.round(vectorReadMs * 10) / 10,
+      vectorBytesRead,
+      rerankMs: Math.round(rerankMs * 10) / 10,
+      yieldMs: Math.round(yieldMs * 10) / 10,
+      finalSortMs: Math.round(finalSortMs * 10) / 10,
+      unattributedMs: Math.round(Math.max(0, durationMs - measuredMs) * 10) / 10,
+      vectorsAvailable,
+      slowestPartitions: partitionTimings
+        .sort((first, second) => second.durationMs - first.durationMs)
+        .slice(0, 5),
+    };
+  };
+  if (!imageQuery || !documentQuery)
+    return { hits: [], diagnostics: diagnostics(0, 0) };
+  const candidates: Array<{ key: number; kind: VectorSearchKind; query: Float32Array }> = [];
+  let partitionCount = 0;
   for (const partition of partitions.values()) {
     if (!sourcePaths.has(partition.sourcePath) || partition.index.size() === 0) continue;
+    partitionCount += 1;
     const query = partition.kind === "image" ? imageQuery : documentQuery;
-    const count = Math.min(perPartitionLimit, partition.index.size());
+    const partitionSize = partition.index.size();
+    indexedRecords += partitionSize;
+    const count = Math.min(perPartitionLimit, partitionSize);
+    const partitionStartedAt = performance.now();
     const matches = partition.index.search(
       query,
       count,
       performanceSettings.searchThreads,
     );
+    const partitionDurationMs = performance.now() - partitionStartedAt;
+    partitionSearchMs += partitionDurationMs;
+    const candidatesBeforePartition = candidates.length;
     for (let index = 0; index < matches.keys.length; index += 1) {
       const key = Number(matches.keys[index]);
       if (Number.isSafeInteger(key) && key >= 0 && Number.isFinite(matches.distances[index]))
         candidates.push({ key, kind: partition.kind, query });
     }
+    partitionTimings.push({
+      sourceKey: partitionId(partition.sourcePath, partition.kind),
+      kind: partition.kind,
+      indexedRecords: partitionSize,
+      candidateCount: candidates.length - candidatesBeforePartition,
+      durationMs: Math.round(partitionDurationMs * 10) / 10,
+    });
   }
-  if (!candidates.length) return [];
+  if (!candidates.length)
+    return { hits: [], diagnostics: diagnostics(0, partitionCount) };
 
+  const candidateSortStartedAt = performance.now();
   candidates.sort((first, second) => first.key - second.key);
+  candidateSortMs = performance.now() - candidateSortStartedAt;
   const exact = new Map<number, number>();
+  const vectorOpenStartedAt = performance.now();
   const handle = await fsPromises.open(vectorsPath, "r").catch(() => null);
-  if (!handle) return [];
+  vectorOpenMs = performance.now() - vectorOpenStartedAt;
+  if (!handle)
+    return { hits: [], diagnostics: diagnostics(candidates.length, partitionCount) };
+  vectorsAvailable = true;
   try {
     for (let start = 0; start < candidates.length; ) {
       let end = start + 1;
@@ -373,7 +445,11 @@ async function search(message: WorkerMessage) {
       ) end += 1;
       const byteLength = (candidates[end - 1].key + 1) * VECTOR_BYTES - firstOffset;
       const buffer = Buffer.allocUnsafeSlow(byteLength);
+      const readStartedAt = performance.now();
       const { bytesRead } = await handle.read(buffer, 0, byteLength, firstOffset);
+      vectorReadMs += performance.now() - readStartedAt;
+      vectorBytesRead += bytesRead;
+      const rerankStartedAt = performance.now();
       for (let index = start; index < end; index += 1) {
         const candidate = candidates[index];
         const localOffset = candidate.key * VECTOR_BYTES - firstOffset;
@@ -388,14 +464,18 @@ async function search(message: WorkerMessage) {
           similarity += candidate.query[dimension] * vector[dimension];
         if (Number.isFinite(similarity)) exact.set(candidate.key, similarity);
       }
+      rerankMs += performance.now() - rerankStartedAt;
       start = end;
+      const yieldStartedAt = performance.now();
       await new Promise<void>((resolve) => setImmediate(resolve));
+      yieldMs += performance.now() - yieldStartedAt;
     }
   } finally {
     await handle.close();
   }
   const imageHits: Array<{ key: number; confidence: number }> = [];
   const documentHits: Array<{ key: number; confidence: number }> = [];
+  const finalSortStartedAt = performance.now();
   for (const candidate of candidates) {
     const similarity = exact.get(candidate.key);
     if (similarity === undefined) continue;
@@ -407,7 +487,9 @@ async function search(message: WorkerMessage) {
   }
   const sortAndLimit = (hits: Array<{ key: number; confidence: number }>) =>
     hits.sort((first, second) => second.confidence - first.confidence).slice(0, INDEX_LIMIT_PER_KIND);
-  return [...sortAndLimit(imageHits), ...sortAndLimit(documentHits)];
+  const hits = [...sortAndLimit(imageHits), ...sortAndLimit(documentHits)];
+  finalSortMs = performance.now() - finalSortStartedAt;
+  return { hits, diagnostics: diagnostics(candidates.length, partitionCount) };
 }
 
 async function applyUpsert(message: WorkerMessage) {
@@ -466,8 +548,13 @@ async function handle(message: WorkerMessage) {
     return;
   }
   if (message.type === "search") {
-    const hits = await search(message);
-    parentPort?.postMessage({ type: "reply", requestId: message.requestId, hits });
+    const result = await search(message);
+    parentPort?.postMessage({
+      type: "reply",
+      requestId: message.requestId,
+      hits: result.hits,
+      diagnostics: result.diagnostics,
+    });
     return;
   }
   if (message.type === "flush") {

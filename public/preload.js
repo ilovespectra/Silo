@@ -148,8 +148,6 @@ contextBridge.exposeInMainWorld("electron", {
     ),
   getPhotoIndicators: (filePaths) =>
     ipcRenderer.invoke("get-photo-indicators", filePaths),
-  getThumbnailPregenProgress: () =>
-    ipcRenderer.invoke("get-thumbnail-pregen-progress"),
   getIndexingOverview: () => ipcRenderer.invoke("get-indexing-overview"),
   getLibraryDashboard: () => ipcRenderer.invoke("get-library-dashboard"),
   refreshLibraryStats: () => ipcRenderer.invoke("refresh-library-stats"),
@@ -162,12 +160,6 @@ contextBridge.exposeInMainWorld("electron", {
   exportRuntimeDiagnostics: (format) => ipcRenderer.invoke("export-runtime-diagnostics", format),
   retryIndexingStage: (id) => ipcRenderer.invoke("retry-indexing-stage", id),
   pauseIndexingStage: (id) => ipcRenderer.invoke("pause-indexing-stage", id),
-  onThumbnailPregenProgress: (callback) => {
-    const listener = (_event, progress) => callback(progress);
-    ipcRenderer.on("thumbnail-pregen-progress", listener);
-    return () =>
-      ipcRenderer.removeListener("thumbnail-pregen-progress", listener);
-  },
   onPhotoIndicatorsChanged: (callback) => {
     const listener = () => callback();
     ipcRenderer.on("photo-indicators-changed", listener);

@@ -78,8 +78,8 @@ module.exports = {
   },
   dmg: {
     title: packageJson.build.productName,
-    // With a background, dmg-builder derives Finder window size from image pixels.
-    // Keep the art 720x500 at 72 DPI for the intended compact installer layout.
+    // Keep a 2x Retina background while preserving the intended 720x500 point
+    // Finder window; the former 1x bitmap blurred on Retina displays.
     background: 'public/dmg-background.png',
     window: { width: 720, height: 500 },
     contents: [

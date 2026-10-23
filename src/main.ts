@@ -58,7 +58,6 @@ import { GoogleManager, loadGoogleEnv, type CloudFileInfo } from "./googleManage
 import { MessageExportCoordinator } from "./messageExportCoordinator";
 import { ContactManager } from "./contactManager";
 import { GeoIndexer, type GeoPhoto } from "./geoIndexer";
-import { ThumbnailPregenerator } from "./thumbnailPregenerator";
 import { AudioLibraryCache, CachedAudioFile, CachedMemoryAudioMetadata } from "./audioLibraryCache";
 import { LibraryStatsManager } from "./libraryStats";
 import { InventoryFingerprint } from "./inventoryFingerprint";
@@ -2888,7 +2887,6 @@ let googleManager: GoogleManager;
 let messageExportCoordinator: MessageExportCoordinator;
 let contactManager: ContactManager;
 let geoIndexer: GeoIndexer;
-let thumbnailPregenerator: ThumbnailPregenerator | null = null;
 let audioLibraryCache: AudioLibraryCache | null = null;
 let indexerGovernor!: IndexerGovernor;
 let previousGovernorCpuSample: ReturnType<typeof os.cpus> | null = null;
@@ -4100,9 +4098,9 @@ async function refreshMemoryTopicsAfterIndexing(): Promise<void> {
   const result = await getMemoryTopicProfile().refresh();
   runtimeLog("memory-topic-profile", { ...result, sampled: memoryTopicProfile?.getSnapshot()?.sampledPhotos ?? 0 });
   if (!result.changed || !memoryManager) return;
-  const state = await memoryManager.refreshForProfileChange();
-  // Previews render only once indexing is quiet; the next notification retries otherwise.
-  if (!memoryProfileBusy()) await prepareAllMemoryPreviews(state.suggestions);
+  // Updating saved cards must not launch a batch of FFmpeg renders in the background.
+  // The Memories view prepares previews when Jacqueline actually opens it.
+  await memoryManager.refreshForProfileChange();
 }
 let memoryPhotoPromptVectors: Promise<{
   nonPhoto: Float32Array[];
@@ -4592,7 +4590,6 @@ async function prepareAllMemoryPreviews(
   visible: MemorySuggestion[],
   logGeneratorSummary = false,
 ): Promise<void> {
-  const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
   const visibleTask = prepareMemoryPreviews(visible);
   if (logGeneratorSummary) {
     void visibleTask.then(async () => {
@@ -4613,8 +4610,6 @@ async function prepareAllMemoryPreviews(
   } else {
     void visibleTask.catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
   }
-  if (reserve.length)
-    void prepareMemoryPreviews(reserve).catch((error) => runtimeLog("memory-reserve-preview-error", memoryErrorDetails(error)));
 }
 
 let memoryPreviewEmitTimer: NodeJS.Timeout | null = null;
@@ -4844,11 +4839,9 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
     memoryExportScratch = null;
   }
 }
-let thumbnailPregenTimer: NodeJS.Timeout | null = null;
 const phoneBackupHolds = new Map<string, string>();
 const phoneBackupLastStatus = new Map<string, string>();
 let phoneManagerBackupDestination: string | null = null;
-let thumbnailPregenDirty = true;
 let startupIndexReconciliationSettled = false;
 let indexRecovery: IndexingRecovery | null = null;
 let indexRecoveryTimer: NodeJS.Timeout | null = null;
@@ -4879,7 +4872,6 @@ const ALL_INDEX_RECOVERY_STAGES = [
   "faces",
   "locations",
   "duplicates",
-  "thumbnails",
   "audio",
   "quality",
 ];
@@ -5068,7 +5060,6 @@ function requestSourceProcessingStages(sourcePaths: string[]) {
     "faces",
     "locations",
     "duplicates",
-    "thumbnails",
     "audio",
     "quality",
   ];
@@ -5089,21 +5080,6 @@ const PIPELINE_BUSY_STATUSES = new Set([
   "loading-model",
   "indexing",
 ]);
-
-// Runs only once CLIP, face clustering, and location indexing have all settled.
-function scheduleThumbnailPregeneration(markDirty = false) {
-  if (markDirty) thumbnailPregenDirty = true;
-  if (!thumbnailPregenerator) return;
-  if (thumbnailPregenTimer) clearTimeout(thumbnailPregenTimer);
-  thumbnailPregenTimer = setTimeout(() => {
-    thumbnailPregenTimer = null;
-    if (!thumbnailPregenerator || !thumbnailPregenDirty) return;
-    const waitMessage = getThumbnailIndexingWaitMessage();
-    if (waitMessage) return thumbnailPregenerator.setWaiting(waitMessage);
-    thumbnailPregenDirty = false;
-    requestIndexRecoveryStages(["thumbnails"]);
-  }, 5000);
-}
 
 function getThumbnailIndexingWaitMessage(): string | null {
   if (indexStorageUnavailableMessage) return indexStorageUnavailableMessage;
@@ -5195,7 +5171,6 @@ function registerMediaProtocols() {
       return new Response("Not found", { status: 404 });
     }
   });
-  const thumbnailDirectory = indexStoragePath("thumbnail-cache");
   protocol.handle("thumb", async (request) => {
     const fileName = new URL(request.url).pathname.slice(1);
     // Only content-hash names from getThumbnail are servable; blocks path traversal.
@@ -5203,7 +5178,7 @@ function registerMediaProtocols() {
       return new Response("Not found", { status: 404 });
     try {
       const data = await fsPromises.readFile(
-        path.join(thumbnailDirectory, fileName),
+        indexStoragePath("thumbnail-cache", fileName),
       );
       return new Response(data, {
         headers: {
@@ -5291,15 +5266,18 @@ const safetyCachePath = () =>
 const thumbnailMemoryCache = new Map<string, string>();
 const MAX_THUMBNAIL_CACHE_SIZE = 2048; // Limit to 2K cached thumbnails in memory
 const MAX_QUEUE_SIZE = 1024; // Limit queue to prevent memory explosion
+const MAX_EXTERNAL_THUMBNAIL_JOBS = 2;
 
 interface ThumbnailJob {
   execute: () => void;
   filePath: string;
+  externalVolume: boolean;
   priority: number;
   queuedAt: number;
 }
 const thumbnailJobs: ThumbnailJob[] = [];
 let activeThumbnailJobs = 0;
+let activeExternalThumbnailJobs = 0;
 const visibleThumbnailPaths = new Set<string>();
 const pendingThumbnails = new Map<string, Promise<string | null>>();
 // Content keys that could not be rendered; skips repeated expensive failures until the file changes.
@@ -5583,7 +5561,6 @@ function discoverPhones(): Promise<void> {
             runtimeLog("phone-source-index-error", { message: String(error) }),
         );
         requestIndexRecoveryStages(["audio"]);
-        scheduleThumbnailPregeneration(true);
       }
 
       if (devicesChanged) invalidateSourceList();
@@ -5650,18 +5627,24 @@ function queueThumbnail<T>(
 
     const isVisible = visibleThumbnailPaths.has(filePath);
     const priority = urgent || isVisible ? 0 : 1000;
+    const externalVolume =
+      process.platform === "darwin" &&
+      (filePath === "/Volumes" || filePath.startsWith("/Volumes/"));
 
     thumbnailJobs.push({
       execute: () => {
         activeThumbnailJobs += 1;
+        if (externalVolume) activeExternalThumbnailJobs += 1;
         void job()
           .then(resolve, reject)
           .finally(() => {
             activeThumbnailJobs -= 1;
+            if (externalVolume) activeExternalThumbnailJobs -= 1;
             runThumbnailJobs();
           });
       },
       filePath,
+      externalVolume,
       priority,
       queuedAt: Date.now(),
     });
@@ -5673,7 +5656,12 @@ function queueThumbnail<T>(
 
 function runThumbnailJobs() {
   while (activeThumbnailJobs < 6 && thumbnailJobs.length > 0) {
-    const job = thumbnailJobs.shift()!;
+    const nextIndex =
+      activeExternalThumbnailJobs >= MAX_EXTERNAL_THUMBNAIL_JOBS
+        ? thumbnailJobs.findIndex((job) => !job.externalVolume)
+        : 0;
+    if (nextIndex < 0) return;
+    const job = thumbnailJobs.splice(nextIndex, 1)[0]!;
     job.execute();
   }
 }
@@ -5898,13 +5886,20 @@ async function getThumbnail(
       `${mimeType.startsWith("video/") ? "video-frame-v1" : `v${THUMBNAIL_CACHE_VERSION}`}:${size}:${filePath}:${stats.size}:${stats.mtimeMs}`,
     )
     .digest("hex");
-  if (force) failedThumbnailKeys.delete(cacheKey);
-  const memoryHit = thumbnailMemoryCache.get(cacheKey);
-  if (memoryHit) return memoryHit;
-  if (failedThumbnailKeys.has(cacheKey)) return null;
-
+  if (force) {
+    failedThumbnailKeys.delete(cacheKey);
+    // A cached thumb:// URL can point to a file that was removed or moved.
+    // Forced renderer retries must evict it so the cache file is regenerated.
+    thumbnailMemoryCache.delete(cacheKey);
+  }
   const cacheDirectory = indexStoragePath("thumbnail-cache");
   const cachePath = path.join(cacheDirectory, `${cacheKey}.jpg`);
+  const memoryHit = thumbnailMemoryCache.get(cacheKey);
+  // Do not stat the cache file for every warm thumbnail request. The thumb
+  // protocol resolves the active cache location when Chromium fetches it; if
+  // that file is gone, the renderer's image-error retry regenerates it.
+  if (memoryHit) return memoryHit;
+  if (failedThumbnailKeys.has(cacheKey)) return null;
 
   try {
     await fsPromises.access(cachePath);
@@ -5944,6 +5939,22 @@ interface FileInfo {
   backupTimestamp?: number;
   siloAlias?: boolean;
   sourceSnapshotAt?: number;
+}
+
+// Overlapping library roots can report the same physical path more than once.
+// Preserve Shelter aliases, which intentionally share a physical path.
+function fileListKey(file: Pick<FileInfo, "path" | "relativePath" | "siloAlias">) {
+  return file.siloAlias ? `${file.path}\u0000${file.relativePath}` : file.path;
+}
+
+function dedupeFileInfos(files: FileInfo[]): FileInfo[] {
+  const seen = new Set<string>();
+  return files.filter((file) => {
+    const key = fileListKey(file);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 type SourceClonePhase =
@@ -7480,17 +7491,24 @@ async function readAllSources(
   }
 
   const results = new Array<FileInfo[]>(enabled.length);
-  const scannedBySource = new Array<number>(enabled.length).fill(0);
-  const audioBySource = new Array<number>(enabled.length).fill(0);
-  const reportedFiles = new Map<string, string>();
+  const reportedFileKeys = new Set<string>();
+  const audioFileKeys = new Set<string>();
   let nextSource = 0;
   let scanErrors = 0;
   const report = (delta: FileInfo[] = []) => {
+    const fresh: FileInfo[] = [];
+    for (const file of delta) {
+      const key = fileListKey(file);
+      if (file.type === "audio") audioFileKeys.add(key);
+      if (reportedFileKeys.has(key)) continue;
+      reportedFileKeys.add(key);
+      fresh.push(file);
+    }
     onProgress?.(
-      delta,
-      scannedBySource.reduce((sum, count) => sum + count, 0),
+      fresh,
+      reportedFileKeys.size,
       0, // A recursive scan cannot know the final total until each source completes.
-      audioBySource.reduce((sum, count) => sum + count, 0),
+      audioFileKeys.size,
       scanErrors,
     );
   };
@@ -7503,29 +7521,10 @@ async function readAllSources(
         results[sourceIndex] = await readSourceFiles(
           source,
           true,
-          (sourceDeltas, sourceScanned, sourceAudio) => {
-            scannedBySource[sourceIndex] = sourceScanned;
-            audioBySource[sourceIndex] = sourceAudio;
-            const fresh = sourceDeltas.filter((file) => {
-              const signature = JSON.stringify(file);
-              if (reportedFiles.get(file.path) === signature) return false;
-              reportedFiles.set(file.path, signature);
-              return true;
-            });
-            report(fresh);
-          },
+          (sourceDeltas) => report(sourceDeltas),
         );
-        scannedBySource[sourceIndex] = results[sourceIndex].length;
-        audioBySource[sourceIndex] = results[sourceIndex].filter(
-          (file) => file.type === "audio",
-        ).length;
-        const finalDeltas = results[sourceIndex].filter((file) => {
-          const signature = JSON.stringify(file);
-          if (reportedFiles.get(file.path) === signature) return false;
-          reportedFiles.set(file.path, signature);
-          return true;
-        });
-        report(finalDeltas);
+        // Include any final items that a provider did not report incrementally.
+        report(results[sourceIndex]);
       } catch (error) {
         results[sourceIndex] = [];
         scanErrors += 1;
@@ -7541,7 +7540,7 @@ async function readAllSources(
   // Keep recursive discovery on one source at a time so large libraries do
   // not saturate the disk and CPU while Silo is opening or searching.
   await scanWorker();
-  return results.flat();
+  return dedupeFileInfos(results.flat());
 }
 
 function isRemotePath(candidate: string): boolean {
@@ -10012,7 +10011,7 @@ async function indexNewSources(sourcePaths: string[], reason: string) {
   runtimeLog("auto-index-new-sources", { reason, sources: added });
   queueSemanticIndexWork(
     { fullScanRoots: added },
-    ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+    ["faces", "locations", "duplicates", "audio", "quality"],
   );
 }
 
@@ -10086,6 +10085,12 @@ async function createUnifiedScanSource() {
     };
     const isSiloPrivatePath = (candidatePath: string) =>
       isSiloAppData(candidatePath) || isSiloIndexData(candidatePath);
+    const isPathDisappearance = (error: unknown) =>
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT";
+    const externalVolume =
+      process.platform === "darwin" &&
+      (sourcePath === "/Volumes" || sourcePath.startsWith("/Volumes/"));
     // A user may add a broad parent such as Home or an external volume. Never
     // treat Silo's private storage as source material; phone snapshots remain
     // indexable via the virtual /__phone__ scanner above.
@@ -10112,8 +10117,14 @@ async function createUnifiedScanSource() {
       const directoryPath = pendingDirectories[nextPendingDirectory++];
       if (isMacDataVolumePathExcluded(directoryPath, sourcePath)) continue;
       if (machineDevice !== null) {
-        const directoryStats = await fsPromises.stat(directoryPath).catch(() => null);
-        if (!directoryStats || directoryStats.dev !== machineDevice) continue;
+        let directoryStats;
+        try {
+          directoryStats = await fsPromises.stat(directoryPath);
+        } catch (error) {
+          if (isPathDisappearance(error)) continue;
+          throw error;
+        }
+        if (directoryStats.dev !== machineDevice) continue;
       }
       if (isSiloPrivatePath(directoryPath)) continue;
       if (await isSiloCloneDirectory(directoryPath)) continue;
@@ -10123,14 +10134,24 @@ async function createUnifiedScanSource() {
         entries = await fsPromises.readdir(directoryPath, {
           withFileTypes: true,
         });
-      } catch {
-        continue;
+      } catch (error) {
+        // An incomplete scan must fail reconciliation; treating an unreadable
+        // folder as empty can retire valid paths from the saved index.
+        if (isPathDisappearance(error)) continue;
+        throw error;
       }
 
-      const ENTRY_BATCH_SIZE = 32;
+      // External volumes use smaller metadata bursts to reduce seek and
+      // temperature pressure while leaving the existing search-yield points.
+      const ENTRY_BATCH_SIZE = externalVolume ? 4 : 32;
       for (let offset = 0; offset < entries.length; offset += ENTRY_BATCH_SIZE) {
         if (isCancelled()) return;
         if (!(await waitForSearchIdle())) return;
+        const entryBatchStartedAt = performance.now();
+        const releaseExternalScanLane =
+          externalVolume && indexerGovernor
+            ? indexerGovernor.enterLane("external-scan")
+            : null;
         const entryResults = await Promise.all(
           entries.slice(offset, offset + ENTRY_BATCH_SIZE).map(async (entry) => {
           if (timeMachine && shouldSkipTimeMachineEntry(entry.name))
@@ -10144,9 +10165,19 @@ async function createUnifiedScanSource() {
             let stats;
             try {
               stats = await fsPromises.stat(fullPath);
-            } catch {
-              if (!timeMachine) throw new Error("stat failed");
-              stats = await fsPromises.lstat(fullPath);
+            } catch (error) {
+              if (timeMachine) {
+                try {
+                  stats = await fsPromises.lstat(fullPath);
+                } catch (fallbackError) {
+                  if (isPathDisappearance(fallbackError)) return null;
+                  throw fallbackError;
+                }
+              } else if (isPathDisappearance(error)) {
+                return null;
+              } else {
+                throw error;
+              }
             }
             if (machineDevice !== null && stats.dev !== machineDevice) return null;
 
@@ -10174,11 +10205,12 @@ async function createUnifiedScanSource() {
               },
               directoryPath: isDirectory ? fullPath : null,
             };
-          } catch {
-            return null;
+          } catch (error) {
+            if (isPathDisappearance(error)) return null;
+            throw error;
           }
           }),
-        );
+        ).finally(() => releaseExternalScanLane?.());
 
         for (const result of entryResults) {
           if (isCancelled()) return;
@@ -10218,6 +10250,21 @@ async function createUnifiedScanSource() {
             await new Promise<void>((resolve) => setImmediate(resolve));
             discoveryCpuBaseline = process.cpuUsage();
             entriesSinceCooldown = 0;
+          }
+        }
+        if (externalVolume && !isCancelled() && indexerGovernor) {
+          // CPU-time budgeting misses slow metadata reads on external disks.
+          // Pace by elapsed batch time and cap this background lane at 5% duty.
+          const releaseExternalScanLane = indexerGovernor.enterLane("external-scan");
+          try {
+            await indexerGovernor.paceAfterWork(
+              Math.max(20, performance.now() - entryBatchStartedAt),
+              shouldPauseForSearch,
+              isCancelled,
+              5,
+            );
+          } finally {
+            releaseExternalScanLane();
           }
         }
       }
@@ -10447,7 +10494,6 @@ function indexStorageWritersBusy() {
     (geoIndexer && isBusyIndexStatus(geoIndexer.getStatus().status)) ||
     (duplicateManager && duplicateManager.getState().status === "scanning") ||
     audioInventoryRunning ||
-    (thumbnailPregenerator && ["scanning", "generating"].includes(thumbnailPregenerator.getProgress().status)) ||
     magicLibraryProgress.running ||
     activeIndexStorageCacheWrites > 0 ||
     Boolean(libraryStatsManager?.getSnapshot().running)
@@ -11132,8 +11178,6 @@ app.whenReady().then(async () => {
       // Progress is emitted for every indexed item. The topic profile only needs
       // the stage edges; per-item notifications just keep resetting its timer.
       if (statusChanged) memoryProfileScheduler?.notify();
-      if (statusChanged)
-        scheduleThumbnailPregeneration(progress.status === "indexing");
     },
     logIndexingDiagnostic,
     cacheDestinationRoot("semantic-index"),
@@ -11321,8 +11365,6 @@ app.whenReady().then(async () => {
       sendFaceIndexProgress(progress);
       const statusChanged = progress.status !== lastFaceProgressStatus;
       lastFaceProgressStatus = progress.status;
-      if (statusChanged)
-        scheduleThumbnailPregeneration(progress.status === "indexing");
     },
     cacheDestinationRoot("face-index"),
     contentSettingsStore.getSearchPerformanceSnapshot().settings
@@ -11559,7 +11601,6 @@ app.whenReady().then(async () => {
   geoIndexer = new GeoIndexer(app.getPath("userData"), (state) => {
     // Progress events carry counts only; the renderer fetches photos when photosVersion changes.
     sendToRenderer("geo-index-progress", state);
-    scheduleThumbnailPregeneration();
   }, cacheDestinationRoot("geo-index.jsonl"));
   const geoLoad = indexStorageInitializationDeferred
     ? Promise.resolve()
@@ -11724,63 +11765,6 @@ app.whenReady().then(async () => {
   geoIndexer.setInferenceWindowMinutes(
     stateStore.getState().borrowedLocationWindowMinutes,
   );
-  thumbnailPregenerator = new ThumbnailPregenerator({
-    getSourceRoots: getAllIndexSources,
-    isMedia: (fileName) => {
-      const type = mime.getType(fileName);
-      return Boolean(
-        type && (type.startsWith("image/") || type.startsWith("video/")),
-      );
-    },
-    isRemotePath,
-    listRemoteMediaFiles: async (root) => {
-      const source = (await listSources()).find(
-        (candidate) => candidate.rootPath === root && candidate.available,
-      );
-      if (!source) return [];
-      try {
-        const files = await readSourceFiles(source, true);
-        return files
-          .filter(
-            (file) =>
-              !file.isDirectory &&
-              mime.getType(file.name)?.match(/^(image|video)\//),
-          )
-          .map((file) => file.path);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (
-          source.kind === "gdrive" &&
-          /403|forbidden|permission/i.test(message)
-        ) {
-          runtimeLog("thumbnail-pregen-source-skipped", {
-            sourceKind: source.kind,
-            sourceLabel: source.label,
-            message,
-          });
-          return [];
-        }
-        throw error;
-      }
-    },
-    generate: async (filePath) =>
-      Boolean(
-        await queueThumbnail(
-          filePath,
-          async () =>
-            await getThumbnail(
-              await resolveLocalPath(filePath),
-              false,
-              GRID_THUMBNAIL_SIZE,
-            ),
-        ),
-      ),
-    isInteractiveBusy: () => thumbnailJobs.length > 0,
-    getIndexingWaitMessage: getThumbnailIndexingWaitMessage,
-    onProgress: (progress) =>
-      sendToRenderer("thumbnail-pregen-progress", progress),
-  });
-  scheduleThumbnailPregeneration();
   memoryManager = new MemoryManager(app.getPath("userData"), {
     search: searchMemoryMedia,
     searchPrompted: searchPromptedMemoryMedia,
@@ -11814,12 +11798,11 @@ app.whenReady().then(async () => {
   });
   // Coverage and cooldowns are persisted per source. Recheck all available sources
   resolveServicesReady();
-  // Warm saved memory movies in the background while indexing starts; popup/page
-  // reads join the preview queue instead of racing or failing with a busy error.
-  void memoryManager.getState()
-    .then((state) => prepareAllMemoryPreviews(state.suggestions))
-    .catch((error) => runtimeLog("memory-preview-warmup-error", memoryAudioErrorDetails(error)));
-  scheduleAutomaticMemories();
+  // Do not render saved Memory movies during startup. The Memories page queues
+  // visible previews on demand, keeping startup and external-drive reads quiet.
+  void scheduleAutomaticMemories().catch((error) =>
+    runtimeLog("memory-auto-schedule-error", memoryErrorDetails(error)),
+  );
   // even when the audio screen is closed, and retry failures once due.
   audioInventoryRetryTimer = setInterval(
     () => requestIndexRecoveryStages(["audio"]),
@@ -11865,7 +11848,7 @@ app.whenReady().then(async () => {
             lifetimeFullScanPending = false;
             queueSemanticIndexWork(
               { fullScanAll: true, force: true },
-              ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+              ["faces", "locations", "duplicates", "audio", "quality"],
             );
           } else if (!pausedByUser) {
             queueSemanticIndexWork(
@@ -11879,12 +11862,11 @@ app.whenReady().then(async () => {
                   ...semanticIndexer.getRetryableFiles(sources),
                 ]),
               },
-              ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+              ["faces", "locations", "duplicates", "audio", "quality"],
             );
           }
         } finally {
           startupIndexReconciliationSettled = true;
-          scheduleThumbnailPregeneration(true);
         }
       })().catch((error) =>
         runtimeLog("startup-index-reconcile-error", { message: String(error) }),
@@ -11892,7 +11874,6 @@ app.whenReady().then(async () => {
     }, 5000);
   } else {
     startupIndexReconciliationSettled = true;
-    scheduleThumbnailPregeneration(true);
   }
   const indexingCpuCount = Math.max(1, os.cpus().length);
   const indexingMemoryGiB = os.totalmem() / 1024 ** 3;
@@ -11970,10 +11951,7 @@ app.whenReady().then(async () => {
     !PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status) &&
     !magicLibraryProgress.running;
   const diskIdle = () =>
-    duplicateManager.getState().status !== "scanning" &&
-    !["scanning", "generating"].includes(
-      thumbnailPregenerator?.getProgress().status ?? "idle",
-    );
+    duplicateManager.getState().status !== "scanning";
   indexRecovery = new IndexingRecovery([
     {
       id: "semantic-runtime",
@@ -12224,38 +12202,6 @@ app.whenReady().then(async () => {
       pause: () => duplicateManager.pause(),
     },
     {
-      id: "thumbnails",
-      lane: indexingDiskLane,
-      blockedReason: () =>
-        getThumbnailIndexingWaitMessage() ||
-        "Thumbnail generation is already active.",
-      needsInitialCheck: true,
-      progress: () =>
-        thumbnailPregenerator?.getProgress() ?? {
-          status: "idle",
-          message: "Waiting for services",
-        },
-      ready: () =>
-        indexStorageAvailable &&
-        Boolean(thumbnailPregenerator) &&
-        !getThumbnailIndexingWaitMessage() &&
-        duplicateManager.getState().status !== "scanning" &&
-        !["scanning", "generating"].includes(
-          thumbnailPregenerator?.getProgress().status ?? "idle",
-        ),
-      unresolvedWork: () => {
-        const failed = thumbnailPregenerator?.getProgress().failed ?? 0;
-        return failed
-          ? `${failed.toLocaleString()} thumbnails could not be generated and will be retried.`
-          : null;
-      },
-      start: async () => {
-        thumbnailPregenDirty = false;
-        await thumbnailPregenerator?.start();
-      },
-      pause: () => thumbnailPregenerator?.pause(),
-    },
-    {
       id: "audio",
       // Audio discovery starts independently of semantic indexing, including
       // on startup, and uses a throttled, separately scheduled disk walk.
@@ -12460,7 +12406,6 @@ app.on("before-quit", (event) => {
       faceIndexer?.pause(),
       geoIndexer?.pause(),
       duplicateManager?.pause(),
-      thumbnailPregenerator?.pause(),
       libraryStatsManager?.cancelAndWait(),
       audioLibraryCache?.waitForIdle(),
       phoneManager?.unmountAll(),
@@ -12537,9 +12482,14 @@ app.on("activate", () => {
 
 const AUTO_MEMORY_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const AUTO_MEMORY_POLL_MS = 60 * 1000;
+const AUTO_MEMORY_MIN_IDLE_SECONDS = 5 * 60;
+const AUTO_MEMORY_STATE_PATH = () =>
+  path.join(app.getPath("userData"), "memories", "automatic-run.json");
 let lastAutoMemoryRunAt = 0;
 let autoMemoryTimer: NodeJS.Timeout | null = null;
 let autoMemoryStartupTimer: NodeJS.Timeout | null = null;
+let autoMemorySchedulerInitializing = false;
+let lastAutoMemoryWaitReason = "";
 
 /** Tops up the editable memories (never retires them) and pushes the new state to the page. */
 /** Stories retired by Generate before their movie finished; listed in the Memory Book until it does. */
@@ -12609,24 +12559,79 @@ async function runMemoryGenerator(reason: string, replace = false) {
       card.soundtrackId?.startsWith("library:"),
     ).length,
   });
-  if (state.suggestions.length)
+  if (reason === "on-demand" && state.suggestions.length)
     void prepareAllMemoryPreviews(state.suggestions, true).catch((error) => runtimeLog("memory-preview-error", memoryAudioErrorDetails(error)));
   const next = { ...(await memoryStateWithPreviews()), message: state.message };
   sendToRenderer("memories-changed", next);
   return next;
 }
 
-/** Generates once after startup indexing settles, then every 24 hours while running. */
-function scheduleAutomaticMemories() {
-  if (autoMemoryTimer || shuttingDown) return;
+async function readLastAutomaticMemoryRunAt(): Promise<number> {
+  try {
+    const raw = JSON.parse(await fsPromises.readFile(AUTO_MEMORY_STATE_PATH(), "utf8"));
+    const timestamp = raw?.lastRunAt;
+    return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0
+      ? timestamp
+      : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function persistLastAutomaticMemoryRunAt(timestamp: number): Promise<void> {
+  const filePath = AUTO_MEMORY_STATE_PATH();
+  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.tmp`;
+  await fsPromises.writeFile(
+    temporaryPath,
+    JSON.stringify({ version: 1, lastRunAt: timestamp }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+  await fsPromises.rename(temporaryPath, filePath);
+}
+
+function getAutomaticMemoryWaitReason(): string | null {
+  const signals = readIndexerGovernorSignals();
+  if ((signals.idleSeconds ?? 0) < AUTO_MEMORY_MIN_IDLE_SECONDS)
+    return "system-not-idle";
+  if (signals.thermalState !== "nominal")
+    return `thermal-${signals.thermalState ?? "unknown"}`;
+  if (signals.onBattery) return "on-battery";
+  if ((signals.cpuUtilization ?? 1) >= 0.45) return "cpu-busy";
+  if ((signals.busiestCoreUtilization ?? 1) >= 0.65)
+    return "foreground-core-busy";
+  if ((signals.freeMemoryRatio ?? 0) < 0.12) return "low-free-memory";
+  return null;
+}
+
+/** Runs at most daily, only after indexing settles and the machine stays cool and idle. */
+async function scheduleAutomaticMemories() {
+  if (autoMemoryTimer || autoMemorySchedulerInitializing || shuttingDown) return;
+  autoMemorySchedulerInitializing = true;
+  try {
+    lastAutoMemoryRunAt = await readLastAutomaticMemoryRunAt();
+  } catch (error) {
+    runtimeLog("memory-auto-schedule-state-read-error", memoryErrorDetails(error));
+  } finally {
+    autoMemorySchedulerInitializing = false;
+  }
+  if (shuttingDown) return;
   const tick = () => {
     if (shuttingDown || !memoryManager) return;
     const due = lastAutoMemoryRunAt === 0 || Date.now() - lastAutoMemoryRunAt >= AUTO_MEMORY_INTERVAL_MS;
     if (!due || getThumbnailIndexingWaitMessage() !== null || autoMemoryMusicPreflightRunning) return;
+    const waitReason = getAutomaticMemoryWaitReason();
+    if (waitReason) {
+      if (waitReason !== lastAutoMemoryWaitReason)
+        runtimeLog("memory-auto-generate-deferred", { reason: waitReason });
+      lastAutoMemoryWaitReason = waitReason;
+      return;
+    }
+    lastAutoMemoryWaitReason = "";
     const reason = lastAutoMemoryRunAt === 0 ? "startup" : "scheduled";
     autoMemoryMusicPreflightRunning = true;
     void getMemoryMusicAvailability()
-      .then((availability) => {
+      .then(async (availability) => {
         runtimeLog("memory-auto-music-preflight", {
           reason,
           available: availability.available,
@@ -12641,6 +12646,9 @@ function scheduleAutomaticMemories() {
           return;
         }
         lastAutoMemoryRunAt = Date.now();
+        await persistLastAutomaticMemoryRunAt(lastAutoMemoryRunAt).catch((error) =>
+          runtimeLog("memory-auto-schedule-state-write-error", memoryErrorDetails(error)),
+        );
         return runMemoryGenerator(reason).catch((error) =>
           runtimeLog("memory-auto-generate-error", memoryAudioErrorDetails(error)),
         );
@@ -13688,7 +13696,7 @@ ipcMain.handle(
       const sourcesBySpecificity = [...availableSources].sort(
         (first, second) => second.rootPath.length - first.rootPath.length,
       );
-      const indexed = filterForContentSafety(
+      const indexed = dedupeFileInfos(filterForContentSafety(
         semanticIndexer
           .getIndexedFiles(enabledPaths)
           .filter(
@@ -13709,7 +13717,7 @@ ipcMain.handle(
               sourceLabel: source?.label,
             };
           }),
-      );
+      ));
       const preview = indexed.slice(0, 500);
       preview.sort((first, second) => {
         const direction = scanOptions?.sortAscending === false ? -1 : 1;
@@ -14465,8 +14473,8 @@ ipcMain.handle(
     if (!remote && !path.isAbsolute(filePath)) return null;
     const pendingKey = `${filePath}:${thumbnailSize}`;
     const pending = pendingThumbnails.get(pendingKey);
-    if (pending && !force) {
-      if (urgent) {
+    if (pending) {
+      if (urgent || force) {
         for (const job of thumbnailJobs)
           if (job.filePath === filePath) job.priority = 0;
         sortThumbnailJobs();
@@ -14480,17 +14488,13 @@ ipcMain.handle(
         () => getThumbnail(localPath, force === true, thumbnailSize),
         urgent === true || force === true,
       );
-    })()
-      .catch(() => null)
-      .finally(() => pendingThumbnails.delete(pendingKey));
+    })().catch(() => null);
     pendingThumbnails.set(pendingKey, request);
-    return request;
+    return request.finally(() => {
+      if (pendingThumbnails.get(pendingKey) === request)
+        pendingThumbnails.delete(pendingKey);
+    });
   },
-);
-
-ipcMain.handle(
-  "get-thumbnail-pregen-progress",
-  () => thumbnailPregenerator?.getProgress() ?? null,
 );
 
 ipcMain.on("update-visible-thumbnails", (_event, visiblePaths: string[]) => {
@@ -15207,7 +15211,7 @@ ipcMain.handle("start-indexing", async () => {
     fullAccessEnabled()
       ? { fullScanRoots: sources, force: true }
       : { fullScanAll: true, force: true },
-    ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+    ["faces", "locations", "duplicates", "audio", "quality"],
   );
   return semanticIndexer.getProgress();
 });
@@ -16369,7 +16373,6 @@ ipcMain.handle("get-indexing-overview", async () => {
   const face = faceIndexer.getProgress();
   const geo = geoIndexer.getStatus();
   const duplicates = duplicateManager.getState();
-  const thumbnails = thumbnailPregenerator?.getProgress();
   const audio = audioLibraryCache?.getSnapshot();
   const coveredAudioSources =
     audio?.sourceIds.filter(
@@ -16551,16 +16554,6 @@ ipcMain.handle("get-indexing-overview", async () => {
       total: magicLibraryProgress.total,
       unit: "photos",
       message: "Local photographic quality analysis",
-    },
-    {
-      id: "thumbnails",
-      label: "Thumbnails",
-      status: thumbnails?.status ?? "idle",
-      processed: thumbnails?.processed ?? 0,
-      total: thumbnails?.total ?? 0,
-      unit: "files",
-      errors: thumbnails?.failed ?? 0,
-      message: thumbnails?.message ?? "Waiting to start",
     },
   ].concat(phoneBackupStages).map((stage) => ({
     ...stage,

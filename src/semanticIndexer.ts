@@ -15,7 +15,12 @@ import {
   isWithinSiloClone,
 } from "./indexingPathPolicy";
 import { formatDemoFileSample, selectDemoFilePaths } from "./demoLimits";
-import { PersistedVectorIndex, VectorSearchGroup, VectorSearchKind } from "./persistedVectorIndex";
+import {
+  PersistedVectorIndex,
+  VectorSearchDiagnostics,
+  VectorSearchGroup,
+  VectorSearchKind,
+} from "./persistedVectorIndex";
 import { ChildProcess, execFile, fork } from "child_process";
 import { promisify } from "util";
 import { getIndexStorageExclusionRevision } from "./indexingStorage";
@@ -34,7 +39,7 @@ class UnreadableImageError extends Error {
 
 // Decoder verdicts about the file itself; retrying an unchanged file repeats them.
 const PERMANENT_IMAGE_FAILURE =
-  /unsupported image format|could not be read as an image|corrupt|premature end|bad seek|invalid (?:marker|image|dimensions)|exceeds the 100 million pixel|not a (?:valid )?(?:jpeg|png|tiff|gif|webp)|vipsjpeg|vipspng|heif: |unable to decode/i;
+  /unsupported image format|could not be read as an image|corrupt|premature end|bad seek|invalid (?:marker|image|dimensions)|exceeds(?: the 100 million)? pixels?(?: limit)?|not a (?:valid )?(?:jpeg|png|tiff|gif|webp)|vipsjpeg|vipspng|heif: |unable to decode/i;
 
 export function isPermanentImageFailure(message: string | undefined): boolean {
   return Boolean(message && PERMANENT_IMAGE_FAILURE.test(message));
@@ -2392,6 +2397,7 @@ export class SemanticIndexer {
       0,
     );
     let hits: Array<{ key: number; confidence: number }>;
+    let annDiagnostics: VectorSearchDiagnostics | undefined;
     let searchMode: "ann" | "exact" = "exact";
     const retrievalStartedAt = Date.now();
     if (this.vectorIndexFailed || include) {
@@ -2406,12 +2412,14 @@ export class SemanticIndexer {
       searchMode = "ann";
       onSearchProgress?.([], 0, indexedRecordCount, "ann");
       try {
-        hits = await this.persistedVectorIndex.search(
+        const annResponse = await this.persistedVectorIndex.search(
           sourcePaths,
           searchEmbeddings.image,
           searchEmbeddings.document,
           SEARCH_RESULTS_PER_TYPE,
         );
+        hits = annResponse.hits;
+        annDiagnostics = annResponse.diagnostics;
       } catch (error) {
         if (isCancelled()) return [];
         searchMode = "exact";
@@ -2473,6 +2481,7 @@ export class SemanticIndexer {
           mode: searchMode,
           annReady: this.vectorIndexReadyState,
           annFailed: this.vectorIndexFailed,
+          ...(annDiagnostics ? { ann: annDiagnostics } : {}),
         });
     }
     return isCancelled() ? [] : results;

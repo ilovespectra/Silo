@@ -1,6 +1,6 @@
 import * as os from "os";
 
-export type IndexerLane = "audio" | "face";
+export type IndexerLane = "audio" | "face" | "thumbnail" | "external-scan";
 export type ThermalState = "nominal" | "fair" | "serious" | "critical" | "unknown";
 
 export interface IndexerMachineProfile {
@@ -71,7 +71,7 @@ export function getIndexerGovernorProfile(
 const clamp = (value: number, minimum: number, maximum: number) =>
   Math.max(minimum, Math.min(maximum, value));
 
-/** One process-wide budget shared by audio inventory and face analysis. */
+/** One process-wide budget shared by background indexing and external scans. */
 export class IndexerGovernor {
   private userPaceLimitPercent: number;
   private readonly activeLanes = new Map<IndexerLane, number>();
@@ -142,6 +142,7 @@ export class IndexerGovernor {
     workMs: number,
     shouldYield: () => boolean,
     shouldStop: () => boolean = () => false,
+    maximumDutyPercent?: number,
   ) {
     let waitedMs = 0;
     while (!shouldStop()) {
@@ -154,7 +155,13 @@ export class IndexerGovernor {
         await new Promise<void>((resolve) => setTimeout(resolve, 500));
         continue;
       }
-      const dutyPercent = this.getTargetDutyPercent(signals);
+      const dutyCeiling = Number.isFinite(maximumDutyPercent)
+        ? clamp(maximumDutyPercent as number, this.profile.minimumDutyPercent, 100)
+        : 100;
+      const dutyPercent = Math.min(
+        this.getTargetDutyPercent(signals),
+        dutyCeiling,
+      );
       if (dutyPercent <= 0) {
         await new Promise<void>((resolve) => setTimeout(resolve, 250));
         continue;

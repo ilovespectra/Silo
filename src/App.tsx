@@ -81,6 +81,7 @@ import {
   GRID_THUMBNAIL_SIZE,
   LRUCache,
   loadThumbnail,
+  refreshThumbnail,
   thumbnailCache,
   thumbnailCacheKey,
 } from "./utils/thumbnailCache";
@@ -491,6 +492,11 @@ function FileThumbnail({
 }) {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [thumbnailVisible, setThumbnailVisible] = useState(false);
+  const [thumbnailRetry, setThumbnailRetry] = useState<{
+    key: string;
+    url: string;
+  } | null>(null);
+  const [thumbnailFailedKey, setThumbnailFailedKey] = useState<string | null>(null);
   const isPreviewable = file.type === "image" || file.type === "video";
   const indicators = usePhotoIndicator(file.path, isPreviewable);
   const { thumbnail } = useThumbnail(
@@ -518,6 +524,28 @@ function FileThumbnail({
     if (thumbnail) onThumbnailLoaded?.(file.path, file);
   }, [file.path, onThumbnailLoaded, thumbnail]);
 
+  const thumbnailAttemptKey = `${file.path}\u0000${thumbnailSize}\u0000${thumbnail ?? ""}`;
+  const retryThumbnailUrl =
+    thumbnailRetry?.key === thumbnailAttemptKey ? thumbnailRetry.url : null;
+  const thumbnailLoadFailed = thumbnailFailedKey === thumbnailAttemptKey;
+  const recoverThumbnailLoad = () => {
+    if (retryThumbnailUrl) {
+      setThumbnailFailedKey(thumbnailAttemptKey);
+      return;
+    }
+    void refreshThumbnail(file.path, thumbnailSize).then((url) => {
+      if (!url) {
+        setThumbnailFailedKey(thumbnailAttemptKey);
+        return;
+      }
+      // A new URL prevents Chromium from reusing a cached failed image response.
+      setThumbnailRetry({
+        key: thumbnailAttemptKey,
+        url: `${url}?retry=${Date.now()}`,
+      });
+    });
+  };
+
   return (
     <div
       className={`thumbnail-frame ${isPreviewable ? "previewable" : ""} ${file.type === "video" ? "video-thumbnail" : ""}`}
@@ -538,8 +566,12 @@ function FileThumbnail({
         onOpen();
       }}
     >
-      {thumbnail ? (
-        <img src={thumbnail} alt="" />
+      {thumbnail && !thumbnailLoadFailed ? (
+        <img
+          src={retryThumbnailUrl ?? thumbnail}
+          alt=""
+          onError={recoverThumbnailLoad}
+        />
       ) : (
         <div className="thumbnail-placeholder">
           {file.isDirectory ? (
@@ -828,6 +860,9 @@ function App() {
   const [showFilters, setShowFilters] = useState(false);
   const [typeFilterOpen, setTypeFilterOpen] = useState(false);
   const typeFilterRef = useRef<HTMLDivElement>(null);
+  const [yearFilterOpen, setYearFilterOpen] = useState(false);
+  const yearFilterRef = useRef<HTMLDivElement>(null);
+  const yearFilterTriggerRef = useRef<HTMLButtonElement>(null);
   const [yearFilter, setYearFilter] = useState<string[]>([]);
   const [audioYearOptions, setAudioYearOptions] = useState<string[]>([]);
   const [expandedYears, setExpandedYears] = useState<Set<string>>(
@@ -965,12 +1000,6 @@ function App() {
     indexStorageStatus.missingRoots.length > 0;
   const [indexProgress, setIndexProgress] =
     useState<IndexProgress>(emptyIndexProgress);
-  const [thumbnailPregen, setThumbnailPregen] =
-    useState<ThumbnailPregenProgress | null>(null);
-  const [thumbnailPregenDismissed, setThumbnailPregenDismissed] =
-    useState(false);
-  const lastThumbnailPregenStatusRef =
-    useRef<ThumbnailPregenProgress["status"]>("idle");
   const [digitalFolders, setDigitalFolders] = useState<DigitalFolder[]>([]);
   const [mediaPlaylists, setMediaPlaylists] = useState<MediaPlaylist[]>([]);
   const [mediaHostBounds, setMediaHostBounds] = useState<{
@@ -1770,6 +1799,30 @@ function App() {
   }, [typeFilterOpen]);
 
   useEffect(() => {
+    if (!yearFilterOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!yearFilterRef.current?.contains(event.target as Node))
+        setYearFilterOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setYearFilterOpen(false);
+      yearFilterTriggerRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [yearFilterOpen]);
+
+  useEffect(() => {
+    if (!showFilters || headerToolsCollapsed || appSection !== "files")
+      setYearFilterOpen(false);
+  }, [appSection, headerToolsCollapsed, showFilters]);
+
+  useEffect(() => {
     localStorage.setItem("silo.sidebarWidth", String(sidebarWidth));
   }, [sidebarWidth]);
   const activeDigitalFolderIdRef = useRef(activeDigitalFolderId);
@@ -2465,23 +2518,6 @@ function App() {
     loadDirectory,
     needsRecursiveBrowse,
   ]);
-
-  useEffect(() => {
-    if (!electronAPI?.onThumbnailPregenProgress) return;
-    const applyProgress = (progress: ThumbnailPregenProgress | null) => {
-      if (!progress) return;
-      const previous = lastThumbnailPregenStatusRef.current;
-      if (progress.status === "scanning" && previous !== "scanning")
-        setThumbnailPregenDismissed(false);
-      lastThumbnailPregenStatusRef.current = progress.status;
-      setThumbnailPregen(progress);
-    };
-    void electronAPI
-      .getThumbnailPregenProgress()
-      .then(applyProgress)
-      .catch(() => undefined);
-    return electronAPI.onThumbnailPregenProgress(applyProgress);
-  }, [electronAPI]);
 
   useEffect(() => {
     if (!electronAPI?.getIndexStorageStatus || !electronAPI.onIndexStorageStatus)
@@ -5830,7 +5866,11 @@ function App() {
       sort: viewSort,
       yearFilter: viewYearFilter,
     } = deferredBrowseViewInputs;
+    const seenFileKeys = new Set<string>();
     const filtered = viewContentFiles.filter((file) => {
+      const key = fileListKey(file);
+      if (seenFileKeys.has(key)) return false;
+      seenFileKeys.add(key);
       if (file.isDirectory)
         return (
           !viewSearchQuery.trim() &&
@@ -6161,6 +6201,13 @@ function App() {
   }, [allSourcesPath, currentPath, sources]);
 
   const yearSections = useMemo(() => {
+    if (appSection !== "files" || searchQuery.trim())
+      return {
+        allFolders: [] as FileInfo[],
+        folders: [] as FileInfo[],
+        years: [] as string[],
+        byYear: new Map<string, FileInfo[]>(),
+      };
     const allFolders: FileInfo[] = [];
     const byYear = new Map<string, FileInfo[]>();
     const sectionOrder = new Map<string, { year: string; priority: number }>();
@@ -6218,8 +6265,15 @@ function App() {
       );
     });
     return { allFolders, folders, years, byYear };
-  }, [displayLimit, filteredAndSortedFiles, deferredBrowseViewInputs]);
+  }, [
+    appSection,
+    displayLimit,
+    filteredAndSortedFiles,
+    deferredBrowseViewInputs,
+    searchQuery,
+  ]);
   useEffect(() => {
+    if (appSection !== "files" || searchQuery.trim()) return;
     const context = JSON.stringify([
       currentPath,
       activeDigitalFolderId,
@@ -6245,6 +6299,7 @@ function App() {
     }
   }, [
     activeDigitalFolderId,
+    appSection,
     currentPath,
     filters.includedType,
     searchQuery,
@@ -6352,9 +6407,6 @@ function App() {
       : "",
     ["loading-model", "indexing"].includes(faceProgress.status)
       ? "face indexing"
-      : "",
-    ["scanning", "generating"].includes(thumbnailPregen?.status ?? "")
-      ? "thumbnail generation"
       : "",
     duplicateState.status === "scanning" ? "duplicate scanning" : "",
     waitingForSortIndicators ? "photo metadata lookup" : "",
@@ -7609,31 +7661,60 @@ function App() {
           </div>
           <div className="filter-section">
             <h3>Year</h3>
-            <div className="year-filter-checklist" aria-label="Filter by year">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={yearFilter.length === 0}
-                  onChange={() => setYearFilter([])}
-                />
-                <span>All years</span>
-              </label>
-              {yearOptions.map((year) => (
-                <label key={year}>
-                  <input
-                    type="checkbox"
-                    checked={yearFilter.includes(year)}
-                    onChange={() =>
-                      setYearFilter((current) =>
-                        current.includes(year)
-                          ? current.filter((selected) => selected !== year)
-                          : [...current, year],
-                      )
-                    }
-                  />
-                  <span>{year}</span>
-                </label>
-              ))}
+            <div className="year-filter-dropdown" ref={yearFilterRef}>
+              <button
+                ref={yearFilterTriggerRef}
+                type="button"
+                className="type-select type-filter-trigger year-filter-trigger"
+                aria-expanded={yearFilterOpen}
+                aria-controls="year-filter-options"
+                aria-label={
+                  yearFilter.length === 0
+                    ? "Filter by year, all years selected"
+                    : `Filter by year, ${yearFilter.length} selected`
+                }
+                onClick={() => setYearFilterOpen((open) => !open)}
+              >
+                <span>
+                  {yearFilter.length === 0
+                    ? "All years"
+                    : `${yearFilter.length} selected`}
+                </span>
+                <FiChevronDown aria-hidden="true" />
+              </button>
+              {yearFilterOpen && (
+                <div
+                  className="year-filter-checklist"
+                  id="year-filter-options"
+                  role="group"
+                  aria-label="Filter by year"
+                >
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={yearFilter.length === 0}
+                      onChange={() => setYearFilter([])}
+                    />
+                    <span>All years</span>
+                  </label>
+                  {yearOptions.map((year) => (
+                    <label key={year}>
+                      <input
+                        type="checkbox"
+                        checked={yearFilter.includes(year)}
+                        onChange={() =>
+                          setYearFilter((current) =>
+                            current.includes(year)
+                              ? current.filter((selected) => selected !== year)
+                              : [...current, year],
+                          )
+                        }
+                      />
+                      <span>{year}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
           {!audioOnlySelected && <div className="filter-section">

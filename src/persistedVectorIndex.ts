@@ -15,12 +15,48 @@ export interface VectorSearchHit {
   confidence: number;
 }
 
+export interface VectorSearchPartitionDiagnostic {
+  sourceKey: string;
+  kind: VectorSearchKind;
+  indexedRecords: number;
+  candidateCount: number;
+  durationMs: number;
+}
+
+export interface VectorSearchDiagnostics {
+  durationMs: number;
+  sourceCount: number;
+  partitionCount: number;
+  indexedRecords: number;
+  candidateCount: number;
+  searchThreads: number;
+  perPartitionLimit: number;
+  expansionSearch: number;
+  partitionSearchMs: number;
+  candidateSortMs: number;
+  vectorOpenMs: number;
+  vectorReadMs: number;
+  vectorBytesRead: number;
+  rerankMs: number;
+  yieldMs: number;
+  finalSortMs: number;
+  unattributedMs: number;
+  vectorsAvailable: boolean;
+  slowestPartitions: VectorSearchPartitionDiagnostic[];
+}
+
+export interface VectorSearchResponse {
+  hits: VectorSearchHit[];
+  diagnostics: VectorSearchDiagnostics;
+}
+
 interface VectorSearchWorkerResponse {
   type: "progress" | "ready" | "reply" | "error";
   requestId?: number;
   fraction?: number;
   records?: number;
   hits?: VectorSearchHit[];
+  diagnostics?: VectorSearchDiagnostics;
   error?: string;
 }
 
@@ -70,7 +106,12 @@ export class PersistedVectorIndex {
         if (!pending) return;
         this.pending.delete(message.requestId as number);
         if (message.error) pending.reject(new Error(message.error));
-        else pending.resolve(message.hits ?? undefined);
+        else if (message.hits)
+          pending.resolve({
+            hits: message.hits,
+            diagnostics: message.diagnostics,
+          });
+        else pending.resolve(undefined);
       }
     });
     this.worker.on("error", (cause) =>
@@ -103,14 +144,14 @@ export class PersistedVectorIndex {
     imageQuery: Float32Array,
     documentQuery: Float32Array,
     limit: number,
-  ): Promise<VectorSearchHit[]> {
+  ): Promise<VectorSearchResponse> {
     return (await this.request({
       type: "search",
       sourcePaths,
       imageQuery,
       documentQuery,
       limit,
-    })) as VectorSearchHit[];
+    })) as VectorSearchResponse;
   }
 
   setPaused(paused: boolean) {
