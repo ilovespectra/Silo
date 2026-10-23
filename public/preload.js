@@ -167,6 +167,12 @@ contextBridge.exposeInMainWorld("electron", {
     return () =>
       ipcRenderer.removeListener("photo-indicators-changed", listener);
   },
+  onPersonRecognitionChanged: (callback) => {
+    const listener = (_event, personIds) => callback(personIds);
+    ipcRenderer.on("person-recognition-changed", listener);
+    return () =>
+      ipcRenderer.removeListener("person-recognition-changed", listener);
+  },
   updateVisibleThumbnails: (visiblePaths) =>
     ipcRenderer.send("update-visible-thumbnails", visiblePaths),
   createFolder: (parentPath, folderName) =>

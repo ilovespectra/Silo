@@ -45,6 +45,7 @@ export interface FaceRecord {
   cropPath: string;
   personIds: string[];
   manual?: boolean;
+  descriptorStatus?: "pending" | "ready" | "unavailable";
 }
 
 export interface FacePersonAssignment {
@@ -62,8 +63,12 @@ interface FaceBox {
 
 interface FaceEdit {
   box?: FaceBox;
+  imagePath?: string;
+  signature?: string;
   cropPath?: string;
   descriptor?: number[];
+  descriptorStatus?: "pending" | "ready" | "unavailable";
+  score?: number;
   deleted?: boolean;
   created?: boolean;
 }
@@ -82,6 +87,8 @@ export interface PersonCluster {
   selectedCoverPhotoPath?: string | null; // User-selected profile picture
   status?: "confirmed" | "banned";
   trainedAt?: number;
+  recognitionPending?: boolean;
+  recognitionFailed?: boolean;
   suggestedFaceIds?: string[];
 }
 
@@ -101,6 +108,8 @@ export interface PersonSummary {
   status: PersonStatus;
   suggestedCount: number;
   trainedAt: number | null;
+  recognitionPending: boolean;
+  recognitionFailed: boolean;
 }
 
 export interface PersonDetail extends PersonSummary {
@@ -118,6 +127,7 @@ export interface PersonDetail extends PersonSummary {
 interface FaceState {
   version: 1;
   faceRecordVersion?: number;
+  stateJournalVersion?: number;
   people: PersonCluster[];
   faceEdits?: Record<string, FaceEdit>;
   bannedFaces?: { [personId: string]: BannedFace };
@@ -130,6 +140,30 @@ interface FaceJournalEntry {
   signature: string;
   faces: FaceRecord[];
   createdPeople?: PersonCluster[];
+}
+
+interface FaceStateJournalEntry {
+  version: 1;
+  sequence: number;
+  people?: Record<string, PersonCluster | null>;
+  personPatches?: Record<
+    string,
+    Partial<
+      Pick<
+        PersonCluster,
+        | "centroid"
+        | "suggestedFaceIds"
+        | "recognitionPending"
+        | "recognitionFailed"
+      >
+    >
+  >;
+  faceEdits?: Record<string, FaceEdit | null>;
+  personFlags?: Record<
+    string,
+    Pick<PersonCluster, "recognitionPending" | "recognitionFailed">
+  >;
+  bannedFaces?: Record<string, BannedFace>;
 }
 
 export interface BannedFace {
@@ -156,10 +190,30 @@ interface EditStep {
   label: string;
   before: Map<string, string | null>;
   after: Map<string, string | null>;
-  bannedBefore: string;
-  bannedAfter: string;
+  facesBefore: Map<string, string | null>;
+  facesAfter: Map<string, string | null>;
+  recomputePersonIds: string[];
+  bannedBefore: string | null;
+  bannedAfter: string | null;
   faceEditsBefore: Map<string, string | null>;
   faceEditsAfter: Map<string, string | null>;
+}
+
+interface FaceRuntimeSnapshot {
+  box: FaceBox;
+  cropPath: string;
+  descriptor: number[];
+  descriptorStatus: NonNullable<FaceRecord["descriptorStatus"]>;
+  score: number;
+}
+
+export interface FaceEditScope {
+  personIds?: string[];
+  faceIds?: string[];
+  captureNewPeople?: boolean;
+  captureNewFaceEdits?: boolean;
+  trackBannedFaces?: boolean;
+  trackPeople?: boolean;
 }
 const MAX_EDIT_HISTORY = 100;
 
@@ -179,6 +233,7 @@ export class FaceIndexer {
   private readonly directory: string;
   private readonly recordsPath: string;
   private readonly statePath: string;
+  private readonly stateJournalPath: string;
   private readonly progressPath: string;
   private readonly cropsDirectory: string;
   private readonly modelPath: string;
@@ -197,12 +252,13 @@ export class FaceIndexer {
   private runPromise: Promise<void> | null = null;
   private pauseRequested = false;
   private bannedPhotoPaths = new Set<string>();
-  private recognitionChain: Promise<void> = Promise.resolve();
   private recognitionListener: (change: {
     added: string[];
     removed: string[];
   }) => void = () => undefined;
+  private recognitionProgressListener: (personIds: string[]) => void = () => undefined;
   private stateWriteChain: Promise<void> = Promise.resolve();
+  private stateJournalSequence = 0;
   private recordWriteChain: Promise<void> = Promise.resolve();
   private faceRecordVersion = 0;
   private recoveryJournal: FaceJournalEntry[] = [];
@@ -214,6 +270,15 @@ export class FaceIndexer {
     () => false;
   private peopleChangeListener: () => void = () => undefined;
   private photoPeopleCache: Map<string, string[]> | null = null;
+  private readonly faceDescriptorJobs = new Map<string, Promise<void>>();
+  private readonly pendingRecognitionJobs = new Map<
+    string,
+    Set<string> | null
+  >();
+  private recognitionProducerTimer: NodeJS.Timeout | null = null;
+  private recognitionProducerRunning = false;
+  private refreshBannedFacesPending = false;
+  private faceDescriptorChain: Promise<void> = Promise.resolve();
   private backgroundWorkPercent = 5;
 
   constructor(
@@ -230,6 +295,7 @@ export class FaceIndexer {
     this.directory = path.join(indexStoragePath, "face-index");
     this.recordsPath = path.join(this.directory, "faces.jsonl");
     this.statePath = path.join(this.directory, "people.json");
+    this.stateJournalPath = path.join(this.directory, "people-edits.jsonl");
     this.progressPath = path.join(this.directory, "progress.json");
     this.cropsDirectory = path.join(this.directory, "crops");
     this.modelPath = modelPath;
@@ -251,6 +317,7 @@ export class FaceIndexer {
     await fsPromises.mkdir(this.cropsDirectory, { recursive: true });
     let savedFaceRecordVersion: number | null = null;
     let hasJournalVersion = false;
+    let savedStateJournalVersion = 0;
     try {
       this.state = JSON.parse(
         await fsPromises.readFile(this.statePath, "utf8"),
@@ -260,10 +327,17 @@ export class FaceIndexer {
         savedFaceRecordVersion = storedVersion!;
         hasJournalVersion = true;
       }
+      if (
+        Number.isSafeInteger(this.state.stateJournalVersion) &&
+        this.state.stateJournalVersion! >= 0
+      )
+        savedStateJournalVersion = this.state.stateJournalVersion!;
     } catch {
       this.state = { version: 1, people: [], bannedFaces: {} };
     }
+    await this.loadStateJournal(savedStateJournalVersion);
     await this.loadRecords(savedFaceRecordVersion);
+    this.applyPersistedFaceEdits();
     try {
       this.progress = {
         ...initialProgress,
@@ -296,9 +370,13 @@ export class FaceIndexer {
       // Stored suggestions are already current on a clean launch. Matching every
       // cached face against every trained person on each open burned CPU without
       // changing anything; refresh only after journal recovery or photo restore.
-      if (recognitionNeedsRefresh || restoredPhotos)
+      const pendingRecognition = this.state.people.some(
+        (person) => person.recognitionPending && person.status === "confirmed",
+      );
+      if (recognitionNeedsRefresh || restoredPhotos || pendingRecognition)
         void this.refreshRecognition();
     });
+    void this.resumePendingFaceDescriptors();
   }
 
   setHiddenPhotoPredicate(
@@ -349,50 +427,127 @@ export class FaceIndexer {
     this.recognitionListener = listener;
   }
 
+  setRecognitionProgressListener(listener: (personIds: string[]) => void) {
+    this.recognitionProgressListener = listener;
+  }
+
   getBannedPhotoPaths(): ReadonlySet<string> {
     return this.bannedPhotoPaths;
   }
 
   /** Runs a user edit and records what it changed so it can be undone and redone. */
-  async recordEdit<T>(label: string, edit: () => Promise<T>): Promise<T> {
-    const before = new Map(
-      this.state.people.map((person) => [person.id, JSON.stringify(person)]),
-    );
-    const bannedBefore = JSON.stringify(this.state.bannedFaces ?? {});
-    const faceEditsBefore = new Map(
-      Object.entries(this.state.faceEdits ?? {}).map(([id, value]) => [
-        id,
-        JSON.stringify(value),
-      ]),
-    );
+  async recordEdit<T>(
+    label: string,
+    edit: () => Promise<T>,
+    scope?: FaceEditScope,
+  ): Promise<T> {
+    const trackPeople = !scope || scope.trackPeople !== false;
+    const trackedPersonIds = new Set(scope?.personIds ?? []);
+    const trackedFaceIds = new Set(scope?.faceIds ?? []);
+    if (scope) {
+      for (const faceId of trackedFaceIds)
+        for (const personId of this.faces.get(faceId)?.personIds ?? [])
+          trackedPersonIds.add(personId);
+    }
+    const captureNewPeople =
+      trackPeople && (scope?.captureNewPeople ?? !scope);
+    const peopleIdsBefore = captureNewPeople
+      ? new Set(this.state.people.map((person) => person.id))
+      : null;
+    const before = new Map<string, string | null>();
+    if (!scope) {
+      for (const person of this.state.people)
+        before.set(person.id, JSON.stringify(person));
+    } else if (trackPeople) {
+      for (const personId of trackedPersonIds) {
+        const person = this.state.people.find((item) => item.id === personId);
+        if (person) before.set(personId, JSON.stringify(person));
+      }
+    }
+    const facesBefore = new Map<string, string | null>();
+    for (const faceId of trackedFaceIds) {
+      const face = this.faces.get(faceId);
+      if (!face) continue;
+      const snapshot: FaceRuntimeSnapshot = {
+        box: { ...face.box },
+        cropPath: face.cropPath,
+        descriptor: [...face.descriptor],
+        descriptorStatus: face.descriptor.length
+          ? "ready"
+          : face.descriptorStatus ?? "unavailable",
+        score: face.score,
+      };
+      facesBefore.set(faceId, JSON.stringify(snapshot));
+    }
+    const trackBannedFaces = scope?.trackBannedFaces ?? !scope;
+    const bannedBefore = trackBannedFaces
+      ? JSON.stringify(this.state.bannedFaces ?? {})
+      : null;
+    const faceEditsBefore = new Map<string, string | null>();
+    let faceEditIdsBefore: Set<string> | null = null;
+    if (!scope) {
+      for (const [id, value] of Object.entries(this.state.faceEdits ?? {}))
+        faceEditsBefore.set(id, JSON.stringify(value));
+    } else {
+      for (const faceId of trackedFaceIds) {
+        const value = this.state.faceEdits?.[faceId];
+        faceEditsBefore.set(faceId, value ? JSON.stringify(value) : null);
+      }
+      if (scope.captureNewFaceEdits)
+        faceEditIdsBefore = new Set(Object.keys(this.state.faceEdits ?? {}));
+    }
     const result = await edit();
+    if (peopleIdsBefore)
+      for (const person of this.state.people)
+        if (!peopleIdsBefore.has(person.id)) trackedPersonIds.add(person.id);
     const step: EditStep = {
       label,
       before: new Map(),
       after: new Map(),
+      facesBefore: new Map(),
+      facesAfter: new Map(),
+      recomputePersonIds: trackPeople ? [] : [...trackedPersonIds],
       bannedBefore,
-      bannedAfter: JSON.stringify(this.state.bannedFaces ?? {}),
+      bannedAfter: trackBannedFaces
+        ? JSON.stringify(this.state.bannedFaces ?? {})
+        : null,
       faceEditsBefore: new Map(),
       faceEditsAfter: new Map(),
     };
-    const present = new Set<string>();
+    const currentPeople = new Map<string, PersonCluster>();
     for (const person of this.state.people) {
-      present.add(person.id);
-      const now = JSON.stringify(person);
-      const was = before.get(person.id);
-      if (was === now) continue;
-      step.before.set(person.id, was ?? null);
-      step.after.set(person.id, now);
+      if (
+        trackPeople &&
+        (!scope || trackedPersonIds.has(person.id)) ||
+        Boolean(
+          trackPeople &&
+            peopleIdsBefore &&
+            !peopleIdsBefore.has(person.id),
+        )
+      )
+        currentPeople.set(person.id, person);
     }
-    for (const [personId, was] of before) {
-      if (present.has(personId)) continue;
+    const personIds = trackPeople
+      ? new Set([...before.keys(), ...trackedPersonIds])
+      : new Set<string>();
+    for (const personId of personIds) {
+      const nowPerson = currentPeople.get(personId);
+      const now = nowPerson ? JSON.stringify(nowPerson) : null;
+      const was = before.get(personId) ?? null;
+      if (was === now) continue;
       step.before.set(personId, was);
-      step.after.set(personId, null);
+      step.after.set(personId, now);
     }
     const currentFaceEdits = this.state.faceEdits ?? {};
+    if (!scope)
+      for (const faceId of Object.keys(currentFaceEdits))
+        trackedFaceIds.add(faceId);
+    if (faceEditIdsBefore)
+      for (const faceId of Object.keys(currentFaceEdits))
+        if (!faceEditIdsBefore.has(faceId)) trackedFaceIds.add(faceId);
     const faceEditIds = new Set([
       ...faceEditsBefore.keys(),
-      ...Object.keys(currentFaceEdits),
+      ...trackedFaceIds,
     ]);
     for (const faceId of faceEditIds) {
       const was = faceEditsBefore.get(faceId) ?? null;
@@ -403,10 +558,29 @@ export class FaceIndexer {
       step.faceEditsBefore.set(faceId, was);
       step.faceEditsAfter.set(faceId, now);
     }
+    for (const faceId of trackedFaceIds) {
+      const face = this.faces.get(faceId);
+      if (!face) continue;
+      const snapshot: FaceRuntimeSnapshot = {
+        box: { ...face.box },
+        cropPath: face.cropPath,
+        descriptor: [...face.descriptor],
+        descriptorStatus: face.descriptor.length
+          ? "ready"
+          : face.descriptorStatus ?? "unavailable",
+        score: face.score,
+      };
+      const now = JSON.stringify(snapshot);
+      const was = facesBefore.get(faceId) ?? null;
+      if (was === now) continue;
+      step.facesBefore.set(faceId, was);
+      step.facesAfter.set(faceId, now);
+    }
     if (
       step.before.size > 0 ||
-      step.bannedBefore !== step.bannedAfter ||
-      step.faceEditsBefore.size > 0
+      (step.bannedBefore !== null && step.bannedBefore !== step.bannedAfter) ||
+      step.faceEditsBefore.size > 0 ||
+      step.facesBefore.size > 0
     ) {
       this.undoStack.push(step);
       if (this.undoStack.length > MAX_EDIT_HISTORY) this.undoStack.shift();
@@ -430,6 +604,8 @@ export class FaceIndexer {
       step.before,
       step.bannedBefore,
       step.faceEditsBefore,
+      step.facesBefore,
+      step.recomputePersonIds,
     );
     this.redoStack.push(step);
     this.peopleChangeListener();
@@ -443,6 +619,8 @@ export class FaceIndexer {
       step.after,
       step.bannedAfter,
       step.faceEditsAfter,
+      step.facesAfter,
+      step.recomputePersonIds,
     );
     this.undoStack.push(step);
     this.peopleChangeListener();
@@ -451,8 +629,10 @@ export class FaceIndexer {
 
   private async restoreSnapshot(
     snapshot: Map<string, string | null>,
-    bannedFaces: string,
+    bannedFaces: string | null,
     faceEdits: Map<string, string | null>,
+    faces: Map<string, string | null>,
+    recomputePersonIds: string[],
   ) {
     for (const [personId, serialized] of snapshot) {
       const index = this.state.people.findIndex(
@@ -466,11 +646,14 @@ export class FaceIndexer {
         this.state.people.push(JSON.parse(serialized) as PersonCluster);
       }
     }
-    this.state.bannedFaces = JSON.parse(bannedFaces);
+    if (bannedFaces !== null) this.state.bannedFaces = JSON.parse(bannedFaces);
     this.state.faceEdits ??= {};
     for (const [faceId, serialized] of faceEdits) {
       if (serialized === null) delete this.state.faceEdits[faceId];
       else this.state.faceEdits[faceId] = JSON.parse(serialized) as FaceEdit;
+    }
+    for (const [faceId, serialized] of faceEdits) {
+      if (serialized !== null) continue;
       const face = this.faces.get(faceId);
       if (face) {
         face.box = { ...(this.baseFaceBoxes.get(faceId) ?? face.box) };
@@ -481,21 +664,66 @@ export class FaceIndexer {
             this.baseFaceCrops.get(faceId) ??
             face.cropPath,
         );
+        const descriptorEdit = this.state.faceEdits[faceId];
+        if (descriptorEdit?.descriptor) face.descriptor = [...descriptorEdit.descriptor];
+        if (descriptorEdit?.descriptorStatus)
+          face.descriptorStatus = descriptorEdit.descriptorStatus;
         if (face.manual && !this.state.faceEdits[faceId])
           this.state.faceEdits[faceId] = { deleted: true };
       }
+    }
+    for (const [faceId, serialized] of faces) {
+      const face = this.faces.get(faceId);
+      if (!face || serialized === null) continue;
+      const restored = JSON.parse(serialized) as FaceRuntimeSnapshot;
+      face.box = { ...restored.box };
+      face.cropPath = this.rebaseCropPath(restored.cropPath);
+      face.descriptor = [...restored.descriptor];
+      face.descriptorStatus = restored.descriptorStatus;
+      face.score = restored.score;
+      // Keep undo/redo durable even when the prior state had no explicit edit
+      // override and the append-only face journal already contains the moved box.
+      this.state.faceEdits[faceId] = {
+        ...this.state.faceEdits[faceId],
+        ...(face.manual ? { created: true } : {}),
+        box: { ...face.box },
+        cropPath: face.cropPath,
+        descriptor: [...face.descriptor],
+        descriptorStatus: face.descriptorStatus,
+        score: face.score,
+      };
     }
     // Face -> person links are derived from people, so rebuild them to match the restored state.
     for (const face of this.faces.values()) face.personIds = [];
     for (const person of this.state.people)
       for (const faceId of person.faceIds)
         this.faces.get(faceId)?.personIds.push(person.id);
-    for (const personId of snapshot.keys()) {
+    const peopleToRecompute = new Set([
+      ...snapshot.keys(),
+      ...recomputePersonIds,
+    ]);
+    for (const personId of peopleToRecompute) {
       const person = this.state.people.find((item) => item.id === personId);
-      if (person) this.updateCentroid(person);
+      if (!person) continue;
+      this.updateCentroid(person);
+      if (recomputePersonIds.includes(personId) && person.status === "confirmed" && person.trainedAt) {
+        person.recognitionPending = true;
+        person.recognitionFailed = false;
+      }
     }
-    await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+    this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({
+      personIds: [...snapshot.keys()],
+      personPatchIds: recomputePersonIds,
+      faceIds: [...faceEdits.keys(), ...faces.keys()],
+      ...(bannedFaces === null ? {} : { bannedFaces: this.state.bannedFaces ?? {} }),
+    });
+    await this.resumePendingFaceDescriptors();
+    for (const personId of recomputePersonIds) {
+      const person = this.state.people.find((item) => item.id === personId);
+      if (person?.status === "confirmed" && person.trainedAt)
+        this.schedulePersonRecognition(person);
+    }
   }
 
   getProgress() {
@@ -536,7 +764,28 @@ export class FaceIndexer {
         (first, second) =>
           second.photoCount - first.photoCount ||
           first.name.localeCompare(second.name),
+    );
+  }
+
+  getPeopleByIds(personIds: string[]): PersonSummary[] {
+    if (personIds.length === 0) return [];
+    const requested = new Set(personIds);
+    return this.state.people
+      .filter((person) => requested.has(person.id))
+      .map((person) => this.summarizePerson(person))
+      .filter(
+        (person) =>
+          person.photoCount > 0 ||
+          person.manual ||
+          person.status !== "unconfirmed",
       );
+  }
+
+  getPersonIdsForFace(faceId: string): string[] {
+    const personIds = new Set(this.faces.get(faceId)?.personIds ?? []);
+    for (const person of this.state.people)
+      if (person.suggestedFaceIds?.includes(faceId)) personIds.add(person.id);
+    return [...personIds];
   }
 
   getPerson(personId: string): PersonDetail | null {
@@ -573,7 +822,7 @@ export class FaceIndexer {
     person.confirmedPhotoPaths = Array.from(
       new Set([...person.confirmedPhotoPaths, ...reviewable]),
     );
-    await this.persistState();
+    await this.persistStateDelta({ personIds: [personId] });
     return this.getPerson(personId);
   }
 
@@ -582,8 +831,10 @@ export class FaceIndexer {
     const person = this.requireFullyConfirmed(personId);
     if (person.status !== "banned") person.status = "confirmed";
     person.trainedAt = Date.now();
-    await this.queueRecognition(() => this.refreshSuggestions(person));
-    await this.persistState();
+    person.recognitionPending = true;
+    person.recognitionFailed = false;
+    await this.persistStateDelta({ personIds: [personId] });
+    this.schedulePersonRecognition(person);
     return this.getPerson(personId);
   }
 
@@ -601,8 +852,11 @@ export class FaceIndexer {
       reason: { type: "banned-people" },
       addedAt: Date.now(),
     };
-    await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+    await this.persistStateDelta({
+      personIds: [personId],
+      bannedFaces: this.state.bannedFaces,
+    });
+    this.requestRecognitionReindex([], { refreshBanned: true });
     return this.getPerson(personId);
   }
 
@@ -686,8 +940,10 @@ export class FaceIndexer {
     this.updateCentroid(source);
     if (destination) this.updateCentroid(destination);
     if (source.status === "banned" || destination?.status === "banned")
-      await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+      this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({
+      personIds: [source.id, ...(destination ? [destination.id] : [])],
+    });
     return { people: this.getPeople(), destinationId: destination?.id ?? null };
   }
 
@@ -695,8 +951,11 @@ export class FaceIndexer {
     const person = this.requirePerson(personId);
     if (person.status === "banned") person.status = "confirmed";
     if (this.state.bannedFaces) delete this.state.bannedFaces[personId];
-    await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+    this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({
+      personIds: [personId],
+      bannedFaces: this.state.bannedFaces ?? {},
+    });
     return this.getPerson(personId);
   }
 
@@ -718,8 +977,8 @@ export class FaceIndexer {
     );
     this.updateCentroid(person);
     if (person.status === "banned")
-      await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+      this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({ personIds: [personId] });
     return this.getPerson(personId);
   }
 
@@ -732,9 +991,9 @@ export class FaceIndexer {
     person.suggestedFaceIds = (person.suggestedFaceIds ?? []).filter(
       (faceId) => !rejected.has(this.faces.get(faceId)?.imagePath ?? ""),
     );
+    await this.persistStateDelta({ personIds: [personId] });
     if (person.status === "banned")
-      await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+      this.requestRecognitionReindex([], { refreshBanned: true });
     return this.getPerson(personId);
   }
 
@@ -754,7 +1013,7 @@ export class FaceIndexer {
       manual: true,
     };
     this.state.people.push(person);
-    await this.persistState();
+    await this.persistStateDelta({ personIds: [person.id] });
     return this.getPeople();
   }
 
@@ -764,7 +1023,7 @@ export class FaceIndexer {
     if (!cleanName) throw new Error("Enter a person name.");
     person.name = cleanName;
     person.nameSource = "user";
-    await this.persistState();
+    await this.persistStateDelta({ personIds: [person.id] });
     return this.getPeople();
   }
 
@@ -777,9 +1036,12 @@ export class FaceIndexer {
       face.personIds = face.personIds.filter((id) => id !== personId);
     if (wasBanned) {
       delete this.state.bannedFaces![personId];
-      await this.queueRecognition(() => this.refreshBannedPhotos());
+      this.requestRecognitionReindex([], { refreshBanned: true });
     }
-    await this.persistState();
+    await this.persistStateDelta({
+      personIds: [personId],
+      ...(wasBanned ? { bannedFaces: this.state.bannedFaces ?? {} } : {}),
+    });
     return this.getPeople();
   }
 
@@ -789,6 +1051,8 @@ export class FaceIndexer {
     if (!face) throw new Error("Face not found.");
     if (!person.faceIds.includes(faceId)) person.faceIds.push(faceId);
     if (!face.personIds.includes(personId)) face.personIds.push(personId);
+    if (!person.confirmedPhotoPaths.includes(face.imagePath))
+      person.confirmedPhotoPaths.push(face.imagePath);
     person.rejectedPhotoPaths = person.rejectedPhotoPaths.filter(
       (item) => item !== face.imagePath,
     );
@@ -847,41 +1111,38 @@ export class FaceIndexer {
         }
       }
 
-      // A face has one owner. Reassignment removes stale membership and keeps
-      // a shared group photo in the old person only when another face remains.
-      for (const previous of this.state.people) {
-        if (previous === person || !previous.faceIds.includes(item.face.id))
-          continue;
-        previous.faceIds = previous.faceIds.filter((id) => id !== item.face.id);
-        const anotherFaceInPhoto = previous.faceIds.some(
-          (id) => this.faces.get(id)?.imagePath === item.face.imagePath,
-        );
-        if (
-          !anotherFaceInPhoto &&
-          !previous.manualPhotoPaths.includes(item.face.imagePath) &&
-          !previous.rejectedPhotoPaths.includes(item.face.imagePath)
-        ) {
-          previous.rejectedPhotoPaths.push(item.face.imagePath);
-          previous.confirmedPhotoPaths = previous.confirmedPhotoPaths.filter(
-            (imagePath) => imagePath !== item.face.imagePath,
-          );
-        }
-        affected.add(previous);
-      }
-
+      // Person assignment is additive: one detected face can belong to several
+      // named clusters, which lets multi-person searches find the same group photo.
       if (!person.faceIds.includes(item.face.id)) person.faceIds.push(item.face.id);
-      item.face.personIds = [person.id];
+      if (!item.face.personIds.includes(person.id))
+        item.face.personIds.push(person.id);
+      if (!person.confirmedPhotoPaths.includes(item.face.imagePath))
+        person.confirmedPhotoPaths.push(item.face.imagePath);
       person.rejectedPhotoPaths = person.rejectedPhotoPaths.filter(
         (imagePath) => imagePath !== item.face.imagePath,
       );
       affected.add(person);
     }
 
-    for (const person of affected) this.updateCentroid(person);
+    for (const person of affected) {
+      this.updateCentroid(person);
+      if (person.status === "confirmed" && person.trainedAt) {
+        person.recognitionPending = true;
+        person.recognitionFailed = false;
+      }
+    }
     if (Array.from(affected).some((person) => person.status === "banned"))
-      await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
-    return this.getPeople();
+      this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({
+      personIds: Array.from(affected, (person) => person.id),
+    });
+    for (const person of affected)
+      if (person.status === "confirmed" && person.trainedAt)
+        this.schedulePersonRecognition(person);
+    // Assignment affects only the clusters touched by this photo. Returning a
+    // full People snapshot here made one manual edit resummarize every cluster
+    // before the renderer immediately requested that full snapshot again.
+    return Array.from(affected, (person) => this.summarizePerson(person));
   }
 
   async addPhoto(personId: string, imagePath: string) {
@@ -902,7 +1163,7 @@ export class FaceIndexer {
     person.rejectedPhotoPaths = person.rejectedPhotoPaths.filter(
       (item) => item !== imagePath,
     );
-    await this.persistState();
+    await this.persistStateDelta({ personIds: [personId] });
     return this.getPerson(personId);
   }
 
@@ -915,7 +1176,7 @@ export class FaceIndexer {
       confirmed.add(imagePath);
       person.confirmedPhotoPaths.push(imagePath);
     }
-    await this.persistState();
+    await this.persistStateDelta({ personIds: [personId] });
     return this.getPerson(personId);
   }
 
@@ -938,10 +1199,7 @@ export class FaceIndexer {
     return person;
   }
 
-  /**
-   * Adds photos to a person as confirmed. A photo with exactly one detected face gets that face assigned
-   * (taking it out of any unnamed automatic cluster); otherwise it is added as a manual photo.
-   */
+  /** Adds photos to a person's cluster as confirmed without removing other memberships. */
   async addPhotosToPerson(
     target: { personId?: string; newName?: string },
     imagePaths: string[],
@@ -961,22 +1219,7 @@ export class FaceIndexer {
       );
       if (!alreadyHasFace && activeFaces.length === 1) {
         const face = activeFaces[0];
-        for (const other of this.state.people) {
-          if (
-            other.id === person.id ||
-            other.manual ||
-            other.status ||
-            other.nameSource !== "automatic"
-          )
-            continue;
-          if (!other.faceIds.includes(face.id)) continue;
-          other.faceIds = other.faceIds.filter((faceId) => faceId !== face.id);
-          face.personIds = face.personIds.filter(
-            (personId) => personId !== other.id,
-          );
-          affected.add(other);
-        }
-        person.faceIds.push(face.id);
+        if (!person.faceIds.includes(face.id)) person.faceIds.push(face.id);
         if (!face.personIds.includes(person.id)) face.personIds.push(person.id);
       } else if (
         !alreadyHasFace &&
@@ -989,8 +1232,8 @@ export class FaceIndexer {
     }
     affected.forEach((item) => this.updateCentroid(item));
     if (person.status === "banned")
-      await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+      this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({ personIds: [person.id] });
     return {
       people: this.getPeople(),
       personId: person.id,
@@ -1057,8 +1300,11 @@ export class FaceIndexer {
     if (sourceWasBanned) delete this.state.bannedFaces![sourceId];
     this.updateCentroid(target);
     if (sourceWasBanned || target.status === "banned")
-      await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+      this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({
+      personIds: [sourceId, targetId],
+      bannedFaces: this.state.bannedFaces ?? {},
+    });
     return {
       detail: this.getPerson(targetId),
       moved: sourcePhotos.size,
@@ -1082,8 +1328,8 @@ export class FaceIndexer {
 
   private async afterPersonPhotosChanged(person: PersonCluster) {
     if (person.status === "banned")
-      await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+      this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({ personIds: [person.id] });
   }
 
   async setSelectedCoverPhoto(personId: string, photoPath: string | null) {
@@ -1096,7 +1342,7 @@ export class FaceIndexer {
       }
     }
     person.selectedCoverPhotoPath = photoPath;
-    await this.persistState();
+    await this.persistStateDelta({ personIds: [personId] });
     return this.getPerson(personId);
   }
 
@@ -1125,8 +1371,11 @@ export class FaceIndexer {
     if (!this.state.bannedFaces) this.state.bannedFaces = {};
     this.state.bannedFaces[personId] = banned;
     person.status = "banned";
-    await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+    this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({
+      personIds: [personId],
+      bannedFaces: this.state.bannedFaces ?? {},
+    });
     return this.getBannedFaces();
   }
 
@@ -1135,8 +1384,11 @@ export class FaceIndexer {
       delete this.state.bannedFaces[personId];
       const person = this.state.people.find((item) => item.id === personId);
       if (person?.status === "banned") person.status = "confirmed";
-      await this.queueRecognition(() => this.refreshBannedPhotos());
-      await this.persistState();
+      this.requestRecognitionReindex([], { refreshBanned: true });
+      await this.persistStateDelta({
+        personIds: person ? [personId] : [],
+        bannedFaces: this.state.bannedFaces ?? {},
+      });
     }
     return this.getBannedFaces();
   }
@@ -1149,8 +1401,11 @@ export class FaceIndexer {
       0,
       Math.min(100, confidence),
     );
-    await this.queueRecognition(() => this.refreshBannedPhotos());
-    await this.persistState();
+    this.requestRecognitionReindex([], { refreshBanned: true });
+    await this.persistStateDelta({
+      personIds: [personId],
+      bannedFaces: this.state.bannedFaces,
+    });
     return this.getBannedFaces();
   }
 
@@ -1173,9 +1428,10 @@ export class FaceIndexer {
         cropUrl: this.cropUrl(face.cropPath),
         score: face.score,
         hasDescriptor: face.descriptor.length > 0,
-        personIds: this.state.people
-          .filter((person) => person.faceIds.includes(face.id))
-          .map((person) => person.id),
+        descriptorStatus: face.descriptor.length
+          ? "ready" as const
+          : face.descriptorStatus ?? "unavailable" as const,
+        personIds: [...face.personIds],
       }));
   }
 
@@ -1190,7 +1446,8 @@ export class FaceIndexer {
       width,
       height,
     };
-    let descriptorResult: { descriptor: number[]; score: number } | null = null;
+    let imageRecord: IndexableFile | null = null;
+    let nextCropPath: string | null = null;
     if (localPath) {
       const sharp = require("sharp") as (input: string) => any;
       const image = sharp(localPath);
@@ -1212,7 +1469,7 @@ export class FaceIndexer {
         orientedHeight - top,
         Math.ceil(height * orientedHeight),
       );
-      const cropPath = path.join(
+      nextCropPath = path.join(
         this.cropsDirectory,
         `${face.id}-edit-${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`,
       );
@@ -1221,31 +1478,54 @@ export class FaceIndexer {
         .extract({ left, top, width: cropWidth, height: cropHeight })
         .resize(256, 256, { fit: "cover" })
         .jpeg({ quality: 78 })
-        .toFile(cropPath);
-      descriptorResult = await this.descriptorForFaceBox(localPath, nextBox);
-      face.cropPath = cropPath;
-      if (descriptorResult) {
-        face.descriptor = descriptorResult.descriptor;
-        if (descriptorResult.descriptor.length)
-          face.score = descriptorResult.score;
-      }
-      this.state.faceEdits ??= {};
-      this.state.faceEdits[faceId] = {
-        ...this.state.faceEdits[faceId],
-        cropPath,
-        ...(descriptorResult ? { descriptor: descriptorResult.descriptor } : {}),
+        .toFile(nextCropPath);
+      const stats = await fsPromises.stat(localPath);
+      imageRecord = {
+        name: path.basename(face.imagePath),
+        path: face.imagePath,
+        relativePath: face.imagePath,
+        size: stats.size,
+        modified: stats.mtimeMs,
+        isDirectory: false,
+        type: "image",
+        extension: path.extname(face.imagePath),
       };
     }
+    face.box = nextBox;
+    if (nextCropPath) face.cropPath = nextCropPath;
+    // A descriptor belongs to one exact crop. Drop the old vector now so a
+    // moved box cannot keep training recognition against the previous face.
+    face.descriptor = [];
+    face.descriptorStatus = imageRecord ? "pending" : "unavailable";
     this.state.faceEdits ??= {};
     this.state.faceEdits[faceId] = {
       ...this.state.faceEdits[faceId],
       box: nextBox,
+      ...(nextCropPath ? { cropPath: nextCropPath } : {}),
+      descriptorStatus: face.descriptorStatus,
+      descriptor: [],
     };
-    face.box = nextBox;
-    if (descriptorResult)
-      for (const person of this.state.people)
-        if (person.faceIds.includes(faceId)) this.updateCentroid(person);
-    await this.persistState();
+    const linkedPeople = new Set(face.personIds);
+    const affectedPeople = this.state.people.filter((person) =>
+      linkedPeople.has(person.id),
+    );
+    for (const person of affectedPeople) {
+      this.updateCentroid(person);
+      if (person.status === "confirmed" && person.trainedAt) {
+        person.recognitionPending = true;
+        person.recognitionFailed = false;
+      }
+    }
+    await this.persistStateDelta({
+      faceIds: [faceId],
+      personPatchIds: affectedPeople.map((person) => person.id),
+    });
+    if (localPath && imageRecord)
+      this.scheduleFaceDescriptor(face, imageRecord, localPath, nextBox);
+    else
+      for (const person of affectedPeople)
+        if (person.status === "confirmed" && person.trainedAt)
+          this.schedulePersonRecognition(person);
     return this.getFacesForImage(face.imagePath);
   }
 
@@ -1256,16 +1536,41 @@ export class FaceIndexer {
     this.state.faceEdits[faceId] = {
       ...this.state.faceEdits[faceId],
       deleted: true,
+      imagePath: face.imagePath,
+      signature: face.signature,
+      box: { ...face.box },
     };
+    const linkedPeople = new Set(face.personIds);
     face.personIds = [];
     for (const person of this.state.people) {
+      const ownedFace = linkedPeople.has(person.id);
+      if (!ownedFace) continue;
       person.faceIds = person.faceIds.filter((id) => id !== faceId);
-      person.suggestedFaceIds = (person.suggestedFaceIds ?? []).filter(
-        (id) => id !== faceId,
-      );
+      if (
+        !person.manualPhotoPaths.includes(face.imagePath) &&
+        !person.faceIds.some(
+          (id) => this.faces.get(id)?.imagePath === face.imagePath,
+        )
+      ) {
+        person.confirmedPhotoPaths = person.confirmedPhotoPaths.filter(
+          (imagePath) => imagePath !== face.imagePath,
+        );
+      }
       this.updateCentroid(person);
+      if (person.status === "confirmed" && person.trainedAt) {
+        person.recognitionPending = true;
+        person.recognitionFailed = false;
+      }
     }
-    await this.persistState();
+    await this.persistStateDelta({
+      faceIds: [faceId],
+      personIds: Array.from(linkedPeople),
+    });
+    for (const personId of linkedPeople) {
+      const person = this.state.people.find((item) => item.id === personId);
+      if (person?.status === "confirmed" && person.trainedAt)
+        this.schedulePersonRecognition(person);
+    }
     return this.getFacesForImage(face.imagePath);
   }
 
@@ -1309,40 +1614,182 @@ export class FaceIndexer {
       .resize(256, 256, { fit: "cover" })
       .jpeg({ quality: 78 })
       .toFile(cropPath);
-    const descriptorResult = await this.descriptorForFaceBox(
-      localPath,
-      normalized,
-    );
+    const imageRecord: IndexableFile = {
+      name: path.basename(imagePath),
+      path: imagePath,
+      relativePath: imagePath,
+      size: stats.size,
+      modified: stats.mtimeMs,
+      isDirectory: false,
+      type: "image",
+      extension: path.extname(imagePath),
+    };
     const face: FaceRecord = {
       id: faceId,
       imagePath,
       signature: `${stats.size}:${stats.mtimeMs}`,
       box: normalized,
-      score: descriptorResult?.score ?? 1,
-      descriptor: descriptorResult?.descriptor ?? [],
+      score: 1,
+      descriptor: [],
+      descriptorStatus: "pending",
       cropPath,
       personIds: [],
       manual: true,
     };
     this.state.faceEdits ??= {};
-    this.state.faceEdits[faceId] = { created: true };
+    this.state.faceEdits[faceId] = {
+      created: true,
+      descriptorStatus: "pending",
+    };
     const existing = this.facesByImage.get(imagePath) ?? [];
-    await this.appendProcessed(
-      {
-        name: path.basename(imagePath),
-        path: imagePath,
-        relativePath: imagePath,
+    await this.appendProcessed(imageRecord, [...existing, face], false);
+    await this.persistStateDelta({ faceIds: [faceId] });
+    this.scheduleFaceDescriptor(face, imageRecord, localPath, normalized);
+    return this.getFacesForImage(imagePath);
+  }
+
+  private scheduleFaceDescriptor(
+    face: FaceRecord,
+    image: IndexableFile,
+    localPath: string,
+    box: FaceBox,
+  ) {
+    if (this.faceDescriptorJobs.has(face.id)) return;
+    const snapshot = { ...box };
+    const task = this.faceDescriptorChain.then(async () => {
+      await this.waitForRecognitionWindow();
+      const workStartedAt = Date.now();
+      const current = this.faces.get(face.id);
+      if (
+        current !== face ||
+        this.isFaceDeleted(face) ||
+        current.descriptorStatus !== "pending" ||
+        !this.sameFaceBox(current.box, snapshot)
+      )
+        return;
+
+      let result: { descriptor: number[]; score: number } | null = null;
+      try {
+        result = await this.descriptorForFaceBox(localPath, snapshot);
+        const currentStats = await fsPromises.stat(localPath);
+        if (
+          currentStats.size !== image.size ||
+          currentStats.mtimeMs !== image.modified
+        )
+          result = null;
+      } catch {
+        // Keep the manual box usable even when model inference is unavailable.
+        result = null;
+      }
+
+      const latest = this.faces.get(face.id);
+      if (
+        latest !== face ||
+        this.isFaceDeleted(face) ||
+        latest.descriptorStatus !== "pending" ||
+        !this.sameFaceBox(latest.box, snapshot)
+      )
+        return;
+
+      const hasDescriptor = Boolean(result?.descriptor.length);
+      latest.descriptor = hasDescriptor ? result!.descriptor : [];
+      latest.descriptorStatus = hasDescriptor ? "ready" : "unavailable";
+      if (hasDescriptor) latest.score = result!.score;
+      this.state.faceEdits ??= {};
+      this.state.faceEdits[face.id] = {
+        ...this.state.faceEdits[face.id],
+        descriptorStatus: latest.descriptorStatus,
+        descriptor: latest.descriptor,
+      };
+
+      const affectedPeople = this.state.people.filter((person) =>
+        person.faceIds.includes(face.id),
+      );
+      for (const person of affectedPeople) {
+        this.updateCentroid(person);
+        if (person.status === "confirmed" && person.trainedAt) {
+          person.recognitionPending = true;
+          person.recognitionFailed = false;
+        }
+      }
+      await this.appendProcessed(
+        image,
+        this.facesByImage.get(image.path) ?? [latest],
+        false,
+      );
+      await this.persistStateDelta({
+        faceIds: [face.id],
+        personPatchIds: affectedPeople.map((person) => person.id),
+      });
+      await this.paceBackgroundWork(Date.now() - workStartedAt);
+      this.peopleChangeListener();
+      for (const person of affectedPeople)
+        if (person.status === "confirmed" && person.trainedAt)
+          this.schedulePersonRecognition(person);
+    });
+    this.faceDescriptorChain = task.catch(() => undefined);
+    this.faceDescriptorJobs.set(face.id, task);
+    void task
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.faceDescriptorJobs.get(face.id) !== task) return;
+        this.faceDescriptorJobs.delete(face.id);
+        const latest = this.faces.get(face.id);
+        if (
+          latest &&
+          !this.isFaceDeleted(latest) &&
+          latest.descriptorStatus === "pending" &&
+          !this.sameFaceBox(latest.box, snapshot)
+        )
+          void this.resumePendingFaceDescriptor(latest);
+      });
+  }
+
+  private sameFaceBox(first: FaceBox, second: FaceBox) {
+    return (
+      first.x === second.x &&
+      first.y === second.y &&
+      first.width === second.width &&
+      first.height === second.height
+    );
+  }
+
+  private async resumePendingFaceDescriptors() {
+    for (const face of this.faces.values()) {
+      if (
+        !face.manual ||
+        face.descriptorStatus !== "pending" ||
+        this.faceDescriptorJobs.has(face.id)
+      )
+        continue;
+      await this.resumePendingFaceDescriptor(face);
+    }
+  }
+
+  private async resumePendingFaceDescriptor(face: FaceRecord) {
+    if (
+      this.faceDescriptorJobs.has(face.id) ||
+      face.descriptorStatus !== "pending" ||
+      this.isFaceDeleted(face)
+    )
+      return;
+    try {
+      const localPath = await this.resolveImagePath(face.imagePath);
+      const stats = await fsPromises.stat(localPath);
+      const image: IndexableFile = {
+        name: path.basename(face.imagePath),
+        path: face.imagePath,
+        relativePath: face.imagePath,
         size: stats.size,
         modified: stats.mtimeMs,
         isDirectory: false,
         type: "image",
-        extension: path.extname(imagePath),
-      },
-      [...existing, face],
-      false,
-    );
-    await this.persistState();
-    return this.getFacesForImage(imagePath);
+        extension: path.extname(face.imagePath),
+      };
+      this.scheduleFaceDescriptor(face, image, localPath, { ...face.box });
+    } catch {
+      // Leave pending work visible; the source may be temporarily offline.
+    }
   }
 
   getPeopleForImages(imagePaths: string[]) {
@@ -1404,7 +1851,12 @@ export class FaceIndexer {
       );
       if (pending.length === 0) {
         const combined = await this.combineSimilarClusters();
-        await this.refreshRecognition();
+        const pendingPeople = this.state.people
+          .filter((person) => person.recognitionPending)
+          .map((person) => person.id);
+        this.requestRecognitionReindex(pendingPeople, {
+          refreshBanned: true,
+        });
         await this.updateProgress(
           {
             status: "complete",
@@ -1429,6 +1881,7 @@ export class FaceIndexer {
         true,
       );
 
+      const candidateFaceIds = new Set<string>();
       for (let index = 0; index < pending.length; index += 1) {
         const workStartedAt = Date.now();
         if (this.pauseRequested) {
@@ -1444,9 +1897,14 @@ export class FaceIndexer {
           return;
         }
         const image = pending[index];
+        const existingFaceIds = new Set(
+          (this.facesByImage.get(image.path) ?? []).map((face) => face.id),
+        );
         await this.updateProgress({ currentFile: image.name }, false);
         try {
           await this.processImage(image, runtime);
+          for (const face of this.facesByImage.get(image.path) ?? [])
+            if (!existingFaceIds.has(face.id)) candidateFaceIds.add(face.id);
         } catch {
           this.progress.errors += 1;
         }
@@ -1471,11 +1929,24 @@ export class FaceIndexer {
       );
       const combined = await this.combineSimilarClusters();
       await this.updateProgress(
-        { message: "Matching confirmed people..." },
+        { message: "Finishing face indexing..." },
         false,
       );
-      await this.refreshRecognition();
       await this.persistState();
+      if (candidateFaceIds.size > 0)
+        this.requestRecognitionReindex([], {
+          allConfirmed: true,
+          faceIds: [...candidateFaceIds],
+          refreshBanned: true,
+        });
+      else {
+        const pendingPeople = this.state.people
+          .filter((person) => person.recognitionPending)
+          .map((person) => person.id);
+        this.requestRecognitionReindex(pendingPeople, {
+          refreshBanned: true,
+        });
+      }
       await this.updateProgress(
         {
           status: "complete",
@@ -2303,6 +2774,32 @@ export class FaceIndexer {
     return union > 0 ? intersection / union : 0;
   }
 
+  /** Treat modest detector jitter around one face as the same region. */
+  private boxesRepresentSameFace(
+    first: FaceRecord["box"],
+    second: FaceRecord["box"],
+    minimumCoverage = 0.55,
+    centerScale = 0.45,
+  ) {
+    const left = Math.max(first.x, second.x);
+    const top = Math.max(first.y, second.y);
+    const right = Math.min(first.x + first.width, second.x + second.width);
+    const bottom = Math.min(first.y + first.height, second.y + second.height);
+    const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
+    const smallerArea = Math.min(
+      first.width * first.height,
+      second.width * second.height,
+    );
+    if (smallerArea <= 0 || intersection / smallerArea < minimumCoverage)
+      return false;
+
+    const centerDistance = Math.hypot(
+      first.x + first.width / 2 - (second.x + second.width / 2),
+      first.y + first.height / 2 - (second.y + second.height / 2),
+    );
+    return centerDistance <= Math.sqrt(smallerArea) * centerScale;
+  }
+
   private summarizePerson(person: PersonCluster): PersonSummary {
     const faces = person.faceIds
       .map((id) => this.faces.get(id))
@@ -2360,6 +2857,8 @@ export class FaceIndexer {
       status: person.status ?? "unconfirmed",
       suggestedCount: this.suggestedFacesOf(person).length,
       trainedAt: person.trainedAt ?? null,
+      recognitionPending: Boolean(person.recognitionPending),
+      recognitionFailed: Boolean(person.recognitionFailed),
     };
   }
 
@@ -2410,10 +2909,25 @@ export class FaceIndexer {
     if (edit?.box) face.box = { ...edit.box };
     if (edit?.cropPath) face.cropPath = this.rebaseCropPath(edit.cropPath);
     if (edit?.descriptor) face.descriptor = [...edit.descriptor];
+    if (edit?.descriptorStatus) face.descriptorStatus = edit.descriptorStatus;
+    if (Number.isFinite(edit?.score)) face.score = edit!.score!;
     this.faces.set(face.id, face);
     const list = this.facesByImage.get(face.imagePath) ?? [];
     list.push(face);
     this.facesByImage.set(face.imagePath, list);
+  }
+
+  /** State-journal edits load after the face-record journal, so reapply their face overrides. */
+  private applyPersistedFaceEdits() {
+    for (const face of this.faces.values()) {
+      const edit = this.state.faceEdits?.[face.id];
+      if (!edit) continue;
+      if (edit.box) face.box = { ...edit.box };
+      if (edit.cropPath) face.cropPath = this.rebaseCropPath(edit.cropPath);
+      if (edit.descriptor) face.descriptor = [...edit.descriptor];
+      if (edit.descriptorStatus) face.descriptorStatus = edit.descriptorStatus;
+      if (Number.isFinite(edit.score)) face.score = edit.score!;
+    }
   }
 
   private replaceImageFaces(
@@ -2421,24 +2935,80 @@ export class FaceIndexer {
     records: FaceRecord[],
     updatePeople = true,
   ) {
-    const nextIds = new Set(records.map((face) => face.id));
-    for (const oldFace of this.facesByImage.get(imagePath) ?? []) {
+    const existingFaces = this.facesByImage.get(imagePath) ?? [];
+    const manualRegions = [...existingFaces, ...records]
+      .filter((face) => face.manual && !this.isFaceDeleted(face))
+      .map((face) => face.box);
+    const indexedSignature =
+      records.find((face) => !face.manual)?.signature ?? records[0]?.signature;
+    const dismissedRegions = Object.values(this.state.faceEdits ?? {})
+      .filter(
+        (edit) =>
+          edit.deleted &&
+          edit.imagePath === imagePath &&
+          (!edit.signature ||
+            !indexedSignature ||
+            edit.signature === indexedSignature) &&
+          edit.box,
+      )
+      .map((edit) => edit.box!);
+    const retainedRecords: FaceRecord[] = [];
+    for (const face of records) {
+      if (this.isFaceDeleted(face)) continue;
+      if (face.manual) {
+        retainedRecords.push(face);
+        continue;
+      }
+      if (
+        dismissedRegions.some((box) =>
+          this.boxesRepresentSameFace(box, face.box, 0.5, 0.65),
+        ) ||
+        manualRegions.some((box) =>
+          this.boxesRepresentSameFace(box, face.box, 0.5, 0.65),
+        )
+      )
+        continue;
+
+      const duplicateIndex = retainedRecords.findIndex(
+        (other) =>
+          !other.manual &&
+          this.boxesRepresentSameFace(other.box, face.box, 0.68, 0.4),
+      );
+      if (duplicateIndex < 0) retainedRecords.push(face);
+      else if (face.score > retainedRecords[duplicateIndex].score)
+        retainedRecords[duplicateIndex] = face;
+    }
+
+    const nextIds = new Set(retainedRecords.map((face) => face.id));
+    for (const oldFace of existingFaces) {
       if (nextIds.has(oldFace.id)) continue;
       this.faces.delete(oldFace.id);
       this.baseFaceBoxes.delete(oldFace.id);
       this.baseFaceCrops.delete(oldFace.id);
       if (updatePeople) {
         for (const person of this.state.people) {
+          const ownedFace = person.faceIds.includes(oldFace.id);
           person.faceIds = person.faceIds.filter((id) => id !== oldFace.id);
           person.suggestedFaceIds = (person.suggestedFaceIds ?? []).filter(
             (id) => id !== oldFace.id,
           );
+          if (
+            ownedFace &&
+            !person.manualPhotoPaths.includes(imagePath) &&
+            !person.faceIds.some(
+              (id) => this.faces.get(id)?.imagePath === imagePath,
+            )
+          ) {
+            person.confirmedPhotoPaths = person.confirmedPhotoPaths.filter(
+              (photoPath) => photoPath !== imagePath,
+            );
+          }
           this.updateCentroid(person);
         }
       }
     }
     this.facesByImage.set(imagePath, []);
-    for (const face of records) this.indexFace(face);
+    for (const face of retainedRecords) this.indexFace(face);
   }
 
   private isFaceDeleted(face: FaceRecord) {
@@ -2489,13 +3059,27 @@ export class FaceIndexer {
     exemplars: number[][],
     maxDistance: number,
     skip: (face: FaceRecord) => boolean,
+    candidateFaceIds?: ReadonlySet<string>,
   ) {
     const best = new Map<string, { face: FaceRecord; distance: number }>();
     if (exemplars.length === 0) return best;
+    await this.waitForRecognitionWindow();
     let checked = 0;
-    for (const face of this.faces.values()) {
-      if (++checked % 2000 === 0)
-        await new Promise((resolve) => setImmediate(resolve));
+    let chunkStartedAt = Date.now();
+    const candidates = candidateFaceIds
+      ? Array.from(candidateFaceIds, (faceId) => this.faces.get(faceId)).filter(
+          (face): face is FaceRecord => Boolean(face),
+        )
+      : this.faces.values();
+    for (const face of candidates) {
+      checked += 1;
+      if (checked % 128 === 0) {
+        const workMs = Date.now() - chunkStartedAt;
+        await this.waitForRecognitionWindow();
+        await this.paceRecognitionWork(workMs);
+        await this.waitForRecognitionWindow();
+        chunkStartedAt = Date.now();
+      }
       if (
         skip(face) ||
         this.isFaceDeleted(face) ||
@@ -2516,7 +3100,10 @@ export class FaceIndexer {
     return best;
   }
 
-  private async refreshSuggestions(person: PersonCluster) {
+  private async refreshSuggestions(
+    person: PersonCluster,
+    candidateFaceIds?: ReadonlySet<string>,
+  ) {
     const owned = new Set(this.photoPathsOf(person));
     const rejected = new Set(person.rejectedPhotoPaths);
     const otherKnown = new Set(
@@ -2531,10 +3118,30 @@ export class FaceIndexer {
         owned.has(face.imagePath) ||
         rejected.has(face.imagePath) ||
         face.personIds.some((personId) => otherKnown.has(personId)),
+      candidateFaceIds,
     );
-    person.suggestedFaceIds = Array.from(matches.values())
+    const matchedFaceIds = Array.from(matches.values())
       .sort((first, second) => first.distance - second.distance)
       .map(({ face }) => face.id);
+    if (!candidateFaceIds) {
+      person.suggestedFaceIds = matchedFaceIds;
+      return;
+    }
+    const existingSuggestions = (person.suggestedFaceIds ?? []).filter((faceId) => {
+      if (candidateFaceIds.has(faceId)) return false;
+      const face = this.faces.get(faceId);
+      return Boolean(
+        face &&
+          !this.isFaceDeleted(face) &&
+          face.descriptor.length > 0 &&
+          !owned.has(face.imagePath) &&
+          !rejected.has(face.imagePath) &&
+          !face.personIds.some((personId) => otherKnown.has(personId)),
+      );
+    });
+    person.suggestedFaceIds = Array.from(
+      new Set([...existingSuggestions, ...matchedFaceIds]),
+    );
   }
 
   private async refreshBannedPhotos() {
@@ -2566,20 +3173,141 @@ export class FaceIndexer {
       this.recognitionListener({ added, removed });
   }
 
-  /** Re-runs matching for every confirmed and banned person (after indexing finds new faces). */
+  /** Queue matching as background work so scans and UI actions never wait on it. */
   private refreshRecognition() {
-    return this.queueRecognition(async () => {
-      for (const person of this.state.people)
-        if (person.status === "confirmed" && person.trainedAt)
-          await this.refreshSuggestions(person);
-      await this.refreshBannedPhotos();
+    this.requestRecognitionReindex([], {
+      allConfirmed: true,
+      refreshBanned:
+        this.bannedPhotoPaths.size > 0 ||
+        this.state.people.some((person) => person.status === "banned"),
     });
+    return Promise.resolve();
   }
 
-  private queueRecognition(task: () => Promise<void>) {
-    const run = this.recognitionChain.then(task);
-    this.recognitionChain = run.catch(() => undefined);
-    return run;
+  private requestRecognitionReindex(
+    personIds: readonly string[],
+    options: {
+      allConfirmed?: boolean;
+      refreshBanned?: boolean;
+      faceIds?: readonly string[];
+    } = {},
+  ) {
+    const queuedPeople = new Set(personIds);
+    if (options.allConfirmed)
+      for (const person of this.state.people)
+        if (person.status === "confirmed" && person.trainedAt)
+          queuedPeople.add(person.id);
+    for (const personId of queuedPeople) {
+      const existing = this.pendingRecognitionJobs.get(personId);
+      if (existing === null) continue;
+      if (options.faceIds === undefined) {
+        this.pendingRecognitionJobs.set(personId, null);
+      } else {
+        const candidates = existing ?? new Set<string>();
+        for (const faceId of options.faceIds) candidates.add(faceId);
+        this.pendingRecognitionJobs.set(personId, candidates);
+      }
+    }
+    if (
+      options.refreshBanned &&
+      (this.bannedPhotoPaths.size > 0 ||
+        Object.keys(this.state.bannedFaces ?? {}).length > 0)
+    )
+      this.refreshBannedFacesPending = true;
+    if (this.pendingRecognitionJobs.size === 0 && !this.refreshBannedFacesPending)
+      return;
+    if (this.recognitionProducerTimer || this.recognitionProducerRunning) return;
+    this.recognitionProducerTimer = setTimeout(() => {
+      this.recognitionProducerTimer = null;
+      void this.runRecognitionProducer();
+    }, 250);
+    this.recognitionProducerTimer.unref?.();
+  }
+
+  private async waitForRecognitionWindow() {
+    while (
+      this.hasActiveInteractiveSearch() ||
+      this.pauseRequested ||
+      this.runPromise !== null ||
+      this.progress.status === "loading-model" ||
+      this.progress.status === "indexing"
+    )
+      await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  private async paceRecognitionWork(workMs: number) {
+    let cooldownRemaining = Math.ceil(
+      Math.max(1, workMs) *
+        ((100 - this.backgroundWorkPercent) / this.backgroundWorkPercent),
+    );
+    while (cooldownRemaining > 0) {
+      await this.waitForRecognitionWindow();
+      const sliceMs = Math.min(50, cooldownRemaining);
+      const startedAt = Date.now();
+      await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
+      cooldownRemaining -= Math.max(1, Date.now() - startedAt);
+    }
+  }
+
+  private async runRecognitionProducer() {
+    if (this.recognitionProducerRunning) return;
+    this.recognitionProducerRunning = true;
+    try {
+      while (this.pendingRecognitionJobs.size > 0 || this.refreshBannedFacesPending) {
+        await this.waitForRecognitionWindow();
+        const queued = this.pendingRecognitionJobs.entries().next().value as
+          | [string, Set<string> | null]
+          | undefined;
+        const personId = queued?.[0];
+        if (personId) {
+          const candidateFaceIds = queued![1];
+          this.pendingRecognitionJobs.delete(personId);
+          const person = this.state.people.find((item) => item.id === personId);
+          if (!person || person.status !== "confirmed" || !person.trainedAt)
+            continue;
+          const wasPending = Boolean(person.recognitionPending);
+          const previousSuggestions = (person.suggestedFaceIds ?? []).join("\u0000");
+          try {
+            await this.refreshSuggestions(person, candidateFaceIds ?? undefined);
+            if (wasPending) person.recognitionFailed = false;
+          } catch {
+            if (wasPending) person.recognitionFailed = true;
+          }
+          if (this.state.people.find((item) => item.id === personId) !== person)
+            continue;
+          if (wasPending) person.recognitionPending = false;
+          try {
+            await this.persistStateDelta({ personPatchIds: [personId] });
+          } catch {
+            if (wasPending) {
+              person.recognitionPending = true;
+              person.recognitionFailed = true;
+            }
+          }
+          const suggestionsChanged =
+            previousSuggestions !== (person.suggestedFaceIds ?? []).join("\u0000");
+          if (wasPending || suggestionsChanged) {
+            this.peopleChangeListener();
+            this.recognitionProgressListener([personId]);
+          }
+        } else if (this.refreshBannedFacesPending) {
+          this.refreshBannedFacesPending = false;
+          await this.refreshBannedPhotos();
+          await this.persistState();
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    } finally {
+      this.recognitionProducerRunning = false;
+      if (this.pendingRecognitionJobs.size > 0 || this.refreshBannedFacesPending)
+        this.requestRecognitionReindex([]);
+    }
+  }
+
+  private schedulePersonRecognition(person: PersonCluster) {
+    if (person.status !== "confirmed" || !person.trainedAt) return;
+    this.requestRecognitionReindex([person.id]);
   }
 
   private updateCentroid(person: PersonCluster) {
@@ -2704,16 +3432,187 @@ export class FaceIndexer {
     await fsPromises.rename(temporary, this.progressPath);
   }
 
+  private async loadStateJournal(savedVersion: number) {
+    this.stateJournalSequence = savedVersion;
+    let contents: string;
+    try {
+      contents = await fsPromises.readFile(this.stateJournalPath, "utf8");
+    } catch {
+      this.state.stateJournalVersion = savedVersion;
+      return;
+    }
+
+    const peopleById = new Map(this.state.people.map((person) => [person.id, person]));
+    this.state.faceEdits ??= {};
+    for (const line of contents.split("\n")) {
+      if (!line.trim()) continue;
+      let entry: FaceStateJournalEntry;
+      try {
+        entry = JSON.parse(line) as FaceStateJournalEntry;
+      } catch {
+        // A torn final append is ignored; the next append begins on a new line.
+        continue;
+      }
+      if (
+        entry?.version !== 1 ||
+        !Number.isSafeInteger(entry.sequence) ||
+        entry.sequence < 1
+      )
+        continue;
+      this.stateJournalSequence = Math.max(
+        this.stateJournalSequence,
+        entry.sequence,
+      );
+      if (entry.sequence <= savedVersion) continue;
+
+      for (const [personId, person] of Object.entries(entry.people ?? {})) {
+        if (person === null) {
+          peopleById.delete(personId);
+          continue;
+        }
+        if (!person || person.id !== personId) continue;
+        peopleById.set(personId, person);
+      }
+      for (const [personId, patch] of Object.entries(
+        entry.personPatches ?? {},
+      )) {
+        const person = peopleById.get(personId);
+        if (!person || !patch || typeof patch !== "object") continue;
+        if (Array.isArray(patch.centroid)) person.centroid = patch.centroid;
+        if (Array.isArray(patch.suggestedFaceIds))
+          person.suggestedFaceIds = patch.suggestedFaceIds;
+        if (typeof patch.recognitionPending === "boolean")
+          person.recognitionPending = patch.recognitionPending;
+        if (typeof patch.recognitionFailed === "boolean")
+          person.recognitionFailed = patch.recognitionFailed;
+      }
+      for (const [faceId, edit] of Object.entries(entry.faceEdits ?? {})) {
+        if (edit === null) delete this.state.faceEdits[faceId];
+        else if (edit && typeof edit === "object")
+          this.state.faceEdits[faceId] = edit;
+      }
+      for (const [personId, flags] of Object.entries(entry.personFlags ?? {})) {
+        const person = peopleById.get(personId);
+        if (!person || !flags || typeof flags !== "object") continue;
+        if (typeof flags.recognitionPending === "boolean")
+          person.recognitionPending = flags.recognitionPending;
+        if (typeof flags.recognitionFailed === "boolean")
+          person.recognitionFailed = flags.recognitionFailed;
+      }
+      if (entry.bannedFaces) this.state.bannedFaces = entry.bannedFaces;
+    }
+    this.state.people = Array.from(peopleById.values());
+    this.state.stateJournalVersion = this.stateJournalSequence;
+  }
+
+  private queueStateWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const write = this.stateWriteChain.then(operation);
+    this.stateWriteChain = write.then(
+      () => undefined,
+      () => undefined,
+    );
+    return write;
+  }
+
+  /** Persist only the people and face edits touched by a user-facing face edit. */
+  private async persistStateDelta(options: {
+    personIds?: readonly string[];
+    personPatchIds?: readonly string[];
+    faceIds?: readonly string[];
+    personFlagIds?: readonly string[];
+    bannedFaces?: Record<string, BannedFace>;
+  }) {
+    await this.recordWriteChain;
+    const peopleById = new Map(this.state.people.map((person) => [person.id, person]));
+    const people = Object.fromEntries(
+      Array.from(new Set(options.personIds ?? []), (personId) => {
+        const person = peopleById.get(personId);
+        return [personId, person ? JSON.parse(JSON.stringify(person)) : null];
+      }),
+    );
+    const personPatches = Object.fromEntries(
+      Array.from(new Set(options.personPatchIds ?? []), (personId) => {
+        const person = peopleById.get(personId);
+        return [
+          personId,
+          person
+            ? {
+                centroid: [...person.centroid],
+                suggestedFaceIds: [...(person.suggestedFaceIds ?? [])],
+                recognitionPending: Boolean(person.recognitionPending),
+                recognitionFailed: Boolean(person.recognitionFailed),
+              }
+            : null,
+        ];
+      }).filter(([, patch]) => patch !== null),
+    );
+    const edits = this.state.faceEdits ?? {};
+    const faceEdits = Object.fromEntries(
+      Array.from(new Set(options.faceIds ?? []), (faceId) => [
+        faceId,
+        edits[faceId] ? JSON.parse(JSON.stringify(edits[faceId])) : null,
+      ]),
+    );
+    const personFlags = Object.fromEntries(
+      Array.from(new Set(options.personFlagIds ?? []), (personId) => {
+        const person = peopleById.get(personId);
+        return [
+          personId,
+          person
+            ? {
+                recognitionPending: Boolean(person.recognitionPending),
+                recognitionFailed: Boolean(person.recognitionFailed),
+              }
+            : null,
+        ];
+      }).filter(([, flags]) => flags !== null),
+    );
+    if (
+      Object.keys(people).length === 0 &&
+      Object.keys(personPatches).length === 0 &&
+      Object.keys(faceEdits).length === 0 &&
+      Object.keys(personFlags).length === 0 &&
+      options.bannedFaces === undefined
+    )
+      return;
+
+    const snapshot = JSON.stringify({
+      people,
+      personPatches,
+      faceEdits,
+      personFlags,
+      ...(options.bannedFaces === undefined
+        ? {}
+        : { bannedFaces: options.bannedFaces }),
+    });
+    await this.queueStateWrite(async () => {
+      const entry: FaceStateJournalEntry = {
+        version: 1,
+        sequence: this.stateJournalSequence + 1,
+        ...(JSON.parse(snapshot) as Omit<FaceStateJournalEntry, "version" | "sequence">),
+      };
+      const line = `\n${JSON.stringify(entry)}\n`;
+      await fsPromises.appendFile(this.stateJournalPath, line, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      this.stateJournalSequence = entry.sequence;
+      this.state.stateJournalVersion = entry.sequence;
+      this.photoPeopleCache = null;
+    });
+  }
+
   private async persistState() {
     // A state checkpoint must never claim to include journal records that have
     // not reached disk yet. Waiting here also makes user edits a safe checkpoint.
-    await this.recordWriteChain;
-    this.photoPeopleCache = null;
-    const data = JSON.stringify({
-      ...this.state,
-      faceRecordVersion: this.faceRecordVersion,
-    });
-    const write = this.stateWriteChain.then(async () => {
+    return this.queueStateWrite(async () => {
+      await this.recordWriteChain;
+      this.photoPeopleCache = null;
+      const data = JSON.stringify({
+        ...this.state,
+        faceRecordVersion: this.faceRecordVersion,
+        stateJournalVersion: this.stateJournalSequence,
+      });
       const temporary = `${this.statePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
       try {
         await fsPromises.writeFile(temporary, data);
@@ -2721,8 +3620,7 @@ export class FaceIndexer {
       } finally {
         await fsPromises.rm(temporary, { force: true });
       }
+      await fsPromises.rm(this.stateJournalPath, { force: true }).catch(() => undefined);
     });
-    this.stateWriteChain = write.catch(() => undefined);
-    return write;
   }
 }

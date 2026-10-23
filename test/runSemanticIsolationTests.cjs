@@ -1594,3 +1594,53 @@ test("filename search streams its first match while the index is hydrating", asy
     await searchPromise;
   }
 });
+
+test("filename-search eligibility cache follows index-storage exclusions", (t) => {
+  let exclusionRevision = 0;
+  const { SemanticIndexer } = loadSource("semanticIndexer.ts", {
+    "./indexingStorage": {
+      getIndexStorageExclusionRevision: () => exclusionRevision,
+    },
+  });
+  const indexer = Object.create(SemanticIndexer.prototype);
+  Object.assign(indexer, {
+    indexStorageRoot: "/app-data/index",
+    userDataPath: "/app-data",
+    canonicalUserDataPath: "/app-data",
+    canonicalSourcePaths: new Map([["/photos", "/photos"]]),
+    searchIndexabilityCache: new WeakMap(),
+  });
+  let evaluations = 0;
+  const isIndexable = indexer.isIndexable.bind(indexer);
+  indexer.isIndexable = (...args) => {
+    evaluations += 1;
+    return isIndexable(...args);
+  };
+  const record = {
+    path: "/photos/IMG_0001.jpg",
+    sourcePath: "/photos",
+    type: "image",
+    extension: ".jpg",
+  };
+
+  assert.equal(indexer.isSearchRecordIndexable(record), true);
+  assert.equal(indexer.isSearchRecordIndexable(record), true);
+  assert.equal(evaluations, 1, "unchanged records reuse their eligibility result");
+
+  indexer.indexStorageRoot = "/photos";
+  exclusionRevision += 1;
+  assert.equal(indexer.isSearchRecordIndexable(record), false);
+  assert.equal(evaluations, 2, "storage changes invalidate cached decisions");
+});
+
+test("source coverage persistence failure does not reject the in-memory scan result", async (t) => {
+  const { indexer } = makeIndexer(t);
+  indexer.persistSourceCoverage = async () => {
+    throw new Error("cache volume disappeared");
+  };
+
+  await assert.doesNotReject(
+    indexer.setSourceCoverage("/photos", "completed"),
+  );
+  assert.equal(indexer.sourceCoverage.get("/photos").status, "completed");
+});

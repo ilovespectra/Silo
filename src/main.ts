@@ -3178,7 +3178,7 @@ type MemoryPromptContext = {
 
 /** Resolves saved names independently so conjunctions and co-occurrence survive parsing. */
 function memoryPromptContext(query: string, roots: string[]): MemoryPromptContext {
-  const state = stateStore.getState();
+  const state = stateStore.getSearchState();
   let matchedFolder = false;
   const folderPaths = new Set<string>();
   const promptedFolderIdsByPath = new Map<string, string>();
@@ -3266,8 +3266,9 @@ async function namedMemoryMedia(
 ): Promise<ScoredMemoryMedia[]> {
   const normalizedQuery = query.trim().toLocaleLowerCase();
   if (normalizedQuery.length < 3) return [];
-  const state = stateStore.getState();
+  const state = stateStore.getSearchState();
   const paths = new Set<string>();
+  const matchedPeopleByPath = new Map<string, number>();
   const promptedFolderIdsByPath = new Map<string, string>();
   for (const folder of state.digitalFolders) {
     if (!memoryNameMatches(folder.name, normalizedQuery)) continue;
@@ -3276,9 +3277,20 @@ async function namedMemoryMedia(
       promptedFolderIdsByPath.set(filePath, folder.id);
     }
   }
-  for (const person of faceIndexer.getPeople())
-    if (memoryNameMatches(person.name, normalizedQuery))
-      faceIndexer.getPerson(person.id)?.confirmedPhotoPaths.forEach((filePath) => paths.add(filePath));
+  for (const person of faceIndexer.getPeople()) {
+    if (!memoryNameMatches(person.name, normalizedQuery)) continue;
+    const detail = faceIndexer.getPerson(person.id);
+    const confirmedPaths = detail?.fullyConfirmed
+      ? detail.photoPaths
+      : detail?.confirmedPhotoPaths ?? [];
+    for (const filePath of new Set(confirmedPaths)) {
+      paths.add(filePath);
+      matchedPeopleByPath.set(
+        filePath,
+        (matchedPeopleByPath.get(filePath) ?? 0) + 1,
+      );
+    }
+  }
   for (const entry of state.nameIndex)
     if (entry.sourceType !== "person" && memoryNameMatches(entry.name, normalizedQuery))
       entry.filePaths.forEach(({ path: filePath }) => paths.add(filePath));
@@ -3303,9 +3315,30 @@ async function namedMemoryMedia(
     && memoryAllowed(filePath, allowPromptedFolderOverride && promptedFolderIdsByPath.has(filePath)
       ? { promptedMemoryFolderId: promptedFolderIdsByPath.get(filePath)! } : undefined)
     && roots.some((root) => filePath === root || filePath.startsWith(root.endsWith(path.sep) ? root : root + path.sep)));
-  // Spread a large named collection across the whole set instead of its first entries.
-  const step = Math.max(1, eligible.length / 160);
-  const sampled = Array.from({ length: Math.min(eligible.length, 160) }, (_, index) => eligible[Math.floor(index * step)]);
+  // Preserve group photos before sampling broad person collections. A shared
+  // photo can occur near the end of one person's paths and otherwise be lost
+  // when a large library is evenly sampled.
+  const sampleLimit = 160;
+  const sharedPeoplePaths = eligible
+    .filter((filePath) => (matchedPeopleByPath.get(filePath) ?? 0) > 1)
+    .sort((first, second) =>
+      (matchedPeopleByPath.get(second) ?? 0) -
+      (matchedPeopleByPath.get(first) ?? 0),
+    );
+  const prioritizedShared = sharedPeoplePaths.slice(0, sampleLimit);
+  const prioritizedSet = new Set(prioritizedShared);
+  const remaining = eligible.filter((filePath) => !prioritizedSet.has(filePath));
+  const remainingSlots = sampleLimit - prioritizedShared.length;
+  const step = remainingSlots > 0
+    ? Math.max(1, remaining.length / remainingSlots)
+    : Infinity;
+  const sampled = [
+    ...prioritizedShared,
+    ...Array.from(
+      { length: Math.min(remaining.length, remainingSlots) },
+      (_, index) => remaining[Math.floor(index * step)],
+    ),
+  ];
   const media: ScoredMemoryMedia[] = [];
   for (let start = 0; start < sampled.length; start += 32) {
     const stats = await Promise.all(sampled.slice(start, start + 32).map(async (filePath) => {
@@ -4139,11 +4172,9 @@ function prepareMemoryPreviews(suggestions: MemorySuggestion[]): Promise<void> {
   return task;
 }
 
-/** Visible cards first, then the reserve stockpile, all on the single render queue. */
+/** Prepare only the current suggestion cards; reserve stories stay cold until requested. */
 async function prepareAllMemoryPreviews(visible: MemorySuggestion[]): Promise<void> {
-  const reserve = await memoryManager.getReserve().catch(() => [] as MemorySuggestion[]);
   void prepareMemoryPreviews(visible).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
-  if (reserve.length) void prepareMemoryPreviews(reserve).catch((error) => runtimeLog("memory-reserve-preview-error", memoryErrorDetails(error)));
 }
 
 let memoryPreviewEmitTimer: NodeJS.Timeout | null = null;
@@ -4266,11 +4297,9 @@ async function prepareMemoryPreviewsNow(suggestions: MemorySuggestion[]): Promis
     memoryExportScratch = null;
   }
 }
-let thumbnailPregenTimer: NodeJS.Timeout | null = null;
 const phoneBackupHolds = new Map<string, string>();
 const phoneBackupLastStatus = new Map<string, string>();
 let phoneManagerBackupDestination: string | null = null;
-let thumbnailPregenDirty = true;
 let startupIndexReconciliationSettled = false;
 let indexRecovery: IndexingRecovery | null = null;
 let indexRecoveryTimer: NodeJS.Timeout | null = null;
@@ -4301,7 +4330,6 @@ const ALL_INDEX_RECOVERY_STAGES = [
   "faces",
   "locations",
   "duplicates",
-  "thumbnails",
   "audio",
   "quality",
 ];
@@ -4460,7 +4488,6 @@ function requestSourceProcessingStages(sourcePaths: string[]) {
     "faces",
     "locations",
     "duplicates",
-    "thumbnails",
     "audio",
     "quality",
   ];
@@ -4481,21 +4508,6 @@ const PIPELINE_BUSY_STATUSES = new Set([
   "loading-model",
   "indexing",
 ]);
-
-// Runs only once CLIP, face clustering, and location indexing have all settled.
-function scheduleThumbnailPregeneration(markDirty = false) {
-  if (markDirty) thumbnailPregenDirty = true;
-  if (!thumbnailPregenerator) return;
-  if (thumbnailPregenTimer) clearTimeout(thumbnailPregenTimer);
-  thumbnailPregenTimer = setTimeout(() => {
-    thumbnailPregenTimer = null;
-    if (!thumbnailPregenerator || !thumbnailPregenDirty) return;
-    const waitMessage = getThumbnailIndexingWaitMessage();
-    if (waitMessage) return thumbnailPregenerator.setWaiting(waitMessage);
-    thumbnailPregenDirty = false;
-    requestIndexRecoveryStages(["thumbnails"]);
-  }, 5000);
-}
 
 function getThumbnailIndexingWaitMessage(): string | null {
   if (indexStorageUnavailableMessage) return indexStorageUnavailableMessage;
@@ -4977,7 +4989,6 @@ function discoverPhones(): Promise<void> {
             runtimeLog("phone-source-index-error", { message: String(error) }),
         );
         requestIndexRecoveryStages(["audio"]);
-        scheduleThumbnailPregeneration(true);
       }
 
       if (devicesChanged) invalidateSourceList();
@@ -6580,7 +6591,7 @@ async function buildSourceList(): Promise<BrowseSource[]> {
     return [];
   });
   resumedPaths.forEach((sourcePath) => sourcesReturnedFromEjectedVolumes.add(sourcePath));
-  const appState = stateStore.getState();
+  const appState = stateStore.getSourcesState();
   const disabled = new Set(appState.disabledSourceIds);
   const explicitPhoneChoiceByDevice = new Map<string, string>();
   for (const sourceId of appState.enabledSourceIds ?? []) {
@@ -8526,7 +8537,7 @@ async function indexNewSources(sourcePaths: string[], reason: string) {
   runtimeLog("auto-index-new-sources", { reason, sources: added });
   queueSemanticIndexWork(
     { fullScanRoots: added },
-    ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+    ["faces", "locations", "duplicates", "audio", "quality"],
   );
 }
 
@@ -9638,8 +9649,6 @@ app.whenReady().then(async () => {
       // Progress is emitted for every indexed item. The topic profile only needs
       // the stage edges; per-item notifications just keep resetting its timer.
       if (statusChanged) memoryProfileScheduler?.notify();
-      if (statusChanged)
-        scheduleThumbnailPregeneration(progress.status === "indexing");
     },
     logIndexingDiagnostic,
     cacheDestinationRoot("semantic-index"),
@@ -9775,8 +9784,6 @@ app.whenReady().then(async () => {
       sendFaceIndexProgress(progress);
       const statusChanged = progress.status !== lastFaceProgressStatus;
       lastFaceProgressStatus = progress.status;
-      if (statusChanged)
-        scheduleThumbnailPregeneration(progress.status === "indexing");
     },
     cacheDestinationRoot("face-index"),
     contentSettingsStore.getSearchPerformanceSnapshot().settings
@@ -9796,6 +9803,9 @@ app.whenReady().then(async () => {
   });
   faceIndexer.setPeopleChangeListener(() =>
     sendToRenderer("photo-indicators-changed", null),
+  );
+  faceIndexer.setRecognitionProgressListener((personIds) =>
+    sendToRenderer("person-recognition-changed", personIds),
   );
   faceIndexer.setHiddenPhotoPredicate((photoPath, ownerBanned) => {
     const settings = contentSettingsStore?.getPublicSettings();
@@ -9993,7 +10003,6 @@ app.whenReady().then(async () => {
   geoIndexer = new GeoIndexer(app.getPath("userData"), (state) => {
     // Progress events carry counts only; the renderer fetches photos when photosVersion changes.
     sendToRenderer("geo-index-progress", state);
-    scheduleThumbnailPregeneration();
   }, cacheDestinationRoot("geo-index.jsonl"));
   const geoLoad = indexStorageInitializationDeferred
     ? Promise.resolve()
@@ -10058,7 +10067,31 @@ app.whenReady().then(async () => {
       runtimeLog("startup-load-error", { message: String(result.reason) });
   }
   audioLibraryCache = new AudioLibraryCache(cacheDestinationRoot("audio-library-index.json"));
-  if (!indexStorageInitializationDeferred) await audioLibraryCache.initialize();
+  if (!indexStorageInitializationDeferred) {
+    try {
+      await audioLibraryCache.initialize();
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error
+          ? String(error.code)
+          : "unknown";
+      runtimeLog("audio-library-cache-init-failed", { code });
+      // This derived cache is rebuildable. If its removable destination vanished
+      // after the startup probe, fall back locally for this session.
+      audioLibraryCache = new AudioLibraryCache(app.getPath("userData"));
+      try {
+        await audioLibraryCache.initialize();
+      } catch (fallbackError) {
+        const fallbackCode =
+          fallbackError && typeof fallbackError === "object" && "code" in fallbackError
+            ? String(fallbackError.code)
+            : "unknown";
+        runtimeLog("audio-library-cache-fallback-init-failed", {
+          code: fallbackCode,
+        });
+      }
+    }
+  }
   geoIndexer.setOverrides(stateStore.getState().geoOverrides);
   thumbnailPregenerator = new ThumbnailPregenerator({
     getSourceRoots: getAllIndexSources,
@@ -10116,7 +10149,6 @@ app.whenReady().then(async () => {
     onProgress: (progress) =>
       sendToRenderer("thumbnail-pregen-progress", progress),
   });
-  scheduleThumbnailPregeneration();
   memoryManager = new MemoryManager(app.getPath("userData"), {
     search: searchMemoryMedia,
     searchPrompted: searchPromptedMemoryMedia,
@@ -10140,11 +10172,7 @@ app.whenReady().then(async () => {
   });
   // Coverage and cooldowns are persisted per source. Recheck all available sources
   resolveServicesReady();
-  // Warm saved memory movies in the background while indexing starts; popup/page
-  // reads join the preview queue instead of racing or failing with a busy error.
-  void memoryManager.getState()
-    .then((state) => prepareAllMemoryPreviews(state.suggestions))
-    .catch((error) => runtimeLog("memory-preview-warmup-error", memoryErrorDetails(error)));
+  // Saved previews are prepared when Memories is opened, not during app startup.
   scheduleAutomaticMemories();
   // even when the audio screen is closed, and retry failures once due.
   audioInventoryRetryTimer = setInterval(
@@ -10191,7 +10219,7 @@ app.whenReady().then(async () => {
             lifetimeFullScanPending = false;
             queueSemanticIndexWork(
               { fullScanAll: true, force: true },
-              ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+              ["faces", "locations", "duplicates", "audio", "quality"],
             );
           } else if (!pausedByUser) {
             queueSemanticIndexWork(
@@ -10205,12 +10233,11 @@ app.whenReady().then(async () => {
                   ...semanticIndexer.getRetryableFiles(sources),
                 ]),
               },
-              ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+              ["faces", "locations", "duplicates", "audio", "quality"],
             );
           }
         } finally {
           startupIndexReconciliationSettled = true;
-          scheduleThumbnailPregeneration(true);
         }
       })().catch((error) =>
         runtimeLog("startup-index-reconcile-error", { message: String(error) }),
@@ -10218,7 +10245,6 @@ app.whenReady().then(async () => {
     }, 5000);
   } else {
     startupIndexReconciliationSettled = true;
-    scheduleThumbnailPregeneration(true);
   }
   const searchSettled = () => {
     const localRoots = recoverySearchSourcePaths.filter((root) => !isRemotePath(root));
@@ -10465,7 +10491,8 @@ app.whenReady().then(async () => {
       blockedReason: () =>
         getThumbnailIndexingWaitMessage() ||
         "Thumbnail generation is already active.",
-      needsInitialCheck: true,
+      // Whole-library pre-generation is opt-in via explicit stage retry; visible
+      // thumbnails already generate on demand and adjacent viewer items are warmed.
       progress: () =>
         thumbnailPregenerator?.getProgress() ?? {
           status: "idle",
@@ -10486,7 +10513,6 @@ app.whenReady().then(async () => {
           : null;
       },
       start: async () => {
-        thumbnailPregenDirty = false;
         await thumbnailPregenerator?.start();
       },
       pause: () => thumbnailPregenerator?.pause(),
@@ -10822,7 +10848,9 @@ async function runMemoryGenerator(reason: string, replace = false) {
   const state = await memoryManager.generate(replace);
   if (replace) await retireMemoriesToBook(before, state.suggestions).catch(() => undefined);
   runtimeLog("memory-generate", { reason, count: state.suggestions.length });
-  if (state.suggestions.length)
+  // Automatic discovery stores suggestions without rendering movies at startup.
+  // User-requested generation prepares its cards immediately.
+  if (reason === "on-demand" && state.suggestions.length)
     void prepareAllMemoryPreviews(state.suggestions).catch((error) => runtimeLog("memory-preview-error", memoryErrorDetails(error)));
   const next = { ...(await memoryStateWithPreviews()), message: state.message };
   sendToRenderer("memories-changed", next);
@@ -13057,7 +13085,7 @@ ipcMain.handle("start-indexing", async () => {
     fullAccessEnabled()
       ? { fullScanRoots: sources, force: true }
       : { fullScanAll: true, force: true },
-    ["faces", "locations", "duplicates", "thumbnails", "audio", "quality"],
+    ["faces", "locations", "duplicates", "audio", "quality"],
   );
   return semanticIndexer.getProgress();
 });
@@ -14587,7 +14615,11 @@ ipcMain.handle("clear-geo-location", async (_event, filePaths: string[]) => {
   };
 });
 ipcMain.handle("start-face-indexing", async () => {
-  await retryIndexRecoveryStage("faces");
+  void retryIndexRecoveryStage("faces").catch((error) =>
+    runtimeLog("face-index-start-error", {
+      message: error instanceof Error ? error.message : String(error),
+    }),
+  );
   return faceIndexer.getProgress();
 });
 ipcMain.handle("pause-face-indexing", async () => {
@@ -14774,8 +14806,14 @@ ipcMain.handle("train-person", async (_event, personId: string) => {
   const detail = await faceIndexer.recordEdit("Train person", () =>
     faceIndexer.trainPerson(personId),
   );
-  // Also pick up photos added to any source since the last face pass; suggestions refresh when it finishes.
-  await retryIndexRecoveryStage("faces");
+  // The person edit returns promptly; new face discovery continues under the
+  // shared indexer budget and reports its own progress to the UI.
+  void retryIndexRecoveryStage("faces").catch((error) =>
+    runtimeLog("face-train-rescan-error", {
+      personId,
+      message: error instanceof Error ? error.message : String(error),
+    }),
+  );
   return detail;
 });
 ipcMain.handle("ban-person", (_event, personId: string) => {
@@ -14869,6 +14907,14 @@ ipcMain.handle(
     return faceIndexer.recordEdit(
       `Assign ${entries.length} photo faces`,
       () => faceIndexer.assignFaces(entries),
+      {
+        faceIds: entries.map((entry) => entry.faceId),
+        personIds: entries.flatMap((entry) =>
+          typeof entry.personId === "string" ? [entry.personId] : [],
+        ),
+        captureNewPeople: true,
+        trackBannedFaces: false,
+      },
     );
   },
 );
@@ -14919,8 +14965,19 @@ ipcMain.handle(
     imagePath: string,
     box: { x: number; y: number; width: number; height: number },
   ) =>
-    faceIndexer.recordEdit("Move face box", async () =>
-      faceIndexer.updateFaceBox(faceId, box, await resolveLocalPath(imagePath)),
+    faceIndexer.recordEdit(
+      "Move face box",
+      async () =>
+        faceIndexer.updateFaceBox(
+          faceId,
+          box,
+          await resolveLocalPath(imagePath),
+        ),
+      {
+        faceIds: [faceId],
+        trackPeople: false,
+        trackBannedFaces: false,
+      },
     ),
 );
 ipcMain.handle(
@@ -14930,19 +14987,34 @@ ipcMain.handle(
     imagePath: string,
     box: { x: number; y: number; width: number; height: number },
   ) =>
-    faceIndexer.recordEdit("Create face box", async () =>
-      faceIndexer.createFaceBox(
-        imagePath,
-        await resolveLocalPath(imagePath),
-        box,
-      ),
+    faceIndexer.recordEdit(
+      "Create face box",
+      async () =>
+        faceIndexer.createFaceBox(
+          imagePath,
+          await resolveLocalPath(imagePath),
+          box,
+        ),
+      {
+        captureNewPeople: false,
+        captureNewFaceEdits: true,
+        trackBannedFaces: false,
+      },
     ),
 );
-ipcMain.handle("delete-face", (_event, faceId: string) =>
-  faceIndexer.recordEdit("Delete detected face", () =>
-    faceIndexer.deleteFace(faceId),
-  ),
-);
+ipcMain.handle("delete-face", async (_event, faceId: string) => {
+  const personIds = faceIndexer.getPersonIdsForFace(faceId);
+  const faces = await faceIndexer.recordEdit(
+    "Delete detected face",
+    () => faceIndexer.deleteFace(faceId),
+    {
+      faceIds: [faceId],
+      personIds,
+      trackBannedFaces: false,
+    },
+  );
+  return { faces, people: faceIndexer.getPeopleByIds(personIds) };
+});
 ipcMain.handle("get-photo-indicators", async (_event, filePaths: unknown) => {
   if (Array.isArray(filePaths) && filePaths.length > 1000)
     throw new Error(
@@ -14952,16 +15024,20 @@ ipcMain.handle("get-photo-indicators", async (_event, filePaths: unknown) => {
     ? filePaths.filter((item): item is string => typeof item === "string")
     : [];
   const personNames = faceIndexer.getPeopleForImages(paths);
-  const visibleNames = new Set(getDemoPeople().map((person) => person.name));
+  // Paid users can see every indexed name. Avoid rebuilding every People
+  // summary just to decorate one visible thumbnail after a face edit.
+  const visibleNames = fullAccessEnabled()
+    ? null
+    : new Set(getDemoPeople().map((person) => person.name));
   const result = Object.fromEntries(
     paths.map((filePath) => [
       filePath,
       {
         hasLocation: geoIndexer.hasLocation(filePath),
         locationLabel: geoIndexer.locationLabel(filePath),
-        people: (personNames[filePath] ?? []).filter((name) =>
-          visibleNames.has(name),
-        ),
+        people: visibleNames
+          ? (personNames[filePath] ?? []).filter((name) => visibleNames.has(name))
+          : personNames[filePath] ?? [],
       },
     ]),
   );
@@ -16260,7 +16336,12 @@ ipcMain.handle(
     await getEnabledIndexSources();
     if (shouldEnable && phoneTarget)
       void indexNewSources([target!.rootPath], "phone-source-enabled");
-    await semanticIndexer.startWatching(await getAllIndexSources());
+    void getAllIndexSources()
+      .then((roots) => semanticIndexer.startWatching(roots))
+      .catch((error) => runtimeLog("source-watch-update-error", {
+        sourceId,
+        message: error instanceof Error ? error.message : String(error),
+      }));
     return listSources();
   },
 );
@@ -16907,8 +16988,14 @@ ipcMain.handle(
   "start-face-indexing-for-source",
   async (_event, sourcePath: string) => {
     try {
-      // Face coverage is independent of source selection; preserve UI checkboxes.
-      await retryIndexRecoveryStage("faces");
+      // Face coverage is independent of source selection; acknowledge quickly
+      // while indexing proceeds in the background.
+      void retryIndexRecoveryStage("faces").catch((error) =>
+        runtimeLog("face-index-source-start-error", {
+          sourcePath,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
 
       return {
         success: true,

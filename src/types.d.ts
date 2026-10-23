@@ -854,6 +854,8 @@ interface PersonSummary {
   status: "unconfirmed" | "confirmed" | "banned";
   suggestedCount: number;
   trainedAt: number | null;
+  recognitionPending: boolean;
+  recognitionFailed: boolean;
 }
 
 interface PersonDetail extends PersonSummary {
@@ -875,6 +877,7 @@ interface ImageFace {
   cropUrl: string;
   score: number;
   hasDescriptor: boolean;
+  descriptorStatus: "pending" | "ready" | "unavailable";
   personIds: string[];
 }
 
@@ -1205,6 +1208,9 @@ interface Window {
       >
     >;
     onPhotoIndicatorsChanged(callback: () => void): () => void;
+    onPersonRecognitionChanged(
+      callback: (personIds: string[]) => void,
+    ): () => void;
     getThumbnailPregenProgress(): Promise<ThumbnailPregenProgress | null>;
     getIndexingOverview(): Promise<IndexingStageProgress[]>;
     getLibraryDashboard(): Promise<LibraryDashboardSnapshot>;
@@ -1526,7 +1532,10 @@ interface Window {
       imagePath: string,
       box: ImageFace["box"],
     ): Promise<ImageFace[]>;
-    deleteFace(faceId: string): Promise<ImageFace[]>;
+    deleteFace(faceId: string): Promise<{
+      faces: ImageFace[];
+      people: PersonSummary[];
+    }>;
     mergePerson(
       sourcePersonId: string,
       targetPersonId: string,

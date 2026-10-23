@@ -275,6 +275,15 @@ export class StateStore {
     return structuredClone(this.state);
   }
 
+  /** Source-list refreshes need only these small fields, not file metadata and folders. */
+  getSourcesState(): Pick<PersistedAppState, "indexSources" | "disabledSourceIds" | "enabledSourceIds"> {
+    return {
+      indexSources: structuredClone(this.state.indexSources),
+      disabledSourceIds: [...this.state.disabledSourceIds],
+      enabledSourceIds: [...this.state.enabledSourceIds],
+    };
+  }
+
   /** Search reads this small live view instead of cloning the full library state. */
   getSearchState(): Pick<
     PersistedAppState,
@@ -382,36 +391,44 @@ export class StateStore {
   }
 
   async setSourceEnabled(sourceId: string, enabled: boolean) {
-    const previous = this.state;
-    this.state = structuredClone(this.state);
-    const source = this.state.indexSources.find((item) => item.path === sourceId);
-    if (source?.resumeAfterEject) delete source.resumeAfterEject;
-    const disabled = new Set(this.state.disabledSourceIds);
-    const explicitlyEnabled = new Set(this.state.enabledSourceIds);
+    const previousDisabled = this.state.disabledSourceIds;
+    const previousEnabled = this.state.enabledSourceIds;
+    const previousSources = this.state.indexSources;
+    const disabled = new Set(previousDisabled);
+    const explicitlyEnabled = new Set(previousEnabled);
     if (enabled) disabled.delete(sourceId);
     else disabled.add(sourceId);
     if (enabled) explicitlyEnabled.add(sourceId);
     else explicitlyEnabled.delete(sourceId);
     this.state.disabledSourceIds = Array.from(disabled);
     this.state.enabledSourceIds = Array.from(explicitlyEnabled);
+    this.state.indexSources = previousSources.map((source) => {
+      if (source.path !== sourceId || !source.resumeAfterEject) return source;
+      const { resumeAfterEject: _resume, ...rest } = source;
+      return rest;
+    });
     try {
       await this.write();
     } catch (error) {
-      this.state = previous;
+      this.state.disabledSourceIds = previousDisabled;
+      this.state.enabledSourceIds = previousEnabled;
+      this.state.indexSources = previousSources;
       throw error;
     }
-    return this.getState();
   }
 
   async setAllSourcesEnabled(sourceIds: string[], enabled: boolean) {
-    const previous = this.state;
-    this.state = structuredClone(this.state);
+    const previousDisabled = this.state.disabledSourceIds;
+    const previousEnabled = this.state.enabledSourceIds;
+    const previousSources = this.state.indexSources;
     const selectedIds = new Set(sourceIds);
-    for (const source of this.state.indexSources)
-      if (selectedIds.has(source.path) && source.resumeAfterEject)
-        delete source.resumeAfterEject;
-    const disabled = new Set(this.state.disabledSourceIds);
-    const explicitlyEnabled = new Set(this.state.enabledSourceIds);
+    this.state.indexSources = previousSources.map((source) => {
+      if (!selectedIds.has(source.path) || !source.resumeAfterEject) return source;
+      const { resumeAfterEject: _resume, ...rest } = source;
+      return rest;
+    });
+    const disabled = new Set(previousDisabled);
+    const explicitlyEnabled = new Set(previousEnabled);
     for (const sourceId of sourceIds) {
       if (enabled) {
         disabled.delete(sourceId);
@@ -426,10 +443,11 @@ export class StateStore {
     try {
       await this.write();
     } catch (error) {
-      this.state = previous;
+      this.state.disabledSourceIds = previousDisabled;
+      this.state.enabledSourceIds = previousEnabled;
+      this.state.indexSources = previousSources;
       throw error;
     }
-    return this.getState();
   }
 
   async prepareSourcesForEject(sourcePaths: string[]) {

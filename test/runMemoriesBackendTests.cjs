@@ -343,7 +343,7 @@ async function run() {
     }
   });
 
-  await test("memory source roots keep offline local indexes and ready added sources", async () => {
+  await test("memory source roots skip offline sources and keep ready added sources", async () => {
     const originalFullAccess = context.__fullAccess;
     try {
       context.__fullAccess = true;
@@ -353,15 +353,16 @@ async function run() {
         { id: "phone", rootPath: "/__phone__/ios/ready", available: true, enabled: true },
         { id: "disconnected-phone", rootPath: "/__phone__/ios/gone", available: false, enabled: true },
       ]);
-      assert.deepEqual(plain(roots), ["/offline-drive/Photos", "/added/Camera", "/__phone__/ios/ready"]);
+      assert.deepEqual(plain(roots), ["/added/Camera", "/__phone__/ios/ready"],
+        "offline drives are excluded so Memory work does not probe unavailable volumes");
       context.__fullAccess = false;
       const selectedRoots = await context.getIndexableRootsFromSources([
         { id: "/offline-drive/Photos", rootPath: "/offline-drive/Photos", available: false, enabled: false },
         { id: "/added/Camera", rootPath: "/added/Camera", available: true, enabled: true },
         { id: "/locked", rootPath: "/locked", available: true, enabled: true, demoLocked: true },
       ]);
-      assert.deepEqual(plain(selectedRoots), ["/offline-drive/Photos", "/added/Camera"],
-        "Memories includes all configured roots regardless of source selection state");
+      assert.deepEqual(plain(selectedRoots), ["/added/Camera"],
+        "ready sources are included regardless of selection, while offline and locked roots are excluded");
     } finally {
       context.__fullAccess = originalFullAccess;
     }
@@ -599,6 +600,51 @@ async function run() {
     context.__folders = []; context.__names = []; context.__people = []; context.__metadata = {};
   });
 
+  await test("multi-person Memory search prioritizes shared photos in large clusters", async () => {
+    const directory = path.join(library, "large-group-search");
+    await fsp.mkdir(directory, { recursive: true });
+    const exclusivePaths = Array.from({ length: 319 }, (_, index) =>
+      path.join(directory, `alice-${String(index).padStart(3, "0")}.jpg`),
+    );
+    const groupPath = path.join(directory, "alice-bob-group.jpg");
+    await Promise.all(
+      [...exclusivePaths, groupPath].map((filePath) =>
+        fsp.writeFile(filePath, "fixture"),
+      ),
+    );
+    const previousPeople = context.__people;
+    context.__people = [
+      {
+        id: "alice-large-cluster",
+        name: "Alice Example",
+        confirmedPhotoPaths: [...exclusivePaths, groupPath],
+      },
+      {
+        id: "bob-large-cluster",
+        name: "Bob Example",
+        confirmedPhotoPaths: [groupPath],
+      },
+    ];
+    try {
+      const named = await context.namedMemoryMedia(
+        "Alice Example and Bob Example",
+        [library],
+      );
+      assert.equal(named.length, 160, "named candidates remain bounded");
+      assert.equal(
+        named[0].path,
+        groupPath,
+        "a shared group photo beyond the old even-sample boundary is searched first",
+      );
+      assert(
+        named.some((photo) => photo.path === groupPath),
+        "the photo shared by both queried People survives candidate sampling",
+      );
+    } finally {
+      context.__people = previousPeople;
+    }
+  });
+
   await test("named phone photos resolve through the phone cache", async () => {
     const phonePath = "/__phone__/ios/ready/DCIM/IMG_2050.JPG";
     const cachedPath = path.join(root, "cached-phone-photo.jpg");
@@ -659,6 +705,50 @@ async function run() {
       context.__people = original.people;
       context.__geoPhotos = original.geoPhotos;
       searchResults = original.searchResults;
+    }
+  });
+
+  await test("multiple named people keep shared group photos and rank them first", async () => {
+    const directory = path.join(library, "prompted-people-together");
+    await fsp.mkdir(directory, { recursive: true });
+    const together = path.join(directory, "alice-bob-together.jpg");
+    const aliceOnly = path.join(directory, "alice-only.jpg");
+    const bobOnly = path.join(directory, "bob-only.jpg");
+    for (const filePath of [together, aliceOnly, bobOnly])
+      await fsp.writeFile(filePath, Buffer.alloc(200_000));
+    const original = {
+      folders: context.__folders,
+      people: context.__people,
+      geoPhotos: context.__geoPhotos,
+      metadata: context.__metadata,
+      searchResults,
+      indexedImages,
+    };
+    context.__folders = [];
+    context.__people = [
+      { id: "p-alice", name: "Alice Example", confirmedPhotoPaths: [together, aliceOnly] },
+      { id: "p-bob", name: "Bob Example", confirmedPhotoPaths: [together, bobOnly] },
+    ];
+    context.__geoPhotos = [];
+    context.__metadata = {};
+    searchResults = [];
+    indexedImages = [];
+
+    try {
+      const matches = await context.searchPromptedMemoryMedia("Alice Example and Bob Example together");
+      const byPath = new Map(matches.map((item) => [item.path, item]));
+      assert(byPath.has(together), "the same confirmed group photo must survive both named-person searches");
+      assert(byPath.has(aliceOnly), "Alice-only photos remain available as a fallback");
+      assert(byPath.has(bobOnly), "Bob-only photos remain available as a fallback");
+      assert(byPath.get(together).score > byPath.get(aliceOnly).score, "the shared photo should outrank Alice-only results");
+      assert(byPath.get(together).score > byPath.get(bobOnly).score, "the shared photo should outrank Bob-only results");
+    } finally {
+      context.__folders = original.folders;
+      context.__people = original.people;
+      context.__geoPhotos = original.geoPhotos;
+      context.__metadata = original.metadata;
+      searchResults = original.searchResults;
+      indexedImages = original.indexedImages;
     }
   });
 

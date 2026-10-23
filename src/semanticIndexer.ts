@@ -18,6 +18,7 @@ import { formatDemoFileSample, selectDemoFilePaths } from "./demoLimits";
 import { PersistedVectorIndex, VectorSearchGroup, VectorSearchKind } from "./persistedVectorIndex";
 import { ChildProcess, execFile, fork } from "child_process";
 import { promisify } from "util";
+import { getIndexStorageExclusionRevision } from "./indexingStorage";
 
 const execFileAsync = promisify(execFile);
 const SLOW_EMBEDDING_REQUEST_WARNING_MS = 90_000;
@@ -304,6 +305,19 @@ export class SemanticIndexer {
   private readonly textRecordIds = new Map<string, number>();
   private readonly textRecordPaths: string[] = [];
   private readonly textRecordTerms: Array<Set<string>> = [];
+  private readonly searchIndexabilityCache = new WeakMap<
+    IndexRecord,
+    {
+      path: string;
+      sourcePath: string;
+      type: string;
+      extension: string;
+      canonicalSourcePath: string;
+      canonicalUserDataPath: string;
+      exclusionRevision: number;
+      value: boolean;
+    }
+  >();
   private readonly textPostingTerms: Array<Set<string>> = [];
   private readonly textPostings = new Map<string, number[]>();
   private readonly activeTextSearches = new Set<ActiveTextSearch>();
@@ -461,7 +475,9 @@ export class SemanticIndexer {
       completedAt:
         status === "completed" ? Date.now() : (previous?.completedAt ?? 0),
     });
-    await this.persistSourceCoverage();
+    // This rebuildable sidecar can fail when a removable cache disappears.
+    // Keep the updated in-memory status so the scan itself can finish cleanly.
+    await this.persistSourceCoverage().catch(() => undefined);
   }
 
   private async persistSourceCoverage() {
@@ -1244,7 +1260,7 @@ export class SemanticIndexer {
     search.scanned += 1;
     if (
       !search.sourcePaths.has(record.sourcePath) ||
-      !this.isIndexable(record, record.sourcePath) ||
+      !this.isSearchRecordIndexable(record) ||
       (search.demoPaths && !search.demoPaths.has(record.path))
     )
       return;
@@ -3631,6 +3647,38 @@ export class SemanticIndexer {
     } finally {
       await handle.close();
     }
+  }
+
+  private isSearchRecordIndexable(record: IndexRecord) {
+    const sourcePath = record.sourcePath;
+    const canonicalSourcePath =
+      this.canonicalSourcePaths.get(sourcePath) ?? path.resolve(sourcePath);
+    const exclusionRevision = getIndexStorageExclusionRevision();
+    const cached = this.searchIndexabilityCache.get(record);
+    if (
+      cached &&
+      cached.path === record.path &&
+      cached.sourcePath === sourcePath &&
+      cached.type === record.type &&
+      cached.extension === record.extension &&
+      cached.canonicalSourcePath === canonicalSourcePath &&
+      cached.canonicalUserDataPath === this.canonicalUserDataPath &&
+      cached.exclusionRevision === exclusionRevision
+    )
+      return cached.value;
+
+    const value = this.isIndexable(record, sourcePath);
+    this.searchIndexabilityCache.set(record, {
+      path: record.path,
+      sourcePath,
+      type: record.type,
+      extension: record.extension,
+      canonicalSourcePath,
+      canonicalUserDataPath: this.canonicalUserDataPath,
+      exclusionRevision,
+      value,
+    });
+    return value;
   }
 
   private isIndexable(

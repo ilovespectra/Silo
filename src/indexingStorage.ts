@@ -53,6 +53,7 @@ export async function assertLocalIndexStorageCapacity(
 let activeIndexStorageRoot = "";
 let indexStorageExclusionRoots: string[] = [];
 let canonicalIndexStorageExclusionRoots: string[] | null = null;
+let indexStorageExclusionRevision = 0;
 
 function canonicalizeStoragePath(storageRoot: string) {
   const resolved = path.resolve(storageRoot);
@@ -68,6 +69,7 @@ export function setActiveIndexStorageRoot(storageRoot: string) {
   activeIndexStorageRoot = canonicalizeStoragePath(resolved);
   indexStorageExclusionRoots = [resolved];
   canonicalIndexStorageExclusionRoots = null;
+  indexStorageExclusionRevision += 1;
 }
 
 export function setIndexStorageExclusionRoots(storageRoots: readonly string[]) {
@@ -75,6 +77,11 @@ export function setIndexStorageExclusionRoots(storageRoots: readonly string[]) {
     new Set(storageRoots.map((storageRoot) => path.resolve(storageRoot))),
   );
   canonicalIndexStorageExclusionRoots = null;
+  indexStorageExclusionRevision += 1;
+}
+
+export function getIndexStorageExclusionRevision() {
+  return indexStorageExclusionRevision;
 }
 
 function storagePathAliases(storageRoot: string) {

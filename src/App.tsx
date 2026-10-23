@@ -75,10 +75,12 @@ import {
   matchesMetadataFilters,
   MetadataFilter,
 } from "./utils/metadataFilters";
+import { reconcilePendingSourceToggles } from "./sourceToggleReconciliation";
 import {
   GRID_THUMBNAIL_SIZE,
   LRUCache,
   loadThumbnail,
+  refreshThumbnail,
   thumbnailCache,
   thumbnailCacheKey,
 } from "./utils/thumbnailCache";
@@ -433,6 +435,11 @@ function FileThumbnail({
 }) {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [thumbnailVisible, setThumbnailVisible] = useState(false);
+  const [thumbnailRetry, setThumbnailRetry] = useState<{
+    key: string;
+    url: string;
+  } | null>(null);
+  const [thumbnailFailedKey, setThumbnailFailedKey] = useState<string | null>(null);
   const isPreviewable = file.type === "image" || file.type === "video";
   const indicators = usePhotoIndicator(file.path, isPreviewable);
   const { thumbnail } = useThumbnail(
@@ -460,6 +467,27 @@ function FileThumbnail({
     if (thumbnail) onThumbnailLoaded?.(file.path, file);
   }, [file.path, onThumbnailLoaded, thumbnail]);
 
+  const thumbnailAttemptKey = `${file.path}\u0000${thumbnailSize}\u0000${thumbnail ?? ""}`;
+  const retryThumbnailUrl =
+    thumbnailRetry?.key === thumbnailAttemptKey ? thumbnailRetry.url : null;
+  const thumbnailLoadFailed = thumbnailFailedKey === thumbnailAttemptKey;
+  const recoverThumbnailLoad = () => {
+    if (retryThumbnailUrl) {
+      setThumbnailFailedKey(thumbnailAttemptKey);
+      return;
+    }
+    void refreshThumbnail(file.path, thumbnailSize).then((url) => {
+      if (!url) {
+        setThumbnailFailedKey(thumbnailAttemptKey);
+        return;
+      }
+      setThumbnailRetry({
+        key: thumbnailAttemptKey,
+        url: `${url}?retry=${Date.now()}`,
+      });
+    });
+  };
+
   return (
     <div
       className={`thumbnail-frame ${isPreviewable ? "previewable" : ""} ${file.type === "video" ? "video-thumbnail" : ""}`}
@@ -480,8 +508,12 @@ function FileThumbnail({
         onOpen();
       }}
     >
-      {thumbnail ? (
-        <img src={thumbnail} alt="" />
+      {thumbnail && !thumbnailLoadFailed ? (
+        <img
+          src={retryThumbnailUrl ?? thumbnail}
+          alt=""
+          onError={recoverThumbnailLoad}
+        />
       ) : (
         <div className="thumbnail-placeholder">
           {file.isDirectory ? (
@@ -1162,6 +1194,9 @@ function App() {
   const [faceAssignmentFaces, setFaceAssignmentFaces] = useState<ImageFace[]>(
     [],
   );
+  const [faceAssignmentLoadedPath, setFaceAssignmentLoadedPath] = useState<
+    string | null
+  >(null);
   const [faceAssignmentSelectedId, setFaceAssignmentSelectedId] = useState<
     string | null
   >(null);
@@ -1169,12 +1204,19 @@ function App() {
     Record<string, { personId: string; newName: string }>
   >({});
   const [faceAssignmentBusy, setFaceAssignmentBusy] = useState(false);
+  const [faceAssignmentLoading, setFaceAssignmentLoading] = useState(false);
   const [faceAssignmentError, setFaceAssignmentError] = useState("");
+  const faceAssignmentRequestRef = useRef(0);
+  const hasPendingFaceDescriptor =
+    faceAssignmentLoadedPath === selectedFile?.path &&
+    faceAssignmentFaces.some((face) => face.descriptorStatus === "pending");
   const [faceCreationBox, setFaceCreationBox] = useState<
     ImageFace["box"] | null
   >(null);
   const faceBoxDragRef = useRef<{
     faceId: string;
+    imagePath: string;
+    request: number;
     startX: number;
     startY: number;
     startBox: ImageFace["box"];
@@ -1182,6 +1224,8 @@ function App() {
     moved: boolean;
   } | null>(null);
   const faceCreateDragRef = useRef<{
+    imagePath: string;
+    request: number;
     startX: number;
     startY: number;
     currentBox: ImageFace["box"];
@@ -1351,6 +1395,8 @@ function App() {
   }, [showPhoneBackups, sourceSort, sources]);
   const sourcesRef = useRef<BrowseSource[]>([]);
   const sourcesRefreshRequestRef = useRef(0);
+  const sourceToggleRequestRef = useRef(new Map<string, number>());
+  const sourceToggleChainRef = useRef<Promise<void>>(Promise.resolve());
   sourcesRef.current = sources;
   const [allSourcesPath, setAllSourcesPath] =
     useState<string>("/__sources__/all");
@@ -2385,8 +2431,10 @@ function App() {
         setCurrentPath(pathToLoad);
         setNavigationHistory([{ type: "path", value: pathToLoad }]);
         setHistoryIndex(0);
-        await loadDirectory(pathToLoad, nextExploded);
+        // Render the restored shell as soon as state and sources are ready.
+        // The initial directory inventory can stream in without blocking startup.
         if (!cancelled) setHydrated(true);
+        await loadDirectory(pathToLoad, nextExploded);
       })
       .catch((error) => {
         if (cancelled) return;
@@ -3080,8 +3128,13 @@ function App() {
     const request = ++sourcesRefreshRequestRef.current;
     const latest = await electronAPI.listSources();
     if (request !== sourcesRefreshRequestRef.current) return;
-    sourcesRef.current = latest;
-    setSources(latest);
+    const reconciled = reconcilePendingSourceToggles(
+      latest,
+      sourcesRef.current,
+      sourceToggleRequestRef.current,
+    );
+    sourcesRef.current = reconciled;
+    setSources(reconciled);
   }, [electronAPI]);
 
   useEffect(() => {
@@ -3172,29 +3225,120 @@ function App() {
   const toggleSource = useCallback(
     async (sourceId: string, enabled: boolean) => {
       if (!electronAPI) return;
-      const updated = await electronAPI.setSourceEnabled(sourceId, enabled);
+      const prior = sourcesRef.current;
+      const request = (sourceToggleRequestRef.current.get(sourceId) ?? 0) + 1;
+      sourceToggleRequestRef.current.set(sourceId, request);
       sourcesRefreshRequestRef.current += 1;
-      sourcesRef.current = updated;
-      setSources(updated);
+      const optimistic = prior.map((source) =>
+        source.id === sourceId ? { ...source, enabled } : source,
+      );
+      sourcesRef.current = optimistic;
+      setSources(optimistic);
+      if (!enabled) {
+        const disabledSource = prior.find((source) => source.id === sourceId);
+        if (disabledSource) {
+          const rootPrefix = disabledSource.rootPath.endsWith("/")
+            ? disabledSource.rootPath
+            : `${disabledSource.rootPath}/`;
+          setFiles((current) => current.filter((file) =>
+            file.sourceId !== sourceId && !file.path.startsWith(rootPrefix),
+          ));
+          allSourcesLoadedRef.current.delete(sourceId);
+        }
+      }
+      const previousToggle = sourceToggleChainRef.current;
+      const updatePromise = previousToggle
+        .catch(() => undefined)
+        .then(async () => {
+          if (sourceToggleRequestRef.current.get(sourceId) !== request)
+            return null;
+          return electronAPI.setSourceEnabled(sourceId, enabled);
+        });
+      sourceToggleChainRef.current = updatePromise.then(
+        () => undefined,
+        () => undefined,
+      );
+      let updated: BrowseSource[] | null;
+      try {
+        updated = await updatePromise;
+      } catch (error) {
+        if (sourceToggleRequestRef.current.get(sourceId) === request) {
+          sourcesRefreshRequestRef.current += 1;
+          const authoritative = await electronAPI
+            .listSources()
+            .catch(() => prior);
+          if (sourceToggleRequestRef.current.get(sourceId) === request) {
+            const reconciled = reconcilePendingSourceToggles(
+              authoritative,
+              sourcesRef.current,
+              sourceToggleRequestRef.current,
+              new Set([sourceId]),
+            );
+            sourcesRef.current = reconciled;
+            setSources(reconciled);
+            const inAggregateBrowse =
+              currentPath === allSourcesPath ||
+              (activeDigitalFolderId === null && currentPath === null);
+            if (inAggregateBrowse) {
+              setCurrentPath(allSourcesPath);
+              if (!explodedRef.current) {
+                if (sourceRefreshTimerRef.current !== null)
+                  window.clearTimeout(sourceRefreshTimerRef.current);
+                sourceRefreshTimerRef.current = window.setTimeout(() => {
+                  sourceRefreshTimerRef.current = null;
+                  void loadDirectory(allSourcesPath, false, true, true);
+                }, 180);
+              } else {
+                const restoredSource = reconciled.find(
+                  (source) => source.id === sourceId && source.enabled,
+                );
+                if (
+                  restoredSource?.available &&
+                  !allSourcesLoadedRef.current.has(restoredSource.id)
+                )
+                  await loadAggregateSource(restoredSource);
+              }
+            } else if (currentPath) void loadDirectory(currentPath);
+            setBrowseError(
+              `Could not update source selection. ${error instanceof Error ? error.message : String(error)}`,
+            );
+            if (sourceToggleRequestRef.current.get(sourceId) === request)
+              sourceToggleRequestRef.current.delete(sourceId);
+          }
+        }
+        return;
+      }
+      if (!updated || sourceToggleRequestRef.current.get(sourceId) !== request)
+        return;
+      sourcesRefreshRequestRef.current += 1;
+      const reconciled = reconcilePendingSourceToggles(
+        updated,
+        sourcesRef.current,
+        sourceToggleRequestRef.current,
+        new Set([sourceId]),
+      );
+      sourcesRef.current = reconciled;
+      setSources(reconciled);
       const inAggregateBrowse =
         currentPath === allSourcesPath ||
         (activeDigitalFolderId === null && currentPath === null);
-      if (!inAggregateBrowse) return;
-      setCurrentPath(allSourcesPath);
-      if (!explodedRef.current) {
-        if (sourceRefreshTimerRef.current !== null)
-          window.clearTimeout(sourceRefreshTimerRef.current);
-        sourceRefreshTimerRef.current = window.setTimeout(() => {
-          sourceRefreshTimerRef.current = null;
-          void loadDirectory(allSourcesPath, false, true, true);
-        }, 180);
-        return;
+      if (inAggregateBrowse) {
+        setCurrentPath(allSourcesPath);
+        if (!explodedRef.current) {
+          if (sourceRefreshTimerRef.current !== null)
+            window.clearTimeout(sourceRefreshTimerRef.current);
+          sourceRefreshTimerRef.current = window.setTimeout(() => {
+            sourceRefreshTimerRef.current = null;
+            void loadDirectory(allSourcesPath, false, true, true);
+          }, 180);
+        } else if (enabled) {
+          const source = reconciled.find((item) => item.id === sourceId);
+          if (source?.available && !allSourcesLoadedRef.current.has(source.id))
+            await loadAggregateSource(source);
+        }
       }
-      if (!enabled) return;
-      const source = updated.find((item) => item.id === sourceId);
-      if (!source?.available || allSourcesLoadedRef.current.has(source.id))
-        return;
-      await loadAggregateSource(source);
+      if (sourceToggleRequestRef.current.get(sourceId) === request)
+        sourceToggleRequestRef.current.delete(sourceId);
     },
     [
       activeDigitalFolderId,
@@ -3665,33 +3809,100 @@ function App() {
   );
 
   const openFaceAssignment = useCallback(
-    async (file: FileInfo) => {
+    (file: FileInfo) => {
       if (!electronAPI || file.type !== "image") return;
-      await openMediaViewer(file);
+      // Reveal the face editor immediately; preview decoding can continue while
+      // this image's saved face boxes load from the local index. A path-keyed
+      // effect below owns each load so viewer navigation cannot leave stale boxes.
+      void openMediaViewer(file);
       setFaceAssignmentOpen(true);
       setFaceAssignmentFaces([]);
+      setFaceAssignmentLoadedPath(null);
       setFaceAssignmentSelectedId(null);
       setFaceAssignmentTargets({});
       setFaceAssignmentError("");
-      const [faces] = await Promise.all([
-        electronAPI.getImageFaces(file.path),
-        refreshPeople(),
-      ]);
-      setFaceAssignmentFaces(faces);
-      setFaceAssignmentTargets(
-        Object.fromEntries(
-          faces.map((face) => [
-            face.id,
-            { personId: face.personIds[0] ?? "", newName: "" },
-          ]),
-        ),
-      );
+      setFaceAssignmentLoading(true);
     },
-    [electronAPI, openMediaViewer, refreshPeople],
+    [electronAPI, openMediaViewer],
   );
 
+  useEffect(() => {
+    const request = ++faceAssignmentRequestRef.current;
+    const imagePath =
+      faceAssignmentOpen && selectedFile?.type === "image"
+        ? selectedFile.path
+        : null;
+    faceBoxDragRef.current = null;
+    faceCreateDragRef.current = null;
+    setFaceCreationBox(null);
+    setFaceAssignmentBusy(false);
+    setFaceAssignmentFaces([]);
+    setFaceAssignmentLoadedPath(null);
+    setFaceAssignmentSelectedId(null);
+    setFaceAssignmentTargets({});
+    setFaceAssignmentError("");
+
+    if (!electronAPI || !imagePath) {
+      setFaceAssignmentLoading(false);
+      return () => {
+        if (faceAssignmentRequestRef.current === request)
+          faceAssignmentRequestRef.current += 1;
+      };
+    }
+
+    let active = true;
+    setFaceAssignmentLoading(true);
+    void electronAPI
+      .getImageFaces(imagePath)
+      .then((faces) => {
+        if (!active || request !== faceAssignmentRequestRef.current) return;
+        setFaceAssignmentFaces(faces);
+        setFaceAssignmentLoadedPath(imagePath);
+        setFaceAssignmentTargets(
+          Object.fromEntries(
+            faces.map((face) => [
+              face.id,
+              { personId: face.personIds[0] ?? "", newName: "" },
+            ]),
+          ),
+        );
+        setFaceAssignmentLoading(false);
+      })
+      .catch((cause) => {
+        if (!active || request !== faceAssignmentRequestRef.current) return;
+        setFaceAssignmentError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not load face boxes for this photo.",
+        );
+        setFaceAssignmentLoading(false);
+      });
+    return () => {
+      active = false;
+      if (faceAssignmentRequestRef.current === request)
+        faceAssignmentRequestRef.current += 1;
+    };
+  }, [electronAPI, faceAssignmentOpen, selectedFile?.path, selectedFile?.type]);
+
+  const closeFaceAssignment = useCallback(() => {
+    faceAssignmentRequestRef.current += 1;
+    setFaceAssignmentOpen(false);
+    setFaceAssignmentLoading(false);
+    setFaceAssignmentBusy(false);
+  }, []);
+
   const saveFaceAssignments = useCallback(async () => {
-    if (!electronAPI || !selectedFile || faceAssignmentFaces.length === 0) return;
+    if (
+      !electronAPI ||
+      !selectedFile ||
+      faceAssignmentLoadedPath !== selectedFile.path ||
+      faceAssignmentLoading ||
+      faceAssignmentBusy ||
+      faceAssignmentFaces.length === 0
+    )
+      return;
+    const request = faceAssignmentRequestRef.current;
+    const imagePath = selectedFile.path;
     setFaceAssignmentBusy(true);
     setFaceAssignmentError("");
     try {
@@ -3705,74 +3916,164 @@ function App() {
       });
       if (assignments.some((item) => !item))
         throw new Error("Choose a person or enter a name for every face box.");
-      await electronAPI.assignFacesToPeople(
-        assignments.filter((item): item is NonNullable<typeof item> => item !== null),
+      const savedAssignments = assignments.filter(
+        (item): item is NonNullable<typeof item> => item !== null,
       );
-      const faces = await electronAPI.getImageFaces(selectedFile.path);
+      const savedByFaceId = new Map(
+        savedAssignments.map((item) => [item.faceId, item]),
+      );
+      const updatedPeople = await electronAPI.assignFacesToPeople(
+        savedAssignments,
+      );
+      setPeople((current) => {
+        const next = new Map(current.map((person) => [person.id, person]));
+        for (const person of updatedPeople) {
+          if (
+            person.photoCount > 0 ||
+            person.manual ||
+            person.status !== "unconfirmed"
+          )
+            next.set(person.id, person);
+          else next.delete(person.id);
+        }
+        return Array.from(next.values()).sort(
+          (first, second) =>
+            second.photoCount - first.photoCount ||
+          first.name.localeCompare(second.name),
+        );
+      });
+      if (request !== faceAssignmentRequestRef.current) return;
+      const faces = await electronAPI.getImageFaces(imagePath);
+      if (request !== faceAssignmentRequestRef.current) return;
       setFaceAssignmentFaces(faces);
       setFaceAssignmentTargets(
         Object.fromEntries(
-          faces.map((face) => [
-            face.id,
-            { personId: face.personIds[0] ?? "", newName: "" },
-          ]),
+          faces.map((face) => {
+            const saved = savedByFaceId.get(face.id);
+            const createdPerson = saved?.newName
+              ? updatedPeople.find(
+                  (person) =>
+                    person.name.toLocaleLowerCase() ===
+                    saved.newName!.toLocaleLowerCase(),
+                )
+              : undefined;
+            return [
+              face.id,
+              {
+                personId:
+                  saved?.personId ??
+                  createdPerson?.id ??
+                  face.personIds[0] ??
+                  "",
+                newName: "",
+              },
+            ];
+          }),
         ),
       );
       setFaceAssignmentSelectedId(null);
-      refreshPhotoIndicators([selectedFile.path]);
-      await refreshPeople();
+      refreshPhotoIndicators([imagePath]);
     } catch (cause) {
-      setFaceAssignmentError(
-        cause instanceof Error ? cause.message : "Could not assign these faces.",
-      );
+      if (request === faceAssignmentRequestRef.current)
+        setFaceAssignmentError(
+          cause instanceof Error ? cause.message : "Could not assign these faces.",
+        );
     } finally {
-      setFaceAssignmentBusy(false);
+      if (request === faceAssignmentRequestRef.current)
+        setFaceAssignmentBusy(false);
     }
   }, [
     electronAPI,
+    faceAssignmentBusy,
     faceAssignmentFaces,
+    faceAssignmentLoadedPath,
+    faceAssignmentLoading,
     faceAssignmentTargets,
-    refreshPeople,
     refreshPhotoIndicators,
     selectedFile,
   ]);
 
   const deleteDetectedFace = useCallback(
     async (faceId: string) => {
-      if (!electronAPI || !selectedFile) return;
+      if (
+        !electronAPI ||
+        !selectedFile ||
+        faceAssignmentLoadedPath !== selectedFile.path ||
+        faceAssignmentLoading ||
+        faceAssignmentBusy
+      )
+        return;
+      const request = faceAssignmentRequestRef.current;
+      const imagePath = selectedFile.path;
       setFaceAssignmentBusy(true);
       setFaceAssignmentError("");
       try {
-        setFaceAssignmentFaces(await electronAPI.deleteFace(faceId));
+        const result = await electronAPI.deleteFace(faceId);
+        setPeople((current) => {
+          const next = new Map(current.map((person) => [person.id, person]));
+          for (const person of result.people) {
+            if (
+              person.photoCount > 0 ||
+              person.manual ||
+              person.status !== "unconfirmed"
+            )
+              next.set(person.id, person);
+            else next.delete(person.id);
+          }
+          return Array.from(next.values()).sort(
+            (first, second) =>
+              second.photoCount - first.photoCount ||
+              first.name.localeCompare(second.name),
+          );
+        });
+        if (request !== faceAssignmentRequestRef.current) return;
+        setFaceAssignmentFaces(result.faces);
         setFaceAssignmentTargets((current) => {
           const next = { ...current };
           delete next[faceId];
           return next;
         });
-        if (selectedPersonPhoto?.path === selectedFile.path)
-          setSelectedPhotoFaces(
-            await electronAPI.getImageFaces(selectedFile.path),
-          );
+        if (selectedPersonPhoto?.path === imagePath) {
+          const faces = await electronAPI.getImageFaces(imagePath);
+          if (request !== faceAssignmentRequestRef.current) return;
+          setSelectedPhotoFaces(faces);
+        }
         setFaceAssignmentSelectedId((current) =>
           current === faceId ? null : current,
         );
-        await refreshPeople();
       } catch (cause) {
-        setFaceAssignmentError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not delete this face.",
-        );
+        if (request === faceAssignmentRequestRef.current)
+          setFaceAssignmentError(
+            cause instanceof Error
+              ? cause.message
+              : "Could not delete this face.",
+          );
       } finally {
-        setFaceAssignmentBusy(false);
+        if (request === faceAssignmentRequestRef.current)
+          setFaceAssignmentBusy(false);
       }
     },
-    [electronAPI, refreshPeople, selectedFile, selectedPersonPhoto],
+    [
+      electronAPI,
+      faceAssignmentBusy,
+      faceAssignmentLoadedPath,
+      faceAssignmentLoading,
+      selectedFile,
+      selectedPersonPhoto,
+    ],
   );
 
   const beginFaceCreation = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
-      if (!event.shiftKey || event.button !== 0) return;
+      if (
+        !event.shiftKey ||
+        event.button !== 0 ||
+        faceAssignmentBusy ||
+        faceAssignmentLoading ||
+        !selectedFile ||
+        faceAssignmentLoadedPath !== selectedFile.path
+      )
+        return;
       const image = event.currentTarget.querySelector("img");
       const bounds = image?.getBoundingClientRect();
       if (!bounds || !bounds.width || !bounds.height) return;
@@ -3787,6 +4088,8 @@ function App() {
         Math.min(1, (event.clientY - bounds.top) / bounds.height),
       );
       faceCreateDragRef.current = {
+        imagePath: selectedFile.path,
+        request: faceAssignmentRequestRef.current,
         startX: x,
         startY: y,
         currentBox: { x, y, width: 0, height: 0 },
@@ -3794,13 +4097,23 @@ function App() {
       setFaceCreationBox(faceCreateDragRef.current.currentBox);
       event.currentTarget.setPointerCapture(event.pointerId);
     },
-    [],
+    [
+      faceAssignmentBusy,
+      faceAssignmentLoadedPath,
+      faceAssignmentLoading,
+      selectedFile,
+    ],
   );
 
   const updateFaceCreation = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
       const drag = faceCreateDragRef.current;
-      if (!drag) return;
+      if (
+        !drag ||
+        drag.request !== faceAssignmentRequestRef.current ||
+        drag.imagePath !== selectedFile?.path
+      )
+        return;
       const image = event.currentTarget.querySelector("img");
       const bounds = image?.getBoundingClientRect();
       if (!bounds || !bounds.width || !bounds.height) return;
@@ -3820,7 +4133,7 @@ function App() {
       };
       setFaceCreationBox({ ...drag.currentBox });
     },
-    [],
+    [selectedFile?.path],
   );
 
   const finishFaceCreation = useCallback(
@@ -3833,17 +4146,25 @@ function App() {
       if (
         !electronAPI ||
         !selectedFile ||
+        drag.request !== faceAssignmentRequestRef.current ||
+        drag.imagePath !== selectedFile.path ||
+        faceAssignmentLoadedPath !== drag.imagePath ||
+        faceAssignmentLoading ||
+        faceAssignmentBusy ||
         drag.currentBox.width < 0.01 ||
         drag.currentBox.height < 0.01
       )
         return;
+      const request = drag.request;
+      const imagePath = drag.imagePath;
       setFaceAssignmentBusy(true);
       setFaceAssignmentError("");
       try {
         const faces = await electronAPI.createFaceBox(
-          selectedFile.path,
+          imagePath,
           drag.currentBox,
         );
+        if (request !== faceAssignmentRequestRef.current) return;
         setFaceAssignmentFaces(faces);
         const createdFace = faces[faces.length - 1];
         setFaceAssignmentSelectedId(createdFace?.id ?? null);
@@ -3853,25 +4174,36 @@ function App() {
             [createdFace.id]: { personId: "", newName: "" },
           }));
           setFaceAssignmentError(
-            createdFace.hasDescriptor
-              ? "Face box saved. Choose a person for each box, then save all assignments."
-              : "Face box saved, but Silo could not read a recognition descriptor. You can assign it, but it will not train matching.",
+            createdFace.descriptorStatus === "pending"
+              ? "Face box saved. Recognition is preparing in the background; you can assign the person now."
+              : createdFace.hasDescriptor
+                ? "Face box saved. Choose a person for each box, then save all assignments."
+                : "Face box saved, but recognition is unavailable. You can assign it, but it will not train matching.",
           );
         }
-        if (selectedPersonPhoto?.path === selectedFile.path)
+        if (selectedPersonPhoto?.path === imagePath)
           setSelectedPhotoFaces(faces);
-        await refreshPeople();
       } catch (cause) {
-        setFaceAssignmentError(
-          cause instanceof Error
-            ? cause.message
-            : "Could not create the face box.",
-        );
+        if (request === faceAssignmentRequestRef.current)
+          setFaceAssignmentError(
+            cause instanceof Error
+              ? cause.message
+              : "Could not create the face box.",
+          );
       } finally {
-        setFaceAssignmentBusy(false);
+        if (request === faceAssignmentRequestRef.current)
+          setFaceAssignmentBusy(false);
       }
     },
-    [electronAPI, refreshPeople, selectedFile, selectedPersonPhoto],
+    [
+      electronAPI,
+      faceAssignmentBusy,
+      faceAssignmentLoadedPath,
+      faceAssignmentLoading,
+      refreshPeople,
+      selectedFile,
+      selectedPersonPhoto,
+    ],
   );
 
   const beginFaceBoxDrag = useCallback(
@@ -3879,6 +4211,10 @@ function App() {
       if (
         event.button !== 0 ||
         event.shiftKey ||
+        faceAssignmentBusy ||
+        faceAssignmentLoading ||
+        !selectedFile ||
+        faceAssignmentLoadedPath !== selectedFile.path ||
         (event.target as HTMLElement).closest("button")
       )
         return;
@@ -3886,6 +4222,8 @@ function App() {
       event.stopPropagation();
       faceBoxDragRef.current = {
         faceId: face.id,
+        imagePath: selectedFile.path,
+        request: faceAssignmentRequestRef.current,
         startX: event.clientX,
         startY: event.clientY,
         startBox: { ...face.box },
@@ -3894,13 +4232,23 @@ function App() {
       };
       event.currentTarget.setPointerCapture(event.pointerId);
     },
-    [],
+    [
+      faceAssignmentBusy,
+      faceAssignmentLoadedPath,
+      faceAssignmentLoading,
+      selectedFile,
+    ],
   );
 
   const moveFaceBox = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
       const drag = faceBoxDragRef.current;
-      if (!drag) return;
+      if (
+        !drag ||
+        drag.request !== faceAssignmentRequestRef.current ||
+        drag.imagePath !== selectedFile?.path
+      )
+        return;
       const image = event.currentTarget.parentElement?.querySelector("img");
       const bounds = image?.getBoundingClientRect();
       if (!bounds || !bounds.width || !bounds.height) return;
@@ -3928,7 +4276,7 @@ function App() {
         ),
       );
     },
-    [],
+    [selectedFile?.path],
   );
 
   const finishFaceBoxDrag = useCallback(
@@ -3936,20 +4284,33 @@ function App() {
       const drag = faceBoxDragRef.current;
       if (!drag) return;
       faceBoxDragRef.current = null;
-      if (!drag.moved || !electronAPI || !selectedFile) return;
+      if (
+        !drag.moved ||
+        !electronAPI ||
+        !selectedFile ||
+        drag.request !== faceAssignmentRequestRef.current ||
+        drag.imagePath !== selectedFile.path ||
+        faceAssignmentLoadedPath !== drag.imagePath ||
+        faceAssignmentLoading ||
+        faceAssignmentBusy
+      )
+        return;
+      const request = drag.request;
+      const imagePath = drag.imagePath;
       setFaceAssignmentBusy(true);
       setFaceAssignmentError("");
       try {
         const faces = await electronAPI.updateFaceBox(
           drag.faceId,
-          selectedFile.path,
+          imagePath,
           drag.currentBox,
         );
+        if (request !== faceAssignmentRequestRef.current) return;
         setFaceAssignmentFaces(faces);
-        if (selectedPersonPhoto?.path === selectedFile.path)
+        if (selectedPersonPhoto?.path === imagePath)
           setSelectedPhotoFaces(faces);
-        await refreshPeople();
       } catch (cause) {
+        if (request !== faceAssignmentRequestRef.current) return;
         setFaceAssignmentFaces((faces) =>
           faces.map((item) =>
             item.id === drag.faceId ? { ...item, box: drag.startBox } : item,
@@ -3961,11 +4322,19 @@ function App() {
             : "Could not move this face box.",
         );
       } finally {
-        setFaceAssignmentBusy(false);
+        if (request === faceAssignmentRequestRef.current)
+          setFaceAssignmentBusy(false);
       }
       event.stopPropagation();
     },
-    [electronAPI, refreshPeople, selectedFile, selectedPersonPhoto],
+    [
+      electronAPI,
+      faceAssignmentBusy,
+      faceAssignmentLoadedPath,
+      faceAssignmentLoading,
+      selectedFile,
+      selectedPersonPhoto,
+    ],
   );
 
   const saveSelectedFileToDevice = useCallback(async () => {
@@ -4669,6 +5038,8 @@ function App() {
       toastTimer = window.setTimeout(() => setHistoryToast(""), 3500);
     };
     const remove = electronAPI.onEditMenuCommand(async (command) => {
+      const faceRequest = faceAssignmentRequestRef.current;
+      const editedImagePath = selectedFile?.path;
       const active = document.activeElement as HTMLElement | null;
       // Text fields keep normal text undo/redo.
       if (
@@ -4692,11 +5063,18 @@ function App() {
         await refreshPeople();
         const personId = selectedPersonIdRef.current;
         if (personId) await openPerson(personId);
-        if (faceAssignmentOpen && selectedFile?.type === "image") {
-          const faces = await electronAPI.getImageFaces(selectedFile.path);
-          setFaceAssignmentFaces(faces);
-          if (selectedPersonPhoto?.path === selectedFile.path)
-            setSelectedPhotoFaces(faces);
+        if (
+          faceAssignmentOpen &&
+          selectedFile?.type === "image" &&
+          editedImagePath
+        ) {
+          const faces = await electronAPI.getImageFaces(editedImagePath);
+          if (faceAssignmentRequestRef.current === faceRequest) {
+            setFaceAssignmentFaces(faces);
+            setFaceAssignmentLoadedPath(editedImagePath);
+            if (selectedPersonPhoto?.path === editedImagePath)
+              setSelectedPhotoFaces(faces);
+          }
         }
       } catch (cause) {
         showToast(cause instanceof Error ? cause.message : "Could not undo.");
@@ -5241,6 +5619,80 @@ function App() {
     },
     [fileMetadata, rawContentFiles],
   );
+
+  useEffect(() => {
+    if (
+      !electronAPI?.onPersonRecognitionChanged ||
+      !personDetail
+    )
+      return;
+    const personId = personDetail.id;
+    return electronAPI.onPersonRecognitionChanged((personIds) => {
+      if (!personIds.includes(personId)) return;
+      void electronAPI
+        .getPerson(personId)
+        .then((detail) => {
+          if (!detail) return;
+          setPersonDetail(detail);
+          void refreshPeople();
+        })
+        .catch(() => {
+          // Keep the current status visible; the next state event can retry.
+        });
+    });
+  }, [
+    electronAPI,
+    personDetail?.id,
+    personDetail?.recognitionPending,
+    refreshPeople,
+  ]);
+
+  useEffect(() => {
+    if (
+      !electronAPI ||
+      !faceAssignmentOpen ||
+      !selectedFile ||
+      faceAssignmentLoadedPath !== selectedFile.path ||
+      !hasPendingFaceDescriptor
+    )
+      return;
+    const imagePath = selectedFile.path;
+    let stopped = false;
+    let inFlight = false;
+    const timer = window.setInterval(async () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const latest = await electronAPI.getImageFaces(imagePath);
+        if (stopped) return;
+        const byId = new Map(latest.map((face) => [face.id, face]));
+        setFaceAssignmentFaces((current) => {
+          let changed = false;
+          const next = current.map((face) => {
+            const refreshed = byId.get(face.id);
+            if (!refreshed || refreshed.descriptorStatus === face.descriptorStatus)
+              return face;
+            changed = true;
+            return {
+              ...face,
+              descriptorStatus: refreshed.descriptorStatus,
+              hasDescriptor: refreshed.hasDescriptor,
+              score: refreshed.score,
+            };
+          });
+          return changed ? next : current;
+        });
+      } catch {
+        // A later poll can recover while the face editor remains open.
+      } finally {
+        inFlight = false;
+      }
+    }, 1000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [electronAPI, faceAssignmentOpen, faceAssignmentLoadedPath, hasPendingFaceDescriptor, selectedFile?.path]);
 
   useEffect(() => {
     if (!electronAPI?.onPhotoIndicatorsChanged) return;
@@ -7530,13 +7982,17 @@ function App() {
                     confirmed
                   </strong>
                   <span>
-                    {personDetail.fullyConfirmed
-                      ? personDetail.status === "banned"
-                        ? "Photos with this face are hidden across Silo."
-                        : personDetail.trainedAt
-                          ? `Recognition trained ${new Date(personDetail.trainedAt).toLocaleDateString()}. Retrain after confirming new suggestions.`
-                          : "Every photo is confirmed. Train recognition to find more photos of this person."
-                      : "Confirm or remove every photo to unlock recognition training. Right-click or Shift-click photos to move them to another person."}
+                    {personDetail.recognitionPending
+                      ? "Recognition is updating in the background. New suggestions will appear when it finishes."
+                      : personDetail.recognitionFailed
+                        ? "Recognition could not finish. Choose Retrain to try again."
+                        : personDetail.fullyConfirmed
+                          ? personDetail.status === "banned"
+                            ? "Photos with this face are hidden across Silo."
+                            : personDetail.trainedAt
+                              ? `Recognition trained ${new Date(personDetail.trainedAt).toLocaleDateString()}. Retrain after confirming new suggestions.`
+                              : "Every photo is confirmed. Train recognition to find more photos of this person."
+                          : "Confirm or remove every photo to unlock recognition training. Right-click or Shift-click photos to move them to another person."}
                     {personDetail.hiddenCount > 0 &&
                       ` ${personDetail.hiddenCount.toLocaleString()} photo${personDetail.hiddenCount === 1 ? " is" : "s are"} hidden by content protection and not counted.`}
                   </span>
@@ -10009,7 +10465,7 @@ function App() {
                     className={faceAssignmentOpen ? "active" : ""}
                     onClick={() =>
                       faceAssignmentOpen
-                        ? setFaceAssignmentOpen(false)
+                        ? closeFaceAssignment()
                         : void openFaceAssignment(selectedFile)
                     }
                     title="Add people to this photo"
@@ -10296,18 +10752,30 @@ function App() {
                   maxWidth: viewerFit ? "100%" : "none",
                 }}
                 onPointerDown={
-                  faceAssignmentOpen ? beginFaceCreation : undefined
+                  faceAssignmentOpen &&
+                  faceAssignmentLoadedPath === selectedFile.path &&
+                  !faceAssignmentLoading
+                    ? beginFaceCreation
+                    : undefined
                 }
                 onPointerMove={
-                  faceAssignmentOpen ? updateFaceCreation : undefined
+                  faceAssignmentOpen &&
+                  faceAssignmentLoadedPath === selectedFile.path &&
+                  !faceAssignmentLoading
+                    ? updateFaceCreation
+                    : undefined
                 }
                 onPointerUp={
-                  faceAssignmentOpen
+                  faceAssignmentOpen &&
+                  faceAssignmentLoadedPath === selectedFile.path &&
+                  !faceAssignmentLoading
                     ? (event) => void finishFaceCreation(event)
                     : undefined
                 }
                 onPointerCancel={
-                  faceAssignmentOpen
+                  faceAssignmentOpen &&
+                  faceAssignmentLoadedPath === selectedFile.path &&
+                  !faceAssignmentLoading
                     ? (event) => void finishFaceCreation(event)
                     : undefined
                 }
@@ -10339,6 +10807,7 @@ function App() {
                   />
                 )}
                 {faceAssignmentOpen &&
+                  faceAssignmentLoadedPath === selectedFile.path &&
                   faceAssignmentFaces.map((face, index) => (
                     <div
                       key={face.id}
@@ -10363,21 +10832,22 @@ function App() {
                       }}
                       title={
                         face.personIds.length
-                          ? `Assigned: ${face.personIds.map((id) => people.find((person) => person.id === id)?.name ?? "Person").join(", ")}`
+                          ? `Face ${index + 1} · Assigned: ${face.personIds.map((id) => people.find((person) => person.id === id)?.name ?? "Person").join(", ")}`
                           : `Detected face ${index + 1}`
                       }
                     >
                       <span>
+                        {index + 1}
                         {face.personIds.length
-                          ? face.personIds
+                          ? ` · ${face.personIds
                               .map(
                                 (id) =>
                                   people.find((person) => person.id === id)
                                     ?.name,
                               )
                               .filter(Boolean)
-                              .join(", ")
-                          : index + 1}
+                              .join(", ")}`
+                          : ""}
                       </span>
                       <button
                         className="face-assignment-delete"
@@ -10410,18 +10880,24 @@ function App() {
               <header>
                 <strong>Add people to photo</strong>
                 <button
-                  onClick={() => setFaceAssignmentOpen(false)}
+                  onClick={closeFaceAssignment}
                   title="Close face assignment"
                 >
                   <FiX />
                 </button>
               </header>
               <p>
-                {faceAssignmentFaces.length
+                {faceAssignmentLoadedPath !== selectedFile.path ||
+                faceAssignmentLoading
+                  ? faceAssignmentError
+                    ? "Could not load the saved face boxes."
+                    : "Loading saved face boxes…"
+                  : faceAssignmentFaces.length
                   ? "Drag a box to adjust it. Shift-drag on the photo to add every missed face. Choose a person or enter a name for each box, then save them together."
                   : "No face boxes yet. Shift-drag around each face to add it. Then choose a person or enter a name for every box."}
               </p>
-              {faceAssignmentFaces.length > 0 && (
+              {faceAssignmentLoadedPath === selectedFile.path &&
+                faceAssignmentFaces.length > 0 && (
                 <div className="face-assignment-targets">
                   {faceAssignmentFaces.map((face, index) => {
                     const target = faceAssignmentTargets[face.id] ?? {
@@ -10433,9 +10909,11 @@ function App() {
                         <label htmlFor={`face-person-${face.id}`}>
                           Face {index + 1}
                           <span>
-                            {face.hasDescriptor
-                              ? "Recognition ready"
-                              : "Box only · not usable for training"}
+                            {face.descriptorStatus === "pending"
+                              ? "Recognition preparing…"
+                              : face.hasDescriptor
+                                ? "Recognition ready"
+                                : "Box only · recognition unavailable"}
                           </span>
                         </label>
                         <select
@@ -10487,7 +10965,8 @@ function App() {
                   {faceAssignmentError}
                 </small>
               )}
-              {faceAssignmentFaces.length > 0 && (
+              {faceAssignmentLoadedPath === selectedFile.path &&
+                faceAssignmentFaces.length > 0 && (
                 <button
                   className="primary"
                   disabled={
