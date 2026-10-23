@@ -10858,6 +10858,7 @@ app.whenReady().then(async () => {
   if (!(await requireIndexStorageSelection(userDataPath))) return;
   console.error("[startup-debug] after requireIndexStorageSelection");
   let storage: Awaited<ReturnType<typeof prepareConfiguredIndexStorage>>;
+  console.error("[startup-debug] before cacheDestinationSettingsSaved branch");
   if (cacheDestinationSettingsSaved) {
     const missing = await probeCacheDestinationRoots(cacheDestinationRoots);
     const semanticRoot = getCacheDestinationRoot(
@@ -10881,6 +10882,7 @@ app.whenReady().then(async () => {
       bytesVerified: 0,
     };
   } else {
+    console.error("[startup-debug] entering startup storage setup loop");
     const startupStorageProgress = createStartupStorageProgress();
     let useLocalCacheThisSession = false;
     for (;;) {
@@ -10939,6 +10941,7 @@ app.whenReady().then(async () => {
               stallCheckRunning = false;
             });
           }, 10_000);
+        console.error("[startup-debug] before prepareConfiguredIndexStorage");
         storage = await prepareConfiguredIndexStorage(
           userDataPath,
           (filesVerified, bytesVerified, detail) => {
@@ -10959,6 +10962,7 @@ app.whenReady().then(async () => {
           },
           { destinationUnavailable: useLocalCacheThisSession },
         );
+        console.error("[startup-debug] after prepareConfiguredIndexStorage");
         if (watchdog) clearInterval(watchdog);
         startupStorageProgress.close();
         break;
@@ -10997,12 +11001,16 @@ app.whenReady().then(async () => {
     const legacyRoots: CacheDestinationRoots = {};
     for (const item of CACHE_DESTINATIONS)
       legacyRoots[item.id] = storage.storageRoot;
+    console.error("[startup-debug] before copyBrowserSessionDataVerified");
     await copyBrowserSessionDataVerified(
       app.getPath("sessionData"),
       storage.storageRoot,
       userDataPath,
     );
+    console.error("[startup-debug] after copyBrowserSessionDataVerified");
+    console.error("[startup-debug] before writeCacheDestinationRoots");
     await writeCacheDestinationRoots(userDataPath, legacyRoots);
+    console.error("[startup-debug] after writeCacheDestinationRoots");
     cacheDestinationRoots = legacyRoots;
     cacheDestinationSettingsSaved = true;
   }
@@ -11070,6 +11078,7 @@ app.whenReady().then(async () => {
   }
   // A restored config is swapped in before any store opens its files.
   try {
+    console.error("[startup-debug] before applyPendingImport");
     if (
       await applyPendingImport(
         app.getPath("userData"),
@@ -11077,17 +11086,25 @@ app.whenReady().then(async () => {
       )
     )
       runtimeLog("config-import-applied", {});
+    console.error("[startup-debug] after applyPendingImport");
   } catch (error) {
     runtimeLog("config-import-failed", { message: String(error) });
   }
   stateStore = new StateStore(app.getPath("userData"));
+  console.error("[startup-debug] before stateStore.initialize");
   await stateStore.initialize();
+  console.error("[startup-debug] after stateStore.initialize");
   // Signed purchase and beta licenses remain usable offline. The relay can
   // migrate a legacy receipt or provide a current signed entitlement.
+  console.error("[startup-debug] before readLifetimeLicense");
   let effectiveLicense = await readLifetimeLicense();
+  console.error("[startup-debug] after readLifetimeLicense", { isLicensed: effectiveLicense.isLicensed });
   if (!effectiveLicense.isLicensed) {
+    console.error("[startup-debug] before migrateLegacyLifetimeLicense");
     await migrateLegacyLifetimeLicense();
+    console.error("[startup-debug] after migrateLegacyLifetimeLicense");
     effectiveLicense = await readLifetimeLicense();
+    console.error("[startup-debug] after second readLifetimeLicense", { isLicensed: effectiveLicense.isLicensed });
   }
   lifetimeLicensed = effectiveLicense.isLicensed;
   if (lifetimeLicensed) {
