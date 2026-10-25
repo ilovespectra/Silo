@@ -172,9 +172,234 @@ async function checkFaceJournalRecovery() {
   }
 }
 
+async function checkFacePreparationCheckpoint() {
+  const directory = await fsPromises.mkdtemp(
+    path.join(os.tmpdir(), "face-preparation-test-"),
+  );
+  try {
+    const images = Array.from({ length: 40 }, (_, index) => ({
+      name: `photo-${index}.jpg`,
+      path: `/photos/photo-${index}.jpg`,
+      relativePath: `photo-${index}.jpg`,
+      size: 100_000 + index,
+      modified: index,
+      isDirectory: false,
+      type: "image",
+      extension: "jpg",
+    }));
+    let pacedBatches = 0;
+    let pacingStoppedForPause = false;
+    const governor = {
+      setPaceLimitPercent: () => undefined,
+      enterLane: () => () => undefined,
+      paceAfterWork: async (
+        _workMs: number,
+        _shouldYield: () => boolean,
+        shouldStop: () => boolean,
+      ) => {
+        pacedBatches += 1;
+        pacingStoppedForPause = shouldStop();
+      },
+    };
+    const indexer = new FaceIndexer(
+      directory,
+      directory,
+      directory,
+      () => images,
+      () => undefined,
+      directory,
+      5,
+      () => false,
+      undefined,
+      governor as any,
+    );
+    await indexer.initialize();
+
+    const classifierBatches: string[][] = [];
+    let announceFirstBatch!: () => void;
+    let releaseFirstBatch!: () => void;
+    const firstBatchStarted = new Promise<void>((resolve) => {
+      announceFirstBatch = resolve;
+    });
+    const firstBatchGate = new Promise<void>((resolve) => {
+      releaseFirstBatch = resolve;
+    });
+    indexer.setPeoplePhotoClassifier(async (batch) => {
+      classifierBatches.push(batch.map((image) => image.path));
+      if (classifierBatches.length === 1) {
+        announceFirstBatch();
+        await firstBatchGate;
+      }
+      return new Set<string>();
+    });
+
+    (indexer as any).loadRuntime = async () => ({ faceapi: {}, sharp: {} });
+    (indexer as any).processImage = async (image: (typeof images)[number]) => {
+      (indexer as any).processedSignatures.set(
+        image.path,
+        `${image.size}:${image.modified}`,
+      );
+    };
+    (indexer as any).combineSimilarClusters = async () => 0;
+    (indexer as any).refreshRecognition = async () => undefined;
+
+    const firstRun = indexer.start();
+    await firstBatchStarted;
+    const pause = indexer.pause();
+    releaseFirstBatch();
+    await pause;
+    await firstRun;
+
+    assert.equal(classifierBatches.length, 1);
+    assert.equal(classifierBatches[0].length, 32);
+    assert.equal(pacedBatches, 1, "each classification batch enters the shared duty governor");
+    assert.equal(pacingStoppedForPause, true, "a scheduler pause interrupts the throttle wait");
+    assert.equal(indexer.getProgress().status, "paused");
+    assert.match(indexer.getProgress().message, /paused while preparing photos/i);
+
+    const resumedIndexer = new FaceIndexer(
+      directory,
+      directory,
+      directory,
+      () => images,
+      () => undefined,
+    );
+    await resumedIndexer.initialize();
+    const resumedBatches: string[][] = [];
+    resumedIndexer.setPeoplePhotoClassifier(async (batch) => {
+      resumedBatches.push(batch.map((image) => image.path));
+      return new Set<string>();
+    });
+    (resumedIndexer as any).loadRuntime = async () => ({ faceapi: {}, sharp: {} });
+    (resumedIndexer as any).processImage = async (image: (typeof images)[number]) => {
+      (resumedIndexer as any).processedSignatures.set(
+        image.path,
+        `${image.size}:${image.modified}`,
+      );
+    };
+    (resumedIndexer as any).combineSimilarClusters = async () => 0;
+    (resumedIndexer as any).refreshRecognition = async () => undefined;
+
+    await resumedIndexer.start();
+    assert.deepStrictEqual(
+      classifierBatches.map((batch) => batch.length),
+      [32],
+      "the interrupted process completed only its first bounded classifier batch",
+    );
+    assert.deepStrictEqual(
+      resumedBatches.map((batch) => batch.length),
+      [8],
+      "a fresh indexer resumes from durable per-photo classification checkpoints",
+    );
+    assert.equal(
+      new Set([...classifierBatches, ...resumedBatches].flat()).size,
+      40,
+    );
+    assert.equal(resumedIndexer.getProgress().status, "complete");
+    assert.equal(resumedIndexer.getProgress().processed, 40);
+    assert.equal(resumedIndexer.getProgress().remaining, 0);
+    assert.equal(resumedIndexer.getProgress().preparationProcessed, 40);
+    assert.equal(
+      await fsPromises.stat(path.join(directory, "face-index", "photo-classification.jsonl")).then(() => true, () => false),
+      false,
+      "completed face work removes its temporary classification journal",
+    );
+  } finally {
+    await fsPromises.rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function checkLargeFaceQueueResumeWithinProcess() {
+  const directory = await fsPromises.mkdtemp(
+    path.join(os.tmpdir(), "face-queue-resume-test-"),
+  );
+  try {
+    const images = Array.from({ length: 600 }, (_, index) => ({
+      name: `queue-photo-${index}.jpg`,
+      path: `/photos/queue-photo-${index}.jpg`,
+      relativePath: `queue-photo-${index}.jpg`,
+      size: 120_000 + index,
+      modified: index,
+      isDirectory: false,
+      type: "image",
+      extension: "jpg",
+    }));
+    let providerCalls = 0;
+    let classifierCalls = 0;
+    let pauseDuringQueue: Promise<void> | null = null;
+    const processedPaths: string[] = [];
+    const governor = {
+      setPaceLimitPercent: () => undefined,
+      enterLane: () => () => undefined,
+      paceAfterWork: async () => undefined,
+    };
+    let indexer!: FaceIndexer;
+    indexer = new FaceIndexer(
+      directory,
+      directory,
+      directory,
+      () => {
+        providerCalls += 1;
+        return images;
+      },
+      (progress) => {
+        if (
+          !pauseDuringQueue &&
+          progress.phase === "building-queue" &&
+          progress.message.includes("256 of")
+        )
+          pauseDuringQueue = indexer.pause();
+      },
+      directory,
+      5,
+      () => false,
+      undefined,
+      governor as any,
+    );
+    await indexer.initialize();
+    indexer.setPeoplePhotoClassifier(async () => {
+      classifierCalls += 1;
+      return new Set<string>();
+    });
+    (indexer as any).loadRuntime = async () => ({ faceapi: {}, sharp: {} });
+    (indexer as any).processImage = async (image: (typeof images)[number]) => {
+      processedPaths.push(image.path);
+      (indexer as any).processedSignatures.set(
+        image.path,
+        `${image.size}:${image.modified}`,
+      );
+    };
+    (indexer as any).combineSimilarClusters = async () => 0;
+    (indexer as any).refreshRecognition = async () => undefined;
+
+    await indexer.start();
+    assert.ok(pauseDuringQueue, "large queue construction should be pausable");
+    await pauseDuringQueue;
+    assert.equal(indexer.getProgress().status, "paused");
+    assert.equal(
+      (indexer as any).preparation.pendingBuildCursor,
+      256,
+      "the queue cursor is retained at the cooperative pause boundary",
+    );
+
+    await indexer.start();
+    assert.equal(providerCalls, 1, "resume reuses the current source snapshot");
+    assert.equal(classifierCalls, 19, "resume does not classify the same queue again");
+    assert.equal(processedPaths.length, images.length);
+    assert.equal(new Set(processedPaths).size, images.length);
+    assert.equal(indexer.getProgress().status, "complete");
+    assert.equal(indexer.getProgress().processed, images.length);
+    assert.equal(indexer.getProgress().remaining, 0);
+  } finally {
+    await fsPromises.rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function run() {
   await checkFaceInferenceThreadLimit();
   await checkFaceJournalRecovery();
+  await checkFacePreparationCheckpoint();
+  await checkLargeFaceQueueResumeWithinProcess();
   const { directory, indexer } = await setup();
   try {
     const closeA = descriptor(1, 0);

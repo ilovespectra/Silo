@@ -33,6 +33,7 @@ import {
   SearchResult,
   SemanticIndexer,
   type IndexProgress,
+  type SourceScanCheckpoint,
 } from "./semanticIndexer";
 import { DuplicateState } from "./duplicateManager";
 import {
@@ -44,7 +45,7 @@ import {
   type MessageDisplayFlags,
 } from "./stateStore";
 import { FaceIndexer } from "./faceIndexer";
-import { IndexerGovernor, getIndexerGovernorProfile, type IndexerGovernorSignals } from "./indexerGovernor";
+import { IndexerGovernor, getAvailableMemoryRatio, getIndexerGovernorProfile, type IndexerGovernorSignals } from "./indexerGovernor";
 import { PetIndexer } from "./petIndexer";
 import {
   PhoneBackupProgress,
@@ -113,7 +114,7 @@ import {
   isDocumentPreviewFile,
   readPreviewBytes,
 } from "./documentPreview";
-import { IndexingRecovery } from "./indexingRecovery";
+import { IndexingRecovery, isIndexStageUserPaused } from "./indexingRecovery";
 import {
   isLegacyLicenseRejected,
   persistLegacyLicenseRejection,
@@ -170,7 +171,10 @@ import {
   writeIndexStorageRoot,
   getLocalIndexStorageFreeBytes,
   assertLocalIndexStorageCapacity,
+  INDEX_STORAGE_FREE_SPACE_RESERVE_BYTES,
   LOCAL_INDEX_STORAGE_RESERVE_BYTES,
+  StableStorageRecoveryGate,
+  findIndexStorageCapacityIssue,
   setLocalIndexStorageFallback,
   setActiveIndexStorageRoot,
   setIndexStorageExclusionRoots,
@@ -462,35 +466,76 @@ function probeIndexStorageDestination(
   timeoutMs = 8000,
 ): Promise<IndexStorageProbeResult> {
   return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const timeoutDeadline = startedAt + timeoutMs;
     let settled = false;
-    const finish = (result: IndexStorageProbeResult) => {
+    let deferredForEventLoopDelay = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (result: IndexStorageProbeResult, reason: string) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      runtimeLog("index-storage-probe-result", {
+        root: path.resolve(storageRoot),
+        result,
+        reason,
+        elapsedMs: Date.now() - startedAt,
+      });
       resolve(result);
     };
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(process.execPath, [
         "-e",
-        "const fs=require('fs');const p=process.argv[1];try{if(!fs.statSync(p).isDirectory())process.exit(1);fs.accessSync(p,fs.constants.R_OK|fs.constants.W_OK)}catch{process.exit(1)}",
+        "const fs=require('fs');const p=process.argv[1];try{if(!fs.statSync(p).isDirectory())process.exit(2);fs.accessSync(p,fs.constants.R_OK|fs.constants.W_OK)}catch(e){process.exit(e.code==='ENOENT'||e.code==='ENOTDIR'?2:e.code==='EACCES'||e.code==='EPERM'?3:4)}",
         storageRoot,
       ], {
         stdio: "ignore",
         detached: true,
         env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
       });
-    } catch {
+    } catch (error) {
+      runtimeLog("index-storage-probe-result", {
+        root: path.resolve(storageRoot),
+        result: "unresponsive",
+        reason: error instanceof Error ? error.message : String(error),
+        elapsedMs: Date.now() - startedAt,
+      });
       resolve("unresponsive");
       return;
     }
-    const timer = setTimeout(() => {
+    const handleTimeout = () => {
+      const elapsedMs = Date.now() - startedAt;
+      const timerLatenessMs = elapsedMs - timeoutMs;
+      // A busy main thread can deliver this timer several seconds late. Give
+      // the already-running child one event-loop turn to report its result
+      // before treating delayed JavaScript as evidence of a stalled volume.
+      if (!deferredForEventLoopDelay && Date.now() > timeoutDeadline + 1000) {
+        deferredForEventLoopDelay = true;
+        runtimeLog("index-storage-probe-timeout-deferred", {
+          root: path.resolve(storageRoot),
+          timerLatenessMs,
+        });
+        timer = setTimeout(handleTimeout, 250);
+        return;
+      }
       try { child.kill("SIGKILL"); } catch {}
       child.unref();
-      finish("unresponsive");
-    }, timeoutMs);
-    child.once("error", () => finish("unresponsive"));
-    child.once("exit", (code) => finish(code === 0 ? "ok" : "missing"));
+      finish("unresponsive", `timeout-${timeoutMs}ms`);
+    };
+    timer = setTimeout(handleTimeout, timeoutMs);
+    child.once("error", (error) =>
+      finish(
+        "unresponsive",
+        (error as NodeJS.ErrnoException).code || error.message || "spawn-error",
+      ),
+    );
+    child.once("exit", (code, signal) =>
+      finish(
+        code === 0 ? "ok" : "missing",
+        code === 0 ? "ok" : `exit-code-${code ?? "null"}-signal-${signal ?? "none"}`,
+      ),
+    );
   });
 }
 
@@ -522,6 +567,36 @@ function volumeRootFor(storageRoot: string) {
   if (process.platform === "darwin" && parts[0] === "Volumes" && parts[1])
     return path.join("/Volumes", parts[1]);
   return null;
+}
+
+function getIndexStorageCapacityRoots() {
+  const roots = indexStorageUsingLocalFallback
+    ? [indexStorageRoot]
+    : [
+        indexStorageRoot,
+        ...CACHE_DESTINATIONS.map((item) =>
+          getCacheDestinationRoot(item.id, cacheDestinationRoots, indexStorageRoot),
+        ),
+      ];
+  return Array.from(
+    new Set(
+      roots.map((root) => volumeRootFor(root) ?? path.resolve(root)),
+    ),
+  );
+}
+
+function describeIndexStorageCapacityIssue(issue: {
+  root: string;
+  freeBytes: number | null;
+}) {
+  const available = issue.freeBytes === null
+    ? "could not be verified"
+    : issue.freeBytes >= 1024 ** 3
+      ? `${(issue.freeBytes / 1024 ** 3).toFixed(1)} GB free`
+      : issue.freeBytes >= 1024 ** 2
+        ? `${Math.floor(issue.freeBytes / 1024 ** 2)} MB free`
+        : `${Math.floor(issue.freeBytes / 1024)} KB free`;
+  return `Silo paused indexing because cache storage ${path.basename(issue.root)} has ${available}. It keeps at least ${Math.round(INDEX_STORAGE_FREE_SPACE_RESERVE_BYTES / 1024 ** 3)} GB free on every cache drive. Free space or choose another cache destination; existing index files are preserved.`;
 }
 
 function runDiskutil(args: string[], timeoutMs: number) {
@@ -1818,6 +1893,7 @@ function createIndexingDiagnosticReport(
     `System: ${process.platform} ${os.release()} (${process.arch})`,
     `Index status: ${progress.status}`,
     `Progress: ${progress.indexed} indexed, ${progress.remaining} remaining, ${progress.total} total, ${progress.errors} errors.`,
+    `Search work queue: ${progress.queuedRemaining.toLocaleString()} files waiting beyond the active batch.`,
     unaccountedCount === 0
       ? "Counter check: indexed, remaining, and errors account for the total."
       : `Counter check: ${Math.abs(unaccountedCount)} files are ${unaccountedCount > 0 ? "unaccounted for" : "over-counted"} across indexed, remaining, and errors.`,
@@ -2819,6 +2895,7 @@ let indexStorageFallbackEnabled = true;
 let indexStorageDestinationAvailable = true;
 let indexStorageMessageText: string | null = null;
 let indexStorageMissingRoots: string[] = [];
+const indexStorageRecoveryGate = new StableStorageRecoveryGate(3);
 let indexStorageFreeBytes: number | null = null;
 let indexStorageTransfer: MainIndexStorageStatus["transfer"] = null;
 let indexStorageMonitorTimer: NodeJS.Timeout | null = null;
@@ -2946,11 +3023,25 @@ function readIndexerGovernorSignals(): IndexerGovernorSignals {
   } catch {
     // Desktop hardware and unsupported platforms default to AC power.
   }
-  const totalMemoryBytes = os.totalmem();
+  let availableMemoryRatio: number | undefined;
+  try {
+    availableMemoryRatio = getAvailableMemoryRatio(
+      process.getSystemMemoryInfo(),
+      process.platform,
+    );
+  } catch {
+    // Fall back to Node's portable free-memory counter if Electron telemetry fails.
+  }
+  if (availableMemoryRatio === undefined) {
+    const totalMemoryBytes = os.totalmem();
+    availableMemoryRatio = totalMemoryBytes > 0
+      ? os.freemem() / totalMemoryBytes
+      : undefined;
+  }
   return {
     cpuUtilization: governorCpuUtilization,
     busiestCoreUtilization: governorBusiestCoreUtilization,
-    freeMemoryRatio: totalMemoryBytes > 0 ? os.freemem() / totalMemoryBytes : undefined,
+    availableMemoryRatio,
     idleSeconds,
     onBattery,
     thermalState,
@@ -4843,6 +4934,7 @@ const phoneBackupHolds = new Map<string, string>();
 const phoneBackupLastStatus = new Map<string, string>();
 let phoneManagerBackupDestination: string | null = null;
 let startupIndexReconciliationSettled = false;
+let startupSearchDiscoveryAvailable = false;
 let indexRecovery: IndexingRecovery | null = null;
 let indexRecoveryTimer: NodeJS.Timeout | null = null;
 let activeInteractiveSearches = 0;
@@ -5006,27 +5098,13 @@ function queueSemanticIndexWork(
   }
 
   if (typeof semanticIndexer !== "undefined" && semanticIndexer) {
-    const progress = semanticIndexer.getProgress();
-    if (
-      !work.force &&
-      progress.status === "paused" &&
-      !/interrupted/i.test(progress.message)
-    )
-      return;
+    const recovery = indexRecovery?.details("search");
+    if (!work.force && isIndexStageUserPaused(recovery)) return;
   }
   semanticChangesPending = true;
   if (indexRecovery) {
-    void indexRecovery
-      .requestWithPriority("search", ["faces"])
-      .then(() => {
-        if (relatedStages.length) requestIndexRecoveryStages(relatedStages);
-      })
-      .catch((error) =>
-        runtimeLog("index-recovery-priority-error", {
-          stage: "search",
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      );
+    indexRecovery.requestFairly("search");
+    if (relatedStages.length) requestIndexRecoveryStages(relatedStages);
   } else {
     requestIndexRecoveryStages(["search", ...relatedStages]);
   }
@@ -10029,6 +10107,7 @@ async function createUnifiedScanSource() {
     onFile: (file: any) => void,
     isCancelled: () => boolean,
     shouldPauseForSearch: () => boolean = () => false,
+    checkpoint?: SourceScanCheckpoint,
   ): Promise<void> => {
     // Detect source type and delegate to appropriate scanner
     if (phoneManager.isPhonePath(sourcePath)) {
@@ -10085,6 +10164,13 @@ async function createUnifiedScanSource() {
     };
     const isSiloPrivatePath = (candidatePath: string) =>
       isSiloAppData(candidatePath) || isSiloIndexData(candidatePath);
+    const excludedAliasDirectories = (checkpoint?.excludeDirectories ?? [])
+      .filter((directory) => typeof directory === "string" && path.isAbsolute(directory))
+      .map((directory) => path.resolve(directory));
+    const isExcludedAliasPath = (candidatePath: string) =>
+      excludedAliasDirectories.some((directory) =>
+        isPathWithin(candidatePath, directory),
+      );
     const isPathDisappearance = (error: unknown) =>
       error instanceof Error &&
       (error as NodeJS.ErrnoException).code === "ENOENT";
@@ -10096,11 +10182,27 @@ async function createUnifiedScanSource() {
     // indexable via the virtual /__phone__ scanner above.
     if (isSiloPrivatePath(sourcePath) || isNonLibraryPath(sourcePath)) return;
     if (await isSiloCloneDirectory(sourcePath)) return;
-    const results: any[] = [];
-    const pendingDirectories = [sourcePath];
+    const pendingDirectories = checkpoint?.resumeDirectories
+      ? [...checkpoint.resumeDirectories]
+      : [sourcePath];
+    const queuedDirectories = new Set(pendingDirectories);
     let nextPendingDirectory = 0;
+    let checkpointEntries: any[] = [];
+    let entriesSinceCheckpoint = 0;
+    const persistDirectoryCheckpoint = async (remainingDirectories: string[]) => {
+      if (!checkpoint?.onCheckpoint) return;
+      await checkpoint.onCheckpoint(remainingDirectories, checkpointEntries);
+      checkpointEntries = [];
+      entriesSinceCheckpoint = 0;
+    };
     const timeMachine = await isTimeMachineDirectory(sourcePath);
-    const DISCOVERY_COOLDOWN_EVERY_ENTRIES = 256;
+    // Use smaller filesystem bursts on low-memory or <=8-core machines. The
+    // same CPU duty budget then gets enforced more often, keeping large source
+    // reconciliation from monopolizing the main-process event loop between
+    // cooldowns. Removable volumes retain their stricter four-entry batches.
+    const conservativeDiscovery =
+      os.cpus().length <= 8 || os.totalmem() <= 12 * 1024 ** 3;
+    const DISCOVERY_COOLDOWN_EVERY_ENTRIES = conservativeDiscovery ? 64 : 256;
     let entriesSinceCooldown = 0;
     let discoveryCpuBaseline = process.cpuUsage();
     const waitForSearchIdle = async () => {
@@ -10115,7 +10217,16 @@ async function createUnifiedScanSource() {
     ) {
       if (!(await waitForSearchIdle())) return;
       const directoryPath = pendingDirectories[nextPendingDirectory++];
-      if (isMacDataVolumePathExcluded(directoryPath, sourcePath)) continue;
+      queuedDirectories.delete(directoryPath);
+      if (
+        isMacDataVolumePathExcluded(directoryPath, sourcePath) ||
+        isExcludedAliasPath(directoryPath)
+      ) {
+        await persistDirectoryCheckpoint(
+          pendingDirectories.slice(nextPendingDirectory),
+        );
+        continue;
+      }
       if (machineDevice !== null) {
         let directoryStats;
         try {
@@ -10143,23 +10254,29 @@ async function createUnifiedScanSource() {
 
       // External volumes use smaller metadata bursts to reduce seek and
       // temperature pressure while leaving the existing search-yield points.
-      const ENTRY_BATCH_SIZE = externalVolume ? 4 : 32;
+      const ENTRY_BATCH_SIZE = externalVolume
+        ? 4
+        : conservativeDiscovery
+          ? 8
+          : 32;
       for (let offset = 0; offset < entries.length; offset += ENTRY_BATCH_SIZE) {
         if (isCancelled()) return;
         if (!(await waitForSearchIdle())) return;
         const entryBatchStartedAt = performance.now();
-        const releaseExternalScanLane =
-          externalVolume && indexerGovernor
-            ? indexerGovernor.enterLane("external-scan")
-            : null;
-        const entryResults = await Promise.all(
+        const releaseSourceDiscoveryLane =
+          indexerGovernor?.enterLane("source-discovery") ?? null;
+        try {
+          const entryResults = await Promise.all(
           entries.slice(offset, offset + ENTRY_BATCH_SIZE).map(async (entry) => {
           if (timeMachine && shouldSkipTimeMachineEntry(entry.name))
             return null;
           if (entry.isSymbolicLink()) return null;
 
           const fullPath = path.join(directoryPath, entry.name);
-          if (isMacDataVolumePathExcluded(fullPath, sourcePath)) return null;
+          if (
+            isMacDataVolumePathExcluded(fullPath, sourcePath) ||
+            isExcludedAliasPath(fullPath)
+          ) return null;
           if (isSiloPrivatePath(fullPath)) return null;
           try {
             let stats;
@@ -10210,19 +10327,41 @@ async function createUnifiedScanSource() {
             throw error;
           }
           }),
-        ).finally(() => releaseExternalScanLane?.());
+        );
 
-        for (const result of entryResults) {
+          for (const result of entryResults) {
           if (isCancelled()) return;
           if (shouldPauseForSearch() && !(await waitForSearchIdle())) return;
           entriesSinceCooldown += 1;
+          entriesSinceCheckpoint += 1;
           if (result) {
             onFile(result.file);
-            if (result.directoryPath) {
+            if (checkpoint?.onCheckpoint)
+              checkpointEntries.push(result.file);
+            if (
+              result.directoryPath &&
+              !queuedDirectories.has(result.directoryPath)
+            ) {
               pendingDirectories.push(result.directoryPath);
+              queuedDirectories.add(result.directoryPath);
             }
           }
-          if (entriesSinceCooldown >= DISCOVERY_COOLDOWN_EVERY_ENTRIES) {
+          if (
+            entriesSinceCheckpoint >= 512 &&
+            checkpoint?.onCheckpoint
+          ) {
+            await persistDirectoryCheckpoint([
+              directoryPath,
+              ...pendingDirectories.slice(nextPendingDirectory),
+            ]);
+          }
+          // Keep the work in small async batches for UI responsiveness, but
+          // avoid a full cooldown after every 4–8 entries. On an Intel Mac the
+          // configured 10% background budget is enforced every 64 entries.
+          if (
+            !externalVolume &&
+            entriesSinceCooldown >= DISCOVERY_COOLDOWN_EVERY_ENTRIES
+          ) {
             const cpuSinceLastBatch = process.cpuUsage(discoveryCpuBaseline);
             discoveryCpuBaseline = process.cpuUsage();
             const cpuWorkMs = (cpuSinceLastBatch.user + cpuSinceLastBatch.system) / 1000;
@@ -10234,18 +10373,27 @@ async function createUnifiedScanSource() {
                   .backgroundWorkPercent ?? 5,
               ),
             );
-            let cooldownRemaining = Math.ceil(
-              cpuWorkMs * ((100 - workBudgetPercent) / workBudgetPercent),
-            );
-            while (cooldownRemaining > 0 && !isCancelled()) {
-              if (shouldPauseForSearch()) {
-                if (!(await waitForSearchIdle())) return;
-                discoveryCpuBaseline = process.cpuUsage();
-                continue;
+            if (indexerGovernor) {
+              await indexerGovernor.paceAfterWork(
+                cpuWorkMs,
+                shouldPauseForSearch,
+                isCancelled,
+                workBudgetPercent,
+              );
+            } else {
+              let cooldownRemaining = Math.ceil(
+                cpuWorkMs * ((100 - workBudgetPercent) / workBudgetPercent),
+              );
+              while (cooldownRemaining > 0 && !isCancelled()) {
+                if (shouldPauseForSearch()) {
+                  if (!(await waitForSearchIdle())) return;
+                  discoveryCpuBaseline = process.cpuUsage();
+                  continue;
+                }
+                const sliceMs = Math.min(50, cooldownRemaining);
+                await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
+                cooldownRemaining -= sliceMs;
               }
-              const sliceMs = Math.min(50, cooldownRemaining);
-              await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
-              cooldownRemaining -= sliceMs;
             }
             await new Promise<void>((resolve) => setImmediate(resolve));
             discoveryCpuBaseline = process.cpuUsage();
@@ -10254,21 +10402,26 @@ async function createUnifiedScanSource() {
         }
         if (externalVolume && !isCancelled() && indexerGovernor) {
           // CPU-time budgeting misses slow metadata reads on external disks.
-          // Pace by elapsed batch time and cap this background lane at 5% duty.
-          const releaseExternalScanLane = indexerGovernor.enterLane("external-scan");
-          try {
-            await indexerGovernor.paceAfterWork(
-              Math.max(20, performance.now() - entryBatchStartedAt),
-              shouldPauseForSearch,
-              isCancelled,
-              5,
-            );
-          } finally {
-            releaseExternalScanLane();
-          }
+          // Pace by elapsed batch time through the shared adaptive governor.
+          await indexerGovernor.paceAfterWork(
+            Math.max(20, performance.now() - entryBatchStartedAt),
+            shouldPauseForSearch,
+            isCancelled,
+          );
+        }
+        } finally {
+          releaseSourceDiscoveryLane?.();
         }
       }
+      await persistDirectoryCheckpoint(
+        pendingDirectories.slice(nextPendingDirectory),
+      );
     }
+    // Keep a recovery sentinel until reconciliation has committed the complete
+    // source. If the app exits in that small window, a resumed walk must still
+    // discover additions made after this pass finished.
+    if (checkpoint?.onCheckpoint && !isCancelled())
+      await persistDirectoryCheckpoint([sourcePath]);
   };
 }
 
@@ -10422,6 +10575,23 @@ function publishIndexStorageStatus(message?: string | null) {
   sendToRenderer("index-storage-status", currentIndexStorageStatus());
 }
 
+function confirmIndexStorageRecovery() {
+  const recoveryPending = indexStorageInitializationDeferred || !indexStorageAvailable;
+  const confirmed = indexStorageRecoveryGate.recordSuccess(recoveryPending);
+  if (recoveryPending) {
+    runtimeLog("index-storage-recovery-verification", {
+      successfulProbes: indexStorageRecoveryGate.successfulProbes,
+      requiredProbes: indexStorageRecoveryGate.requiredSuccesses,
+      confirmed,
+    });
+    if (!confirmed)
+      publishIndexStorageStatus(
+        `Cache storage is responding. Verifying stable access (${indexStorageRecoveryGate.successfulProbes}/${indexStorageRecoveryGate.requiredSuccesses}); indexing remains paused and cache files are preserved.`,
+      );
+  }
+  return confirmed;
+}
+
 function unavailableIndexStorageMessage() {
   const destination = getIndexStorageDestinationLabel();
   if (indexStorageUsingLocalFallback)
@@ -10510,6 +10680,7 @@ async function waitForIndexStorageWritersToPause() {
 }
 
 async function pauseIndexingForStorage(message: string) {
+  indexStorageRecoveryGate.recordFailure();
   indexStorageAvailable = false;
   indexStorageUnavailableMessage = message;
   publishIndexStorageStatus(message);
@@ -10518,7 +10689,10 @@ async function pauseIndexingForStorage(message: string) {
     await indexRecovery?.setBlocked(message);
     return;
   }
-  if (semanticIndexer) await semanticIndexer.setHold(message);
+  if (semanticIndexer) {
+    await semanticIndexer.cancelReconciliation();
+    await semanticIndexer.setHold(message);
+  }
   await indexRecovery?.setBlocked(message);
   await Promise.allSettled([
     faceIndexer?.pause(),
@@ -10527,6 +10701,9 @@ async function pauseIndexingForStorage(message: string) {
   ].filter(Boolean) as Promise<unknown>[]);
   audioLibraryCache?.cancelScan();
   await waitForIndexStorageWritersToPause();
+  // Reopen the cache after the destination returns. This avoids continuing a
+  // long source walk against a cache that just filled or disconnected.
+  indexStorageInitializationDeferred = true;
 }
 
 async function resumeIndexingAfterStorage() {
@@ -10550,6 +10727,7 @@ async function resumeIndexingAfterStorage() {
     return;
   }
   indexStorageUnavailableMessage = null;
+  indexStorageRecoveryGate.recordSuccess(false);
   indexStorageAvailable = true;
   aestheticScorer?.setBackgroundPaused(activeInteractiveSearches > 0);
   const resumeSources = semanticIndexer
@@ -10567,6 +10745,12 @@ function scheduleIndexStorageRelaunch() {
   if (indexStorageRelaunchPending) return;
   indexStorageRelaunchPending = true;
   setTimeout(() => {
+    if (process.env.SILO_LOCAL_DEV === "1") {
+      runtimeLog("index-storage-dev-restart-requested", { exitCode: 75 });
+      pendingApplicationExitCode = 75;
+      app.quit();
+      return;
+    }
     app.relaunch();
     app.quit();
   }, 3500);
@@ -10577,6 +10761,27 @@ async function prepareStorageTransition(reason: "fallback" | "destination") {
   if (Date.now() < indexStorageTransferRetryAt) return;
   indexStorageTransferRunning = true;
   const destination = getIndexStorageDestinationLabel();
+  if (reason === "destination") {
+    const capacityIssue = await findIndexStorageCapacityIssue([
+      volumeRootFor(selectedIndexStorageRoot) ?? selectedIndexStorageRoot,
+    ]);
+    if (capacityIssue) {
+      indexStorageTransfer = {
+        state: "error",
+        message: `Cache transfer is waiting: ${describeIndexStorageCapacityIssue(capacityIssue)}`,
+        filesVerified: 0,
+        bytesVerified: 0,
+      };
+      indexStorageTransferRetryAt = Date.now() + 30_000;
+      publishIndexStorageStatus(indexStorageTransfer.message);
+      runtimeLog("index-storage-transfer-blocked-capacity", {
+        root: capacityIssue.root,
+        freeBytes: capacityIssue.freeBytes,
+      });
+      indexStorageTransferRunning = false;
+      return;
+    }
+  }
   indexStorageTransfer = {
     state: "moving",
     message: reason === "destination"
@@ -10672,12 +10877,26 @@ async function monitorIndexStorageAvailability() {
   indexStorageMonitorRunning = true;
   try {
     if (cacheDestinationSettingsSaved) {
+      const capacityIssue = await findIndexStorageCapacityIssue(
+        getIndexStorageCapacityRoots(),
+      );
+      if (capacityIssue && capacityIssue.freeBytes !== null) {
+        const message = describeIndexStorageCapacityIssue(capacityIssue);
+        if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
+          await pauseIndexingForStorage(message);
+        else {
+          indexStorageUnavailableMessage = message;
+          publishIndexStorageStatus(message);
+        }
+        return;
+      }
       const unavailable = await probeCacheDestinationRoots(cacheDestinationRoots);
       indexStorageMissingRoots = Array.from(new Set(unavailable.map((item) => item.root)));
       indexStorageDestinationAvailable = unavailable.length === 0;
       indexStorageUsingLocalFallback = false;
       indexStorageFreeBytes = null;
       if (unavailable.length) {
+        indexStorageRecoveryGate.recordFailure();
         const message = `Silo cannot reach these cache destinations: ${unavailable.map((item) => `${item.name} (${item.root})`).join("; ")}. Reconnect the drive, or open Settings → Silo cache destination and locate the existing cache. Indexing is paused until every destination is available.`;
         if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
           await pauseIndexingForStorage(message);
@@ -10687,6 +10906,18 @@ async function monitorIndexStorageAvailability() {
         }
         return;
       }
+      if (capacityIssue) {
+        indexStorageRecoveryGate.recordFailure();
+        const message = describeIndexStorageCapacityIssue(capacityIssue);
+        if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
+          await pauseIndexingForStorage(message);
+        else {
+          indexStorageUnavailableMessage = message;
+          publishIndexStorageStatus(message);
+        }
+        return;
+      }
+      if (!confirmIndexStorageRecovery()) return;
       if (!indexStorageAvailable) {
         await resumeIndexingAfterStorage();
         return;
@@ -10698,8 +10929,24 @@ async function monitorIndexStorageAvailability() {
 
     const externalDestination =
       path.resolve(selectedIndexStorageRoot) !== path.resolve(app.getPath("userData"));
+    const capacityIssue = externalDestination && !indexStorageUsingLocalFallback
+      ? await findIndexStorageCapacityIssue([
+          volumeRootFor(selectedIndexStorageRoot) ?? selectedIndexStorageRoot,
+        ])
+      : null;
+    if (capacityIssue && capacityIssue.freeBytes !== null) {
+      const message = describeIndexStorageCapacityIssue(capacityIssue);
+      if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
+        await pauseIndexingForStorage(message);
+      else {
+        indexStorageUnavailableMessage = message;
+        publishIndexStorageStatus(message);
+      }
+      return;
+    }
     const destinationAvailable = await checkSelectedIndexStorageAvailable();
     indexStorageDestinationAvailable = destinationAvailable;
+    if (!destinationAvailable) indexStorageRecoveryGate.recordFailure();
 
     if (!externalDestination) {
       indexStorageUsingLocalFallback = false;
@@ -10730,6 +10977,8 @@ async function monitorIndexStorageAvailability() {
       return;
     }
 
+    if (destinationAvailable && !confirmIndexStorageRecovery()) return;
+
     if (indexStorageUsingLocalFallback) {
       indexStorageFreeBytes = await getLocalIndexStorageFreeBytes(indexStorageRoot).catch(() => null);
       if (!indexStorageFallbackEnabled) {
@@ -10754,6 +11003,17 @@ async function monitorIndexStorageAvailability() {
       return;
     }
 
+    if (destinationAvailable && capacityIssue) {
+      const message = describeIndexStorageCapacityIssue(capacityIssue);
+      if (indexStorageAvailable || indexStorageUnavailableMessage !== message)
+        await pauseIndexingForStorage(message);
+      else {
+        indexStorageUnavailableMessage = message;
+        publishIndexStorageStatus(message);
+      }
+      return;
+    }
+
     if (destinationAvailable && !indexStorageAvailable) {
       const stats = await fsPromises.stat(selectedIndexStorageRoot);
       indexStorageDeviceId = stats.dev;
@@ -10763,6 +11023,7 @@ async function monitorIndexStorageAvailability() {
     if (!destinationAvailable) publishIndexStorageStatus(unavailableIndexStorageMessage());
     else publishIndexStorageStatus(null);
   } catch (error) {
+    indexStorageRecoveryGate.recordFailure();
     runtimeLog("index-storage-monitor-error", {
       message: error instanceof Error ? error.message : String(error),
     });
@@ -10776,7 +11037,7 @@ function startIndexStorageAvailabilityMonitor() {
   if (indexStorageMonitorTimer) clearInterval(indexStorageMonitorTimer);
   indexStorageMonitorTimer = setInterval(
     () => void monitorIndexStorageAvailability(),
-    1200,
+    15_000,
   );
   void monitorIndexStorageAvailability();
 }
@@ -10860,27 +11121,52 @@ app.whenReady().then(async () => {
   let storage: Awaited<ReturnType<typeof prepareConfiguredIndexStorage>>;
   console.error("[startup-debug] before cacheDestinationSettingsSaved branch");
   if (cacheDestinationSettingsSaved) {
-    const missing = await probeCacheDestinationRoots(cacheDestinationRoots);
     const semanticRoot = getCacheDestinationRoot(
       "semantic-index",
       cacheDestinationRoots,
       app.getPath("userData"),
     );
-    const missingRoots = Array.from(new Set(missing.map((item) => item.root)));
-    storage = {
-      storageRoot: semanticRoot,
-      selectedStorageRoot: semanticRoot,
-      usingLocalFallback: false,
-      destinationAvailable: missing.length === 0,
-      localFallbackEnabled: false,
-      migrationCompleted: false,
-      migrationError: missing.length
-        ? `These Silo cache destinations are unavailable: ${missing.map((item) => `${item.name}: ${item.root}`).join("; ")}`
-        : null,
-      missingRoots,
-      filesVerified: 0,
-      bytesVerified: 0,
-    };
+    const capacityRoots = CACHE_DESTINATIONS.map((item) =>
+      getCacheDestinationRoot(item.id, cacheDestinationRoots, app.getPath("userData")),
+    ).map((root) => volumeRootFor(root) ?? path.resolve(root));
+    const capacityIssue = await findIndexStorageCapacityIssue(capacityRoots);
+    if (capacityIssue && capacityIssue.freeBytes !== null) {
+      storage = {
+        storageRoot: semanticRoot,
+        selectedStorageRoot: semanticRoot,
+        usingLocalFallback: false,
+        destinationAvailable: true,
+        localFallbackEnabled: false,
+        migrationCompleted: false,
+        migrationError: describeIndexStorageCapacityIssue(capacityIssue),
+        missingRoots: [],
+        filesVerified: 0,
+        bytesVerified: 0,
+      };
+      runtimeLog("index-storage-capacity-startup-blocked", {
+        root: capacityIssue.root,
+        freeBytes: capacityIssue.freeBytes,
+      });
+    } else {
+      const missing = await probeCacheDestinationRoots(cacheDestinationRoots);
+      const missingRoots = Array.from(new Set(missing.map((item) => item.root)));
+      storage = {
+        storageRoot: semanticRoot,
+        selectedStorageRoot: semanticRoot,
+        usingLocalFallback: false,
+        destinationAvailable: missing.length === 0,
+        localFallbackEnabled: false,
+        migrationCompleted: false,
+        migrationError: missing.length
+          ? `These Silo cache destinations are unavailable: ${missing.map((item) => `${item.name}: ${item.root}`).join("; ")}`
+          : capacityIssue
+            ? describeIndexStorageCapacityIssue(capacityIssue)
+            : null,
+        missingRoots,
+        filesVerified: 0,
+        bytesVerified: 0,
+      };
+    }
   } else {
     console.error("[startup-debug] entering startup storage setup loop");
     const startupStorageProgress = createStartupStorageProgress();
@@ -10889,9 +11175,34 @@ app.whenReady().then(async () => {
       let watchdog: NodeJS.Timeout | null = null;
       try {
         const savedSettings = await getIndexStorageSettings(userDataPath).catch(() => null);
-        const savedRoot = savedSettings ? path.resolve(savedSettings.path) : null;
+        const savedRoot = savedSettings
+          ? path.resolve(savedSettings.pendingPath ?? savedSettings.path)
+          : null;
         const external = Boolean(savedRoot && savedRoot !== path.resolve(userDataPath));
         if (external && !useLocalCacheThisSession) {
+          const capacityIssue = await findIndexStorageCapacityIssue([
+            volumeRootFor(savedRoot!) ?? savedRoot!,
+          ]);
+          if (capacityIssue && capacityIssue.freeBytes !== null) {
+            storage = {
+              storageRoot: savedRoot!,
+              selectedStorageRoot: savedRoot!,
+              usingLocalFallback: false,
+              destinationAvailable: true,
+              localFallbackEnabled: savedSettings?.allowLocalFallback !== false,
+              migrationCompleted: false,
+              migrationError: describeIndexStorageCapacityIssue(capacityIssue),
+              missingRoots: [],
+              filesVerified: 0,
+              bytesVerified: 0,
+            };
+            runtimeLog("index-storage-capacity-startup-blocked", {
+              root: capacityIssue.root,
+              freeBytes: capacityIssue.freeBytes,
+            });
+            startupStorageProgress.close();
+            break;
+          }
           let probe = await probeIndexStorageDestination(savedRoot!);
           runtimeLog("index-storage-probe", { result: probe, root: savedRoot! });
           while (probe === "unresponsive") {
@@ -10916,6 +11227,26 @@ app.whenReady().then(async () => {
               fallbackMode: true,
             });
             useLocalCacheThisSession = true;
+          }
+          if (!useLocalCacheThisSession && capacityIssue) {
+            storage = {
+              storageRoot: savedRoot!,
+              selectedStorageRoot: savedRoot!,
+              usingLocalFallback: false,
+              destinationAvailable: true,
+              localFallbackEnabled: savedSettings?.allowLocalFallback !== false,
+              migrationCompleted: false,
+              migrationError: describeIndexStorageCapacityIssue(capacityIssue),
+              missingRoots: [],
+              filesVerified: 0,
+              bytesVerified: 0,
+            };
+            runtimeLog("index-storage-capacity-startup-blocked", {
+              root: capacityIssue.root,
+              freeBytes: capacityIssue.freeBytes,
+            });
+            startupStorageProgress.close();
+            break;
           }
         }
         let lastProgressAt = Date.now();
@@ -11034,6 +11365,15 @@ app.whenReady().then(async () => {
     ) {
       indexStorageAvailable = false;
       storage.migrationError = `Local cache indexing is paused to keep at least ${Math.round(LOCAL_INDEX_STORAGE_RESERVE_BYTES / 1024 / 1024 / 1024)} GB free. Reconnect ${path.basename(storage.selectedStorageRoot)} or free local disk space.`;
+    }
+  }
+  if (indexStorageAvailable) {
+    const capacityIssue = await findIndexStorageCapacityIssue(
+      getIndexStorageCapacityRoots(),
+    );
+    if (capacityIssue) {
+      indexStorageAvailable = false;
+      storage.migrationError = describeIndexStorageCapacityIssue(capacityIssue);
     }
   }
   indexStorageInitializationDeferred = !indexStorageAvailable;
@@ -11177,6 +11517,7 @@ app.whenReady().then(async () => {
           total: progress.total,
           indexed: progress.indexed,
           remaining: progress.remaining,
+          queuedRemaining: progress.queuedRemaining,
           errors: progress.errors,
           currentFile: progress.currentFile,
         });
@@ -11202,6 +11543,7 @@ app.whenReady().then(async () => {
   semanticIndexer.setPerformanceSettings(
     contentSettingsStore.getSearchPerformanceSnapshot().settings,
   );
+  semanticIndexer.setIndexerGovernor(indexerGovernor);
   semanticIndexer.setBackgroundIndexWorkListener((changedFiles) =>
     queueSemanticIndexWork({ changedFiles }),
   );
@@ -11371,6 +11713,8 @@ app.whenReady().then(async () => {
         app.getAppPath(),
         "node_modules/@tensorflow/tfjs-backend-wasm/dist",
       );
+  let faceWorkKey = "";
+  let faceWorkStartedAt = 0;
   faceIndexer = new FaceIndexer(
     app.getPath("userData"),
     faceModelPath,
@@ -11380,6 +11724,13 @@ app.whenReady().then(async () => {
     },
     (progress) => {
       sendFaceIndexProgress(progress);
+      const nextFaceWorkKey = progress.currentFile
+        ? `${progress.processed}:${progress.currentFile}`
+        : "";
+      if (nextFaceWorkKey !== faceWorkKey) {
+        faceWorkKey = nextFaceWorkKey;
+        faceWorkStartedAt = nextFaceWorkKey ? Date.now() : 0;
+      }
       const statusChanged = progress.status !== lastFaceProgressStatus;
       lastFaceProgressStatus = progress.status;
     },
@@ -11848,47 +12199,82 @@ app.whenReady().then(async () => {
   const sources = await getAllIndexSources();
   recoverySearchSourcePaths = sources;
   if (sources.length > 0) {
-    void semanticIndexer.startWatching(sources);
-    // Reconcile only changed/new files after the initial UI load; never restart a full library scan at launch.
-    setTimeout(() => {
-      void (async () => {
-        try {
-          // Filesystem reconciliation skips virtual roots; enumerate ready remote
-          // roots explicitly, with cached signatures avoiding repeat embeddings.
-          const remoteSources = sources.filter(isRemotePath);
-          const progress = semanticIndexer.getProgress();
-          const changedFiles = await semanticIndexer.reconcileIndex(sources);
-          startupIndexReconciliationSettled = true;
-          const pausedByUser =
-            progress.status === "paused" && !/interrupted/i.test(progress.message);
-          if (!pausedByUser && lifetimeFullScanPending) {
-            lifetimeFullScanPending = false;
-            queueSemanticIndexWork(
-              { fullScanAll: true, force: true },
-              ["faces", "locations", "duplicates", "audio", "quality"],
-            );
-          } else if (!pausedByUser) {
-            queueSemanticIndexWork(
-              {
-                fullScanRoots: [
-                  ...remoteSources,
-                  ...semanticIndexer.getSourceCoverageErrors(sources),
-                ],
-                changedFiles: new Map([
-                  ...changedFiles,
-                  ...semanticIndexer.getRetryableFiles(sources),
-                ]),
+    if (indexStorageAvailable) {
+      void semanticIndexer.startWatching(sources);
+      // Reconcile only changed/new files after the initial UI load; never restart a full library scan at launch.
+      setTimeout(() => {
+        if (shuttingDown || !indexStorageAvailable) return;
+        void (async () => {
+          try {
+            // Filesystem reconciliation skips virtual roots; enumerate ready remote
+            // roots explicitly, with cached signatures avoiding repeat embeddings.
+            const remoteSources = sources.filter(isRemotePath);
+            const changedFiles = await semanticIndexer.reconcileIndex(
+              sources,
+              (newFiles) => {
+                if (shuttingDown) return;
+                startupSearchDiscoveryAvailable = true;
+                queueSemanticIndexWork({ changedFiles: newFiles });
               },
-              ["faces", "locations", "duplicates", "audio", "quality"],
+              () => {
+                // Startup discovery is required to finish before analysis stages
+                // become eligible. Yielding to queued background Search here can
+                // starve the scan that supplies Search with its changed-file work.
+                // The scanner still yields for a live interactive Search request.
+                if (
+                  !startupSearchDiscoveryAvailable ||
+                  !startupIndexReconciliationSettled
+                )
+                  return false;
+                const recovery = indexRecovery?.details("search");
+                if (isIndexStageUserPaused(recovery)) return false;
+                const progress = semanticIndexer.getProgress();
+                return Boolean(
+                  recovery?.recoveryRunning ||
+                    recovery?.resumeQueued ||
+                    PIPELINE_BUSY_STATUSES.has(progress.status) ||
+                    (progress.status === "paused" &&
+                      semanticIndexer.hasPendingIndexWork()),
+                );
+              },
             );
+            startupIndexReconciliationSettled = true;
+            const pausedByUser = isIndexStageUserPaused(
+              indexRecovery?.details("search"),
+            );
+            if (!pausedByUser && lifetimeFullScanPending) {
+              lifetimeFullScanPending = false;
+              queueSemanticIndexWork(
+                { fullScanAll: true, force: true },
+                ["faces", "locations", "duplicates", "audio", "quality"],
+              );
+            } else if (!pausedByUser) {
+              queueSemanticIndexWork(
+                {
+                  fullScanRoots: [
+                    ...remoteSources,
+                    ...semanticIndexer.getSourceCoverageErrors(sources),
+                  ],
+                  changedFiles: new Map([
+                    ...changedFiles,
+                    ...semanticIndexer.getRetryableFiles(sources),
+                  ]),
+                },
+                ["faces", "locations", "duplicates", "audio", "quality"],
+              );
+            }
+          } finally {
+            startupIndexReconciliationSettled = true;
           }
-        } finally {
-          startupIndexReconciliationSettled = true;
-        }
-      })().catch((error) =>
-        runtimeLog("startup-index-reconcile-error", { message: String(error) }),
-      );
-    }, 5000);
+        })().catch((error) =>
+          runtimeLog("startup-index-reconcile-error", { message: String(error) }),
+        );
+      }, 5000);
+    } else {
+      runtimeLog("startup-index-reconcile-deferred-storage", {
+        message: indexStorageUnavailableMessage || "Cache storage is not ready.",
+      });
+    }
   } else {
     startupIndexReconciliationSettled = true;
   }
@@ -11930,11 +12316,12 @@ app.whenReady().then(async () => {
     indexRecovery?.requestFairly("duplicates");
   };
   let searchRecoveryPauseRequested = false;
+  let searchRecoveryStartedThisSession = false;
   const searchSettled = () => {
     const localRoots = recoverySearchSourcePaths.filter((root) => !isRemotePath(root));
     const coverage = semanticIndexer.getSourceCoverageProgress(localRoots);
     const recovery = indexRecovery?.details("search");
-    return (
+      return (
       startupIndexReconciliationSettled &&
       semanticRuntimeProgress.status === "complete" &&
       !PIPELINE_BUSY_STATUSES.has(semanticIndexer.getProgress().status) &&
@@ -12058,7 +12445,11 @@ app.whenReady().then(async () => {
         indexStorageAvailable &&
         semanticRuntimeProgress.status === "complete" &&
         !magicLibraryProgress.running &&
-        (startupIndexReconciliationSettled || semanticIndexer.hasPendingIndexWork()),
+        (
+          startupIndexReconciliationSettled ||
+          startupSearchDiscoveryAvailable ||
+          semanticIndexer.hasPendingIndexWork()
+        ),
       unresolvedWork: () => {
         const count = semanticIndexer.getRetryableErrorCount(recoverySearchSourcePaths);
         const coverageErrors = semanticIndexer.getSourceCoverageProgress(
@@ -12094,6 +12485,7 @@ app.whenReady().then(async () => {
           semanticIndexer.getSourceCoverageErrors(sources);
 
         if (fullScanAll) {
+          searchRecoveryStartedThisSession = true;
           await semanticIndexer.startFullScan(sources);
           if (searchRecoveryPauseRequested) {
             if (semanticIndexer.hasPendingIndexWork())
@@ -12108,6 +12500,7 @@ app.whenReady().then(async () => {
             new Set([...fullScanRoots, ...coverageRetryRoots]),
           );
           for (let index = 0; index < rootsToScan.length; index += 1) {
+            searchRecoveryStartedThisSession = true;
             await semanticIndexer.start([rootsToScan[index]]);
             if (searchRecoveryPauseRequested) {
               rootsToScan
@@ -12117,6 +12510,7 @@ app.whenReady().then(async () => {
             }
           }
           if (resumeRoots.length) {
+            searchRecoveryStartedThisSession = true;
             await semanticIndexer.start(resumeRoots);
             if (searchRecoveryPauseRequested) {
               resumeRoots.forEach((root) => pendingSemanticResumeRoots.add(root));
@@ -12125,6 +12519,7 @@ app.whenReady().then(async () => {
           }
           if (changedFiles.size) {
             const changedRoots = Array.from(new Set(changedFiles.values()));
+            searchRecoveryStartedThisSession = true;
             await semanticIndexer.start(changedRoots, changedFiles);
             if (searchRecoveryPauseRequested) {
               changedFiles.forEach((root, filePath) =>
@@ -12135,13 +12530,14 @@ app.whenReady().then(async () => {
           } else if (semanticIndexer.hasPendingIndexWork()) {
             // Resume only checkpointed work; an empty retry must never trigger a
             // fresh walk of every configured source.
+            searchRecoveryStartedThisSession = true;
             await semanticIndexer.start(sources);
           }
         }
       },
       pause: () => {
         searchRecoveryPauseRequested = true;
-        return semanticIndexer.pause();
+        return semanticIndexer.pause({ checkpoint: false });
       },
     },
     {
@@ -12154,8 +12550,20 @@ app.whenReady().then(async () => {
       progress: () => faceIndexer.getProgress(),
       ready: () =>
         indexStorageAvailable &&
+        semanticRuntimeProgress.status === "complete" &&
+        // Face work depends on the startup walk that supplies its source coverage.
+        // Do not let it reserve the shared background lane while that walk is
+        // still running; otherwise Search repeatedly yields to a blocked stage.
         startupIndexReconciliationSettled &&
-        semanticIndexer.getProgress().indexed > 0 &&
+        (
+          searchRecoveryStartedThisSession ||
+          isIndexStageUserPaused(indexRecovery?.details("search")) ||
+          (
+            startupIndexReconciliationSettled &&
+            !semanticIndexer.hasPendingIndexWork()
+          )
+        ) &&
+        semanticIndexer.getIndexedImageCount(recoverySearchSourcePaths) > 0 &&
         !magicLibraryProgress.running &&
         !PIPELINE_BUSY_STATUSES.has(faceIndexer.getProgress().status),
       unresolvedWork: () => {
@@ -12223,7 +12631,7 @@ app.whenReady().then(async () => {
       // Audio discovery starts independently of semantic indexing, including
       // on startup, and uses a throttled, separately scheduled disk walk.
       // Interrupted source scans restart at their roots, so they are not sliced.
-      lane: "light",
+      lane: indexingDiskLane,
       needsInitialCheck: true,
       checkOnStartup: true,
       progress: () => ({
@@ -12340,7 +12748,17 @@ app.whenReady().then(async () => {
     const faceProgress = faceIndexer.getProgress();
     const geoState = geoIndexer.getStatus();
     const duplicateState = duplicateManager.getState();
+    const indexerSignals = readIndexerGovernorSignals();
     runtimeLog("heartbeat", {
+      indexerGovernor: {
+        availableMemoryRatio: indexerSignals.availableMemoryRatio,
+        cpuUtilization: indexerSignals.cpuUtilization,
+        busiestCoreUtilization: indexerSignals.busiestCoreUtilization,
+        targetDutyPercent: indexerGovernor.getTargetDutyPercent(indexerSignals),
+        idleSeconds: indexerSignals.idleSeconds,
+        onBattery: indexerSignals.onBattery,
+        thermalState: indexerSignals.thermalState,
+      },
       rendererProcesses: app
         .getAppMetrics()
         .filter((process) => process.type === "Tab")
@@ -12355,10 +12773,17 @@ app.whenReady().then(async () => {
       indexTotal: progress.total,
       indexIndexed: progress.indexed,
       indexRemaining: progress.remaining,
+      indexQueueRemaining: progress.queuedRemaining,
       indexErrors: progress.errors,
       faceStatus: faceProgress.status,
+      facePhase: faceProgress.phase ?? "unknown",
+      faceWorkElapsedMs: faceWorkStartedAt
+        ? Date.now() - faceWorkStartedAt
+        : 0,
       faceProcessed: faceProgress.processed,
       faceRemaining: faceProgress.remaining,
+      facePreparationProcessed: faceProgress.preparationProcessed,
+      facePreparationTotal: faceProgress.preparationTotal,
       faceCount: faceProgress.faces,
       facePeople: faceProgress.people,
       faceErrors: faceProgress.errors,
@@ -12382,6 +12807,7 @@ app.on("window-all-closed", () => {
 
 let quitFlushed = false;
 let shutdownFlushSucceeded = false;
+let pendingApplicationExitCode: number | null = null;
 app.on("before-quit", (event) => {
   memoryExporter?.cancel();
   void libraryShareServer?.stop();
@@ -12395,6 +12821,7 @@ app.on("before-quit", (event) => {
   if (startupCacheCleanupTimer) clearTimeout(startupCacheCleanupTimer);
   startupCacheCleanupTimer = null;
   indexRecovery?.stop();
+  void semanticIndexer?.cancelReconciliation();
   if (indexRecoveryTimer) clearInterval(indexRecoveryTimer);
   if (audioInventoryRetryTimer) clearInterval(audioInventoryRetryTimer);
   audioLibraryCache?.cancelScan();
@@ -12419,6 +12846,7 @@ app.on("before-quit", (event) => {
   quitFlushed = true;
   const flush = (async () => {
     const drains = await Promise.allSettled([
+      semanticIndexer.cancelReconciliation(),
       semanticIndexer.pause(),
       faceIndexer?.pause(),
       geoIndexer?.pause(),
@@ -12452,6 +12880,16 @@ app.on("before-quit", (event) => {
     if (deadlineTimer) clearTimeout(deadlineTimer);
     shutdownFlushSucceeded = succeeded;
     if (!succeeded) runtimeLog("shutdown-drain-incomplete-session-marker-retained");
+    if (pendingApplicationExitCode !== null) {
+      const exitCode = pendingApplicationExitCode;
+      if (shutdownFlushSucceeded) clearActiveSessionMarker();
+      runtimeLog("index-storage-dev-restart-exit", {
+        exitCode,
+        shutdownFlushSucceeded,
+      });
+      app.exit(exitCode);
+      return;
+    }
     app.quit();
   });
 });
@@ -12617,7 +13055,7 @@ function getAutomaticMemoryWaitReason(): string | null {
   if ((signals.cpuUtilization ?? 1) >= 0.45) return "cpu-busy";
   if ((signals.busiestCoreUtilization ?? 1) >= 0.65)
     return "foreground-core-busy";
-  if ((signals.freeMemoryRatio ?? 0) < 0.12) return "low-free-memory";
+  if ((signals.availableMemoryRatio ?? 0) < 0.12) return "low-free-memory";
   return null;
 }
 
@@ -16503,7 +16941,7 @@ ipcMain.handle("get-indexing-overview", async () => {
       errors: globalSearch.errors,
       retryable: retryableSearchRecords,
       message: search.message,
-      detail: `${globalSearch.indexed.toLocaleString()} indexed · ${globalSearch.remaining.toLocaleString()} awaiting embeddings · ${globalSearch.errors.toLocaleString()} failed records · ${retryableSearchRecords.toLocaleString()} retryable unindexed records · recursive totals across saved and current source indexes`,
+      detail: `${search.queuedRemaining.toLocaleString()} files queued for processing · ${globalSearch.indexed.toLocaleString()} indexed · ${globalSearch.remaining.toLocaleString()} awaiting embeddings · ${globalSearch.errors.toLocaleString()} failed records · ${retryableSearchRecords.toLocaleString()} retryable unindexed records · recursive totals across saved and current source indexes`,
     },
     {
       id: "faces",

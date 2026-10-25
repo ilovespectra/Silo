@@ -19,6 +19,28 @@ const compiled = ts.transpileModule(source, {
 const implementation = { exports: {} };
 new Function("require", "module", "exports", compiled)(require, implementation, implementation.exports);
 const cache = implementation.exports;
+const indexingStorageSource = fs.readFileSync(
+  path.join(__dirname, "../src/indexingStorage.ts"),
+  "utf8",
+);
+const indexingStorageCompiled = ts.transpileModule(indexingStorageSource, {
+  compilerOptions: {
+    target: ts.ScriptTarget.ES2020,
+    module: ts.ModuleKind.CommonJS,
+    strict: true,
+  },
+}).outputText;
+const indexingStorageImplementation = { exports: {} };
+new Function(
+  "require",
+  "module",
+  "exports",
+  indexingStorageCompiled,
+)(require, indexingStorageImplementation, indexingStorageImplementation.exports);
+const {
+  findIndexStorageCapacityIssue,
+  StableStorageRecoveryGate,
+} = indexingStorageImplementation.exports;
 const temporaryRoot = process.env.SILO_TEST_TMPDIR || os.tmpdir();
 
 async function fixture(t) {
@@ -35,6 +57,56 @@ async function fixture(t) {
   ]);
   return { root, userData, sourceRoot, destinationRoot };
 }
+
+test("cache capacity checks preserve a free-space reserve on every destination", async () => {
+  const calls = [];
+  const healthy = await findIndexStorageCapacityIssue(
+    ["/Volumes/SiloCache", "/Volumes/SiloCache"],
+    100,
+    async (root) => {
+      calls.push(root);
+      return 100;
+    },
+  );
+  assert.equal(healthy, null, "the configured reserve itself is allowed");
+  assert.deepEqual(calls, [path.resolve("/Volumes/SiloCache")], "duplicate roots are checked once");
+
+  const low = await findIndexStorageCapacityIssue(
+    ["/Volumes/SiloCache"],
+    100,
+    async () => 25,
+  );
+  assert.deepEqual(low, {
+    root: path.resolve("/Volumes/SiloCache"),
+    freeBytes: 25,
+  });
+
+  const unverifiable = await findIndexStorageCapacityIssue(
+    ["/Volumes/DisconnectedCache"],
+    100,
+    async () => {
+      throw new Error("volume unavailable");
+    },
+  );
+  assert.deepEqual(unverifiable, {
+    root: path.resolve("/Volumes/DisconnectedCache"),
+    freeBytes: null,
+  }, "an unreadable capacity check fails closed");
+});
+
+test("cache recovery waits for consecutive successful availability checks", () => {
+  const gate = new StableStorageRecoveryGate(3);
+  assert.equal(gate.recordSuccess(true), false);
+  assert.equal(gate.recordSuccess(true), false);
+  assert.equal(gate.successfulProbes, 2);
+  gate.recordFailure();
+  assert.equal(gate.successfulProbes, 0, "a failed probe resets recovery confirmation");
+  assert.equal(gate.recordSuccess(true), false);
+  assert.equal(gate.recordSuccess(true), false);
+  assert.equal(gate.recordSuccess(true), true);
+  assert.equal(gate.recordSuccess(false), true);
+  assert.equal(gate.successfulProbes, 0, "healthy steady state clears recovery history");
+});
 
 test("destination settings round-trip every cache root and reject malformed roots", async t => {
   const f = await fixture(t);

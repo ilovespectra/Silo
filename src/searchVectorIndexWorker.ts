@@ -71,6 +71,7 @@ let closing = false;
 let saveTimer: NodeJS.Timeout | null = null;
 let messageQueue = Promise.resolve();
 let paused = false;
+let flushRequestsPending = 0;
 let performanceSettings = defaultSearchPerformanceSettings();
 let manifestDirty = false;
 
@@ -113,7 +114,8 @@ function reportProgress(processed: number, total: number) {
 }
 
 async function waitIfPaused() {
-  while (paused && !closing) await new Promise<void>((resolve) => setTimeout(resolve, 40));
+  while (paused && !closing && flushRequestsPending === 0)
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
 }
 
 async function paceBackgroundWork(workMs: number) {
@@ -122,7 +124,7 @@ async function paceBackgroundWork(workMs: number) {
     Math.min(100, performanceSettings.backgroundWorkPercent),
   );
   let remaining = Math.ceil(workMs * ((100 - dutyPercent) / dutyPercent));
-  while (remaining > 0 && !closing) {
+  while (remaining > 0 && !closing && flushRequestsPending === 0) {
     await waitIfPaused();
     const slice = Math.min(50, remaining);
     await new Promise<void>((resolve) => setTimeout(resolve, slice));
@@ -224,7 +226,9 @@ async function saveAll() {
 }
 
 function scheduleSave() {
-  if (saveTimer) clearTimeout(saveTimer);
+  // Start the durability window on the first dirty update. Repeated vector
+  // inserts must not keep postponing the only persisted ANN checkpoint.
+  if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
     messageQueue = messageQueue
@@ -503,17 +507,21 @@ async function applyUpsert(message: WorkerMessage) {
   }
   const key = message.key as number;
   if (partition.keys.has(key)) return;
+  await waitIfPaused();
   const handle = await fsPromises.open(vectorsPath, "r").catch(() => null);
   if (!handle) return;
+  let mutationMs = 0;
   try {
     const buffer = Buffer.alloc(VECTOR_BYTES);
     const { bytesRead } = await handle.read(buffer, 0, VECTOR_BYTES, key * VECTOR_BYTES);
     if (bytesRead !== VECTOR_BYTES) return;
+    const mutationStartedAt = performance.now();
     partition.index.add(
       BigInt(key),
       new Float32Array(buffer.buffer, buffer.byteOffset, VECTOR_SIZE),
       performanceSettings.indexThreads,
     );
+    mutationMs = performance.now() - mutationStartedAt;
     partition.keys.add(key);
     partition.dirty = true;
     manifestDirty = true;
@@ -521,17 +529,24 @@ async function applyUpsert(message: WorkerMessage) {
   } finally {
     await handle.close();
   }
+  // Native HNSW insertion blocks this worker's event loop. Yield afterward so
+  // interactive search messages can run before another background mutation.
+  if (mutationMs > 0) await paceBackgroundWork(mutationMs);
 }
 
-function applyRemove(message: WorkerMessage) {
+async function applyRemove(message: WorkerMessage) {
   if (!message.sourcePath || !message.kind || !Number.isSafeInteger(message.key)) return;
   const partition = partitions.get(partitionId(message.sourcePath, message.kind));
   const key = message.key as number;
-  if (!partition || !partition.keys.delete(key)) return;
+  if (!partition || !partition.keys.has(key)) return;
+  await waitIfPaused();
+  const mutationStartedAt = performance.now();
   if (partition.index.contains(BigInt(key))) partition.index.remove(BigInt(key));
+  partition.keys.delete(key);
   partition.dirty = true;
   manifestDirty = true;
   scheduleSave();
+  await paceBackgroundWork(Math.max(1, performance.now() - mutationStartedAt));
 }
 
 async function handle(message: WorkerMessage) {
@@ -544,7 +559,7 @@ async function handle(message: WorkerMessage) {
     return;
   }
   if (message.type === "remove") {
-    applyRemove(message);
+    await applyRemove(message);
     return;
   }
   if (message.type === "search") {
@@ -560,8 +575,12 @@ async function handle(message: WorkerMessage) {
   if (message.type === "flush") {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = null;
-    await saveAll();
-    parentPort?.postMessage({ type: "reply", requestId: message.requestId });
+    try {
+      await saveAll();
+      parentPort?.postMessage({ type: "reply", requestId: message.requestId });
+    } finally {
+      flushRequestsPending = Math.max(0, flushRequestsPending - 1);
+    }
     return;
   }
   if (message.type === "close") {
@@ -575,6 +594,13 @@ async function handle(message: WorkerMessage) {
 }
 
 parentPort?.on("message", (message: WorkerMessage) => {
+  if (message.type === "flush" || message.type === "close") {
+    // Drain queued mutations through the durability boundary without clearing
+    // the user's pause preference. Count overlapping flushes so each barrier
+    // remains active until its own save completes.
+    flushRequestsPending += 1;
+    if (message.type === "close") closing = true;
+  }
   if (message.type === "set-settings" && message.settings) {
     performanceSettings = message.settings;
     return;

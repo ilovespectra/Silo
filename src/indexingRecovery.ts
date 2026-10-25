@@ -33,6 +33,12 @@ interface RecoveryRecord {
   userPaused: boolean;
 }
 
+export function isIndexStageUserPaused(
+  recovery: { userPaused?: boolean } | null | undefined,
+): boolean {
+  return recovery?.userPaused === true;
+}
+
 export class IndexingRecovery {
   private records = new Map<string, RecoveryRecord>();
   private reportedBlockedReasons = new Map<string, string>();
@@ -154,9 +160,18 @@ export class IndexingRecovery {
   }
 
   private reportBlocked(stage: RecoveryStage, reason: string) {
-    if (!stage.onDiagnostic || this.reportedBlockedReasons.get(stage.id) === reason)
+    // Keep changing progress counters in the live status, but don't append a
+    // synchronous diagnostics row every time a large source scan advances.
+    const diagnosticKey = reason.replace(
+      /\b\d[\d,]*(?=\s+(?:entries inspected|awaiting indexing))/g,
+      "#",
+    );
+    if (
+      !stage.onDiagnostic ||
+      this.reportedBlockedReasons.get(stage.id) === diagnosticKey
+    )
       return;
-    this.reportedBlockedReasons.set(stage.id, reason);
+    this.reportedBlockedReasons.set(stage.id, diagnosticKey);
     this.report(stage, "blocked", { reason });
   }
 
@@ -532,16 +547,17 @@ export class IndexingRecovery {
       return;
     this.tickRunning = true;
     try {
-      const ordered = [...this.stages].sort((first, second) => {
-        const requestedDifference =
-          Number(this.requested.has(second.id)) -
-          Number(this.requested.has(first.id));
-        if (requestedDifference) return requestedDifference;
-        return (
+      // Lane reservations are shared resources. Preserve the checkpoint
+      // fairness order when multiple stages compete for the same lane; a
+      // persisted retry request must not let downstream work (for example,
+      // face inference) starve semantic-runtime or Search after a restart.
+      // Requests still start promptly on independent lanes because tick walks
+      // every ready stage in this order and reserves each lane separately.
+      const ordered = [...this.stages].sort(
+        (first, second) =>
           this.fairnessQueue.indexOf(first.id) -
-          this.fairnessQueue.indexOf(second.id)
-        );
-      });
+          this.fairnessQueue.indexOf(second.id),
+      );
       for (const stage of ordered) {
         if (this.stopped) continue;
         if (this.externalBlockReason) {

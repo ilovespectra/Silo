@@ -186,13 +186,33 @@ async function main() {
   if (phoneToolsDirectory) log(`Using compatible phone tools from ${phoneToolsDirectory}.`);
   const electronEnvironment = { SILO_LOCAL_DEV: "1" };
   if (phoneToolsDirectory) electronEnvironment.SILO_PHONE_TOOLS_DIR = phoneToolsDirectory;
-  electron = start(path.join(root, "node_modules/.bin/electron"),
-    [".", "--enable-logging", "--js-flags=--max-old-space-size=8192 --expose-gc", ...process.argv.slice(2)],
-    electronEnvironment);
-  electron.on("exit", (code) => {
-    log(`Silo exited${code ? ` with code ${code}` : ""}.`);
-    void shutdown(code ?? 0);
-  });
+  const electronCommand = path.join(root, "node_modules/.bin/electron");
+  const electronArgs = [
+    ".",
+    "--enable-logging",
+    "--js-flags=--max-old-space-size=8192 --expose-gc",
+    ...process.argv.slice(2),
+  ];
+  let restartAttempts = 0;
+  function launchElectron() {
+    if (shuttingDown) return;
+    const launchedAt = Date.now();
+    electron = start(electronCommand, electronArgs, electronEnvironment);
+    const launchedElectron = electron;
+    launchedElectron.on("exit", (code) => {
+      if (code === 75 && !shuttingDown) {
+        if (Date.now() - launchedAt >= 120_000) restartAttempts = 0;
+        restartAttempts += 1;
+        const delay = Math.min(30_000, 1000 * 2 ** Math.min(restartAttempts - 1, 5));
+        log(`Silo requested a cache reopen; the dev supervisor will restart it in ${delay / 1000}s.`);
+        setTimeout(() => launchElectron(), delay);
+        return;
+      }
+      log(`Silo exited${code ? ` with code ${code}` : ""}.`);
+      void shutdown(code ?? 0);
+    });
+  }
+  launchElectron();
 }
 
 main().catch((error) => {

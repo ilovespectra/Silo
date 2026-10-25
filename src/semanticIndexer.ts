@@ -3,8 +3,11 @@ import { isPersonalPhotoPath } from "./memoryDiscovery";
 import * as fsPromises from "fs/promises";
 import * as fs from "fs";
 import * as os from "os";
+import { createHash } from "crypto";
+import * as readline from "readline";
 import { defaultSearchPerformanceSettings } from "./contentSettings";
 import type { SearchPerformanceSettings } from "./contentSettings";
+import type { IndexerGovernor } from "./indexerGovernor";
 import { DEFAULT_SEMANTIC_SEARCH_CONFIDENCE } from "./searchSettings";
 import {
   isAppDataPath,
@@ -80,7 +83,11 @@ const SEARCH_RESULT_PRUNE_THRESHOLD = SEARCH_RESULTS_PER_TYPE * 2;
 const SEARCH_TEXT_RESULT_LIMIT = 5000;
 const SEARCH_EMBEDDING_CACHE_LIMIT = 32;
 const RECONCILIATION_DEBOUNCE_MS = 1000; // Debounce reconciliation checks
+const RECONCILIATION_PUBLISH_BATCH_SIZE = 512;
+const RECONCILIATION_PUBLISH_INTERVAL_MS = 5000;
+const RECONCILIATION_REPLAY_BATCH_SIZE = 64;
 const INCREMENTAL_BATCH_SIZE = 250;
+const PENDING_WORK_CHECKPOINT_INTERVAL_MS = 2 * 60 * 1000;
 
 export function confidenceSettingToMinimumThreshold(confidence: number): number {
   const setting = Number.isFinite(confidence)
@@ -151,6 +158,18 @@ export interface IndexableFile {
   extension: string;
 }
 
+export interface SourceScanCheckpoint {
+  /** Remaining filesystem directories, including the directory being resumed. */
+  resumeDirectories?: string[];
+  /** Subdirectories already covered by another selected source root. */
+  excludeDirectories?: string[];
+  /** Persist a committed batch before advancing the durable directory cursor. */
+  onCheckpoint?: (
+    pendingDirectories: string[],
+    discoveredFiles: IndexableFile[],
+  ) => Promise<void>;
+}
+
 export interface SearchResult extends IndexableFile {
   confidence: number;
 }
@@ -167,6 +186,8 @@ export interface IndexProgress {
   total: number;
   indexed: number;
   remaining: number;
+  /** Files still waiting in the persisted-work queue, including beyond this batch. */
+  queuedRemaining: number;
   errors: number;
   currentFile: string | null;
   message: string;
@@ -233,6 +254,7 @@ type ScanSource = (
   onFile: (file: IndexableFile) => void,
   isCancelled: () => boolean,
   shouldPauseForSearch?: () => boolean,
+  checkpoint?: SourceScanCheckpoint,
 ) => Promise<void>;
 type ProgressListener = (progress: IndexProgress) => void;
 type SearchProgressListener = (
@@ -251,6 +273,133 @@ interface SourceCoverage {
   status: SourceCoverageStatus;
   completedAt: number;
   error: string;
+}
+
+interface ReconciliationWalkCheckpoint {
+  version: 1;
+  sourcePath: string;
+  canonicalSourcePath: string;
+  sourceDevice: number;
+  pendingDirectories: string[];
+  journalOffset: number;
+}
+
+export interface SourcePathAlias {
+  /** Selected path retained as the stable path and source root. */
+  primaryRoot: string;
+  /** Equivalent spelling beneath macOS's mounted Data volume. */
+  aliasRoot: string;
+  /** Broad source root whose recursive walk contains aliasRoot. */
+  containerRoot: string;
+}
+
+/**
+ * Find only macOS Data-volume aliases that are independently selected and
+ * verified as the same directory object. This avoids treating hard links or
+ * similarly named paths as interchangeable.
+ */
+export async function findMacDataVolumeSourceAliases(
+  sourcePaths: readonly string[],
+  platform = process.platform,
+  statPath: (value: string) => Promise<{
+    dev: number;
+    ino: number;
+    isDirectory: () => boolean;
+  }> = (value) => fsPromises.stat(value),
+): Promise<SourcePathAlias[]> {
+  const containerRoot = path.resolve("/System/Volumes/Data");
+  const roots = new Set(
+    sourcePaths
+      .filter(
+        (sourcePath) =>
+          typeof sourcePath === "string" &&
+          path.isAbsolute(sourcePath) &&
+          !sourcePath.startsWith("/__phone__/") &&
+          !sourcePath.startsWith("/__cloud__/"),
+      )
+      .map((sourcePath) => path.resolve(sourcePath)),
+  );
+  if (platform !== "darwin" || !roots.has(containerRoot)) return [];
+
+  const aliases: SourcePathAlias[] = [];
+  for (const primaryRoot of roots) {
+    if (
+      primaryRoot === path.parse(primaryRoot).root ||
+      primaryRoot === containerRoot ||
+      isPathWithin(primaryRoot, containerRoot)
+    )
+      continue;
+    const relativeRoot = path.relative(path.parse(primaryRoot).root, primaryRoot);
+    const aliasRoot = path.resolve(containerRoot, relativeRoot);
+    if (aliasRoot === primaryRoot) continue;
+    try {
+      const [primaryStats, aliasStats] = await Promise.all([
+        statPath(primaryRoot),
+        statPath(aliasRoot),
+      ]);
+      if (
+        primaryStats.isDirectory() &&
+        aliasStats.isDirectory() &&
+        primaryStats.dev === aliasStats.dev &&
+        primaryStats.ino === aliasStats.ino
+      )
+        aliases.push({ primaryRoot, aliasRoot, containerRoot });
+    } catch {
+      // Missing or inaccessible counterparts are not aliases.
+    }
+  }
+  return aliases;
+}
+
+export function mapSourcePathAlias(
+  filePath: string,
+  sourcePath: string,
+  aliases: readonly SourcePathAlias[],
+): { filePath: string; sourcePath: string } | null {
+  for (const alias of aliases) {
+    if (
+      !isPathWithin(filePath, alias.aliasRoot) ||
+      !(
+        sourcePath === alias.containerRoot ||
+        sourcePath === alias.aliasRoot ||
+        isPathWithin(alias.aliasRoot, sourcePath)
+      )
+    )
+      continue;
+    const relativePath = path.relative(alias.aliasRoot, filePath);
+    return {
+      filePath: path.resolve(alias.primaryRoot, relativePath),
+      sourcePath: alias.primaryRoot,
+    };
+  }
+  return null;
+}
+
+export function coalesceAliasedPendingWork(
+  entries: Iterable<[string, string]>,
+  aliases: readonly SourcePathAlias[],
+): Map<string, string> {
+  const coalesced = new Map<string, string>();
+  for (const [filePath, sourcePath] of entries) {
+    const mapped = mapSourcePathAlias(filePath, sourcePath, aliases);
+    const nextPath = mapped?.filePath ?? filePath;
+    const nextSource = mapped?.sourcePath ?? sourcePath;
+    if (!coalesced.has(nextPath)) coalesced.set(nextPath, nextSource);
+  }
+  return coalesced;
+}
+
+export function getExcludedSourceAliasDirectories(
+  sourcePath: string,
+  aliases: readonly SourcePathAlias[],
+): string[] {
+  return aliases
+    .filter(
+      (alias) =>
+        sourcePath !== alias.primaryRoot &&
+        isPathWithin(alias.aliasRoot, sourcePath),
+    )
+    .map((alias) => alias.aliasRoot);
 }
 type DiagnosticListener = (
   event: string,
@@ -287,6 +436,7 @@ const initialProgress: IndexProgress = {
   total: 0,
   indexed: 0,
   remaining: 0,
+  queuedRemaining: 0,
   errors: 0,
   currentFile: null,
   message: "No index has been started.",
@@ -296,6 +446,8 @@ export class SemanticIndexer {
   private readonly userDataPath: string;
   private canonicalUserDataPath: string;
   private readonly canonicalSourcePaths = new Map<string, string>();
+  private activeSourcePathAliases: SourcePathAlias[] = [];
+  private sourcePathAliasSignature = "";
   private readonly indexStorageRoot: string;
   private readonly indexDirectory: string;
   private readonly recordsPath: string;
@@ -312,6 +464,7 @@ export class SemanticIndexer {
   private vectorIndexBuildPromise: Promise<void> | null = null;
   private performanceSettings: SearchPerformanceSettings =
     defaultSearchPerformanceSettings();
+  private indexerGovernor: IndexerGovernor | null = null;
   private vectorIndexReadyState = false;
   /** Set when the native ANN index cannot be built; searches then scan vectors exactly. */
   private vectorIndexFailed = false;
@@ -362,7 +515,7 @@ export class SemanticIndexer {
   >();
   private readonly recordCountsBySource = new Map<
     string,
-    { total: number; indexed: number; errors: number }
+    { total: number; indexed: number; indexedImages: number; errors: number }
   >();
   private readonly discoveredTotalsBySource = new Map<string, number>();
   private readonly workerFailures = new Map<string, WorkerFailure>();
@@ -372,6 +525,11 @@ export class SemanticIndexer {
     count: number;
   } | null = null;
   private pendingCheckpoint = false;
+  private pendingWorkCheckpointAt = 0;
+  private pendingWorkCheckpointPromise: Promise<void> | null = null;
+  private pendingWorkMutationVersion = 0;
+  private pendingWorkSnapshotVersion = 0;
+  private checkpointOnPause = true;
   private recoveryFileWriteChain: Promise<void> = Promise.resolve();
   private recoveryFileWriteSequence = 0;
   private restoredSourcePaths: string[] = [];
@@ -430,6 +588,7 @@ export class SemanticIndexer {
     error: "",
   };
   private reconciliationPromise: Promise<Map<string, string>> | null = null;
+  private reconciliationCancelRequested = false;
   private searchDiscovery = {
     running: false,
     source: "",
@@ -519,6 +678,387 @@ export class SemanticIndexer {
     await write;
   }
 
+  private sourceWalkCheckpointNames(sourcePath: string) {
+    const key = createHash("sha256")
+      .update(path.resolve(sourcePath))
+      .digest("hex");
+    return {
+      stateName: `source-walk-${key}.json`,
+      journalPath: path.join(this.indexDirectory, `source-walk-${key}.jsonl`),
+    };
+  }
+
+  private async loadSourceWalkCheckpoint(
+    sourcePath: string,
+    canonicalSourcePath: string,
+    sourceDevice: number,
+  ) {
+    const { stateName, journalPath } = this.sourceWalkCheckpointNames(sourcePath);
+    let saved: ReconciliationWalkCheckpoint | null = null;
+    try {
+      const parsed = JSON.parse(
+        await fsPromises.readFile(path.join(this.indexDirectory, stateName), "utf8"),
+      );
+      const journalStats = await fsPromises.stat(journalPath).catch(() => null);
+      if (
+        parsed.version === 1 &&
+        parsed.sourcePath === sourcePath &&
+        parsed.canonicalSourcePath === canonicalSourcePath &&
+        parsed.sourceDevice === sourceDevice &&
+        Array.isArray(parsed.pendingDirectories) &&
+        parsed.pendingDirectories.every(
+          (directory: unknown) =>
+            typeof directory === "string" && path.isAbsolute(directory),
+        ) &&
+        Number.isSafeInteger(parsed.journalOffset) &&
+        parsed.journalOffset >= 0 &&
+        (parsed.journalOffset === 0 ||
+          (journalStats && journalStats.size >= parsed.journalOffset))
+      ) {
+        saved = parsed as ReconciliationWalkCheckpoint;
+      }
+    } catch {
+      /* Missing or invalid walk state starts a safe full source walk. */
+    }
+
+    if (!saved) {
+      await Promise.all([
+        fsPromises.unlink(path.join(this.indexDirectory, stateName)).catch(() => undefined),
+        fsPromises.unlink(journalPath).catch(() => undefined),
+      ]);
+      saved = {
+        version: 1,
+        sourcePath,
+        canonicalSourcePath,
+        sourceDevice,
+        pendingDirectories: [sourcePath],
+        journalOffset: 0,
+      };
+      await this.writeRecoveryFile(stateName, saved);
+    }
+    return { stateName, journalPath, state: saved };
+  }
+
+  private async paceReconciliationWork(
+    workMs: number,
+    shouldYieldForIndexing: () => boolean,
+  ) {
+    const shouldYield = () =>
+      this.activeSearchCount > 0 || shouldYieldForIndexing();
+    const dutyPercent = Math.max(
+      5,
+      Math.min(100, this.performanceSettings.backgroundWorkPercent),
+    );
+    if (this.indexerGovernor) {
+      await this.indexerGovernor.paceAfterWork(
+        Math.max(1, workMs),
+        shouldYield,
+        () => this.reconciliationCancelRequested,
+        dutyPercent,
+      );
+      return;
+    }
+    let cooldownRemaining = Math.ceil(
+      Math.max(1, workMs) * ((100 - dutyPercent) / dutyPercent),
+    );
+    while (cooldownRemaining > 0 && !this.reconciliationCancelRequested) {
+      if (shouldYield()) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 75));
+        continue;
+      }
+      const sliceMs = Math.min(50, cooldownRemaining);
+      await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
+      cooldownRemaining -= sliceMs;
+    }
+  }
+
+  private async replaySourceWalkJournal(
+    state: ReconciliationWalkCheckpoint,
+    journalPath: string,
+    sourcePath: string,
+    onFile: (file: IndexableFile) => void,
+    shouldYieldForIndexing: () => boolean = () => false,
+    excludedDirectories: readonly string[] = [],
+  ) {
+    if (state.journalOffset === 0) return;
+    const releaseDiscoveryLane =
+      this.indexerGovernor?.enterLane("source-discovery") ?? (() => undefined);
+    const input = fs.createReadStream(journalPath, {
+      start: 0,
+      end: state.journalOffset - 1,
+    });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    let replayedSincePacing = 0;
+    let replayCpuBaseline = process.cpuUsage();
+    try {
+      for await (const line of lines) {
+        if (!line) continue;
+        const row = JSON.parse(line);
+        if (
+          !Array.isArray(row) ||
+          row.length !== 4 ||
+          typeof row[0] !== "string" ||
+          !path.isAbsolute(row[0]) ||
+          !Number.isFinite(row[1]) ||
+          row[1] < 0 ||
+          !Number.isFinite(row[2]) ||
+          typeof row[3] !== "string"
+        )
+          throw new Error("Saved source discovery checkpoint is invalid.");
+        if (
+          excludedDirectories.some((directory) =>
+            isPathWithin(row[0], directory),
+          )
+        )
+          continue;
+        const relativePath = path.relative(sourcePath, row[0]);
+        if (
+          relativePath === ".." ||
+          relativePath.startsWith(`..${path.sep}`) ||
+          path.isAbsolute(relativePath)
+        )
+          throw new Error("Saved source discovery path is outside its source.");
+        while (shouldYieldForIndexing() && !this.reconciliationCancelRequested)
+          await new Promise<void>((resolve) => setTimeout(resolve, 75));
+        if (this.reconciliationCancelRequested)
+          throw new Error("Source discovery was cancelled during shutdown.");
+        if (replayedSincePacing >= RECONCILIATION_REPLAY_BATCH_SIZE) {
+          const cpuSinceLastBatch = process.cpuUsage(replayCpuBaseline);
+          await this.paceReconciliationWork(
+            (cpuSinceLastBatch.user + cpuSinceLastBatch.system) / 1000,
+            shouldYieldForIndexing,
+          );
+          replayCpuBaseline = process.cpuUsage();
+          replayedSincePacing = 0;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        replayedSincePacing += 1;
+        let stats;
+        try {
+          stats = await fsPromises.lstat(row[0]);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT" || code === "ENOTDIR") continue;
+          throw error;
+        }
+        // Journal rows describe paths discovered in an earlier process. Refresh
+        // their metadata now so edits and removals made while Silo was closed
+        // are reflected before the source can be marked complete.
+        if (!stats.isFile() || stats.isSymbolicLink()) continue;
+        onFile({
+          path: row[0],
+          name: path.basename(row[0]),
+          relativePath,
+          size: stats.size,
+          modified: stats.mtimeMs,
+          isDirectory: false,
+          type: row[3],
+          extension: path.extname(row[0]).toLowerCase(),
+        });
+      }
+    } finally {
+      lines.close();
+      input.destroy();
+      releaseDiscoveryLane();
+    }
+  }
+
+  private async persistSourceWalkCheckpoint(
+    state: ReconciliationWalkCheckpoint,
+    stateName: string,
+    journalPath: string,
+    pendingDirectories: string[],
+    discoveredFiles: IndexableFile[],
+    sourcePath: string,
+  ): Promise<ReconciliationWalkCheckpoint> {
+    const rows: string[] = [];
+    for (const file of discoveredFiles) {
+      if (!file.isDirectory && this.isIndexable(file, sourcePath))
+        rows.push(JSON.stringify([file.path, file.size, file.modified, file.type]));
+    }
+    const contents = rows.length ? Buffer.from(`${rows.join("\n")}\n`, "utf8") : null;
+    await fsPromises.mkdir(this.indexDirectory, { recursive: true });
+    let handle: Awaited<ReturnType<typeof fsPromises.open>>;
+    try {
+      handle = await fsPromises.open(journalPath, "r+");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      handle = await fsPromises.open(journalPath, "w+");
+    }
+    let nextOffset = state.journalOffset;
+    try {
+      // Any bytes beyond the last committed offset came from a checkpoint
+      // interrupted before its atomic state-file replacement.
+      await handle.truncate(state.journalOffset);
+      if (contents) {
+        await handle.write(contents, 0, contents.length, state.journalOffset);
+        nextOffset += contents.length;
+      }
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    const nextState: ReconciliationWalkCheckpoint = {
+      ...state,
+      pendingDirectories: Array.from(new Set(pendingDirectories)),
+      journalOffset: nextOffset,
+    };
+    await this.writeRecoveryFile(stateName, nextState);
+    return nextState;
+  }
+
+  private async clearSourceWalkCheckpoint(
+    state: ReconciliationWalkCheckpoint,
+    stateName: string,
+    journalPath: string,
+  ) {
+    try {
+      await fsPromises.unlink(path.join(this.indexDirectory, stateName));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        // If cleanup is blocked, make the next launch start at the root rather
+        // than treating an old completed journal as current discovery.
+        await this.writeRecoveryFile(stateName, {
+          ...state,
+          pendingDirectories: [state.sourcePath],
+          journalOffset: 0,
+        });
+        return;
+      }
+    }
+    await fsPromises.unlink(journalPath).catch(() => undefined);
+  }
+
+  private async coalesceAliasedRecords(
+    aliases: readonly SourcePathAlias[],
+  ): Promise<number> {
+    const aliasRecords = Array.from(this.latestRecords.values()).filter(
+      (record) =>
+        mapSourcePathAlias(record.path, record.sourcePath, aliases) !== null,
+    );
+    if (!aliasRecords.length) return 0;
+
+    const operations = aliasRecords.map((aliasRecord) => {
+      const mapped = mapSourcePathAlias(
+        aliasRecord.path,
+        aliasRecord.sourcePath,
+        aliases,
+      )!;
+      const existingCanonical = this.latestRecords.get(mapped.filePath);
+      const winner =
+        existingCanonical &&
+        (existingCanonical.vectorOffset >= 0 || aliasRecord.vectorOffset < 0)
+          ? existingCanonical
+          : aliasRecord;
+      const canonicalRecord: IndexRecord = {
+        ...winner,
+        path: mapped.filePath,
+        name: path.basename(mapped.filePath),
+        sourcePath: mapped.sourcePath,
+        relativePath: path
+          .relative(mapped.sourcePath, mapped.filePath)
+          .split(path.sep)
+          .join("/"),
+      };
+      const canonicalNeedsWrite =
+        winner === aliasRecord ||
+        !existingCanonical ||
+        existingCanonical.sourcePath !== canonicalRecord.sourcePath ||
+        existingCanonical.relativePath !== canonicalRecord.relativePath;
+      return {
+        aliasPath: aliasRecord.path,
+        canonicalPath: mapped.filePath,
+        canonicalRecord,
+        canonicalNeedsWrite,
+      };
+    });
+
+    // Append the canonical owner before its alias tombstone. A crash between
+    // these lines can leave duplicates for the next pass, but cannot lose the
+    // only usable embedding.
+    for (let offset = 0; offset < operations.length; offset += 500) {
+      const batch = operations.slice(offset, offset + 500);
+      const lines: string[] = [];
+      for (const operation of batch) {
+        if (operation.canonicalNeedsWrite)
+          lines.push(JSON.stringify(operation.canonicalRecord));
+        lines.push(JSON.stringify({ path: operation.aliasPath, deleted: true }));
+      }
+      await this.appendLines(lines);
+
+      for (const operation of batch) {
+        this.deleteLatestRecord(operation.aliasPath);
+        this.deleteLatestRecord(operation.canonicalPath);
+        this.setLatestRecord(operation.canonicalRecord);
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    this.retryableErrorCountCache = null;
+    this.demoFilePathCache.clear();
+    return operations.length;
+  }
+
+  private async configureSourcePathAliases(sourcePaths: string[]) {
+    const aliases = await findMacDataVolumeSourceAliases(sourcePaths);
+    const signature = aliases
+      .map((alias) => `${alias.primaryRoot}\0${alias.aliasRoot}`)
+      .sort()
+      .join("\n");
+    if (signature === this.sourcePathAliasSignature) return;
+
+    const queuedBefore = this.filesToIndex?.size ?? 0;
+    const coalescedQueue = coalesceAliasedPendingWork(
+      this.filesToIndex ?? [],
+      aliases,
+    );
+    let queueChanged = coalescedQueue.size !== queuedBefore;
+    if (!queueChanged) {
+      const coalescedEntries = coalescedQueue.entries();
+      for (const [filePath, sourcePath] of this.filesToIndex ?? []) {
+        const nextEntry = coalescedEntries.next().value as
+          | [string, string]
+          | undefined;
+        if (
+          !nextEntry ||
+          nextEntry[0] !== filePath ||
+          nextEntry[1] !== sourcePath
+        ) {
+          queueChanged = true;
+          break;
+        }
+      }
+    }
+
+    const recordsCoalesced = await this.coalesceAliasedRecords(aliases);
+    if (queueChanged) {
+      this.filesToIndex = coalescedQueue.size ? coalescedQueue : null;
+      this.pendingWorkMutationVersion += 1;
+      await this.checkpointPendingWork(sourcePaths, true);
+    }
+    this.activeSourcePathAliases = aliases;
+    this.sourcePathAliasSignature = signature;
+    if (queueChanged || recordsCoalesced)
+      this.onDiagnostic("semantic-source-aliases-coalesced", {
+        aliases: aliases.length,
+        queuedBefore,
+        queuedAfter: coalescedQueue.size,
+        recordsCoalesced,
+      });
+  }
+
+  private excludedDirectoriesForSource(sourcePath: string): string[] {
+    return getExcludedSourceAliasDirectories(
+      sourcePath,
+      this.activeSourcePathAliases,
+    );
+  }
+
+  private isExcludedSourceAliasPath(filePath: string, sourcePath: string): boolean {
+    return this.excludedDirectoriesForSource(sourcePath).some((excludedRoot) =>
+      isPathWithin(filePath, excludedRoot),
+    );
+  }
+
   // File watching and reconciliation
   private fileWatchers = new Map<string, fs.FSWatcher>(); // sourcePath -> watcher
   private watchedSources = new Set<string>();
@@ -596,7 +1136,18 @@ export class SemanticIndexer {
 
   setPerformanceSettings(settings: SearchPerformanceSettings) {
     this.performanceSettings = { ...settings };
+    this.indexerGovernor?.setPaceLimitPercent(
+      this.performanceSettings.backgroundWorkPercent,
+    );
     this.persistedVectorIndex?.updateSettings(this.performanceSettings);
+  }
+
+  setIndexerGovernor(governor: IndexerGovernor | null) {
+    this.indexerGovernor = governor;
+    if (governor)
+      governor.setPaceLimitPercent(
+        this.performanceSettings.backgroundWorkPercent,
+      );
   }
 
   async initialize(onLoadProgress?: SemanticIndexLoadProgress) {
@@ -864,7 +1415,10 @@ export class SemanticIndexer {
   }
 
   getProgress(): IndexProgress {
-    return { ...this.progress };
+    return {
+      ...this.progress,
+      queuedRemaining: this.filesToIndex?.size ?? 0,
+    };
   }
 
   isSearchActive(): boolean {
@@ -981,6 +1535,30 @@ export class SemanticIndexer {
     };
   }
 
+  /** Count persisted indexed photos without rebuilding a file list. */
+  getIndexedImageCount(sourcePaths?: string[]): number {
+    const roots = sourcePaths ?? Array.from(this.recordCountsBySource.keys());
+    if (this.demoFileLimit !== null) {
+      const demoPaths = this.demoFilePaths(roots);
+      let count = 0;
+      for (const filePath of demoPaths ?? []) {
+        const record = this.latestRecords.get(filePath);
+        if (
+          record?.type === "image" &&
+          record.vectorOffset >= 0 &&
+          this.isIndexable(record, record.sourcePath)
+        )
+          count += 1;
+      }
+      return count;
+    }
+    const activeSources = new Set(roots);
+    let count = 0;
+    for (const [sourcePath, counts] of this.recordCountsBySource)
+      if (activeSources.has(sourcePath)) count += counts.indexedImages;
+    return count;
+  }
+
   /** Forget one configured source's durable search records without touching its files. */
   async removeSourceIndex(
     sourcePath: string,
@@ -1053,6 +1631,7 @@ export class SemanticIndexer {
       for (const filePath of previousRecords.keys()) this.deleteLatestRecord(filePath);
       for (const record of previousRecords.values()) this.setLatestRecord(record);
       this.filesToIndex = previousFilesToIndex ? new Map(previousFilesToIndex) : null;
+      this.pendingWorkMutationVersion += 1;
       this.workerFailures.clear();
       for (const [filePath, failure] of previousWorkerFailures)
         this.workerFailures.set(filePath, failure);
@@ -1076,11 +1655,7 @@ export class SemanticIndexer {
           this.persistDiscoveredTotals(),
           this.persistSourceCoverage(),
           this.persistWorkerFailures(),
-          this.writeRecoveryFile("pending-work.json", {
-            version: 1,
-            entries: Array.from(this.filesToIndex ?? []),
-            sources: this.restoredSourcePaths,
-          }),
+          this.checkpointPendingWork(this.restoredSourcePaths, true),
         ]);
       } catch (error) {
         errors.push(`sidecars: ${error instanceof Error ? error.message : String(error)}`);
@@ -1109,14 +1684,16 @@ export class SemanticIndexer {
       for (const replacement of rehomedRecords) this.setLatestRecord(replacement);
       for (const filePath of removedPaths) {
         this.workerFailures.delete(filePath);
-        this.filesToIndex?.delete(filePath);
+        this.deletePendingFile(filePath);
         this.deleteLatestRecord(filePath);
       }
       for (const [filePath, queuedSource] of this.filesToIndex ?? []) {
         if (queuedSource !== sourcePath) continue;
         const replacementRoot = queuedRehomes.get(filePath);
-        if (replacementRoot) this.filesToIndex?.set(filePath, replacementRoot);
-        else this.filesToIndex?.delete(filePath);
+        if (replacementRoot) {
+          this.filesToIndex?.set(filePath, replacementRoot);
+          this.pendingWorkMutationVersion += 1;
+        } else this.deletePendingFile(filePath);
       }
       this.discoveredTotalsBySource.delete(sourcePath);
       this.sourceCoverage.delete(sourcePath);
@@ -1131,11 +1708,7 @@ export class SemanticIndexer {
         this.persistDiscoveredTotals(),
         this.persistSourceCoverage(),
         this.persistWorkerFailures(),
-        this.writeRecoveryFile("pending-work.json", {
-          version: 1,
-          entries: Array.from(this.filesToIndex ?? []),
-          sources: this.restoredSourcePaths,
-        }),
+        this.checkpointPendingWork(this.restoredSourcePaths, true),
       ]);
       this.reconcileCompletedCounts(Array.from(this.watchedSources));
       return { removedPaths, rollback };
@@ -1199,12 +1772,13 @@ export class SemanticIndexer {
   private updateRecordCounts(record: IndexRecord, direction: 1 | -1) {
     let counts = this.recordCountsBySource.get(record.sourcePath);
     if (!counts) {
-      counts = { total: 0, indexed: 0, errors: 0 };
+      counts = { total: 0, indexed: 0, indexedImages: 0, errors: 0 };
       this.recordCountsBySource.set(record.sourcePath, counts);
     }
     if (record.vectorOffset >= 0) {
       counts.total += direction;
       counts.indexed += direction;
+      if (record.type === "image") counts.indexedImages += direction;
     } else if (record.error) {
       counts.total += direction;
       counts.errors += direction;
@@ -1484,6 +2058,7 @@ export class SemanticIndexer {
       return this.updateProgress({ status: "paused", message: this.holdReason }, true);
     }
     this.pauseRequested = false;
+    this.checkpointOnPause = true;
     const restoredSources = [...this.restoredSourcePaths];
     const requestedSources = Array.from(
       new Set([...restoredSources, ...sourcePaths]),
@@ -1494,15 +2069,25 @@ export class SemanticIndexer {
       for (const [filePath, sourcePath] of changedFiles) {
         this.filesToIndex.set(filePath, sourcePath);
       }
+      if (changedFiles.size)
+        this.pendingWorkMutationVersion += changedFiles.size;
     }
     let resumeFullScanAfterPendingQueue =
       Boolean(this.filesToIndex?.size) && restoredSources.length > 0;
     if (this.runPromise) {
-      this.queuedSourcePaths = Array.from(
-        new Set([...(this.queuedSourcePaths ?? []), ...requestedSources]),
-      );
+      const queuedSources = new Set([
+        ...(this.queuedSourcePaths ?? []),
+        ...requestedSources,
+      ]);
+      if (queuedSources.size !== (this.queuedSourcePaths?.length ?? 0)) {
+        this.queuedSourcePaths = Array.from(queuedSources);
+        this.pendingWorkMutationVersion += 1;
+      }
       return this.runPromise;
     }
+
+    const releaseGovernorLane =
+      this.indexerGovernor?.enterLane("search") ?? (() => undefined);
 
     console.log(
       "[SemanticIndexer] Starting indexing with sources:",
@@ -1512,9 +2097,24 @@ export class SemanticIndexer {
     // progress callback may request another start synchronously during setup.
     const runPromise = Promise.resolve().then(async () => {
       let nextSourcePaths: string[] | null = requestedSources;
+      let aliasSourceSignature = "";
+      const configureAliasesFor = async (roots: string[]) => {
+        const combined = Array.from(
+          new Set([...this.watchedSources, ...roots]),
+        );
+        const nextSignature = combined.slice().sort().join("\n");
+        if (nextSignature === aliasSourceSignature) return;
+        aliasSourceSignature = nextSignature;
+        await this.configureSourcePathAliases(combined);
+      };
       try {
-        await this.checkpointPendingWork(requestedSources, true);
+        await configureAliasesFor(requestedSources);
+        await this.checkpointPendingWork(
+          requestedSources,
+          Boolean(changedFiles?.size),
+        );
         while (nextSourcePaths !== null && !this.pauseRequested) {
+          await configureAliasesFor(nextSourcePaths);
           this.queuedSourcePaths = null;
           this.activeSourcePaths = nextSourcePaths;
           await this.run(nextSourcePaths);
@@ -1534,6 +2134,7 @@ export class SemanticIndexer {
           }
         }
       } finally {
+        releaseGovernorLane();
         this.runPromise = null;
         this.queuedSourcePaths = null;
         this.activeSourcePaths = [];
@@ -1546,12 +2147,13 @@ export class SemanticIndexer {
   async startFullScan(sourcePaths: string[]): Promise<void> {
     await this.loaded;
     while (this.runPromise) await this.runPromise;
+    if (this.filesToIndex) this.pendingWorkMutationVersion += 1;
     this.filesToIndex = null;
     this.queuedSourcePaths = null;
     await this.start(sourcePaths);
   }
 
-  async pause() {
+  async pause(options: { checkpoint?: boolean } = {}) {
     const interruptedSources = Array.from(
       new Set([
         ...this.activeSourcePaths,
@@ -1560,11 +2162,15 @@ export class SemanticIndexer {
         ...Array.from(this.filesToIndex?.values() ?? []),
       ]),
     );
+    this.checkpointOnPause = options.checkpoint !== false;
     this.pauseRequested = true;
     this.queuedSourcePaths = null;
     if (this.runPromise) await this.runPromise.catch(() => undefined);
     if (interruptedSources.length || this.filesToIndex?.size)
-      await this.checkpointPendingWork(interruptedSources, true);
+      await this.checkpointPendingWork(
+        interruptedSources,
+        this.checkpointOnPause,
+      );
     if (!this.runPromise) {
       await this.updateProgress(
         { status: "paused", message: this.holdReason ?? "Indexing paused." },
@@ -1643,6 +2249,7 @@ export class SemanticIndexer {
       canonicalSourcePaths.set(sourcePath, canonicalSourcePath);
       this.canonicalSourcePaths.set(sourcePath, canonicalSourcePath);
     }
+    await this.configureSourcePathAliases(Array.from(requestedSources));
     for (const [sourcePath, watcher] of this.fileWatchers) {
       if (!requestedSources.has(sourcePath)) {
         watcher.close();
@@ -1747,27 +2354,57 @@ export class SemanticIndexer {
    */
   async reconcileIndex(
     sourcePaths: string[],
-    onSourceReady?: (changes: Map<string, string>) => void,
+    onChangesAvailable?: (changes: Map<string, string>) => void,
+    shouldYieldForIndexing: () => boolean = () => false,
   ): Promise<Map<string, string>> {
     await this.loaded;
+    if (this.reconciliationCancelRequested) return new Map();
     if (this.reconciliationPromise) {
       await this.reconciliationPromise;
-      return this.reconcileIndex(sourcePaths, onSourceReady);
+      return this.reconcileIndex(
+        sourcePaths,
+        onChangesAvailable,
+        shouldYieldForIndexing,
+      );
     }
-    const pending = this.runReconciliation(sourcePaths, onSourceReady).finally(
-      () => {
-        this.reconciliationPromise = null;
-      },
-    );
+    const releaseDiscoveryLane =
+      this.indexerGovernor?.enterLane("source-discovery") ?? (() => undefined);
+    const pending = this.runReconciliation(
+      sourcePaths,
+      onChangesAvailable,
+      shouldYieldForIndexing,
+    ).finally(() => {
+      releaseDiscoveryLane();
+      this.reconciliationPromise = null;
+      // Watch events that arrive during a full source walk are coalesced into
+      // the dirty-root set. Schedule one follow-up pass after the active walk
+      // completes instead of letting every debounce callback queue a waiter.
+      if (!this.reconciliationCancelRequested && this.dirtyWatchSources.size)
+        this.scheduleReconciliation();
+    });
     this.reconciliationPromise = pending;
     return pending;
   }
 
   private async runReconciliation(
     sourcePaths: string[],
-    onSourceReady?: (changes: Map<string, string>) => void,
+    onChangesAvailable?: (changes: Map<string, string>) => void,
+    shouldYieldForIndexing: () => boolean = () => false,
   ): Promise<Map<string, string>> {
     sourcePaths = Array.from(new Set(sourcePaths));
+    await this.configureSourcePathAliases(
+      Array.from(new Set([...this.watchedSources, ...sourcePaths])),
+    );
+    const excludedAliasDirectoriesBySource = new Map(
+      sourcePaths.map((sourcePath) => [
+        sourcePath,
+        this.excludedDirectoriesForSource(sourcePath),
+      ]),
+    );
+    const isExcludedAliasPath = (filePath: string, sourcePath: string) =>
+      (excludedAliasDirectoriesBySource.get(sourcePath) ?? []).some(
+        (excludedRoot) => isPathWithin(filePath, excludedRoot),
+      );
     this.getSourceCoverageProgress(sourcePaths);
     this.reconciliation = {
       running: true,
@@ -1783,9 +2420,24 @@ export class SemanticIndexer {
     };
     try {
       const changesFound = new Map<string, string>(); // filePath -> sourcePath
+      const publishChanges = (changes: Map<string, string>) => {
+        if (!changes.size || !onChangesAvailable) return;
+        try {
+          onChangesAvailable(new Map(changes));
+        } catch (error) {
+          this.onDiagnostic("reconciliation-change-publish-error", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      };
       const deletedPaths: string[] = [];
       const seenFiles = new Set<string>(); // files found on disk
       const accessibleSources = new Set<string>();
+      const completedWalkCheckpoints: Array<{
+        state: ReconciliationWalkCheckpoint;
+        stateName: string;
+        journalPath: string;
+      }> = [];
       let auditTotal = 0;
       let auditIndexed = 0;
       let auditErrors = 0;
@@ -1802,40 +2454,124 @@ export class SemanticIndexer {
           await this.setSourceCoverage(sourcePath, "unavailable");
           continue;
         }
-        this.canonicalSourcePaths.set(
-          sourcePath,
-          await fsPromises.realpath(sourcePath).catch(() => path.resolve(sourcePath)),
-        );
+        const canonicalSourcePath = await fsPromises
+          .realpath(sourcePath)
+          .catch(() => path.resolve(sourcePath));
+        this.canonicalSourcePaths.set(sourcePath, canonicalSourcePath);
         await this.setSourceCoverage(sourcePath, "scanning");
         const previousDiscoveredTotal = this.discoveredTotalsBySource.get(sourcePath);
         let sourceFileCount = 0;
-        try {
-          await this.scanSourceForReconciliation(sourcePath, (file) => {
-            this.reconciliation.scanned += 1;
-            seenFiles.add(file.path);
+        let unpublishedChanges = new Map<string, string>();
+        let lastPublishedAt = Date.now();
+        let walkState: ReconciliationWalkCheckpoint | null = null;
+        let walkStateName = "";
+        let walkJournalPath = "";
+        const observedSourceFiles = new Set<string>();
+        const journaledSourceFiles = new Set<string>();
+        const observeFile = (file: IndexableFile) => {
+          if (isExcludedAliasPath(file.path, sourcePath)) return;
+          this.reconciliation.scanned += 1;
+          if (observedSourceFiles.has(file.path)) return;
+          observedSourceFiles.add(file.path);
+          seenFiles.add(file.path);
 
-            if (!this.isIndexable(file, sourcePath)) return;
-            auditTotal += 1;
-            sourceFileCount += 1;
+          if (!this.isIndexable(file, sourcePath)) return;
+          auditTotal += 1;
+          sourceFileCount += 1;
 
-            const stored = this.latestRecords.get(file.path);
-            const currentSig = this.signature(file);
+          const stored = this.latestRecords.get(file.path);
+          const currentSig = this.signature(file);
 
-            // File is new or modified
+          // File is new or modified
+          if (
+            !stored ||
+            stored.signature !== currentSig ||
+            this.shouldRetryFailure(stored)
+          ) {
+            changesFound.set(file.path, sourcePath);
+            unpublishedChanges.set(file.path, sourcePath);
+            this.reconciliation.changed = changesFound.size;
             if (
-              !stored ||
-              stored.signature !== currentSig ||
-              this.shouldRetryFailure(stored)
+              unpublishedChanges.size >= RECONCILIATION_PUBLISH_BATCH_SIZE ||
+              Date.now() - lastPublishedAt >= RECONCILIATION_PUBLISH_INTERVAL_MS
             ) {
-              changesFound.set(file.path, sourcePath);
-              this.reconciliation.changed = changesFound.size;
-            } else if (stored.vectorOffset >= 0) {
-              auditIndexed += 1;
-            } else if (stored.error) {
-              auditErrors += 1;
+              publishChanges(unpublishedChanges);
+              unpublishedChanges = new Map();
+              lastPublishedAt = Date.now();
             }
-          });
+          } else if (stored.vectorOffset >= 0) {
+            auditIndexed += 1;
+          } else if (stored.error) {
+            auditErrors += 1;
+          }
+        };
+        try {
+          const sourceStats = await fsPromises.stat(sourcePath);
+          const checkpoint = await this.loadSourceWalkCheckpoint(
+            sourcePath,
+            canonicalSourcePath,
+            sourceStats.dev,
+          );
+          walkState = checkpoint.state;
+          walkStateName = checkpoint.stateName;
+          walkJournalPath = checkpoint.journalPath;
+          if (walkState.journalOffset > 0) {
+            this.onDiagnostic("source-walk-resumed", {
+              source: path.basename(sourcePath) || "Source",
+              journalBytes: walkState.journalOffset,
+              pendingDirectories: walkState.pendingDirectories.length,
+            });
+          }
+          await this.replaySourceWalkJournal(
+            walkState,
+            walkJournalPath,
+            sourcePath,
+            (file) => {
+              observeFile(file);
+              journaledSourceFiles.add(file.path);
+            },
+            () =>
+              this.activeSearchCount > 0 || shouldYieldForIndexing(),
+          );
+          const scanCheckpoint: SourceScanCheckpoint = {
+            resumeDirectories: walkState.pendingDirectories,
+            excludeDirectories:
+              excludedAliasDirectoriesBySource.get(sourcePath) ?? [],
+            onCheckpoint: async (pendingDirectories, discoveredFiles) => {
+              const newFiles: IndexableFile[] = [];
+              const checkpointPaths = new Set<string>();
+              for (const file of discoveredFiles) {
+                if (
+                  !this.isIndexable(file, sourcePath) ||
+                  journaledSourceFiles.has(file.path) ||
+                  checkpointPaths.has(file.path)
+                )
+                  continue;
+                checkpointPaths.add(file.path);
+                newFiles.push(file);
+              }
+              walkState = await this.persistSourceWalkCheckpoint(
+                walkState!,
+                walkStateName,
+                walkJournalPath,
+                pendingDirectories,
+                newFiles,
+                sourcePath,
+              );
+              for (const file of newFiles) journaledSourceFiles.add(file.path);
+            },
+          };
+          await this.scanSourceForReconciliation(
+            sourcePath,
+            observeFile,
+            shouldYieldForIndexing,
+            scanCheckpoint,
+          );
         } catch (error) {
+          if (this.reconciliationCancelRequested) {
+            await this.setSourceCoverage(sourcePath, "pending");
+            throw error;
+          }
           this.reconciliation.error =
             error instanceof Error ? error.message : String(error);
           if (previousDiscoveredTotal === undefined)
@@ -1852,13 +2588,20 @@ export class SemanticIndexer {
         await this.persistDiscoveredTotals();
         await this.setSourceCoverage(sourcePath, "completed");
         accessibleSources.add(sourcePath);
-        // Begin embeddings from finished sources while later roots are still
-        // being inventoried. start() coalesces work without re-embedding successes.
-        const sourceChanges = new Map(
-          Array.from(changesFound).filter(([, root]) => root === sourcePath),
-        );
-        if (sourceChanges.size) onSourceReady?.(sourceChanges);
+        if (walkState) {
+          completedWalkCheckpoints.push({
+            state: walkState,
+            stateName: walkStateName,
+            journalPath: walkJournalPath,
+          });
+        }
+        // Publish the tail of this source after a complete walk. Intermediate
+        // batches let Search make fair progress during large source discovery;
+        // deletion decisions remain deferred until every source is verified.
+        publishChanges(unpublishedChanges);
       }
+
+      if (this.reconciliationCancelRequested) return changesFound;
 
       // Check for deleted files (in index but not on disk)
       for (const [filePath, record] of this.latestRecords.entries()) {
@@ -1877,6 +2620,13 @@ export class SemanticIndexer {
         );
         console.log(
           `[SemanticIndexer] Reconciliation removed ${deletedPaths.length} deleted files`,
+        );
+      }
+      for (const checkpoint of completedWalkCheckpoints) {
+        await this.clearSourceWalkCheckpoint(
+          checkpoint.state,
+          checkpoint.stateName,
+          checkpoint.journalPath,
         );
       }
 
@@ -1908,6 +2658,12 @@ export class SemanticIndexer {
 
       return changesFound;
     } catch (error) {
+      if (this.reconciliationCancelRequested) {
+        this.reconciliation.message =
+          "Source discovery paused during shutdown; it will resume on next launch.";
+        this.reconciliation.error = "";
+        return new Map();
+      }
       console.error("[SemanticIndexer] Reconciliation error:", error);
       this.reconciliation.error =
         error instanceof Error ? error.message : String(error);
@@ -1950,15 +2706,26 @@ export class SemanticIndexer {
   private async scanSourceForReconciliation(
     sourcePath: string,
     onFile: (file: IndexableFile) => void,
+    shouldYieldForIndexing: () => boolean = () => false,
+    checkpoint?: SourceScanCheckpoint,
   ): Promise<void> {
     // Use the standard scanSource for now, but could be optimized
     // to use a shallow scan for reconciliation
     await this.scanSource(
       sourcePath,
       onFile,
-      () => false,
-      () => this.activeSearchCount > 0,
+      () => this.reconciliationCancelRequested,
+      () => this.activeSearchCount > 0 || shouldYieldForIndexing(),
+      checkpoint,
     );
+    if (this.reconciliationCancelRequested)
+      throw new Error("Source discovery was cancelled during shutdown.");
+  }
+
+  async cancelReconciliation() {
+    this.reconciliationCancelRequested = true;
+    await this.reconciliationPromise?.catch(() => undefined);
+    this.reconciliationCancelRequested = false;
   }
 
   /**
@@ -1972,6 +2739,11 @@ export class SemanticIndexer {
 
     this.reconciliationTimeout = setTimeout(async () => {
       this.reconciliationTimeout = null;
+      // Keep dirty roots queued while a scan is running. reconcileIndex callers
+      // serialize by awaiting the active promise; doing that once per watcher
+      // debounce creates an unbounded chain of rescans on busy or large roots.
+      if (this.reconciliationPromise) return;
+
       // Only roots that actually changed are rescanned, and never while their writes are held.
       const sources = Array.from(this.dirtyWatchSources).filter(
         (sourcePath) => this.watchedSources.has(sourcePath) && !this.isHeld(sourcePath, true),
@@ -1980,13 +2752,23 @@ export class SemanticIndexer {
       sources.forEach((sourcePath) => this.dirtyWatchSources.delete(sourcePath));
 
       console.log("[SemanticIndexer] Running debounced reconciliation for", sources.length, "changed source(s)");
-      const changedFiles = await this.reconcileIndex(sources);
-
-      if (changedFiles.size > 0) {
-        console.log(
-          `[SemanticIndexer] Queueing ${changedFiles.size} changed files for incremental indexing`,
-        );
-        this.backgroundIndexWorkListener?.(changedFiles);
+      try {
+        const changedFiles = await this.reconcileIndex(sources);
+        if (changedFiles.size > 0) {
+          console.log(
+            `[SemanticIndexer] Queueing ${changedFiles.size} changed files for incremental indexing`,
+          );
+          this.backgroundIndexWorkListener?.(changedFiles);
+        }
+      } catch (error) {
+        // Preserve the retry request and let future watcher activity or the
+        // recovery loop retry it; never turn a transient scan error into an
+        // unhandled rejection that can take down the app.
+        sources.forEach((sourcePath) => this.dirtyWatchSources.add(sourcePath));
+        this.onDiagnostic("watch-reconciliation-error", {
+          sourceCount: sources.length,
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
     }, RECONCILIATION_DEBOUNCE_MS);
   }
@@ -2565,7 +3347,9 @@ export class SemanticIndexer {
     pending: Array<{ file: IndexableFile; sourcePath: string }>,
     startIndex: number,
     preserveDiscoveredFiles: boolean,
+    durableQueueAlreadyContainsPending = false,
   ) {
+    if (durableQueueAlreadyContainsPending) return;
     const queued = new Map<string, string>();
     if (preserveDiscoveredFiles)
       for (const { file, sourcePath } of pending.slice(startIndex))
@@ -2573,6 +3357,24 @@ export class SemanticIndexer {
     for (const [filePath, sourcePath] of this.filesToIndex ?? [])
       if (!queued.has(filePath)) queued.set(filePath, sourcePath);
     this.filesToIndex = queued.size ? queued : null;
+    this.pendingWorkMutationVersion += 1;
+  }
+
+  private deletePendingFile(filePath: string) {
+    if (this.filesToIndex?.delete(filePath))
+      this.pendingWorkMutationVersion += 1;
+  }
+
+  private takePendingQueueBatch(
+    queue: Map<string, string>,
+    limit: number,
+  ): Array<[string, string]> {
+    const batch: Array<[string, string]> = [];
+    for (const entry of queue) {
+      batch.push(entry);
+      if (batch.length >= limit) break;
+    }
+    return batch;
   }
 
   private async run(sourcePaths: string[]) {
@@ -2589,9 +3391,11 @@ export class SemanticIndexer {
       // Check if we're doing incremental indexing (only specific files)
       isIncremental = this.filesToIndex !== null;
       let filesToIndex = this.filesToIndex;
-      // Keep an incremental batch durable while it is being processed. Newly
-      // changed files can still be appended by the watcher during this run.
-      this.filesToIndex = filesToIndex ? new Map(filesToIndex) : null;
+      // The queue is the durable source of truth. Snapshot only the next bounded
+      // batch for this run; watcher additions remain appended to the same Map.
+      const incrementalBatchEntries = filesToIndex
+        ? this.takePendingQueueBatch(filesToIndex, INCREMENTAL_BATCH_SIZE)
+        : [];
       const demoPaths = this.demoFilePaths(sourcePaths);
       let demoSlotsRemaining =
         this.demoFileLimit === null
@@ -2608,52 +3412,6 @@ export class SemanticIndexer {
         demoSlotsRemaining -= 1;
         return true;
       };
-
-      if (filesToIndex) {
-        const originalEntries = Array.from(filesToIndex.entries());
-        const entries = await Promise.all(
-          originalEntries.map(async ([filePath, sourcePath]) => {
-            let modified = this.latestRecords.get(filePath)?.modified ?? 0;
-            try {
-              const stats = await fsPromises.stat(await this.resolveFilePath(filePath));
-              if (stats.isFile()) modified = stats.mtime.getTime();
-            } catch {
-              // The normal incremental pass removes stale records for vanished files.
-            }
-            return { filePath, sourcePath, modified };
-          }),
-        );
-        entries.sort(
-          (first, second) =>
-            first.modified - second.modified ||
-            (first.filePath < second.filePath
-              ? -1
-              : first.filePath > second.filePath
-                ? 1
-                : 0),
-        );
-        const orderedEntries = entries.map(
-          ({ filePath, sourcePath }) => [filePath, sourcePath] as const,
-        );
-        const originalPaths = new Set(originalEntries.map(([filePath]) => filePath));
-        const queuedDuringOrdering = Array.from(this.filesToIndex ?? []).filter(
-          ([filePath]) => !originalPaths.has(filePath),
-        );
-        const batchEntries = orderedEntries.slice(0, INCREMENTAL_BATCH_SIZE);
-        const remainingEntries = orderedEntries.slice(INCREMENTAL_BATCH_SIZE);
-        filesToIndex = new Map(batchEntries);
-        this.filesToIndex = new Map([
-          ...batchEntries,
-          ...remainingEntries,
-          ...queuedDuringOrdering,
-        ]);
-        if (remainingEntries.length || queuedDuringOrdering.length) {
-          this.queuedSourcePaths = sourcePaths;
-          console.log(
-            `[SemanticIndexer] Processing ${filesToIndex.size} files now; ${this.filesToIndex.size - filesToIndex.size} queued`,
-          );
-        }
-      }
 
       const statusMsg = isIncremental
         ? `Re-indexing ${filesToIndex!.size} changed file${filesToIndex!.size === 1 ? "" : "s"}...`
@@ -2725,22 +3483,24 @@ export class SemanticIndexer {
       if (isIncremental) {
         // Incremental mode: only process the changed files
         console.log(
-          `[SemanticIndexer] Running in incremental mode for ${filesToIndex!.size} files`,
+          `[SemanticIndexer] Processing the next ${incrementalBatchEntries.length} of ${filesToIndex!.size} queued files`,
         );
-        for (const sourcePath of new Set(filesToIndex!.values())) {
+        for (const sourcePath of new Set(
+          incrementalBatchEntries.map(([, sourcePath]) => sourcePath),
+        )) {
           if (!this.isRemotePath(sourcePath))
             this.canonicalSourcePaths.set(
               sourcePath,
               await fsPromises.realpath(sourcePath).catch(() => path.resolve(sourcePath)),
             );
         }
-        for (const [filePath, sourcePath] of filesToIndex!) {
+        for (const [filePath, sourcePath] of incrementalBatchEntries) {
           if (this.pauseRequested) break;
 
           try {
             const stats = await fsPromises.stat(await this.resolveFilePath(filePath));
             if (stats.isDirectory()) {
-              this.filesToIndex?.delete(filePath);
+              this.deletePendingFile(filePath);
               continue;
             }
 
@@ -2756,7 +3516,7 @@ export class SemanticIndexer {
             };
 
             if (!this.isIndexable(file, sourcePath) || !allowDemoFile(filePath)) {
-              this.filesToIndex?.delete(filePath);
+              this.deletePendingFile(filePath);
               continue;
             }
             seenPaths.add(filePath);
@@ -2768,19 +3528,24 @@ export class SemanticIndexer {
               failure.attempts >= 3
             ) {
               existingErrors += 1;
-              this.filesToIndex?.delete(filePath);
+              this.deletePendingFile(filePath);
               continue;
             }
             // Always re-index in incremental mode
             pending.push({ file, sourcePath });
           } catch (error) {
-            this.filesToIndex?.delete(filePath);
-            console.log(
-              `[SemanticIndexer] Error accessing changed file ${filePath}:`,
-              error instanceof Error ? error.message : "",
-            );
-            // File was deleted or inaccessible
-            this.deleteLatestRecord(filePath);
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "ENOTDIR") {
+              this.deletePendingFile(filePath);
+              this.deleteLatestRecord(filePath);
+            } else {
+              console.warn(
+                `[SemanticIndexer] Error accessing changed file ${filePath}:`,
+                error instanceof Error ? error.message : String(error),
+              );
+              // Preserve transient I/O and permission failures for recovery.
+              throw error;
+            }
           }
         }
         sourceFileStats.set("(incremental)", {
@@ -2846,6 +3611,8 @@ export class SemanticIndexer {
               if (!demoSourceSampleReached) await this.scanSource(
                 sourcePath,
                 (file) => {
+                  if (this.isExcludedSourceAliasPath(file.path, sourcePath))
+                    return;
                   this.searchDiscovery.scanned += 1;
                   if (Date.now() - lastDiscoveryUpdate >= 500) {
                     lastDiscoveryUpdate = Date.now();
@@ -2916,6 +3683,10 @@ export class SemanticIndexer {
                 },
                 () => this.pauseRequested || demoSourceSampleReached,
                 () => this.activeSearchCount > 0,
+                {
+                  excludeDirectories:
+                    this.excludedDirectoriesForSource(sourcePath),
+                },
               );
             } catch (error) {
               this.searchDiscovery.error =
@@ -3030,18 +3801,6 @@ export class SemanticIndexer {
             : 0),
       );
 
-      if (isIncremental) {
-        const activeBatch = pending.map(
-          ({ file, sourcePath }) => [file.path, sourcePath] as const,
-        );
-        const activePaths = new Set(activeBatch.map(([filePath]) => filePath));
-        const laterWork = Array.from(this.filesToIndex ?? []).filter(
-          ([filePath]) => !activePaths.has(filePath),
-        );
-        this.filesToIndex = new Map([...activeBatch, ...laterWork]);
-        await this.checkpointPendingWork(sourcePaths, true);
-      }
-
       await this.updateProgress(
         {
           total:
@@ -3079,7 +3838,7 @@ export class SemanticIndexer {
           0,
           isIncremental || this.demoFileLimit !== null,
         );
-        await this.checkpointPendingWork(sourcePaths, true);
+        await this.checkpointPendingWork(sourcePaths, this.checkpointOnPause);
         await this.updateProgress(
           { status: "paused", message: "Indexing paused." },
           true,
@@ -3117,7 +3876,7 @@ export class SemanticIndexer {
             },
             true,
           );
-          await this.checkpointPendingWork(sourcePaths, true);
+          await this.checkpointPendingWork(sourcePaths);
         } else {
           await this.updateProgress(
             { ...this.reconcileCompletedCounts(sourcePaths), status: "complete", message },
@@ -3167,7 +3926,7 @@ export class SemanticIndexer {
             index,
             isIncremental || this.demoFileLimit !== null,
           );
-          await this.checkpointPendingWork(sourcePaths, true);
+          await this.checkpointPendingWork(sourcePaths, this.checkpointOnPause);
           await this.updateProgress(
             {
               status: "paused",
@@ -3217,7 +3976,7 @@ export class SemanticIndexer {
                     "Semantic image worker crashed 3 times for this unchanged file. Skipped until the file changes; repair or re-export the image to retry. The original file has not been modified.",
                   );
                   nextPendingIndex = index + 1;
-                  this.filesToIndex?.delete(file.path);
+                  this.deletePendingFile(file.path);
                   this.auditErrors += 1;
                   this.progress.errors += 1;
                 }
@@ -3244,7 +4003,7 @@ export class SemanticIndexer {
         nextPendingIndex = index + 1;
         if (succeeded && this.workerFailures.delete(file.path))
           await this.persistWorkerFailures();
-        this.filesToIndex?.delete(file.path);
+        this.deletePendingFile(file.path);
         if (succeeded) {
           this.auditIndexed += 1;
           this.progress.indexed =
@@ -3263,25 +4022,34 @@ export class SemanticIndexer {
         this.emitProgress();
         if (index % 10 === 9) {
           await this.persistProgress();
-          if (isIncremental) await this.checkpointPendingWork(sourcePaths, true);
+          if (isIncremental) await this.checkpointPendingWork(sourcePaths);
         }
         await new Promise<void>((resolve) => setImmediate(resolve));
-        // Treat the preference as a background work-time budget, not a claim
-        // about total machine CPU usage. Interactive searches take priority.
+        // Treat the preference as a ceiling; the shared governor also backs
+        // off for system load, battery, memory pressure, and thermal state.
         const fileWorkMs = Math.max(1, Date.now() - fileWorkStartedAt);
-        let cooldownRemaining = Math.ceil(
-          fileWorkMs *
-            ((100 - this.performanceSettings.backgroundWorkPercent) /
-              this.performanceSettings.backgroundWorkPercent),
-        );
-        while (
-          cooldownRemaining > 0 &&
-          this.activeSearchCount === 0 &&
-          !this.pauseRequested
-        ) {
-          const sliceMs = Math.min(50, cooldownRemaining);
-          await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
-          cooldownRemaining -= sliceMs;
+        if (this.indexerGovernor) {
+          await this.indexerGovernor.paceAfterWork(
+            fileWorkMs,
+            () => this.activeSearchCount > 0,
+            () => this.pauseRequested,
+            this.performanceSettings.backgroundWorkPercent,
+          );
+        } else {
+          let cooldownRemaining = Math.ceil(
+            fileWorkMs *
+              ((100 - this.performanceSettings.backgroundWorkPercent) /
+                this.performanceSettings.backgroundWorkPercent),
+          );
+          while (
+            cooldownRemaining > 0 &&
+            this.activeSearchCount === 0 &&
+            !this.pauseRequested
+          ) {
+            const sliceMs = Math.min(50, cooldownRemaining);
+            await new Promise<void>((resolve) => setTimeout(resolve, sliceMs));
+            cooldownRemaining -= sliceMs;
+          }
         }
         // An active search gets the next inference slot.
         while (this.activeSearchCount > 0 && !this.pauseRequested)
@@ -3290,7 +4058,7 @@ export class SemanticIndexer {
 
       if (this.filesToIndex && this.filesToIndex.size > 0) {
         this.queuedSourcePaths = sourcePaths;
-        await this.checkpointPendingWork(sourcePaths, true);
+        await this.checkpointPendingWork(sourcePaths);
         await this.updateProgress(
           {
             status: "scanning",
@@ -3934,6 +4702,9 @@ export class SemanticIndexer {
         ]),
       );
       this.pendingCheckpoint = true;
+      this.pendingWorkMutationVersion = 1;
+      this.pendingWorkSnapshotVersion = 1;
+      this.pendingWorkCheckpointAt = Date.now();
     } catch {
       /* No interrupted queue to restore. */
     }
@@ -3964,21 +4735,102 @@ export class SemanticIndexer {
     );
   }
 
-  private async checkpointPendingWork(sources: string[], force = false) {
-    if (!force && !this.pendingCheckpoint) return;
-    this.pendingCheckpoint = true;
-    const entries = Array.from(this.filesToIndex ?? []);
-    await this.writeRecoveryFile("pending-work.json", {
-      version: 1,
-      entries,
-      sources: Array.from(
-        new Set([
+  private async checkpointPendingWork(
+    sources: string[],
+    force = false,
+  ): Promise<void> {
+    if (force) this.pendingCheckpoint = true;
+    const checkpointDue =
+      Date.now() - this.pendingWorkCheckpointAt >=
+      PENDING_WORK_CHECKPOINT_INTERVAL_MS;
+    if (
+      !force &&
+      (!this.pendingCheckpoint ||
+        this.pendingWorkSnapshotVersion === this.pendingWorkMutationVersion ||
+        !checkpointDue)
+    )
+      return;
+
+    if (this.pendingWorkCheckpointPromise) {
+      const inFlight = this.pendingWorkCheckpointPromise;
+      if (!force) return inFlight;
+      await inFlight;
+      if (this.pendingWorkSnapshotVersion === this.pendingWorkMutationVersion)
+        return;
+      return this.checkpointPendingWork(sources, true);
+    }
+
+    const operation = Promise.resolve().then(async () => {
+      do {
+        const snapshotVersion = this.pendingWorkMutationVersion;
+        await this.writePendingWorkCheckpoint(sources, this.filesToIndex);
+        this.pendingWorkSnapshotVersion = snapshotVersion;
+        this.pendingWorkCheckpointAt = Date.now();
+      } while (
+        force &&
+        this.pendingWorkSnapshotVersion !== this.pendingWorkMutationVersion
+      );
+    });
+    this.pendingWorkCheckpointPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.pendingWorkCheckpointPromise === operation)
+        this.pendingWorkCheckpointPromise = null;
+    }
+  }
+
+  /** Stream bounded chunks so a large saved queue never needs one giant stringify. */
+  private async writePendingWorkCheckpoint(
+    sources: string[],
+    entries: Map<string, string> | null,
+  ) {
+    const task = this.recoveryFileWriteChain.then(async () => {
+      await fsPromises.mkdir(this.indexDirectory, { recursive: true });
+      const target = path.join(this.indexDirectory, "pending-work.json");
+      const temporaryPath = `${target}.${process.pid}.${++this.recoveryFileWriteSequence}.tmp`;
+      let handle: Awaited<ReturnType<typeof fsPromises.open>> | null = null;
+      try {
+        handle = await fsPromises.open(temporaryPath, "w");
+        await handle.writeFile('{"version":1,"entries":[', "utf8");
+        const roots = new Set([
           ...sources,
           ...(this.queuedSourcePaths ?? []),
-          ...entries.map(([, root]) => root),
-        ]),
-      ),
+        ]);
+        let batch: Array<[string, string]> = [];
+        let wroteEntries = false;
+        const writeBatch = async () => {
+          if (!batch.length) return;
+          const serialized = JSON.stringify(batch);
+          await handle!.writeFile(
+            `${wroteEntries ? "," : ""}${serialized.slice(1, -1)}`,
+            "utf8",
+          );
+          wroteEntries = true;
+          batch = [];
+        };
+        for (const entry of entries ?? []) {
+          batch.push(entry);
+          roots.add(entry[1]);
+          if (batch.length >= 256) await writeBatch();
+        }
+        await writeBatch();
+        await handle.writeFile(
+          `],"sources":${JSON.stringify(Array.from(roots))}}`,
+          "utf8",
+        );
+        await handle.sync();
+        await handle.close();
+        handle = null;
+        await fsPromises.rename(temporaryPath, target);
+      } catch (error) {
+        await handle?.close().catch(() => undefined);
+        await fsPromises.unlink(temporaryPath).catch(() => undefined);
+        throw error;
+      }
     });
+    this.recoveryFileWriteChain = task.catch(() => undefined);
+    await task;
   }
 
   private normalize(values: Iterable<number>) {
@@ -4335,14 +5187,14 @@ export class SemanticIndexer {
   }
 
   private emitProgress() {
-    this.onProgress({ ...this.progress });
+    this.onProgress(this.getProgress());
   }
 
   private async persistProgress() {
     const temporaryPath = `${this.progressPath}.tmp`;
     await fsPromises.writeFile(
       temporaryPath,
-      JSON.stringify(this.progress, null, 2),
+      JSON.stringify(this.getProgress(), null, 2),
     );
     await fsPromises.rename(temporaryPath, this.progressPath);
   }

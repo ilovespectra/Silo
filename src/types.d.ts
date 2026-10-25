@@ -599,6 +599,7 @@ interface IndexProgress {
   total: number;
   indexed: number;
   remaining: number;
+  queuedRemaining: number;
   errors: number;
   currentFile: string | null;
   message: string;
@@ -897,6 +898,18 @@ interface FaceIndexProgress {
   errors: number;
   currentFile: string | null;
   message: string;
+  phase?:
+    | "idle"
+    | "preparing"
+    | "building-queue"
+    | "loading-model"
+    | "decoding"
+    | "detecting"
+    | "saving"
+    | "finalizing"
+    | "paused"
+    | "complete"
+    | "error";
 }
 
 interface PersonSummary {

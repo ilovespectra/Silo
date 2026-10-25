@@ -472,6 +472,7 @@ const emptyIndexProgress: IndexProgress = {
   total: 0,
   indexed: 0,
   remaining: 0,
+  queuedRemaining: 0,
   errors: 0,
   currentFile: null,
   message: "Add a source to begin indexing.",

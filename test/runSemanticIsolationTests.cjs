@@ -60,6 +60,387 @@ function loadSource(name, overrides = {}, globals = {}) {
   return exports;
 }
 
+function waitForWorkerMessage(port, predicate, timeoutMs = 2_000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      port.removeListener("outbound", onMessage);
+      reject(new Error("Timed out waiting for a vector worker message."));
+    }, timeoutMs);
+    const onMessage = (message) => {
+      if (!predicate(message)) return;
+      clearTimeout(timer);
+      port.removeListener("outbound", onMessage);
+      resolve(message);
+    };
+    port.on("outbound", onMessage);
+  });
+}
+
+async function createSearchVectorWorkerHarness(t, {
+  initialKeys = [],
+  saveDelayMs = 120,
+} = {}) {
+  const temporaryDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "search-vector-worker-test-"),
+  );
+  const vectorsPath = path.join(temporaryDirectory, "vectors.bin");
+  const cacheDirectory = path.join(temporaryDirectory, "ann");
+  fs.writeFileSync(vectorsPath, Buffer.alloc(512 * 4 * 32));
+
+  const port = new EventEmitter();
+  port.postMessage = (message) => port.emit("outbound", message);
+  port.close = () => {};
+  const saves = [];
+  let addDelayMs = 0;
+  class FakeIndex {
+    constructor() {
+      this.keys = new Set();
+    }
+    add(keys) {
+      if (addDelayMs > 0) {
+        const blocker = new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(blocker, 0, 0, addDelayMs);
+      }
+      const added = (typeof keys === "bigint" ? [keys] : Array.from(keys))
+        .map(Number);
+      for (const key of added) this.keys.add(key);
+      port.postMessage({ type: "test-add", keys: added });
+    }
+    remove(keys) {
+      const removed = typeof keys === "bigint" ? [keys] : Array.from(keys);
+      for (const key of removed) this.keys.delete(Number(key));
+    }
+    contains(key) {
+      return this.keys.has(Number(key));
+    }
+    size() {
+      return this.keys.size;
+    }
+    search(_query, limit) {
+      const keys = Array.from(this.keys).slice(0, limit);
+      return {
+        keys: BigUint64Array.from(keys, BigInt),
+        distances: Float32Array.from(keys, () => 0),
+      };
+    }
+    save(filename) {
+      saves.push(Date.now());
+      fs.writeFileSync(filename, JSON.stringify(Array.from(this.keys)));
+      port.postMessage({ type: "test-save" });
+    }
+    load(filename) {
+      this.keys = new Set(JSON.parse(fs.readFileSync(filename, "utf8")));
+    }
+  }
+  const workerSetTimeout = (callback, delay, ...args) =>
+    setTimeout(callback, delay === 30_000 ? saveDelayMs : delay, ...args);
+  loadSource("searchVectorIndexWorker.ts", {
+    worker_threads: { parentPort: port },
+    "fs/promises": require("node:fs/promises"),
+    numkong: {},
+    usearch: {
+      Index: FakeIndex,
+      MetricKind: { Cos: "cos" },
+      ScalarKind: { F16: "f16" },
+    },
+    "./contentSettings": {
+      defaultSearchPerformanceSettings: () => ({
+        backgroundWorkPercent: 100,
+        indexThreads: 1,
+        searchThreads: 1,
+      }),
+      getSearchPerformanceMachineInfo: () => ({ availableProcessors: 4 }),
+    },
+  }, {
+    setTimeout: workerSetTimeout,
+    performance: require("node:perf_hooks").performance,
+  });
+
+  const initialized = waitForWorkerMessage(
+    port,
+    (message) => message.type === "ready" || message.type === "error",
+  );
+  port.emit("message", {
+    type: "initialize",
+    vectorsPath,
+    cacheDirectory,
+    settings: {
+      backgroundWorkPercent: 100,
+      indexThreads: 1,
+      searchThreads: 1,
+    },
+    groups: [{
+      sourcePath: "/photos",
+      kind: "image",
+      keys: BigUint64Array.from(initialKeys, BigInt),
+    }],
+  });
+  const ready = await initialized;
+  assert.equal(ready.type, "ready", ready.error);
+  saves.length = 0;
+
+  let closeRequestId = 9000;
+  const harness = {
+    port,
+    saves,
+    setAddDelay(ms) { addDelayMs = ms; },
+    async sendAndWait(message, predicate, timeoutMs) {
+      const response = waitForWorkerMessage(port, predicate, timeoutMs);
+      port.emit("message", message);
+      return response;
+    },
+    waitForAdd(key, timeoutMs = 2_000) {
+      return waitForWorkerMessage(
+        port,
+        (message) => message.type === "test-add" && message.keys.includes(key),
+        timeoutMs,
+      );
+    },
+    async close() {
+      const requestId = closeRequestId++;
+      await harness.sendAndWait(
+        { type: "close", requestId },
+        (message) => message.type === "reply" && message.requestId === requestId,
+      );
+    },
+  };
+  t.after(async () => {
+    try {
+      await harness.close();
+    } finally {
+      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+  });
+  return harness;
+}
+
+const {
+  getAvailableMemoryRatio,
+  getIndexerGovernorProfile,
+  IndexerGovernor,
+} = loadSource("indexerGovernor.ts");
+
+test("Intel macOS availability includes reclaimable file-backed and purgeable pages", () => {
+  const ratio = getAvailableMemoryRatio(
+    { total: 1000, free: 10, fileBacked: 390, purgeable: 30, available: 5 },
+    "darwin",
+  );
+  assert.equal(ratio, 0.43);
+
+  const profile = getIndexerGovernorProfile({
+    platform: "darwin",
+    architecture: "x64",
+    availableProcessors: 4,
+    totalMemoryBytes: 8 * 1024 ** 3,
+  });
+  const governor = new IndexerGovernor(profile, () => ({
+    availableMemoryRatio: ratio,
+    cpuUtilization: 0.2,
+    busiestCoreUtilization: 0.2,
+    idleSeconds: 0,
+    thermalState: "nominal",
+  }));
+  assert.equal(governor.getTargetDutyPercent(), profile.startingDutyPercent);
+});
+
+test("shared indexer lanes stay within the saved background-work ceiling", () => {
+  const profile = {
+    name: "Governor test",
+    startingDutyPercent: 25,
+    maximumDutyPercent: 25,
+    minimumDutyPercent: 3,
+  };
+  const governor = new IndexerGovernor(profile, () => ({
+    idleSeconds: 180,
+    thermalState: "nominal",
+  }));
+  governor.setPaceLimitPercent(10);
+  assert.equal(governor.getTargetDutyPercent(), 10);
+
+  const releaseFace = governor.enterLane("face");
+  const releaseSearch = governor.enterLane("search");
+  const releaseAudio = governor.enterLane("audio");
+  const releaseThumbnail = governor.enterLane("thumbnail");
+  const laneDuty = governor.getTargetDutyPercent();
+  assert.equal(laneDuty, 2.5);
+  assert.ok(laneDuty * 4 <= 10, "active lanes must share the user's 10% cap");
+
+  releaseFace();
+  releaseSearch();
+  releaseAudio();
+  releaseThumbnail();
+  assert.equal(governor.getTargetDutyPercent(), 10);
+});
+
+test("macOS Data-volume aliases require verified directory identity and coalesce queue paths", async () => {
+  const {
+    findMacDataVolumeSourceAliases,
+    mapSourcePathAlias,
+    coalesceAliasedPendingWork,
+    getExcludedSourceAliasDirectories,
+  } = loadSource("semanticIndexer.ts");
+  const dataRoot = "/System/Volumes/Data";
+  const userRoot = "/Users/jacqueline";
+  const aliasRoot = `${dataRoot}/Users/jacqueline`;
+  const aliases = await findMacDataVolumeSourceAliases(
+    [dataRoot, userRoot],
+    "darwin",
+    async (candidate) => ({
+      dev: 7,
+      ino: candidate === userRoot || candidate === aliasRoot ? 42 : 100,
+      isDirectory: () => true,
+    }),
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(aliases)), [
+    { primaryRoot: userRoot, aliasRoot, containerRoot: dataRoot },
+  ]);
+
+  const primaryPath = `${userRoot}/Pictures/one.jpg`;
+  const aliasPath = `${aliasRoot}/Pictures/one.jpg`;
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(mapSourcePathAlias(aliasPath, dataRoot, aliases))),
+    { filePath: primaryPath, sourcePath: userRoot },
+  );
+  const coalesced = coalesceAliasedPendingWork(
+    [
+      [aliasPath, dataRoot],
+      [primaryPath, userRoot],
+      [`${dataRoot}/Shared/readme.txt`, dataRoot],
+    ],
+    aliases,
+  );
+  assert.deepEqual(Array.from(coalesced, (entry) => Array.from(entry)), [
+    [primaryPath, userRoot],
+    [`${dataRoot}/Shared/readme.txt`, dataRoot],
+  ]);
+  assert.deepEqual(Array.from(getExcludedSourceAliasDirectories(dataRoot, aliases)), [aliasRoot]);
+  assert.deepEqual(Array.from(getExcludedSourceAliasDirectories(userRoot, aliases)), []);
+
+  const unverified = await findMacDataVolumeSourceAliases(
+    [dataRoot, userRoot],
+    "darwin",
+    async (candidate) => ({
+      dev: 7,
+      ino: candidate === userRoot ? 42 : 43,
+      isDirectory: () => true,
+    }),
+  );
+  assert.deepEqual(Array.from(unverified), [], "different directory identities are never collapsed");
+  assert.deepEqual(
+    Array.from(
+      await findMacDataVolumeSourceAliases([dataRoot, userRoot], "win32"),
+    ),
+    [],
+    "the macOS firmlink rule is not applied on other platforms",
+  );
+});
+
+test("coalesced alias records persist with one stable canonical path", async (t) => {
+  const { indexer } = makeIndexer(t);
+  await indexer.initialize();
+  const userRoot = "/Users/jacqueline";
+  const dataRoot = "/System/Volumes/Data";
+  const aliasRoot = `${dataRoot}/Users/jacqueline`;
+  const canonicalPath = `${userRoot}/Pictures/one.jpg`;
+  const aliasPath = `${aliasRoot}/Pictures/one.jpg`;
+  const alias = {
+    primaryRoot: userRoot,
+    aliasRoot,
+    containerRoot: dataRoot,
+  };
+  const record = (filePath, sourcePath) => ({
+    path: filePath,
+    name: path.basename(filePath),
+    sourcePath,
+    relativePath: path.relative(sourcePath, filePath),
+    size: 100,
+    modified: 200,
+    type: "image",
+    extension: ".jpg",
+    signature: "100:200",
+    vectorOffset: -1,
+  });
+  const canonicalRecord = record(canonicalPath, userRoot);
+  const aliasRecord = record(aliasPath, dataRoot);
+  await indexer.appendLines([
+    JSON.stringify(canonicalRecord),
+    JSON.stringify(aliasRecord),
+  ]);
+  indexer.latestRecords.set(canonicalPath, canonicalRecord);
+  indexer.latestRecords.set(aliasPath, aliasRecord);
+
+  assert.equal(await indexer.coalesceAliasedRecords([alias]), 1);
+  assert.equal(indexer.latestRecords.size, 1);
+  assert.equal(indexer.latestRecords.get(canonicalPath).sourcePath, userRoot);
+  await indexer.flushWrites();
+
+  const { indexer: restarted } = makeIndexer(t, {
+    userDataPath: indexer.userDataPath,
+  });
+  await restarted.initialize();
+  assert.equal(restarted.latestRecords.size, 1);
+  assert.equal(restarted.latestRecords.has(canonicalPath), true);
+  assert.equal(restarted.latestRecords.has(aliasPath), false);
+});
+
+test("a saturated single core throttles even when aggregate CPU is moderate", () => {
+  const profile = getIndexerGovernorProfile({
+    platform: "darwin",
+    architecture: "x64",
+    availableProcessors: 4,
+    totalMemoryBytes: 8 * 1024 ** 3,
+  });
+  const governor = new IndexerGovernor(profile, () => ({
+    cpuUtilization: 0.2,
+    busiestCoreUtilization: 0.95,
+    idleSeconds: 180,
+    thermalState: "fair",
+  }));
+  governor.setPaceLimitPercent(10);
+  assert.equal(governor.getTargetDutyPercent(), 3.2);
+});
+
+test("high aggregate and single-core CPU pressure both reduce indexing duty", () => {
+  const profile = getIndexerGovernorProfile({
+    platform: "darwin",
+    architecture: "x64",
+    availableProcessors: 4,
+    totalMemoryBytes: 8 * 1024 ** 3,
+  });
+  const governor = new IndexerGovernor(profile, () => ({
+    cpuUtilization: 0.85,
+    busiestCoreUtilization: 0.98,
+    idleSeconds: 180,
+    thermalState: "nominal",
+  }));
+  assert.equal(governor.getTargetDutyPercent(), 4);
+});
+
+test("Linux governor memory uses the kernel available estimate", () => {
+  assert.equal(
+    getAvailableMemoryRatio(
+      { total: 1000, free: 10, available: 250, fileBacked: 600, purgeable: 50 },
+      "linux",
+    ),
+    0.25,
+  );
+});
+
+test("other platforms fall back to free memory and invalid snapshots stay unknown", () => {
+  assert.equal(
+    getAvailableMemoryRatio(
+      { total: 1000, free: 150, fileBacked: 600, purgeable: 50 },
+      "win32",
+    ),
+    0.15,
+  );
+  assert.equal(getAvailableMemoryRatio({ total: 0, free: 10 }, "darwin"), undefined);
+  assert.equal(
+    getAvailableMemoryRatio({ total: 100, free: 500, fileBacked: 500 }, "darwin"),
+    1,
+  );
+});
+
 function makeIndexer(
   t,
   {
@@ -67,6 +448,10 @@ function makeIndexer(
     userDataPath,
     scanSource = async () => {},
     setImmediateImpl = setImmediate,
+    statCounter,
+    onStat = () => {},
+    statFailure = null,
+    onProgress = () => {},
   } = {},
 ) {
   const ownsUserDataPath = !userDataPath;
@@ -81,6 +466,20 @@ function makeIndexer(
   const { SemanticIndexer, confidenceSettingToMinimumThreshold } = loadSource(
     "semanticIndexer.ts",
     {
+      ...(statCounter || statFailure
+        ? {
+            "fs/promises": {
+              ...require("node:fs/promises"),
+              stat: async (...args) => {
+                if (statCounter) statCounter.count += 1;
+                onStat(statCounter?.count ?? 0);
+                const failure = statFailure?.(args[0]);
+                if (failure) throw failure;
+                return require("node:fs/promises").stat(...args);
+              },
+            },
+          }
+        : {}),
       child_process: {
         ...require("node:child_process"),
         fork: (filename, args, options) => {
@@ -123,7 +522,7 @@ function makeIndexer(
     userDataPath,
     "offline-cache",
     scanSource,
-    () => {},
+    onProgress,
     (event, details) => diagnostics.push({ event, details }),
   );
   t.after(async () => {
@@ -150,6 +549,58 @@ function makeIndexer(
     userDataPath,
   };
 }
+
+test("semantic indexing uses the adaptive governor and releases its lane", async (t) => {
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-governor-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  const filePath = path.join(sourcePath, "governed-search.txt");
+  fs.writeFileSync(filePath, "A small local search fixture.");
+
+  const { indexer } = makeIndexer(t);
+  const activeLanes = [];
+  const releasedLanes = [];
+  const paceCalls = [];
+  const governor = {
+    paceLimit: 0,
+    setPaceLimitPercent(percent) {
+      this.paceLimit = percent;
+    },
+    enterLane(lane) {
+      activeLanes.push(lane);
+      return () => {
+        releasedLanes.push(lane);
+        activeLanes.splice(activeLanes.indexOf(lane), 1);
+      };
+    },
+    async paceAfterWork(workMs, shouldYield, shouldStop, maximumDutyPercent) {
+      paceCalls.push({ workMs, maximumDutyPercent });
+      assert.equal(shouldYield(), false);
+      assert.equal(shouldStop(), false);
+    },
+  };
+
+  indexer.setPerformanceSettings({
+    searchThreads: 1,
+    indexThreads: 1,
+    backgroundWorkPercent: 17,
+  });
+  indexer.setIndexerGovernor(governor);
+  await indexer.initialize();
+  await indexer.start(
+    [sourcePath],
+    new Map([[filePath, sourcePath]]),
+  );
+
+  assert.equal(governor.paceLimit, 17);
+  assert.equal(paceCalls.length, 1);
+  assert.ok(paceCalls[0].workMs >= 1);
+  assert.equal(paceCalls[0].maximumDutyPercent, 17);
+  assert.deepEqual(releasedLanes, ["search"]);
+  assert.deepEqual(activeLanes, []);
+  assert.equal(indexer.getProgress().status, "complete");
+});
 
 if (
   process.env.SILO_REAL_SEMANTIC_SMOKE === "1" ||
@@ -528,6 +979,149 @@ test("runtime construction and preload failures checkpoint all pending files and
   }
 });
 
+test("large incremental queues stat only the next bounded batch and remain resumable", async (t) => {
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-large-queue-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  const statCounter = { count: 0 };
+  let indexer;
+  let firstBatchStatCount = 0;
+  let pausePromise = null;
+  const { indexer: madeIndexer, userDataPath } = makeIndexer(t, {
+    statCounter,
+    onStat: (count) => {
+      if (count === 250) {
+        firstBatchStatCount = count;
+        pausePromise = indexer.pause();
+      }
+    },
+  });
+  indexer = madeIndexer;
+  await indexer.initialize();
+  statCounter.count = 0;
+  const queuedFiles = new Map(
+    Array.from({ length: 1000 }, (_, index) => [
+      path.join(sourcePath, `missing-${index}.txt`),
+      sourcePath,
+    ]),
+  );
+
+  await indexer.start([sourcePath], queuedFiles);
+  await pausePromise;
+
+  assert.equal(firstBatchStatCount, 250,
+    "the initial ordering pass inspects only one bounded batch");
+  assert.equal(indexer.filesToIndex.size, 750,
+    "the checked batch is retired and every later file remains checkpointed");
+  const saved = JSON.parse(
+    fs.readFileSync(
+      path.join(userDataPath, "semantic-index", "pending-work.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(saved.entries.length, 750,
+    "the remaining queue survives in the durable work journal");
+
+  const { indexer: restoredIndexer } = makeIndexer(t, { userDataPath });
+  await restoredIndexer.initialize();
+  assert.equal(restoredIndexer.filesToIndex.size, 750,
+    "the remaining queue is restored after an app restart");
+});
+
+test("pending work checkpoints throttle automatic snapshots and coalesce forced writes", async (t) => {
+  const { indexer } = makeIndexer(t);
+  await indexer.initialize();
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-checkpoint-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  indexer.filesToIndex = new Map([[path.join(sourcePath, "one.jpg"), sourcePath]]);
+  indexer.pendingWorkMutationVersion += 1;
+
+  const originalWrite = indexer.writePendingWorkCheckpoint.bind(indexer);
+  let writeCount = 0;
+  let releaseFirstWrite;
+  let markFirstWriteStarted;
+  const firstWriteGate = new Promise((resolve) => { releaseFirstWrite = resolve; });
+  const firstWriteStarted = new Promise((resolve) => { markFirstWriteStarted = resolve; });
+  indexer.writePendingWorkCheckpoint = async (...args) => {
+    writeCount += 1;
+    if (writeCount === 1) {
+      markFirstWriteStarted();
+      await firstWriteGate;
+    }
+    return originalWrite(...args);
+  };
+
+  const first = indexer.checkpointPendingWork([sourcePath], true);
+  const coalesced = indexer.checkpointPendingWork([sourcePath], true);
+  await firstWriteStarted;
+  indexer.filesToIndex.set(path.join(sourcePath, "two.jpg"), sourcePath);
+  indexer.pendingWorkMutationVersion += 1;
+  releaseFirstWrite();
+  await Promise.all([first, coalesced]);
+  assert.equal(writeCount, 2,
+    "concurrent forced requests share a write, then persist mutations made during it");
+
+  indexer.filesToIndex.set(path.join(sourcePath, "three.jpg"), sourcePath);
+  indexer.pendingWorkMutationVersion += 1;
+  indexer.pendingWorkCheckpointAt = Date.now();
+  await indexer.checkpointPendingWork([sourcePath]);
+  assert.equal(writeCount, 2,
+    "automatic checkpoints skip full snapshots inside the checkpoint interval");
+
+  indexer.pendingWorkCheckpointAt -= 2 * 60 * 1000 + 1;
+  await indexer.checkpointPendingWork([sourcePath]);
+  assert.equal(writeCount, 3,
+    "dirty work is checkpointed once the interval expires");
+  const saved = JSON.parse(
+    fs.readFileSync(
+      path.join(indexer.indexDirectory, "pending-work.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(saved.entries.length, 3,
+    "the streamed checkpoint contains all pending work");
+});
+
+test("transient stat failures retain pending work for restart and retry", async (t) => {
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-stat-recovery-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  const filePath = path.join(sourcePath, "retry.txt");
+  fs.writeFileSync(filePath, "retry after a temporary I/O error");
+  const transientFailure = Object.assign(new Error("temporary volume I/O error"), {
+    code: "EIO",
+  });
+  const { indexer, userDataPath } = makeIndexer(t, {
+    statFailure: (candidate) => candidate === filePath ? transientFailure : null,
+  });
+  await indexer.initialize();
+  await indexer.start([sourcePath], new Map([[filePath, sourcePath]]));
+
+  assert.equal(indexer.getProgress().status, "error");
+  assert.equal(indexer.filesToIndex.get(filePath), sourcePath,
+    "transient I/O errors remain retryable instead of disappearing from the queue");
+  const saved = JSON.parse(
+    fs.readFileSync(
+      path.join(userDataPath, "semantic-index", "pending-work.json"),
+      "utf8",
+    ),
+  );
+  assert.deepEqual(saved.entries, [[filePath, sourcePath]]);
+
+  const { indexer: restoredIndexer } = makeIndexer(t, { userDataPath });
+  await restoredIndexer.initialize();
+  assert.equal(restoredIndexer.filesToIndex.get(filePath), sourcePath,
+    "the interrupted path restores from disk");
+  await restoredIndexer.start([sourcePath]);
+  assert.equal(restoredIndexer.getProgress().status, "complete",
+    "a retry after restart drains the preserved queue");
+  assert.equal(restoredIndexer.filesToIndex.size, 0);
+});
+
 test("three native image crashes persist across restarts, quarantine only unchanged image, and preserve originals", async (t) => {
   const userDataPath = fs.mkdtempSync(
     path.join(os.tmpdir(), "semantic-trap-test-"),
@@ -729,6 +1323,336 @@ test("failed recovery writes retain work and late queued starts cannot restart a
   assert.ok(saved.sources.includes(queuedRoot));
 });
 
+test("startup reconciliation publishes bounded batches before the source walk ends", async (t) => {
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-reconciliation-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  const files = Array.from({ length: 1100 }, (_, index) => {
+    const name = `photo-${String(index).padStart(4, "0")}.jpg`;
+    return {
+      path: path.join(sourcePath, name),
+      name,
+      relativePath: name,
+      size: index + 1,
+      modified: 1,
+      isDirectory: false,
+      type: "image",
+      extension: ".jpg",
+    };
+  });
+  let announceScan;
+  let releaseScan;
+  const scanStarted = new Promise((resolve) => { announceScan = resolve; });
+  const scanGate = new Promise((resolve) => { releaseScan = resolve; });
+  const { indexer } = makeIndexer(t, {
+    scanSource: async (_root, onFile) => {
+      files.forEach(onFile);
+      announceScan();
+      await scanGate;
+    },
+  });
+  await indexer.initialize();
+  const published = [];
+  const reconciliation = indexer.reconcileIndex([sourcePath], (changes) => {
+    published.push(changes);
+  });
+  await scanStarted;
+  assert.deepEqual(
+    published.map((batch) => batch.size),
+    [512, 512],
+    "large roots publish changed files while discovery is still running",
+  );
+  releaseScan();
+  const changes = await reconciliation;
+  assert.deepEqual(published.map((batch) => batch.size), [512, 512, 76]);
+  assert.equal(published.reduce((count, batch) => count + batch.size, 0), files.length);
+  assert.equal(changes.size, files.length);
+  assert.equal(
+    new Set(published.flatMap((batch) => Array.from(batch.keys()))).size,
+    files.length,
+    "each changed path is published once after discovery completes",
+  );
+});
+
+test("reconciliation keeps bounded batches across small, medium, and large roots", async (t) => {
+  for (const fileCount of [1, 512, 4096]) {
+    const sourcePath = fs.mkdtempSync(
+      path.join(os.tmpdir(), `semantic-reconciliation-${fileCount}-`),
+    );
+    t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+    const files = Array.from({ length: fileCount }, (_, index) => {
+      const name = `photo-${String(index).padStart(5, "0")}.jpg`;
+      return {
+        path: path.join(sourcePath, name),
+        name,
+        relativePath: name,
+        size: index + 1,
+        modified: 1,
+        isDirectory: false,
+        type: "image",
+        extension: ".jpg",
+      };
+    });
+    const { indexer } = makeIndexer(t, {
+      scanSource: async (_root, onFile) => {
+        for (let offset = 0; offset < files.length; offset += 256) {
+          for (const file of files.slice(offset, offset + 256)) onFile(file);
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      },
+    });
+    await indexer.initialize();
+    const published = [];
+    const changes = await indexer.reconcileIndex([sourcePath], (batch) => {
+      published.push(batch);
+    });
+    assert.equal(changes.size, fileCount);
+    assert.equal(published.reduce((count, batch) => count + batch.size, 0), fileCount);
+    assert.ok(
+      published.every((batch) => batch.size <= 512),
+      `${fileCount} candidates must publish in bounded batches`,
+    );
+  }
+});
+
+test("watcher reconciliations coalesce while a large source scan is active", async (t) => {
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-reconciliation-coalesce-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  let scanCount = 0;
+  let announceFirstScan;
+  let releaseFirstScan;
+  const firstScanStarted = new Promise((resolve) => { announceFirstScan = resolve; });
+  const firstScanGate = new Promise((resolve) => { releaseFirstScan = resolve; });
+  const { indexer } = makeIndexer(t, {
+    scanSource: async () => {
+      scanCount += 1;
+      if (scanCount === 1) {
+        announceFirstScan();
+        await firstScanGate;
+      }
+    },
+  });
+  await indexer.initialize();
+  indexer.watchedSources.add(sourcePath);
+
+  const initialReconciliation = indexer.reconcileIndex([sourcePath]);
+  await firstScanStarted;
+  for (let pass = 0; pass < 3; pass += 1) {
+    indexer.dirtyWatchSources.add(sourcePath);
+    indexer.scheduleReconciliation();
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+  }
+
+  releaseFirstScan();
+  await initialReconciliation;
+  const deadline = Date.now() + 4000;
+  while (scanCount < 2 && Date.now() < deadline)
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  indexer.stopWatching();
+
+  assert.equal(scanCount, 2, "three watcher bursts during one scan become one follow-up scan");
+});
+
+test("reconciliation scanner observes the cooperative indexing yield gate", async (t) => {
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-reconciliation-yield-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  let announceYield;
+  const yieldObserved = new Promise((resolve) => { announceYield = resolve; });
+  let allowDiscovery = false;
+  const { indexer } = makeIndexer(t, {
+    scanSource: async (_root, _onFile, _isCancelled, shouldPauseForSearch) => {
+      announceYield(shouldPauseForSearch());
+      while (shouldPauseForSearch())
+        await new Promise((resolve) => setTimeout(resolve, 1));
+    },
+  });
+  await indexer.initialize();
+  const reconciliation = indexer.reconcileIndex(
+    [sourcePath],
+    undefined,
+    () => !allowDiscovery,
+  );
+  assert.equal(await yieldObserved, true);
+  allowDiscovery = true;
+  await reconciliation;
+});
+
+test("cancelled reconciliation preserves unverified records and can resume", async (t) => {
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-reconciliation-cancel-source-"),
+  );
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  const missingPath = path.join(sourcePath, "not-yet-verified.jpg");
+  let announceStart;
+  let releaseScan;
+  const scanStarted = new Promise((resolve) => { announceStart = resolve; });
+  const scanGate = new Promise((resolve) => { releaseScan = resolve; });
+  const { indexer } = makeIndexer(t, {
+    scanSource: async () => {
+      announceStart();
+      await scanGate;
+    },
+  });
+  await indexer.initialize();
+  const savedRecord = {
+    path: missingPath,
+    sourcePath,
+    type: "image",
+    extension: ".jpg",
+    size: 8,
+    modified: 1,
+    signature: "8:1",
+    vectorOffset: 0,
+  };
+  indexer.latestRecords.set(missingPath, savedRecord);
+  const reconciliation = indexer.reconcileIndex([sourcePath]);
+  await scanStarted;
+  const cancellation = indexer.cancelReconciliation();
+  releaseScan();
+  await Promise.all([reconciliation, cancellation]);
+  assert.equal(
+    indexer.latestRecords.get(missingPath),
+    savedRecord,
+    "a partial scan cannot make deletion decisions for unseen files",
+  );
+  assert.equal(indexer.getSourceCoverageProgress([sourcePath]).pending, 1);
+
+  await indexer.reconcileIndex([sourcePath]);
+  assert.equal(
+    indexer.getSourceCoverageProgress([sourcePath]).completed,
+    1,
+    "a later full scan can resume after cancellation",
+  );
+  assert.equal(
+    indexer.latestRecords.has(missingPath),
+    false,
+    "only the resumed complete scan may retire the verified-missing record",
+  );
+});
+
+test("resumed source discovery validates saved files and keeps pending directories", async (t) => {
+  const sourcePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-source-walk-resume-source-"),
+  );
+  const pendingDirectory = path.join(sourcePath, "not-yet-walked");
+  fs.mkdirSync(pendingDirectory);
+  t.after(() => fs.rmSync(sourcePath, { recursive: true, force: true }));
+  const changedPath = path.join(sourcePath, "changed.jpg");
+  const removedPath = path.join(sourcePath, "removed.jpg");
+  fs.writeFileSync(changedPath, "old image bytes");
+  fs.writeFileSync(removedPath, "image to remove");
+  const originalFiles = [changedPath, removedPath].map((filePath) => {
+    const stats = fs.statSync(filePath);
+    return {
+      path: filePath,
+      name: path.basename(filePath),
+      relativePath: path.relative(sourcePath, filePath),
+      size: stats.size,
+      modified: stats.mtimeMs,
+      isDirectory: false,
+      type: "image",
+      extension: ".jpg",
+    };
+  });
+  const userDataPath = fs.mkdtempSync(
+    path.join(os.tmpdir(), "semantic-source-walk-resume-data-"),
+  );
+  t.after(() => fs.rmSync(userDataPath, { recursive: true, force: true }));
+  let announceStart;
+  let releaseScan;
+  const scanStarted = new Promise((resolve) => { announceStart = resolve; });
+  const scanGate = new Promise((resolve) => { releaseScan = resolve; });
+  const first = makeIndexer(t, {
+    userDataPath,
+    scanSource: async (_root, onFile, _isCancelled, _shouldPause, checkpoint) => {
+      originalFiles.forEach(onFile);
+      await checkpoint.onCheckpoint([pendingDirectory], originalFiles);
+      announceStart(Array.from(checkpoint.resumeDirectories));
+      await scanGate;
+    },
+  });
+  await first.indexer.initialize();
+  const savedRecord = (file) => ({
+    path: file.path,
+    name: file.name,
+    sourcePath,
+    relativePath: file.relativePath,
+    size: file.size,
+    modified: file.modified,
+    type: file.type,
+    extension: file.extension,
+    signature: `${file.size}:${file.modified}`,
+    vectorOffset: 0,
+  });
+  for (const file of originalFiles)
+    first.indexer.latestRecords.set(file.path, savedRecord(file));
+  const firstReconciliation = first.indexer.reconcileIndex([sourcePath]);
+  assert.deepEqual(await scanStarted, [sourcePath],
+    "a new scan starts with its source root as the initial cursor");
+  const cancellation = first.indexer.cancelReconciliation();
+  releaseScan();
+  await Promise.all([firstReconciliation, cancellation]);
+  assert.equal(first.indexer.latestRecords.has(removedPath), true,
+    "an interrupted scan must not delete unverified records");
+
+  fs.appendFileSync(changedPath, " changed while Silo was stopped");
+  fs.rmSync(removedPath);
+  const addedPath = path.join(pendingDirectory, "added.jpg");
+  fs.writeFileSync(addedPath, "new image bytes");
+  let resumedDirectories;
+  const restarted = makeIndexer(t, {
+    userDataPath,
+    scanSource: async (_root, onFile, _isCancelled, _shouldPause, checkpoint) => {
+      resumedDirectories = Array.from(checkpoint.resumeDirectories);
+      const stats = fs.statSync(addedPath);
+      onFile({
+        path: addedPath,
+        name: path.basename(addedPath),
+        relativePath: path.relative(sourcePath, addedPath),
+        size: stats.size,
+        modified: stats.mtimeMs,
+        isDirectory: false,
+        type: "image",
+        extension: ".jpg",
+      });
+      await checkpoint.onCheckpoint([sourcePath], []);
+    },
+  });
+  await restarted.indexer.initialize();
+  for (const file of originalFiles)
+    restarted.indexer.latestRecords.set(file.path, savedRecord(file));
+  const changes = await restarted.indexer.reconcileIndex([sourcePath]);
+  assert.deepEqual(resumedDirectories, [pendingDirectory],
+    "the next process resumes the saved directory queue");
+  assert.equal(changes.has(changedPath), true,
+    "replay refreshes metadata so edits made while closed are reindexed");
+  assert.equal(changes.has(addedPath), true,
+    "the resumed directory walk discovers new files");
+  assert.equal(restarted.indexer.latestRecords.has(removedPath), false,
+    "a verified missing journal path can be retired only after the resumed walk completes");
+});
+
+test("stale progress errors do not override the saved manual-pause flag", () => {
+  const { isIndexStageUserPaused } = loadSource("indexingRecovery.ts");
+  assert.equal(
+    isIndexStageUserPaused({ userPaused: false }),
+    false,
+    "a stale cache-disconnection pause must not suppress recovered indexing",
+  );
+  assert.equal(
+    isIndexStageUserPaused({ userPaused: true }),
+    true,
+    "an explicit saved user pause remains respected",
+  );
+  assert.equal(isIndexStageUserPaused(undefined), false);
+});
+
 test("index pause and retry requests survive process restarts at saved checkpoints", async (t) => {
   const { IndexingRecovery } = loadSource("indexingRecovery.ts");
   const stateDirectory = fs.mkdtempSync(
@@ -772,6 +1696,144 @@ test("index pause and retry requests survive process restarts at saved checkpoin
   assert.equal(progress.status, "complete");
   assert.equal(afterQueuedRestart.details("faces").recoveryRunning, false);
   assert.equal(afterQueuedRestart.details("faces").resumeQueued, false);
+});
+
+test("fair search requests take a scheduler turn at a face checkpoint", async () => {
+  const { IndexingRecovery } = loadSource("indexingRecovery.ts");
+  let faceProgress = { status: "paused", message: "Waiting" };
+  let faceStarts = 0;
+  let facePauses = 0;
+  let finishFaceSlice;
+  let searchStarts = 0;
+  let searchProgress = { status: "paused", message: "Waiting" };
+  const recovery = new IndexingRecovery([
+    {
+      id: "faces",
+      lane: "cpu",
+      sliceMs: 10,
+      progress: () => faceProgress,
+      ready: () => faceStarts === 0,
+      start: () => {
+        faceStarts += 1;
+        faceProgress = { status: "indexing", message: "Face batch" };
+        return new Promise((resolve) => { finishFaceSlice = resolve; });
+      },
+      pause: async () => {
+        facePauses += 1;
+        faceProgress = { status: "paused", message: "Saved checkpoint" };
+        finishFaceSlice?.();
+      },
+    },
+    {
+      id: "search",
+      lane: "cpu",
+      progress: () => searchProgress,
+      ready: () => true,
+      start: async () => {
+        searchStarts += 1;
+        searchProgress = { status: "complete", message: "Up to date" };
+      },
+    },
+  ]);
+
+  recovery.request("faces");
+  for (let attempt = 0; attempt < 50 && faceStarts === 0; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(faceStarts, 1, "face indexing starts before the fair search request");
+  recovery.requestFairly("search");
+  for (let attempt = 0; attempt < 100 && searchStarts === 0; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(facePauses, 1, "face work yields at its scheduler checkpoint");
+  assert.equal(searchStarts, 1, "queued Search work gets the released CPU lane");
+  recovery.stop();
+});
+
+test("startup recovery gives semantic runtime and Search the shared lane before interrupted face work", async (t) => {
+  const { IndexingRecovery } = loadSource("indexingRecovery.ts");
+  const stateDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "indexing-startup-order-test-"),
+  );
+  t.after(() => fs.rmSync(stateDirectory, { recursive: true, force: true }));
+  const statePath = path.join(stateDirectory, "recovery.json");
+  fs.writeFileSync(statePath, JSON.stringify({
+    version: 1,
+    records: {
+      faces: {
+        attempts: 1,
+        error: "Processing was interrupted and is ready to resume.",
+        retryAt: 0,
+        running: true,
+        checked: false,
+        userPaused: false,
+      },
+    },
+    requested: [],
+  }));
+
+  const starts = [];
+  let runtimeStatus = "paused";
+  let searchStatus = "paused";
+  let faceStatus = "paused";
+  let startupIndexReconciliationSettled = false;
+  let startupSearchDiscoveryAvailable = false;
+  let persistedSearchWork = true;
+  let searchRecoveryStartedThisSession = false;
+  const recovery = new IndexingRecovery([
+    {
+      id: "semantic-runtime",
+      lane: "cpu",
+      needsInitialCheck: true,
+      progress: () => ({ status: runtimeStatus, message: "Model startup" }),
+      ready: () => true,
+      start: async () => {
+        starts.push("semantic-runtime");
+        runtimeStatus = "complete";
+      },
+    },
+    {
+      id: "search",
+      lane: "cpu",
+      progress: () => ({ status: searchStatus, message: "Search queue" }),
+      ready: () =>
+        runtimeStatus === "complete" &&
+        (
+          startupIndexReconciliationSettled ||
+          startupSearchDiscoveryAvailable ||
+          persistedSearchWork
+        ),
+      start: async () => {
+        starts.push("search");
+        searchRecoveryStartedThisSession = true;
+        persistedSearchWork = false;
+        searchStatus = "complete";
+      },
+    },
+    {
+      id: "faces",
+      lane: "cpu",
+      progress: () => ({ status: faceStatus, message: "Face queue" }),
+      ready: () =>
+        runtimeStatus === "complete" &&
+        (
+          searchRecoveryStartedThisSession ||
+          (startupIndexReconciliationSettled && !persistedSearchWork)
+        ),
+      start: async () => {
+        starts.push("faces");
+        faceStatus = "complete";
+      },
+    },
+  ], Date.now, statePath);
+  t.after(() => recovery.stop());
+
+  await recovery.tick();
+  for (let attempt = 0; attempt < 100 && starts.length < 3; attempt += 1)
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.deepEqual(
+    starts,
+    ["semantic-runtime", "search", "faces"],
+    "persisted Search work bypasses startup discovery, and face recovery waits until Search gets its first turn",
+  );
 });
 
 test("a failed pause clears the false paused state and reports the failure", async (t) => {
@@ -1636,4 +2698,130 @@ test("filename search streams its first match while the index is hydrating", asy
     indexer.loadComplete = true;
     await searchPromise;
   }
+});
+
+
+test("ANN worker preserves pause across flush and serves search while background updates wait", async (t) => {
+  const worker = await createSearchVectorWorkerHarness(t, {
+    initialKeys: [0],
+    saveDelayMs: 10_000,
+  });
+  const addedKeys = [];
+  worker.port.on("outbound", (message) => {
+    if (message.type === "test-add") addedKeys.push(...message.keys);
+  });
+
+  worker.port.emit("message", { type: "pause" });
+  worker.port.emit("message", {
+    type: "upsert",
+    sourcePath: "/photos",
+    kind: "image",
+    key: 1,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(addedKeys.includes(1), false, "paused ANN updates must wait");
+
+  const pausedSearch = await worker.sendAndWait(
+    {
+      type: "search",
+      requestId: 41,
+      sourcePaths: ["/photos"],
+      imageQuery: new Float32Array(512),
+      documentQuery: new Float32Array(512),
+      limit: 5,
+    },
+    (message) => message.type === "reply" && message.requestId === 41,
+    500,
+  );
+  assert.equal(pausedSearch.error, undefined,
+    "interactive search must run while the queued ANN update is paused");
+
+  const flush = await worker.sendAndWait(
+    { type: "flush", requestId: 42 },
+    (message) => message.type === "reply" && message.requestId === 42,
+  );
+  assert.equal(flush.error, undefined);
+  assert.equal(addedKeys.includes(1), true,
+    "flush must drain the pending mutation before saving");
+
+  worker.port.emit("message", {
+    type: "upsert",
+    sourcePath: "/photos",
+    kind: "image",
+    key: 2,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(addedKeys.includes(2), false,
+    "flush must preserve the user's paused state");
+  worker.port.emit("message", { type: "resume" });
+  await worker.waitForAdd(2);
+
+  worker.setAddDelay(20);
+  worker.port.emit("message", {
+    type: "set-settings",
+    settings: { backgroundWorkPercent: 10, indexThreads: 1, searchThreads: 1 },
+  });
+  const addFour = worker.waitForAdd(4, 1_000);
+  worker.port.emit("message", {
+    type: "upsert",
+    sourcePath: "/photos",
+    kind: "image",
+    key: 3,
+  });
+  await worker.waitForAdd(3);
+  worker.port.emit("message", {
+    type: "upsert",
+    sourcePath: "/photos",
+    kind: "image",
+    key: 4,
+  });
+  const pacedSearch = await worker.sendAndWait(
+    {
+      type: "search",
+      requestId: 43,
+      sourcePaths: ["/photos"],
+      imageQuery: new Float32Array(512),
+      documentQuery: new Float32Array(512),
+      limit: 5,
+    },
+    (message) => message.type === "reply" && message.requestId === 43,
+    500,
+  );
+  assert.equal(pacedSearch.error, undefined,
+    "search must be serviced during the ANN worker's throttle interval");
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  assert.equal(addedKeys.includes(4), false,
+    "10% background duty must leave a visible cooldown between native updates");
+  await addFour;
+});
+
+test("ANN worker checkpoints dirty partitions during continuous updates", async (t) => {
+  const worker = await createSearchVectorWorkerHarness(t, { saveDelayMs: 220 });
+  const checkpoint = waitForWorkerMessage(
+    worker.port,
+    (message) => message.type === "test-save",
+    340,
+  );
+  const add = (key) => {
+    const added = worker.waitForAdd(key);
+    worker.port.emit("message", {
+      type: "upsert",
+      sourcePath: "/photos",
+      kind: "image",
+      key,
+    });
+    return added;
+  };
+
+  await add(0);
+  await new Promise((resolve) => setTimeout(resolve, 55));
+  await add(1);
+  await new Promise((resolve) => setTimeout(resolve, 55));
+  await add(2);
+  await new Promise((resolve) => setTimeout(resolve, 55));
+  await add(3);
+
+  await checkpoint;
+  assert.ok(worker.saves.length > 0,
+    "ongoing updates must not continually postpone the first durable checkpoint");
 });

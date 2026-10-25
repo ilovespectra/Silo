@@ -1,6 +1,11 @@
 import * as os from "os";
 
-export type IndexerLane = "audio" | "face" | "thumbnail" | "external-scan";
+export type IndexerLane =
+  | "audio"
+  | "face"
+  | "search"
+  | "thumbnail"
+  | "source-discovery";
 export type ThermalState = "nominal" | "fair" | "serious" | "critical" | "unknown";
 
 export interface IndexerMachineProfile {
@@ -15,10 +20,45 @@ export interface IndexerGovernorSignals {
   cpuUtilization?: number;
   /** Highest busy fraction among logical processors; catches a saturated main thread. */
   busiestCoreUtilization?: number;
-  freeMemoryRatio?: number;
+  /** Approximate physically reclaimable memory divided by total memory. */
+  availableMemoryRatio?: number;
   idleSeconds?: number;
   onBattery?: boolean;
   thermalState?: ThermalState;
+}
+
+export interface SystemMemorySnapshot {
+  total: number;
+  free?: number;
+  available?: number;
+  fileBacked?: number;
+  purgeable?: number;
+}
+
+/** Converts Electron's platform-specific memory counters into an availability ratio. */
+export function getAvailableMemoryRatio(
+  memory: SystemMemorySnapshot,
+  platform: string,
+): number | undefined {
+  if (!Number.isFinite(memory.total) || memory.total <= 0) return undefined;
+
+  const validAmount = (value: number | undefined): value is number =>
+    Number.isFinite(value) && (value as number) >= 0;
+  let available: number;
+  if (platform === "darwin") {
+    // macOS can reclaim file-backed and purgeable pages under memory pressure.
+    available = [memory.free, memory.fileBacked, memory.purgeable]
+      .filter(validAmount)
+      .reduce((sum, amount) => sum + amount, 0);
+  } else if (platform === "linux" && validAmount(memory.available)) {
+    available = memory.available;
+  } else if (validAmount(memory.free)) {
+    available = memory.free;
+  } else {
+    return undefined;
+  }
+
+  return Math.max(0, Math.min(1, available / memory.total));
 }
 
 export interface IndexerGovernorProfile {
@@ -112,6 +152,9 @@ export class IndexerGovernor {
       this.profile.startingDutyPercent +
       (this.profile.maximumDutyPercent - this.profile.startingDutyPercent) * idleFraction;
 
+    // Aggregate CPU can hide one saturated core on high-core-count Macs.
+    // Use both readings directly so background work backs off before the
+    // main thread or an interactive worker stays pinned.
     const cpuPressure = Math.max(
       signals.cpuUtilization ?? 0,
       signals.busiestCoreUtilization ?? 0,
@@ -121,7 +164,7 @@ export class IndexerGovernor {
     else if (cpuPressure >= 0.7) duty *= 0.55;
     else if (cpuPressure >= 0.55) duty *= 0.75;
 
-    const memoryAvailable = signals.freeMemoryRatio ?? 1;
+    const memoryAvailable = signals.availableMemoryRatio ?? 1;
     if (memoryAvailable < 0.04) duty *= 0.2;
     else if (memoryAvailable < 0.08) duty *= 0.45;
     else if (memoryAvailable < 0.15) duty *= 0.7;
@@ -130,12 +173,15 @@ export class IndexerGovernor {
     if (signals.thermalState === "fair") duty *= 0.8;
     else if (signals.thermalState === "serious") duty *= 0.35;
     const simultaneousLanes = Math.max(1, this.activeLanes.size);
-    duty /= simultaneousLanes;
-    const maximum = Math.min(
+    const totalMaximum = Math.min(
       this.profile.maximumDutyPercent,
       this.userPaceLimitPercent,
     );
-    return clamp(duty, this.profile.minimumDutyPercent, maximum);
+    // The saved background-work preference is a process-wide ceiling. Split
+    // it across active lanes, and lower the usual per-lane minimum when needed
+    // so several concurrent indexers cannot exceed that ceiling together.
+    const laneMaximum = totalMaximum / simultaneousLanes;
+    return clamp(duty / simultaneousLanes, 0, laneMaximum);
   }
 
   async paceAfterWork(
@@ -156,7 +202,7 @@ export class IndexerGovernor {
         continue;
       }
       const dutyCeiling = Number.isFinite(maximumDutyPercent)
-        ? clamp(maximumDutyPercent as number, this.profile.minimumDutyPercent, 100)
+        ? clamp(maximumDutyPercent as number, 0, 100)
         : 100;
       const dutyPercent = Math.min(
         this.getTargetDutyPercent(signals),

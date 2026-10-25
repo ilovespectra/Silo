@@ -15,7 +15,63 @@ interface IndexStorageSettings {
   allowLocalFallback?: boolean;
 }
 
-export const LOCAL_INDEX_STORAGE_RESERVE_BYTES = 10 * 1024 * 1024 * 1024;
+export const INDEX_STORAGE_FREE_SPACE_RESERVE_BYTES = 10 * 1024 * 1024 * 1024;
+export const LOCAL_INDEX_STORAGE_RESERVE_BYTES = INDEX_STORAGE_FREE_SPACE_RESERVE_BYTES;
+
+/** Require repeated successful checks before reopening a cache after an outage. */
+export class StableStorageRecoveryGate {
+  private consecutiveSuccessfulProbes = 0;
+
+  constructor(readonly requiredSuccesses = 3) {
+    if (!Number.isSafeInteger(requiredSuccesses) || requiredSuccesses < 1)
+      throw new Error("Storage recovery requires at least one successful probe.");
+  }
+
+  get successfulProbes() {
+    return this.consecutiveSuccessfulProbes;
+  }
+
+  recordFailure() {
+    this.consecutiveSuccessfulProbes = 0;
+  }
+
+  recordSuccess(recoveryPending: boolean) {
+    if (!recoveryPending) {
+      this.consecutiveSuccessfulProbes = 0;
+      return true;
+    }
+    this.consecutiveSuccessfulProbes += 1;
+    return this.consecutiveSuccessfulProbes >= this.requiredSuccesses;
+  }
+}
+
+export async function findIndexStorageCapacityIssue(
+  storageRoots: readonly string[],
+  reserveBytes = INDEX_STORAGE_FREE_SPACE_RESERVE_BYTES,
+  readFreeBytes: (storageRoot: string) => Promise<number> = async (storageRoot) => {
+    const stats = await fsPromises.statfs(storageRoot);
+    return stats.bavail * stats.bsize;
+  },
+) {
+  const roots = Array.from(
+    new Set(
+      storageRoots
+        .filter((storageRoot) => typeof storageRoot === "string" && storageRoot.trim())
+        .map((storageRoot) => path.resolve(storageRoot)),
+    ),
+  );
+  for (const root of roots) {
+    try {
+      const freeBytes = await readFreeBytes(root);
+      if (!Number.isFinite(freeBytes) || freeBytes < reserveBytes)
+        return { root, freeBytes: Number.isFinite(freeBytes) ? freeBytes : null };
+    } catch {
+      // Fail closed if the cache volume's available space cannot be verified.
+      return { root, freeBytes: null };
+    }
+  }
+  return null;
+}
 
 function freeBytesAt(storageRoot: string) {
   return fsPromises.statfs(storageRoot).then(
@@ -136,6 +192,7 @@ export async function getIndexStorageSettings(userDataPath: string) {
   return {
     path: settings.path,
     knownPaths: settings.knownPaths ?? [],
+    ...(settings.pendingPath ? { pendingPath: settings.pendingPath } : {}),
     allowLocalFallback: settings.allowLocalFallback !== false,
   };
 }

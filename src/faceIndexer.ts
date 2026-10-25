@@ -14,6 +14,9 @@ const MAX_EXEMPLARS = 64;
 const USE_STRICT_X64_FACE_CLUSTERING = process.arch === "x64";
 const FACE_WASM_THREAD_LIMIT = 1;
 const FACE_STATE_CHECKPOINT_INTERVAL = 1000;
+const FACE_CLASSIFICATION_BATCH_SIZE = 32;
+const FACE_QUEUE_YIELD_INTERVAL = 256;
+const FACE_PHOTO_CLASSIFIER_VERSION = 1;
 
 export type PersonStatus = "unconfirmed" | "confirmed" | "banned";
 export type PersonNameSource = "automatic" | "user";
@@ -34,6 +37,20 @@ export interface FaceIndexProgress {
   errors: number;
   currentFile: string | null;
   message: string;
+  preparationProcessed: number;
+  preparationTotal: number;
+  phase?:
+    | "idle"
+    | "preparing"
+    | "building-queue"
+    | "loading-model"
+    | "decoding"
+    | "detecting"
+    | "saving"
+    | "finalizing"
+    | "paused"
+    | "complete"
+    | "error";
 }
 
 export interface FaceRecord {
@@ -156,6 +173,24 @@ type IndexedImagesProvider = () => IndexableFile[] | Promise<IndexableFile[]>;
 type PeoplePhotoClassifier = (
   images: IndexableFile[],
 ) => Promise<Set<string>>;
+interface FacePreparationState {
+  images: IndexableFile[];
+  changedImages: IndexableFile[];
+  eligibleForClassification: IndexableFile[];
+  newlyExcluded: Set<string>;
+  alreadyClassifiedCount: number;
+  classificationTotal: number;
+  classifiedCount: number;
+  pendingImages: IndexableFile[];
+  pendingBuildCursor: number;
+  pendingCursor: number;
+}
+interface FacePhotoClassificationRecord {
+  version: number;
+  imagePath: string;
+  signature: string;
+  excluded: boolean;
+}
 type ProgressListener = (progress: FaceIndexProgress) => void;
 
 // Serialized people (null = did not exist) on each side of one user edit; only changed people are kept.
@@ -180,6 +215,9 @@ const initialProgress: FaceIndexProgress = {
   errors: 0,
   currentFile: null,
   message: "Waiting for indexed photos.",
+  preparationProcessed: 0,
+  preparationTotal: 0,
+  phase: "idle",
 };
 
 export class FaceIndexer {
@@ -187,6 +225,7 @@ export class FaceIndexer {
   private readonly recordsPath: string;
   private readonly statePath: string;
   private readonly progressPath: string;
+  private readonly photoClassificationPath: string;
   private readonly cropsDirectory: string;
   private readonly modelPath: string;
   private readonly wasmPath: string;
@@ -197,12 +236,17 @@ export class FaceIndexer {
   private readonly baseFaceBoxes = new Map<string, FaceBox>();
   private readonly baseFaceCrops = new Map<string, string>();
   private readonly processedSignatures = new Map<string, string>();
+  private readonly photoClassificationRecords = new Map<
+    string,
+    FacePhotoClassificationRecord
+  >();
   private readonly centroidDescriptorCounts = new Map<string, number>();
   private state: FaceState = { version: 1, people: [], bannedFaces: {} };
   private progress = { ...initialProgress };
   private runtime: FaceRuntime | null = null;
   private runPromise: Promise<void> | null = null;
   private pauseRequested = false;
+  private preparation: FacePreparationState | null = null;
   private bannedPhotoPaths = new Set<string>();
   private recognitionChain: Promise<void> = Promise.resolve();
   private recognitionListener: (change: {
@@ -241,6 +285,10 @@ export class FaceIndexer {
     this.recordsPath = path.join(this.directory, "faces.jsonl");
     this.statePath = path.join(this.directory, "people.json");
     this.progressPath = path.join(this.directory, "progress.json");
+    this.photoClassificationPath = path.join(
+      this.directory,
+      "photo-classification.jsonl",
+    );
     this.cropsDirectory = path.join(this.directory, "crops");
     this.modelPath = modelPath;
     this.wasmPath = wasmPath;
@@ -255,6 +303,7 @@ export class FaceIndexer {
 
   async initialize() {
     await fsPromises.mkdir(this.cropsDirectory, { recursive: true });
+    await this.loadPhotoClassificationRecords();
     let savedFaceRecordVersion: number | null = null;
     let hasJournalVersion = false;
     try {
@@ -277,6 +326,8 @@ export class FaceIndexer {
       };
       if (["loading-model", "indexing"].includes(this.progress.status)) {
         this.progress.status = "paused";
+        this.progress.phase = "paused";
+        this.progress.currentFile = null;
         this.progress.message =
           "Face indexing was interrupted and is ready to resume.";
       }
@@ -1537,44 +1588,187 @@ export class FaceIndexer {
 
   private async run(indexedBatch?: IndexableFile[]) {
     try {
-      const imagesOrPromise = indexedBatch ?? this.getIndexedImages();
-      const images = imagesOrPromise instanceof Promise
-        ? await imagesOrPromise
-        : imagesOrPromise;
-      const changedImages = images.filter(
-        (image) =>
-          this.processedSignatures.get(image.path) !== this.signature(image),
-      );
-      let newlyExcluded = new Set<string>();
-      const eligibleForClassification = changedImages.filter(
-        (image) =>
-          !this.excludedPeoplePhotoPaths.has(image.path) &&
-          !this.isPhotoConfirmed(image.path),
-      );
-      try {
-        newlyExcluded = await this.classifyNonPhotoPeopleImages(
-          eligibleForClassification,
+      if (!this.preparation) {
+        const imagesOrPromise = indexedBatch ?? this.getIndexedImages();
+        const images = imagesOrPromise instanceof Promise
+          ? await imagesOrPromise
+          : imagesOrPromise;
+        const changedImages = images.filter(
+          (image) =>
+            this.processedSignatures.get(image.path) !== this.signature(image),
         );
-      } catch {
-        // A local classifier failure should fall back to face detection.
+        const classificationCandidates = changedImages.filter(
+          (image) =>
+            !this.excludedPeoplePhotoPaths.has(image.path) &&
+            !this.isPhotoConfirmed(image.path),
+        );
+        const newlyExcluded = new Set<string>();
+        const eligibleForClassification: IndexableFile[] = [];
+        let alreadyClassifiedCount = 0;
+        for (const image of classificationCandidates) {
+          const cached = this.photoClassificationRecords.get(image.path);
+          if (
+            cached?.version === FACE_PHOTO_CLASSIFIER_VERSION &&
+            cached.signature === this.signature(image)
+          ) {
+            alreadyClassifiedCount += 1;
+            if (cached.excluded) newlyExcluded.add(image.path);
+          } else {
+            eligibleForClassification.push(image);
+          }
+        }
+        this.preparation = {
+          images,
+          changedImages,
+          eligibleForClassification,
+          newlyExcluded,
+          alreadyClassifiedCount,
+          classificationTotal: classificationCandidates.length,
+          classifiedCount: 0,
+          pendingImages: [],
+          pendingBuildCursor: 0,
+          pendingCursor: 0,
+        };
+        await this.updateProgress(
+          {
+            status: "indexing",
+            phase: "preparing",
+            total: images.length,
+            remaining: changedImages.length,
+            currentFile: null,
+            preparationProcessed: alreadyClassifiedCount,
+            preparationTotal: classificationCandidates.length,
+            message: classificationCandidates.length
+              ? `Preparing photos for face indexing… ${alreadyClassifiedCount.toLocaleString()} of ${classificationCandidates.length.toLocaleString()} checked.`
+              : "Preparing photos for face indexing…",
+          },
+          false,
+        );
       }
-      const pending: IndexableFile[] = [];
-      for (const image of changedImages) {
+
+      const preparation = this.preparation;
+      while (
+        preparation.classifiedCount <
+        preparation.eligibleForClassification.length
+      ) {
+        if (this.pauseRequested) {
+          await this.persistState();
+          await this.updateProgress(
+            {
+              status: "paused",
+              phase: "paused",
+              currentFile: null,
+              message: "Face indexing paused while preparing photos.",
+            },
+            true,
+          );
+          return;
+        }
+        const batch = preparation.eligibleForClassification.slice(
+          preparation.classifiedCount,
+          preparation.classifiedCount + FACE_CLASSIFICATION_BATCH_SIZE,
+        );
+        const classificationWorkStartedAt = Date.now();
+        let excluded = new Set<string>();
+        let classificationSucceeded = false;
+        try {
+          excluded = await this.classifyNonPhotoPeopleImages(batch);
+          classificationSucceeded = true;
+        } catch {
+          // A local classifier failure should fall back to face detection. The
+          // uncheckpointed batch is retried after a process restart if needed.
+        }
+        if (classificationSucceeded) {
+          await this.persistPhotoClassificationBatch(batch, excluded);
+          excluded.forEach((imagePath) =>
+            preparation.newlyExcluded.add(imagePath),
+          );
+        }
+        // Checkpoint first, then use the shared adaptive duty budget. A scheduler
+        // pause or interactive search interrupts the wait at this batch boundary.
+        await this.paceBackgroundWork(Date.now() - classificationWorkStartedAt);
+        preparation.classifiedCount += batch.length;
+        const classifiedCount =
+          preparation.alreadyClassifiedCount + preparation.classifiedCount;
+        if (
+          classifiedCount % (FACE_CLASSIFICATION_BATCH_SIZE * 4) === 0 ||
+          preparation.classifiedCount ===
+            preparation.eligibleForClassification.length
+        ) {
+          await this.updateProgress(
+            {
+              phase: "preparing",
+              preparationProcessed: classifiedCount,
+              preparationTotal: preparation.classificationTotal,
+              message: `Preparing photos for face indexing… ${classifiedCount.toLocaleString()} of ${preparation.classificationTotal.toLocaleString()} checked.`,
+            },
+            true,
+          );
+        }
+        // Let the recovery scheduler and renderer handle pause requests between
+        // bounded classifier batches on large libraries.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      if (this.pauseRequested) {
+        await this.persistState();
+        await this.updateProgress(
+          {
+            status: "paused",
+            phase: "paused",
+            currentFile: null,
+            message: "Face indexing paused while preparing photos.",
+          },
+          true,
+        );
+        return;
+      }
+
+      const { images, changedImages, newlyExcluded } = preparation;
+      const pending = preparation.pendingImages;
+      while (preparation.pendingBuildCursor < changedImages.length) {
+        if (this.pauseRequested) {
+          await this.persistState();
+          await this.updateProgress(
+            {
+              status: "paused",
+              phase: "paused",
+              currentFile: null,
+              message: `Face indexing paused while preparing its queue (${preparation.pendingBuildCursor.toLocaleString()} of ${changedImages.length.toLocaleString()} photos).`,
+            },
+            true,
+          );
+          return;
+        }
+        const image = changedImages[preparation.pendingBuildCursor];
         if (this.isPhotoConfirmed(image.path)) {
           this.excludedPeoplePhotoPaths.delete(image.path);
           pending.push(image);
-          continue;
-        }
-        if (
+        } else if (
           this.excludedPeoplePhotoPaths.has(image.path) ||
           newlyExcluded.has(image.path)
         ) {
           this.excludedPeoplePhotoPaths.add(image.path);
           this.detachUnconfirmedPhoto(image.path);
           await this.appendProcessed(image, []);
-          continue;
+        } else {
+          pending.push(image);
         }
-        pending.push(image);
+        preparation.pendingBuildCursor += 1;
+        if (
+          preparation.pendingBuildCursor % FACE_QUEUE_YIELD_INTERVAL === 0 ||
+          preparation.pendingBuildCursor === changedImages.length
+        ) {
+          await this.updateProgress(
+            {
+              status: "indexing",
+              phase: "building-queue",
+              currentFile: null,
+              message: `Preparing the face queue… ${preparation.pendingBuildCursor.toLocaleString()} of ${changedImages.length.toLocaleString()} photos checked.`,
+            },
+            false,
+          );
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
       }
       if (newlyExcluded.size > 0) {
         this.state.excludedPeoplePhotoPaths = Array.from(
@@ -1582,12 +1776,14 @@ export class FaceIndexer {
         );
         await this.persistState();
       }
-      const processed = images.length - pending.length;
+      const processed = images.length - pending.length + preparation.pendingCursor;
+      const remaining = Math.max(0, pending.length - preparation.pendingCursor);
       await this.updateProgress(
         {
+          phase: remaining ? "loading-model" : "finalizing",
           total: images.length,
           processed,
-          remaining: pending.length,
+          remaining,
           errors: 0,
           faces: this.faces.size,
           people: this.getPeople().length,
@@ -1595,12 +1791,15 @@ export class FaceIndexer {
         },
         true,
       );
-      if (pending.length === 0) {
+      if (remaining === 0) {
         const combined = await this.combineSimilarClusters();
         await this.refreshRecognition();
+        await this.persistState();
+        await this.clearPhotoClassificationJournal();
         await this.updateProgress(
           {
             status: "complete",
+            phase: "complete",
             people: this.getPeople().length,
             message: images.length
               ? combined > 0
@@ -1610,25 +1809,39 @@ export class FaceIndexer {
           },
           true,
         );
+        this.preparation = null;
         return;
       }
       await this.updateProgress(
-        { status: "loading-model", message: "Loading offline face models..." },
+        {
+          status: "loading-model",
+          phase: "loading-model",
+          message: "Loading offline face models...",
+        },
         true,
       );
       const runtime = await this.loadRuntime();
       await this.updateProgress(
-        { status: "indexing", message: "Detecting and clustering faces..." },
+        {
+          status: "indexing",
+          phase: "detecting",
+          message: "Detecting and clustering faces...",
+        },
         true,
       );
 
-      for (let index = 0; index < pending.length; index += 1) {
+      for (
+        let index = preparation.pendingCursor;
+        index < pending.length;
+        index += 1
+      ) {
         const workStartedAt = Date.now();
         if (this.pauseRequested) {
           await this.persistState();
           await this.updateProgress(
             {
               status: "paused",
+              phase: "paused",
               currentFile: null,
               message: "Face indexing paused.",
             },
@@ -1637,7 +1850,10 @@ export class FaceIndexer {
           return;
         }
         const image = pending[index];
-        await this.updateProgress({ currentFile: image.name }, false);
+        await this.updateProgress(
+          { phase: "decoding", currentFile: image.name },
+          false,
+        );
         try {
           await this.processImage(image, runtime);
         } catch {
@@ -1646,6 +1862,9 @@ export class FaceIndexer {
         this.progress.processed += 1;
         this.progress.remaining = Math.max(0, this.progress.remaining - 1);
         this.progress.faces = this.faces.size;
+        preparation.pendingCursor = index + 1;
+        this.progress.currentFile = null;
+        this.progress.phase = "idle";
         // Summarizing every person's full face/photo set for each image made
         // progress accounting grow with the entire library. Refresh this label
         // at the same 25-photo cadence used by the People UI.
@@ -1659,19 +1878,21 @@ export class FaceIndexer {
         await this.paceBackgroundWork(Date.now() - workStartedAt);
       }
       await this.updateProgress(
-        { message: "Bundling similar face clusters..." },
+        { phase: "finalizing", message: "Bundling similar face clusters..." },
         true,
       );
       const combined = await this.combineSimilarClusters();
       await this.updateProgress(
-        { message: "Matching confirmed people..." },
+        { phase: "finalizing", message: "Matching confirmed people..." },
         false,
       );
       await this.refreshRecognition();
       await this.persistState();
+      await this.clearPhotoClassificationJournal();
       await this.updateProgress(
         {
           status: "complete",
+          phase: "complete",
           currentFile: null,
           remaining: 0,
           people: this.getPeople().length,
@@ -1682,10 +1903,12 @@ export class FaceIndexer {
         },
         true,
       );
+      this.preparation = null;
     } catch (error) {
       await this.updateProgress(
         {
           status: "error",
+          phase: "error",
           currentFile: null,
           message:
             error instanceof Error ? error.message : "Face indexing failed.",
@@ -1696,6 +1919,7 @@ export class FaceIndexer {
   }
 
   private async processImage(image: IndexableFile, runtime: FaceRuntime) {
+    await this.updateProgress({ phase: "decoding" }, false);
     const localPath = await this.resolveImagePath(image.path);
     const decoded = await runtime
       .sharp(localPath)
@@ -1710,6 +1934,7 @@ export class FaceIndexer {
       .raw()
       .toBuffer({ resolveWithObject: true });
     const { data, info } = decoded;
+    await this.updateProgress({ phase: "detecting" }, false);
     const tensor = runtime.faceapi.tf.tensor3d(
       new Uint8Array(data),
       [info.height, info.width, info.channels],
@@ -1733,6 +1958,7 @@ export class FaceIndexer {
 
     const records: FaceRecord[] = [];
     const createdPeople: PersonCluster[] = [];
+    await this.updateProgress({ phase: "saving" }, false);
     for (let index = 0; index < detections.length; index += 1) {
       const detection = detections[index];
       const box = detection.detection.box;
@@ -1784,6 +2010,7 @@ export class FaceIndexer {
       person.faceIds.push(faceId);
       this.addDescriptorToCentroid(person, descriptor);
     }
+    await this.updateProgress({ phase: "saving" }, false);
     await this.appendProcessed(image, records, true, createdPeople);
   }
 
@@ -2024,6 +2251,66 @@ export class FaceIndexer {
     this.recordWriteChain = write.catch(() => undefined);
     await write;
     this.processedSignatures.set(image.path, entry.signature);
+  }
+
+  private async loadPhotoClassificationRecords() {
+    try {
+      await fsPromises.access(this.photoClassificationPath);
+    } catch {
+      return;
+    }
+    const lines = readline.createInterface({
+      input: fs.createReadStream(this.photoClassificationPath, {
+        encoding: "utf8",
+      }),
+      crlfDelay: Infinity,
+    });
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const record = JSON.parse(line) as FacePhotoClassificationRecord;
+        if (
+          record.version === FACE_PHOTO_CLASSIFIER_VERSION &&
+          typeof record.imagePath === "string" &&
+          typeof record.signature === "string" &&
+          typeof record.excluded === "boolean"
+        )
+          this.photoClassificationRecords.set(record.imagePath, record);
+      } catch {
+        // Ignore an incomplete final line; its photos will be classified again.
+      }
+    }
+  }
+
+  private async persistPhotoClassificationBatch(
+    images: IndexableFile[],
+    excluded: Set<string>,
+  ) {
+    const records = images.map((image) => ({
+      version: FACE_PHOTO_CLASSIFIER_VERSION,
+      imagePath: image.path,
+      signature: this.signature(image),
+      excluded: excluded.has(image.path),
+    }));
+    const payload = `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+    try {
+      await fsPromises.appendFile(this.photoClassificationPath, payload, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+    } catch (error) {
+      throw new Error(
+        `Could not persist face-photo classification progress: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    records.forEach((record) =>
+      this.photoClassificationRecords.set(record.imagePath, record),
+    );
+  }
+
+  private async clearPhotoClassificationJournal() {
+    await fsPromises.rm(this.photoClassificationPath, { force: true });
+    this.photoClassificationRecords.clear();
   }
 
   private async loadRecords(savedVersion: number | null) {

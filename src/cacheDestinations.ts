@@ -339,11 +339,17 @@ function pathWithin(candidate: string, parent: string, pathApi: typeof path = pa
 }
 
 function canonicalPath(target: string) {
-  const resolved = path.resolve(target);
-  try {
-    return realpathSync.native(resolved);
-  } catch {
-    return resolved;
+  let unresolved = path.resolve(target);
+  const suffix: string[] = [];
+  for (;;) {
+    try {
+      return path.join(realpathSync.native(unresolved), ...suffix);
+    } catch {
+      const parent = path.dirname(unresolved);
+      if (parent === unresolved) return path.resolve(target);
+      suffix.unshift(path.basename(unresolved));
+      unresolved = parent;
+    }
   }
 }
 
