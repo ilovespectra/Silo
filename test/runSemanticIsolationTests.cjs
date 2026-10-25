@@ -272,7 +272,26 @@ test("shared indexer lanes stay within the saved background-work ceiling", () =>
   assert.equal(governor.getTargetDutyPercent(), 10);
 });
 
-test("macOS Data-volume aliases require verified directory identity and coalesce queue paths", async () => {
+test("macOS Data-volume alias detection is not applied on other platforms", async () => {
+  const { findMacDataVolumeSourceAliases } = loadSource("semanticIndexer.ts");
+  assert.deepEqual(
+    Array.from(
+      await findMacDataVolumeSourceAliases(
+        ["/System/Volumes/Data", "/Users/jacqueline"],
+        "win32",
+        async () => assert.fail("non-macOS platforms must not stat alias candidates"),
+      ),
+    ),
+    [],
+  );
+});
+
+test("macOS Data-volume aliases require verified directory identity and coalesce queue paths", async (t) => {
+  // These firmlink paths are POSIX paths; Windows path resolution cannot represent them.
+  if (process.platform !== "darwin") {
+    t.skip("macOS Data-volume firmlinks only exist on macOS.");
+    return;
+  }
   const {
     findMacDataVolumeSourceAliases,
     mapSourcePathAlias,
@@ -326,16 +345,13 @@ test("macOS Data-volume aliases require verified directory identity and coalesce
     }),
   );
   assert.deepEqual(Array.from(unverified), [], "different directory identities are never collapsed");
-  assert.deepEqual(
-    Array.from(
-      await findMacDataVolumeSourceAliases([dataRoot, userRoot], "win32"),
-    ),
-    [],
-    "the macOS firmlink rule is not applied on other platforms",
-  );
 });
 
 test("coalesced alias records persist with one stable canonical path", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS Data-volume firmlinks only exist on macOS.");
+    return;
+  }
   const { indexer } = makeIndexer(t);
   await indexer.initialize();
   const userRoot = "/Users/jacqueline";

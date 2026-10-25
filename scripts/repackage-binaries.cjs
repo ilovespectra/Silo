@@ -190,6 +190,57 @@ function stageFile(source, target) {
   return { temporary, target };
 }
 
+function assertLocalMatchesRemote() {
+  const localSha = capture('git', ['rev-parse', 'HEAD']);
+  const remoteSha = capture('gh', [
+    'api', `repos/${repository}/commits/${branch}`, '--jq', '.sha',
+  ]);
+  if (remoteSha !== localSha) {
+    throw new Error(`Local ${branch} must match GitHub ${branch} before packaging.`);
+  }
+  return localSha;
+}
+
+async function dispatchWindowsWorkflow(commitSha, fields = []) {
+  const previousRunText = capture('gh', [
+    'run', 'list', '--repo', repository, '--workflow', workflow,
+    '--limit', '1', '--json', 'databaseId', '--jq', '.[0].databaseId // ""',
+  ]);
+  const previousRunId = previousRunText ? Number(previousRunText) : null;
+  const startedAt = Date.now();
+  run('gh', [
+    'workflow', 'run', workflow, '--repo', repository, '--ref', branch,
+    ...fields.flatMap((field) => ['-f', field]),
+  ]);
+  const workflowRun = await waitForWorkflowRun(previousRunId, commitSha, startedAt);
+  run('gh', ['run', 'watch', String(workflowRun.databaseId), '--repo', repository, '--exit-status']);
+  return workflowRun;
+}
+
+// Runs Windows install, preparation, compile, and test steps on GitHub Actions
+// for the exact pushed commit before the release version or any build changes.
+async function runWindowsTestGate() {
+  const sha = assertLocalMatchesRemote();
+  const runs = JSON.parse(capture('gh', [
+    'run', 'list', '--repo', repository, '--workflow', workflow,
+    '--commit', sha, '--status', 'success', '--limit', '1', '--json', 'url',
+  ]) || '[]');
+  if (runs.length) {
+    console.log(`\nWindows CI already passed for ${sha.slice(0, 7)}: ${runs[0].url}`);
+    return;
+  }
+  console.log(`\nRunning the Windows test gate on GitHub Actions for ${sha.slice(0, 7)} before building…`);
+  try {
+    await dispatchWindowsWorkflow(sha, ['tests_only=true']);
+  } catch (error) {
+    throw new Error(
+      `Windows test gate failed for ${sha.slice(0, 7)}; no version was changed and nothing was built.\n` +
+      (error instanceof Error ? error.message : String(error)),
+    );
+  }
+  console.log('Windows test gate passed.');
+}
+
 async function repackage() {
   if (process.platform !== 'darwin') {
     throw new Error('Run this command on the release Mac; it builds both Mac installers locally.');
@@ -205,6 +256,10 @@ async function repackage() {
   assertCleanReleaseInputs();
   console.log('\nChecking semantic search before versioning or dispatching Windows packaging…');
   run('npm', ['run', 'test:semantic-isolation']);
+  if (!suppliedWindowsInstaller) {
+    run('gh', ['auth', 'status', '--hostname', 'github.com'], { stdio: 'ignore' });
+    await runWindowsTestGate();
+  }
   if (version !== packageJson.version) {
     if (suppliedWindowsInstaller) {
       throw new Error(`Set the source package to published-release target ${version} and rebuild the supplied Windows installer from that pushed commit.`);
@@ -227,13 +282,7 @@ async function repackage() {
       throw new Error('SILO_WINDOWS_BUILD_SHA must match the exact local main commit used by the Windows build.');
     }
   } else {
-    run('gh', ['auth', 'status', '--hostname', 'github.com'], { stdio: 'ignore' });
-    const remoteSha = capture('gh', [
-      'api', `repos/${repository}/commits/${branch}`, '--jq', '.sha',
-    ]);
-    if (remoteSha !== localSha) {
-      throw new Error(`Local ${branch} must match GitHub ${branch} before packaging.`);
-    }
+    assertLocalMatchesRemote();
   }
 
   const expected = [
@@ -255,15 +304,7 @@ async function repackage() {
     if (suppliedWindowsInstaller) {
       stagedFiles.set(`${product}-${version}-x64-Setup.exe`, suppliedWindowsInstaller);
     } else {
-      const previousRunText = capture('gh', [
-        'run', 'list', '--repo', repository, '--workflow', workflow,
-        '--limit', '1', '--json', 'databaseId', '--jq', '.[0].databaseId // ""',
-      ]);
-      const previousRunId = previousRunText ? Number(previousRunText) : null;
-      const startedAt = Date.now();
-      run('gh', ['workflow', 'run', workflow, '--repo', repository, '--ref', branch]);
-      const workflowRun = await waitForWorkflowRun(previousRunId, localSha, startedAt);
-      run('gh', ['run', 'watch', String(workflowRun.databaseId), '--repo', repository, '--exit-status']);
+      const workflowRun = await dispatchWindowsWorkflow(localSha);
 
       const windowsDownload = path.join(stageRoot, 'windows-ci');
       fs.mkdirSync(windowsDownload);

@@ -2,6 +2,11 @@ name: Windows x64 installer
 
 on:
   workflow_dispatch:
+    inputs:
+      tests_only:
+        description: Run the Windows dependency, compile, and test gate without packaging
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -12,6 +17,7 @@ on:
       - 'package-lock.json'
       - 'scripts/**'
       - 'src/**'
+      - 'test/**'
       - 'electron-dist/**'
       - 'public/**'
       - 'signing/**'
@@ -66,6 +72,7 @@ jobs:
           node test/runSemanticIsolationTests.cjs
 
       - name: Restore cached phone tools
+        if: ${{ !inputs.tests_only }}
         id: phone-tools-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -73,7 +80,7 @@ jobs:
           key: phone-tools-win32-x64-${{ hashFiles('scripts/build-phone-tools.sh') }}
 
       - name: Set up MSYS2 for phone tools
-        if: steps.phone-tools-cache.outputs.cache-hit != 'true'
+        if: ${{ !inputs.tests_only && steps.phone-tools-cache.outputs.cache-hit != 'true' }}
         uses: msys2/setup-msys2@f84a36b4009b96413f91c01441130855db9392e5 # v2.9.0
         with:
           msystem: UCRT64
@@ -87,11 +94,12 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
 
       - name: Build bundled iPhone and Android tools
-        if: steps.phone-tools-cache.outputs.cache-hit != 'true'
+        if: ${{ !inputs.tests_only && steps.phone-tools-cache.outputs.cache-hit != 'true' }}
         shell: msys2 {0}
         run: bash scripts/build-phone-tools.sh x64
 
       - name: Verify bundled phone tools
+        if: ${{ !inputs.tests_only }}
         shell: pwsh
         run: |
           $dir = 'vendor/phone-tools/win32-x64'
@@ -103,6 +111,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'idevice_id.exe does not run outside MSYS2 (missing DLL?)' }
 
       - name: Package and verify NSIS installer
+        if: ${{ !inputs.tests_only }}
         shell: pwsh
         run: |
           $hook = Join-Path $env:RUNNER_TEMP 'silo-installer-progress.nsh'
@@ -228,6 +237,7 @@ jobs:
           node test/runWindowsMemoryRuntimeSmoke.cjs 'release/win-unpacked/resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe'
 
       - name: Verify installer output
+        if: ${{ !inputs.tests_only }}
         shell: pwsh
         run: |
           $installer = Get-ChildItem release -Filter '*-Setup.exe' | Select-Object -First 1
@@ -236,6 +246,7 @@ jobs:
           Get-ChildItem release | Select-Object Name, Length
 
       - name: Upload Windows release assets
+        if: ${{ !inputs.tests_only }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: silo-windows-x64
