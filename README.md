@@ -141,10 +141,14 @@ match GitHub `main`. It prints SHA-256 hashes after copying. It does not publish
 a GitHub release; Mac builds remain ad-hoc signed and are not notarized.
 
 `npm run release:check` validates the compiled renderer before packaging.
-Repackaging also runs `npm run test:semantic-isolation` locally before changing
-the package version or dispatching Windows CI. This catches search API and test
-fixture regressions without waiting for a remote build; Windows still runs its
-real bundled-model smoke test. ANN search fixtures must return the current
+Repackaging first runs `npm ci` from the lockfile, repairs and verifies Electron
+and FFmpeg, refreshes NumKong compiler probes, and checks the offline model and
+WASM runtime assets. Windows CI repeats dependency installation and its local
+runtime checks before compiling. The Mac release flow then runs
+`npm run test:semantic-isolation` before changing the package version or
+dispatching Windows CI. This catches search API and test fixture regressions
+without waiting for a remote build; Windows still runs its real bundled-model
+smoke test. ANN search fixtures must return the current
 `VectorSearchResponse` object (`hits` and optional `diagnostics`), not a bare array.
 The Solana Pay check requires the payment section, QR container, and wallet
 action markers rather than matching the instructional headline, so copy changes

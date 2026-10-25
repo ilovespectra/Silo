@@ -47,6 +47,9 @@ jobs:
       - name: Install Windows dependencies
         run: npm ci
 
+      - name: Prepare and verify Windows build dependencies
+        run: node scripts/prepare-build-dependencies.cjs
+
       - name: Compile app
         run: npm run build
 

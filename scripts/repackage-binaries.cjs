@@ -194,14 +194,14 @@ async function repackage() {
   if (process.platform !== 'darwin') {
     throw new Error('Run this command on the release Mac; it builds both Mac installers locally.');
   }
-  if (!fs.existsSync(path.join(projectRoot, 'node_modules'))) {
-    throw new Error('Install the project dependencies first with npm ci.');
-  }
-  fs.mkdirSync(destination, { recursive: true });
-  if (!fs.statSync(destination).isDirectory()) {
+  if (fs.existsSync(destination) && !fs.statSync(destination).isDirectory()) {
     throw new Error(`The selected release destination is not a folder: ${destination}`);
   }
 
+  assertCleanReleaseInputs();
+  console.log('\nInstalling exact locked dependencies and preparing local app runtime assets…');
+  run('npm', ['ci', '--no-audit', '--no-fund']);
+  run(process.execPath, [path.join(projectRoot, 'scripts', 'prepare-build-dependencies.cjs')]);
   assertCleanReleaseInputs();
   console.log('\nChecking semantic search before versioning or dispatching Windows packaging…');
   run('npm', ['run', 'test:semantic-isolation']);
@@ -305,6 +305,7 @@ async function repackage() {
     if (releases.some((release) => release.tag_name === `v${version}` && !release.draft)) {
       throw new Error(`Version ${version} was published during this build. Refusing to replace its local assets.`);
     }
+    fs.mkdirSync(destination, { recursive: true });
     for (const name of expected) {
       const source = stagedFiles.get(name);
       const target = path.join(destination, name);
