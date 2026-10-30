@@ -7462,7 +7462,9 @@ function App() {
               <FiUserPlus /> Add to Person
             </button>
             <button
-              onClick={() => setShowFolderSelector(true)}
+              onClick={() =>
+                openFolderSelector(undefined, Array.from(selectedFilePaths))
+              }
               className="bulk-action-btn add-to-folder"
               title="Add references to a Digital Folder"
             >

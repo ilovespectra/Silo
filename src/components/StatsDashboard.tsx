@@ -223,6 +223,7 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
   const [showBrowser, setShowBrowser] = useState(false);
   const [showSessionHistory, setShowSessionHistory] = useState(false);
   const [activeCloneProgress, setActiveCloneProgress] = useState<SourceCloneProgress[]>([]);
+  const [recentFailedCloneSession, setRecentFailedCloneSession] = useState<SourceCloneSessionLog | null>(null);
   const [activeOperationToOpen, setActiveOperationToOpen] = useState<SourceCloneProgress | null>(null);
   const [verifying, setVerifying] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -237,6 +238,20 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
       throw new Error("Fallout Shelter status is unavailable in this Silo window.");
     if (mounted.current) setSnapshot(next);
     return next;
+  }, [api]);
+
+  const refreshRecentCloneSession = useCallback(async () => {
+    try {
+      const result = await api.getSourceCloneSessionLogs();
+      const latest = result.sessions.find((session) =>
+        (session.mode === "sources" || session.mode === "shelter-replica") &&
+        ["error", "interrupted", "complete-with-errors"].includes(session.outcome) &&
+        Boolean(session.latestProgress),
+      );
+      if (mounted.current) setRecentFailedCloneSession(latest ?? null);
+    } catch {
+      if (mounted.current) setRecentFailedCloneSession(null);
+    }
   }, [api]);
 
   const refreshInventory = useCallback(async () => {
@@ -330,6 +345,8 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
         const remaining = current.filter((item) => item.operationId !== state.operationId);
         return activePhases.has(state.phase) ? [...remaining, state] : remaining;
       });
+      if (["error", "cancelled", "complete"].includes(state.phase))
+        void refreshRecentCloneSession();
     };
     const changedDuringHydration = new Set<string>();
     const unsubscribe = api.onSourceCloneProgress((state) => {
@@ -352,7 +369,9 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
       disposed = true;
       unsubscribe();
     };
-  }, [api]);
+  }, [api, refreshRecentCloneSession]);
+
+  useEffect(() => { void refreshRecentCloneSession(); }, [refreshRecentCloneSession]);
 
   const availableSources = (snapshot?.sources ?? []).filter((source) => source.available && source.rootPath);
   const selectedSources = availableSources.filter((source) => selectedIds.has(source.id));
@@ -387,19 +406,45 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
         <button className="stats-button small fallout-shelter-replica-button" onClick={() => setShowBrowser((current) => !current)} aria-expanded={showBrowser}><FiHardDrive /> {showBrowser ? "Close backup browser" : "Browse Fallout Shelters"}</button>
         <button className="stats-button small fallout-shelter-replica-button" onClick={() => setShowSessionHistory(true)}><FiClock /> View previous session logs</button>
         {(snapshot?.shelter.replicas ?? []).map((replica, index) => <div className="stats-shelter-replica" key={`${replica.path}:${replica.verifiedAt}:${index}`}><FiCheckCircle /><span><strong>Verified replica</strong><small title={replica.path}>{replica.path}</small></span><time>{formatDate(replica.verifiedAt)}</time></div>)}
+        {recentFailedCloneSession && activeCloneProgress.length === 0 && (
+          <section className="stats-shelter-active-operations" aria-label="Most recent incomplete Fallout Shelter backup">
+            <article className="stats-shelter-active-operation">
+              <header>
+                <div><strong>{recentFailedCloneSession.outcome === "interrupted" ? "Fallout Shelter backup interrupted" : "Last Fallout Shelter backup failed"}</strong><span>Updated {new Date(recentFailedCloneSession.latestProgress?.updatedAt ?? recentFailedCloneSession.updatedAt).toLocaleString()}</span></div>
+                <button className="stats-button small" onClick={() => setShowSessionHistory(true)}>Open log</button>
+              </header>
+              {(recentFailedCloneSession.latestProgress?.sourceProgress ?? []).map((source, index) => {
+                const total = source.totalFiles ?? 0;
+                const present = Math.min(source.completedFiles, total);
+                const percent = total > 0 ? Math.round(present / total * 100) : 0;
+                return (
+                  <div className="stats-shelter-active-source" key={`${recentFailedCloneSession.id}:${source.sourceId}:${index}`}>
+                    <div><strong title={source.label}>{source.label}</strong><span>{percent}% present</span></div>
+                    <progress value={percent} max={100} aria-label={`${source.label} destination presence`} />
+                    <small>{present.toLocaleString()} / {total.toLocaleString()} files copied into the destination · {source.verifiedFiles.toLocaleString()} SHA-256 verified</small>
+                  </div>
+                );
+              })}
+              <small className="stats-source-error">Copy presence is not the same as a verified backup. This failed session has no completed SHA-256 manifest.</small>
+            </article>
+          </section>
+        )}
         {activeCloneProgress.length > 0 && (
           <section className="stats-shelter-active-operations" aria-label="Active Fallout Shelter backups" aria-live="polite">
             {activeCloneProgress.map((operation) => (
               <article className="stats-shelter-active-operation" key={operation.operationId}>
                 <header>
-                  <div><strong>{operation.mode === "shelter-replica" ? "Shelter replica" : "Fallout Shelter backup"}</strong><span>{operation.message}</span></div>
+                  <div><strong>{operation.mode === "shelter-replica" ? "Shelter replica" : "Fallout Shelter backup"}</strong><span>{operation.message} · Updated {operation.updatedAt ? new Date(operation.updatedAt).toLocaleString() : "time not recorded"}</span></div>
                   <button className="stats-button small" onClick={() => setActiveOperationToOpen(operation)}>Open progress</button>
                 </header>
                 {(operation.sourceProgress ?? []).map((source, index) => {
                   const checking = operation.phase === "checking-space" || source.phase === "checking";
                   const total = checking ? source.discoveredFiles : source.totalFiles ?? 0;
                   const current = checking ? source.checkedBytes ?? source.checkedFiles ?? 0
-                    : source.phase === "verifying" ? source.verifiedFiles : source.completedFiles;
+                    : source.completedFiles;
+                  const presencePercent = (source.totalFiles ?? 0) > 0
+                    ? Math.round(Math.min(source.completedFiles, source.totalFiles!) / source.totalFiles! * 100)
+                    : 0;
                   const checkingTotal = checking && (source.totalBytes ?? 0) > 0
                     ? source.totalBytes!
                     : checking ? source.discoveredFiles : source.totalFiles ?? 0;
@@ -411,8 +456,8 @@ export function FalloutShelterSettings({ api }: StatsDashboardProps) {
                         ? <progress aria-label={`${source.label} progress`} />
                         : <progress value={complete ? checkingTotal : Math.min(current, checkingTotal)} max={checkingTotal} aria-label={`${source.label} progress`} />}
                       <small>{source.discoveredFiles.toLocaleString()} found · {checking
-                        ? `${(source.checkedFiles ?? 0).toLocaleString()} / ${source.discoveredFiles.toLocaleString()} paths checked · ${formatBytes(source.checkedBytes ?? 0)} / ${formatBytes(source.totalBytes ?? 0)} hashed`
-                        : `${current.toLocaleString()} / ${total.toLocaleString()} ${source.phase === "verifying" ? "verified" : "processed"}`} · {(source.omittedFiles ?? 0).toLocaleString()} files and {(source.omittedSubtrees ?? 0).toLocaleString()} folders/subtrees omitted</small>
+                        ? `${(source.checkedFiles ?? 0).toLocaleString()} / ${source.discoveredFiles.toLocaleString()} paths preflight-hashed`
+                        : `${current.toLocaleString()} / ${total.toLocaleString()} present (${presencePercent}%) · ${source.verifiedFiles.toLocaleString()} SHA-256 verified`} · {(source.omittedFiles ?? 0).toLocaleString()} files and {(source.omittedSubtrees ?? 0).toLocaleString()} folders/subtrees omitted · Updated {operation.updatedAt ? new Date(operation.updatedAt).toLocaleString() : "time not recorded"}</small>
                     </div>
                   );
                 })}

@@ -181,6 +181,9 @@ const context = vm.createContext({
   classifyFile: () => "other",
   app: { getPath: (name) => { assert.equal(name, "userData"); return userData; }, getVersion: () => "test-version" },
   indexStorageRoot: userData,
+  // Isolate the source-clone harness from the real Electron StateStore while
+  // exercising the empty virtual-folder path used by production.
+  stateStore: { getState: () => ({ digitalFolders: [] }) },
   exportConfig: async (_userData, target) => { await fsp.writeFile(target, "test silo config and indexes"); return { size: 28 }; },
   listSources: async () => [
     { id: sourceRoot, rootPath: sourceRoot, label: "Photos", kind: "local", enabled: true, available: true },
@@ -193,10 +196,12 @@ const context = vm.createContext({
   getShelterDestination: async () => destinations[0],
   sourceCloneOperations: new Map(),
   sourceClonePlans: new Map(),
+  sourceCloneProgressSnapshots: new Map(),
+  sourceCloneSessionsByOperation: new Map(),
   recordSourceCloneSessionProgress: () => {},
   sendToRenderer: (channel, value) => { if (channel === "source-clone-progress") progress.push(value); },
 });
-for (const name of ["cloneSafeSegment", "cloneSafeRelativePath", "sourceCloneOmissionNotice", "sendSourceCloneProgress", "ensureCloneActive", "hashFile", "readFiles", "appendSiloOnlyCloneAliases", "buildShelterReuseIndex", "listLocalCloneEntries", "getSourceCloneStatus", "persistSourceCloneStatus", "prepareSourceClone", "findLatestShelterSnapshot", "prepareShelterReplica", "runSourceClone"]) {
+for (const name of ["cloneSafeSegment", "cloneSafeRelativePath", "resolveCloneDestinationCollisions", "sourceCloneOmissionNotice", "sendSourceCloneProgress", "ensureCloneActive", "hashFile", "readFiles", "appendSiloOnlyCloneAliases", "buildShelterReuseIndex", "listLocalCloneEntries", "getSourceCloneStatus", "persistSourceCloneStatus", "prepareSourceClone", "findLatestShelterSnapshot", "prepareShelterReplica", "sourceCloneSessionCanResume", "runSourceClone"]) {
   assert(functions.has(name), `Missing source clone function ${name}`);
   const compiled = ts.transpileModule(functions.get(name).getText(ast), {
     compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
@@ -211,6 +216,19 @@ for (const name of ["cloneSafeSegment", "cloneSafeRelativePath", "sourceCloneOmi
 
 async function run() {
   try {
+    const collisionBase = path.join("Sources", "01-Pictures", `${"x".repeat(96)}.mov`);
+    const collisionEntries = [
+      { sourceId: "photos", sourcePath: "/source/a.mov", sourceRelativePath: "a.mov", destinationRelativePath: collisionBase, isDirectory: false },
+      { sourceId: "photos", sourcePath: "/source/b.mov", sourceRelativePath: "b.mov", destinationRelativePath: collisionBase, isDirectory: false },
+    ];
+    assert.equal(context.resolveCloneDestinationCollisions(collisionEntries), 1, "safe path mapping deterministically disambiguates file-name collisions");
+    assert.equal(new Set(collisionEntries.map((entry) => entry.destinationRelativePath.toLocaleLowerCase("en-US"))).size, 2);
+    assert.equal(path.basename(collisionEntries[1].destinationRelativePath), `${"x".repeat(92)} (2).mov`, "collision suffixes stay within the 100-character destination component cap");
+    assert.throws(() => context.resolveCloneDestinationCollisions([
+      { sourceId: "photos", sourcePath: "/source/one", sourceRelativePath: "one", destinationRelativePath: "Photos", isDirectory: true },
+      { sourceId: "photos", sourcePath: "/source/two", sourceRelativePath: "two", destinationRelativePath: "photos", isDirectory: true },
+    ]), /Source folders collide/, "ambiguous folder mappings fail closed before any copy");
+
     assert.equal(isMacDataVolumeSourceRoot(MAC_DATA_VOLUME_ROOT), true, "only the exact internal data-volume root is a machine source");
     assert.equal(isMacDataVolumeSourceRoot(`${MAC_DATA_VOLUME_ROOT}/`), true, "a trailing separator does not change machine-root identity");
     assert.equal(isMacDataVolumeSourceRoot(`${MAC_DATA_VOLUME_ROOT}-archive`), false, "a sibling path sharing the machine-root prefix is not a machine source");
@@ -342,8 +360,11 @@ async function run() {
       [machineSource],
       { includeConfig: false },
     );
-    assert.equal(outsideMachinePlan.totalFiles, 3, "an external destination accepts the safely enumerated machine-source files");
     const outsidePlan = context.sourceClonePlans.get(outsideMachinePlan.planId);
+    const plannedMachineFiles = outsidePlan.entries.filter((entry) => !entry.isDirectory && entry.sourceId === machineSource.id);
+    assert.equal(plannedMachineFiles.length, 3, "an external destination accepts the safely enumerated machine-source files");
+    assert.equal(outsideMachinePlan.totalFiles, 4, "the plan also records the generated omissions report under Silo/Audit");
+    assert(outsidePlan.entries.some((entry) => entry.destinationRelativePath === path.join("Silo", "Audit", "omissions.json")), "generated omissions report remains in the plan");
     await fsp.rm(outsidePlan.configDirectory, { recursive: true, force: true });
     context.sourceClonePlans.delete(outsideMachinePlan.planId);
     context.sourceCloneOperations.delete("machine-destination-outside-test");
@@ -378,32 +399,29 @@ async function run() {
     context.sourceCloneOperations.delete("clone-offline");
     const operationId = "clone-test-operation";
     const preflight = await context.prepareSourceClone([sourceRoot, secondSourceRoot], destinations, operationId);
-    assert.equal(preflight.totalSources, 2);
+    assert.equal(preflight.totalSources, 3, "progress includes the Silo configuration and indexes source alongside the two selected roots");
     assert.equal(preflight.destinations.length, 2, "One selection targets both destinations");
-    assert.equal(preflight.totalFiles, 4, "Three unique source files plus one unique config bundle");
-    assert.equal(preflight.duplicateFiles, 2, "Repeated photo and per-source config are aliases, not extra data copies");
+    assert.equal(preflight.totalFiles, 5, "Three unique source payloads plus the configuration bundle and generated omissions report");
+    assert.equal(preflight.duplicateFiles, 1, "The repeated photo is the only content alias; Silo support metadata is included once");
     assert(preflight.destinations.every((destination) => destination.shortfallBytes === 0));
-    assert.equal(context.sourceClonePlans.get(preflight.planId).entries.filter((entry) => entry.destinationRelativePath.endsWith("silo-config.tar.gz")).length, 2);
+    assert.equal(context.sourceClonePlans.get(preflight.planId).entries.filter((entry) => entry.destinationRelativePath.endsWith("silo-config.tar.gz")).length, 1, "the shared Silo config bundle is stored once under Silo/Configuration");
     await context.runSourceClone(preflight.planId);
 
     for (const destination of preflight.destinations) {
       const cloneRoot = destination.cloneRoot;
-      assert.equal(await fsp.readFile(path.join(cloneRoot, "01-Photos", "first.txt"), "utf8"), "first payload");
-      assert.equal(await fsp.readFile(path.join(cloneRoot, "01-Photos", "nested", "second.txt"), "utf8"), "second payload");
-      assert.equal(await fsp.readFile(path.join(cloneRoot, "02-Camera", "third.txt"), "utf8"), "third payload");
-      assert.equal(await fsp.readFile(path.join(cloneRoot, "01-Photos", "silo-config.tar.gz"), "utf8"), "test silo config and indexes");
-      assert.equal(await fsp.access(path.join(cloneRoot, "01-Photos", ".silo-user-data")).then(() => true, () => false), false, "private app data is excluded from local source copies");
-      assert.equal(await fsp.access(path.join(cloneRoot, "01-Photos", "Silo Source Clone previous")).then(() => true, () => false), false, "nested shelter clones are excluded from clone preflight");
-      const canonicalPhoto = await fsp.stat(path.join(cloneRoot, "01-Photos", "first.txt"));
-      const duplicatePhoto = await fsp.stat(path.join(cloneRoot, "02-Camera", "same-first.txt"));
+      assert.equal(await fsp.readFile(path.join(cloneRoot, "Sources", "01-Photos", "first.txt"), "utf8"), "first payload");
+      assert.equal(await fsp.readFile(path.join(cloneRoot, "Sources", "01-Photos", "nested", "second.txt"), "utf8"), "second payload");
+      assert.equal(await fsp.readFile(path.join(cloneRoot, "Sources", "02-Camera", "third.txt"), "utf8"), "third payload");
+      assert.equal(await fsp.readFile(path.join(cloneRoot, "Silo", "Configuration", "silo-config.tar.gz"), "utf8"), "test silo config and indexes");
+      assert.equal(await fsp.access(path.join(cloneRoot, "Sources", "01-Photos", ".silo-user-data")).then(() => true, () => false), false, "private app data is excluded from local source copies");
+      assert.equal(await fsp.access(path.join(cloneRoot, "Sources", "01-Photos", "Silo Source Clone previous")).then(() => true, () => false), false, "nested shelter clones are excluded from clone preflight");
+      const canonicalPhoto = await fsp.stat(path.join(cloneRoot, "Sources", "01-Photos", "first.txt"));
+      const duplicatePhoto = await fsp.stat(path.join(cloneRoot, "Sources", "02-Camera", "same-first.txt"));
       assert.equal(duplicatePhoto.ino, canonicalPhoto.ino, "duplicate source path is materialized as a hard link when supported");
-      const firstConfig = await fsp.stat(path.join(cloneRoot, "01-Photos", "silo-config.tar.gz"));
-      const secondConfig = await fsp.stat(path.join(cloneRoot, "02-Camera", "silo-config.tar.gz"));
-      assert.equal(secondConfig.ino, firstConfig.ino, "per-source config paths share one physical archive");
       const manifest = JSON.parse(await fsp.readFile(path.join(cloneRoot, "silo-clone-manifest.json"), "utf8"));
       assert.equal(manifest.complete, true);
-      assert.equal(manifest.verifiedFiles, 4);
-      assert.equal(manifest.aliases.length, 2);
+      assert.equal(manifest.verifiedFiles, 5);
+      assert.equal(manifest.aliases.length, 1);
       assert(manifest.aliases.every((alias) => alias.materialized));
       assert.equal(manifest.files.find((file) => file.path.endsWith("first.txt")).sha256,
         crypto.createHash("sha256").update("first payload").digest("hex"));
@@ -421,7 +439,7 @@ async function run() {
     }
     assert.equal(status[sourceRoot].sourceFingerprint, expectedFingerprint.finish(), "clone freshness matches the measured source inventory signature");
     assert.equal(progress.at(-1).phase, "complete");
-    assert.equal(progress.at(-1).verifiedFiles, 4);
+    assert.equal(progress.at(-1).verifiedFiles, 5);
 
     const latest = await context.findLatestShelterSnapshot();
     assert.ok(latest && latest.rootPath === preflight.destinations[0].cloneRoot);
@@ -450,7 +468,7 @@ async function run() {
     for (const alias of replicaManifest.aliases)
       assert.equal(await fsp.access(path.join(replicaRoot, alias.path)).then(() => true, () => false), false, "manifest-only alias has no duplicate physical file");
     assert.equal(JSON.parse(await fsp.readFile(path.join(replicaRoot, "silo-source-snapshot-manifest.json"), "utf8")).complete, true);
-    assert.equal(await fsp.readFile(path.join(replicaRoot, "01-Photos", "nested", "second.txt"), "utf8"), "second payload");
+    assert.equal(await fsp.readFile(path.join(replicaRoot, "Sources", "01-Photos", "nested", "second.txt"), "utf8"), "second payload");
     const statusAfterReplica = JSON.parse(await fsp.readFile(context.sourceCloneStatusPath, "utf8"));
     const replicaStatus = statusAfterReplica[`shelter-replica:${latest.rootPath}`];
     assert(replicaStatus.lastClonedAt > 0 && replicaStatus.destinations.includes(replicaRoot), "verified replica location and time persist for Stats");
@@ -463,8 +481,8 @@ async function run() {
       assert(repeatPlan.destinations[0].reusableBytes > 0, "space estimate excludes bytes already in earlier snapshots");
       await context.runSourceClone(repeatPlan.planId);
       const repeatRoot = repeatPlan.destinations[0].cloneRoot;
-      const repeatStats = await fsp.stat(path.join(repeatRoot, "01-Photos", "first.txt"));
-      const firstStats = await fsp.stat(path.join(firstClone, "01-Photos", "first.txt"));
+      const repeatStats = await fsp.stat(path.join(repeatRoot, "Sources", "01-Photos", "first.txt"));
+      const firstStats = await fsp.stat(path.join(firstClone, "Sources", "01-Photos", "first.txt"));
       assert.equal(repeatStats.ino, firstStats.ino, "unchanged file is hard-linked to the earlier snapshot, not copied");
       assert.equal(JSON.parse(await fsp.readFile(path.join(repeatRoot, "silo-clone-manifest.json"), "utf8")).complete, true);
 
@@ -477,8 +495,8 @@ async function run() {
       assert.equal(aliasManifest.complete, true);
       const crossAliases = aliasManifest.aliases.filter((alias) => alias.canonicalClone);
       assert(crossAliases.length >= 4 && crossAliases.every((alias) => !alias.materialized), "no-hard-link drives store Silo-only aliases to earlier snapshots");
-      assert.equal(await fsp.access(path.join(aliasRoot, "01-Photos", "first.txt")).then(() => true, () => false), false, "no second physical copy is written");
-      const listed = await context.readFiles(path.join(aliasRoot, "01-Photos"), true);
+      assert.equal(await fsp.access(path.join(aliasRoot, "Sources", "01-Photos", "first.txt")).then(() => true, () => false), false, "no second physical copy is written");
+      const listed = await context.readFiles(path.join(aliasRoot, "Sources", "01-Photos"), true);
       const listedFirst = listed.find((file) => file.relativePath === "first.txt");
       assert(listedFirst && await fsp.readFile(listedFirst.path, "utf8") === "first payload", "Silo browsing shows the alias at its original location");
       assert(listed.some((file) => file.relativePath === path.join("nested", "second.txt")), "exploded browsing includes nested aliases");
@@ -498,6 +516,108 @@ async function run() {
     const partialStatus = JSON.parse(await fsp.readFile(context.sourceCloneStatusPath, "utf8"));
     assert(partialStatus[sourceRoot].lastClonedAt > previousVerificationTime);
     assert(partialStatus[sourceRoot].destinations.includes(partialPlan.destinations[0].cloneRoot), "the earlier verified target remains recorded when a later target fails");
+
+    const resumeSourceRoot = path.join(root, "resume-source");
+    const resumeSource = { id: resumeSourceRoot, rootPath: resumeSourceRoot, label: "Resume Source", kind: "local", enabled: true, available: true };
+    await fsp.mkdir(resumeSourceRoot);
+    const resumePayload = Buffer.from("verified partial data that continues after restart");
+    await fsp.writeFile(path.join(resumeSourceRoot, "recover.bin"), resumePayload);
+    const resumeSessionId = "a".repeat(32);
+    const resumePreflight = await context.prepareSourceClone([resumeSource.id], [destinations[0]], "clone-in-place-resume", [resumeSource], { includeConfig: false });
+    const resumePlan = context.sourceClonePlans.get(resumePreflight.planId);
+    const resumeRoot = resumePreflight.destinations[0].cloneRoot;
+    await fsp.mkdir(resumeRoot);
+    await fsp.writeFile(path.join(resumeRoot, ".silo-clone-in-progress.json"), JSON.stringify({
+      format: "silo-source-clone", version: 1, sessionId: resumeSessionId, sourceIds: [resumeSource.id],
+    }));
+    const resumeEntry = resumePlan.entries.find((entry) => entry.sourceId === resumeSource.id && !entry.isDirectory);
+    const resumeTarget = path.join(resumeRoot, resumeEntry.destinationRelativePath);
+    const resumePartial = `${resumeTarget}.silo-partial`;
+    await fsp.mkdir(path.dirname(resumeTarget), { recursive: true });
+    await fsp.writeFile(resumePartial, resumePayload.subarray(0, 17));
+    const preexistingVerifiedEntry = resumePlan.entries.find((entry) => entry.sourceId === "silo-support-data" && !entry.isDirectory);
+    const preexistingVerifiedPath = path.join(resumeRoot, preexistingVerifiedEntry.destinationRelativePath);
+    await fsp.mkdir(path.dirname(preexistingVerifiedPath), { recursive: true });
+    const verifiedExistingBytes = await fsp.readFile(preexistingVerifiedEntry.localPath);
+    await fsp.writeFile(preexistingVerifiedPath, verifiedExistingBytes);
+    resumePlan.resumeSessionId = resumeSessionId;
+    resumePlan.resumeExisting = true;
+    const resumableSession = {
+      id: resumeSessionId, mode: "sources", outcome: "interrupted", sourceCount: 1, destinationCount: 1,
+      options: { compress: false, timeMachineRequested: false },
+    };
+    const resumeState = {
+      format: "silo-fallout-shelter-resume-state", version: 1, sessionId: resumeSessionId,
+      sourceIds: [resumeSource.id], destinations: [{ destination: destinations[0], cloneRoot: resumeRoot }], includeCaches: false,
+    };
+    assert.equal(await context.sourceCloneSessionCanResume(resumableSession, resumeState), true,
+      "only the session-marked, unfinished destination is eligible for in-place resume");
+    assert.equal(await context.sourceCloneSessionCanResume({ ...resumableSession, destinationCount: 2 }, resumeState), false,
+      "multi-destination sessions are excluded from the initial in-place resume path");
+    await context.runSourceClone(resumePreflight.planId);
+    assert.deepEqual(await fsp.readFile(resumeTarget), resumePayload, "valid staged prefix is appended and checked without making a new clone root");
+    assert.deepEqual(await fsp.readFile(preexistingVerifiedPath), verifiedExistingBytes,
+      "a pre-existing matching file is verified and reused without rewriting it");
+    assert.equal(await fsp.access(resumePartial).then(() => true, () => false), false, "verified staged file is removed only after safe placement");
+    assert.equal(JSON.parse(await fsp.readFile(path.join(resumeRoot, "silo-clone-manifest.json"), "utf8")).complete, true);
+    assert.equal(await context.sourceCloneSessionCanResume({ ...resumableSession, outcome: "interrupted" }, resumeState), false,
+      "a completed clone is not offered as resumable");
+
+    const badSourceRoot = path.join(root, "bad-prefix-source");
+    const badSource = { ...resumeSource, id: badSourceRoot, rootPath: badSourceRoot, label: "Bad Prefix" };
+    await fsp.mkdir(badSourceRoot);
+    const badPayload = Buffer.from("never discard a mismatched stage");
+    await fsp.writeFile(path.join(badSourceRoot, "bad.bin"), badPayload);
+    const badPreflight = await context.prepareSourceClone([badSource.id], [destinations[0]], "clone-bad-prefix", [badSource], { includeConfig: false });
+    const badPlan = context.sourceClonePlans.get(badPreflight.planId);
+    const badSessionId = "b".repeat(32);
+    const badRoot = badPreflight.destinations[0].cloneRoot;
+    await fsp.mkdir(badRoot);
+    await fsp.writeFile(path.join(badRoot, ".silo-clone-in-progress.json"), JSON.stringify({
+      format: "silo-source-clone", version: 1, sessionId: badSessionId, sourceIds: [badSource.id],
+    }));
+    const badEntry = badPlan.entries.find((entry) => entry.sourceId === badSource.id && !entry.isDirectory);
+    const badTarget = path.join(badRoot, badEntry.destinationRelativePath);
+    const badPartial = `${badTarget}.silo-partial`;
+    await fsp.mkdir(path.dirname(badTarget), { recursive: true });
+    const wrongPrefix = Buffer.from(badPayload);
+    wrongPrefix[0] ^= 0xff;
+    await fsp.writeFile(badPartial, wrongPrefix.subarray(0, 9));
+    badPlan.resumeSessionId = badSessionId;
+    badPlan.resumeExisting = true;
+    await assert.rejects(context.runSourceClone(badPreflight.planId), /not a byte-for-byte source prefix/,
+      "a partial with the wrong prefix is refused rather than appended or deleted");
+    assert.deepEqual(await fsp.readFile(badPartial), wrongPrefix.subarray(0, 9), "mismatched stage remains unchanged after refusal");
+    assert.equal(await fsp.access(path.join(badRoot, ".silo-clone-in-progress.json")).then(() => true, () => false), true,
+      "failed resume keeps the marker so the conflict can be reviewed");
+
+    const conflictSourceRoot = path.join(root, "conflict-source");
+    const conflictSource = { ...resumeSource, id: conflictSourceRoot, rootPath: conflictSourceRoot, label: "Conflict Source" };
+    await fsp.mkdir(conflictSourceRoot);
+    const conflictPayload = Buffer.from("expected source bytes");
+    await fsp.writeFile(path.join(conflictSourceRoot, "conflict.bin"), conflictPayload);
+    const conflictPreflight = await context.prepareSourceClone([conflictSource.id], [destinations[0]], "clone-target-conflict", [conflictSource], { includeConfig: false });
+    const conflictPlan = context.sourceClonePlans.get(conflictPreflight.planId);
+    const conflictSessionId = "c".repeat(32);
+    const conflictRoot = conflictPreflight.destinations[0].cloneRoot;
+    await fsp.mkdir(conflictRoot);
+    await fsp.writeFile(path.join(conflictRoot, ".silo-clone-in-progress.json"), JSON.stringify({
+      format: "silo-source-clone", version: 1, sessionId: conflictSessionId, sourceIds: [conflictSource.id],
+    }));
+    const conflictEntry = conflictPlan.entries.find((entry) => entry.sourceId === conflictSource.id && !entry.isDirectory);
+    const conflictTarget = path.join(conflictRoot, conflictEntry.destinationRelativePath);
+    await fsp.mkdir(path.dirname(conflictTarget), { recursive: true });
+    const conflictBytes = Buffer.from("modified source bytes");
+    assert.equal(conflictBytes.length, conflictPayload.length);
+    await fsp.writeFile(conflictTarget, conflictBytes);
+    conflictPlan.resumeSessionId = conflictSessionId;
+    conflictPlan.resumeExisting = true;
+    await assert.rejects(context.runSourceClone(conflictPreflight.planId), /does not match its verified source/,
+      "a same-sized conflicting destination file is not overwritten");
+    assert.deepEqual(await fsp.readFile(conflictTarget), conflictBytes, "existing conflict bytes are preserved");
+    assert.equal(await fsp.access(path.join(conflictRoot, ".silo-clone-in-progress.json")).then(() => true, () => false), true,
+      "conflicting clone remains marked incomplete for later review");
+
     const compressedDestination = path.join(root, "backup-zip");
     await fsp.mkdir(compressedDestination);
     const compressedPlan = await context.prepareSourceClone([sourceRoot, secondSourceRoot], [compressedDestination], "clone-compressed-test");
@@ -509,11 +629,11 @@ async function run() {
     const extractParent = path.join(root, "restored");
     await fsp.mkdir(extractParent);
     const restored = await extractCloneArchive(`${compressedRoot}${CLONE_ARCHIVE_EXTENSION}`, extractParent);
-    assert.equal(restored.extractedFiles, 4);
-    assert.equal(restored.restoredAliases, 2);
-    assert.equal(await fsp.readFile(path.join(restored.destinationRoot, "01-Photos", "nested", "second.txt"), "utf8"), "second payload");
-    assert.equal(await fsp.readFile(path.join(restored.destinationRoot, "02-Camera", "same-first.txt"), "utf8"), "first payload");
-    const restoredMtimeMs = (await fsp.stat(path.join(restored.destinationRoot, "01-Photos", "first.txt"))).mtimeMs;
+    assert.equal(restored.extractedFiles, 5);
+    assert.equal(restored.restoredAliases, 1);
+    assert.equal(await fsp.readFile(path.join(restored.destinationRoot, "Sources", "01-Photos", "nested", "second.txt"), "utf8"), "second payload");
+    assert.equal(await fsp.readFile(path.join(restored.destinationRoot, "Sources", "02-Camera", "same-first.txt"), "utf8"), "first payload");
+    const restoredMtimeMs = (await fsp.stat(path.join(restored.destinationRoot, "Sources", "01-Photos", "first.txt"))).mtimeMs;
     const sourceMtimeMs = (await fsp.stat(path.join(sourceRoot, "first.txt"))).mtimeMs;
     assert.ok(
       Math.abs(restoredMtimeMs - sourceMtimeMs) < 1,

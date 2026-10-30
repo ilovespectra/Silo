@@ -663,6 +663,7 @@ interface AudioLibraryScanProgress {
 interface SourceCloneProgress {
   operationId: string;
   mode?: SourceCloneSessionMode;
+  updatedAt?: string;
   phase:
     | "scanning"
     | "checking-space"
@@ -771,6 +772,7 @@ type SourceCloneSessionOutcome =
 
 interface SourceCloneSessionProgressSnapshot {
   phase: SourceCloneProgress["phase"];
+  updatedAt?: string;
   totalSources: number;
   totalFiles: number;
   discoveredFiles?: number;
@@ -818,8 +820,9 @@ interface SourceCloneSessionLog {
   outcome: SourceCloneSessionOutcome;
   sourceCount: number;
   destinationCount: number;
-  options: { compress: boolean; timeMachineRequested: boolean };
+  options: { compress: boolean; timeMachineRequested: boolean; includeCaches?: boolean };
   latestProgress?: SourceCloneSessionProgressSnapshot;
+  canResume?: boolean;
   omittedEvents: number;
   events: SourceCloneSessionLogEvent[];
 }
@@ -838,6 +841,7 @@ interface SourceClonePreflight {
   totalFiles: number;
   totalBytes: number;
   duplicateFiles: number;
+  resumingExisting?: boolean;
   excludedPaths?: SourceCloneExcludedPath[];
 }
 
@@ -1152,6 +1156,7 @@ interface Window {
       sourceIds: string[],
       destinations: string[],
       operationId: string,
+      options?: { includeCaches?: boolean },
     ): Promise<{
       ok: boolean;
       plan?: SourceClonePreflight;
@@ -1221,6 +1226,12 @@ interface Window {
       error?: string;
     }>;
     getSourceCloneSessionLogs(): Promise<{ sessions: SourceCloneSessionLog[]; warning: string | null }>;
+    resumeSourceCloneSession(id: string, operationId: string): Promise<{
+      ok: boolean;
+      plan?: SourceClonePreflight;
+      error?: string;
+      errorDetails?: SourceCloneErrorDetails;
+    }>;
     downloadSourceCloneSessionLog(id: string): Promise<{
       ok: boolean;
       cancelled?: boolean;
@@ -1233,6 +1244,7 @@ interface Window {
       sourceIds: string[],
       destinations: string[],
       operationId: string,
+      options?: { includeCaches?: boolean },
     ): Promise<{
       ok: boolean;
       plan?: SourceClonePreflight;

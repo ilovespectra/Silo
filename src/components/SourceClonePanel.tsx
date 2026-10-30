@@ -85,7 +85,7 @@ function sourceProgressMeter(source: SourceCloneSourceProgress, operationPhase: 
   }
   if (source.phase === "verifying") {
     const total = source.totalFiles ?? 0;
-    return total > 0 ? { value: Math.min(source.verifiedFiles, total), max: total } : null;
+    return total > 0 ? { value: Math.min(source.completedFiles, total), max: total } : null;
   }
   const total = source.totalFiles ?? 0;
   return total > 0 ? { value: Math.min(source.completedFiles, total), max: total } : null;
@@ -94,20 +94,24 @@ function sourceProgressMeter(source: SourceCloneSourceProgress, operationPhase: 
 function SourceProgressRows({
   sources,
   operationPhase,
+  updatedAt,
 }: {
   sources: SourceCloneSourceProgress[];
   operationPhase: SourceCloneProgress["phase"];
+  updatedAt?: string;
 }) {
   if (!sources.length) return null;
   return (
     <div className="source-clone-source-progress" aria-label="Progress by source">
       {sources.map((source, index) => {
         const meter = sourceProgressMeter(source, operationPhase);
+        const totalFiles = source.totalFiles ?? 0;
+        const presencePercent = totalFiles > 0
+          ? Math.round(Math.min(source.completedFiles, totalFiles) / totalFiles * 100)
+          : 0;
         const processed = operationPhase === "checking-space" || source.phase === "checking"
-          ? `${(source.checkedFiles ?? 0).toLocaleString()} / ${source.discoveredFiles.toLocaleString()} paths checked · ${formatBytes(source.checkedBytes ?? 0)} / ${formatBytes(source.totalBytes ?? 0)} hashed`
-          : source.phase === "verifying"
-            ? `${source.verifiedFiles.toLocaleString()} / ${(source.totalFiles ?? 0).toLocaleString()} verified`
-            : `${source.completedFiles.toLocaleString()} / ${(source.totalFiles ?? 0).toLocaleString()} files copied`;
+          ? `Preflight hash: ${(source.checkedFiles ?? 0).toLocaleString()} / ${source.discoveredFiles.toLocaleString()} paths · ${formatBytes(source.checkedBytes ?? 0)} / ${formatBytes(source.totalBytes ?? 0)}`
+          : `${source.completedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} present (${presencePercent}%) · ${source.verifiedFiles.toLocaleString()} SHA-256 verified`;
         const omitted = `${(source.omittedFiles ?? 0).toLocaleString()} files · ${(source.omittedSubtrees ?? 0).toLocaleString()} folders/subtrees omitted`;
         return (
           <div className={`source-clone-source-progress-row ${source.phase}`} key={`${source.sourceId}:${index}`}>
@@ -118,7 +122,7 @@ function SourceProgressRows({
             {meter
               ? <progress value={meter.value} max={meter.max} aria-label={`${source.label}: ${sourceProgressPhaseLabel(source.phase)}`} />
               : <progress aria-label={`${source.label}: ${sourceProgressPhaseLabel(source.phase)}`} />}
-            <small>{source.discoveredFiles.toLocaleString()} found · {processed} · {omitted} · {source.omittedPaths.toLocaleString()} omission entries</small>
+            <small>{source.discoveredFiles.toLocaleString()} found · {processed} · {omitted} · {source.omittedPaths.toLocaleString()} omission entries{updatedAt ? ` · Updated ${new Date(updatedAt).toLocaleString()}` : ""}</small>
           </div>
         );
       })}
@@ -175,6 +179,8 @@ function sourceCloneSessionEventLabel(event: string) {
     "verification-failed": "Verification operation failed",
     "preflight-dismissed": "Preflight closed before cloning",
     "preflight-closed-with-app": "Silo closed before cloning began",
+    "resume-started": "In-place resume started",
+    "resume-preflight-ready": "Existing clone checked; awaiting confirmation",
   } as Record<string, string>)[event] ?? event.replace(/-/g, " ");
 }
 
@@ -225,6 +231,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
   const [acknowledged, setAcknowledged] = useState(false);
   const [destinations, setDestinations] = useState<string[]>(initialDestinations);
   const [compress, setCompress] = useState(false);
+  const [includeCaches, setIncludeCaches] = useState(false);
   const [createAppleCompatibleBackup, setCreateAppleCompatibleBackup] = useState(false);
   const [timeMachineMode, setTimeMachineMode] = useState<"instead" | "as-well">("as-well");
   const [timeMachineMessage, setTimeMachineMessage] = useState("");
@@ -240,15 +247,19 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
   const [sessionLogWarning, setSessionLogWarning] = useState("");
   const [selectedSessionLogId, setSelectedSessionLogId] = useState("");
   const [sessionLogStatus, setSessionLogStatus] = useState("");
+  const [resuming, setResuming] = useState(false);
   const [downloadingSessionLog, setDownloadingSessionLog] = useState(false);
   const [cancelPending, setCancelPending] = useState(false);
   const busy = preparing || running || extracting;
+  const activeOperation = Boolean(progress && ["scanning", "checking-space", "copying", "verifying"].includes(progress.phase));
   const supportsTimeMachine = mode === "sources" && sources.length === 1 && sources[0].kind === "machine";
   const timeMachineOnly = supportsTimeMachine && createAppleCompatibleBackup && timeMachineMode === "instead";
   const sourceIdentity = sources.map((source) => source.id).sort().join("\0");
+  const expectedSourceIdentity = plan?.sourceIds?.slice().sort().join("\0") || sourceIdentity;
+  const historyDisplayOnly = historyOnly && !resuming;
 
   useEffect(() => {
-    if (historyOnly) return;
+    if (historyOnly && !resuming) return;
     if (activeOperationId) operationIdRef.current = activeOperationId;
     let mounted = true;
     const liveProgressIds = new Set<string>();
@@ -273,7 +284,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
       }
     });
     const expectedMode = mode === "shelter-replica" ? "shelter-replica" : "sources";
-    const expectedSourceIds = sourceIdentity ? sourceIdentity.split("\0") : [];
+    const expectedSourceIds = expectedSourceIdentity ? expectedSourceIdentity.split("\0") : [];
     void electronAPI.getActiveSourceCloneProgress().then((active) => {
       if (!mounted || !Array.isArray(active)) return;
       const matching = active.filter((state) => {
@@ -293,7 +304,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
       mounted = false;
       unsubscribe();
     };
-  }, [activeOperationId, electronAPI, historyOnly, mode, sourceIdentity]);
+  }, [activeOperationId, electronAPI, expectedSourceIdentity, historyOnly, mode, resuming]);
 
   const beginDiagnostics = (operationId: string, selectedDestinations: string[]) => {
     const now = new Date().toISOString();
@@ -375,8 +386,42 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
     }
   };
 
+  const resumeSavedSession = async (id: string) => {
+    setPreparing(true);
+    setError(""); setPlan(null); setProgress(null); setAcknowledged(false); setCompress(false);
+    const operationId = `clone-resume-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    operationIdRef.current = operationId;
+    try {
+      const result = await electronAPI.resumeSourceCloneSession(id, operationId);
+      if (!result.ok || !result.plan) throw new Error(result.error || "This clone could not be resumed safely.");
+      setResuming(true);
+      setPlan(result.plan);
+      setProgress({
+        operationId,
+        phase: "checking-space",
+        destination: result.plan.destinations[0]?.cloneRoot ?? "",
+        totalSources: result.plan.totalSources,
+        totalFiles: result.plan.totalFiles,
+        sourceProgress: result.plan.sourceProgress,
+        completedFiles: result.plan.totalFiles,
+        totalBytes: result.plan.totalBytes,
+        copiedBytes: 0,
+        verifiedFiles: 0,
+        failedFiles: 0,
+        currentFile: "",
+        message: "Existing clone retained. Review the same destination and confirm to resume without overwriting conflicts.",
+      });
+      setSessionLogStatus("");
+      void loadPreviousSessionLogs();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "This clone could not be resumed safely.");
+    } finally {
+      setPreparing(false);
+    }
+  };
+
   const closePanel = () => {
-    if (operationIdRef.current)
+    if (!activeOperation && operationIdRef.current)
       void electronAPI.dismissSourceCloneSession(operationIdRef.current);
     onClose();
   };
@@ -411,6 +456,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             sources.map((source) => source.id),
             destinations,
             operationId,
+            { includeCaches },
           );
       if (!result.ok || !result.plan) {
         const message = result.error || "Could not prepare this clone.";
@@ -656,19 +702,19 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
     <div className="source-clone-backdrop" role="presentation" onMouseDown={(event) => {
       if (!busy && event.target === event.currentTarget) closePanel();
     }}>
-      <section className={`source-clone-panel${historyOnly ? " history-only" : ""}`} role="dialog" aria-modal="true" aria-labelledby="source-clone-title">
+      <section className={`source-clone-panel${historyDisplayOnly ? " history-only" : ""}`} role="dialog" aria-modal="true" aria-labelledby="source-clone-title">
         <header>
-          <div className="source-clone-icon">{historyOnly ? <FiClock /> : <FiCopy />}</div>
+          <div className="source-clone-icon">{historyDisplayOnly ? <FiClock /> : <FiCopy />}</div>
           <div>
-            <span className="sidebar-kicker">{historyOnly ? "FALLOUT SHELTER · SESSION HISTORY" : mode === "shelter-replica" ? "VERIFIED FALLOUT SHELTER REPLICA" : "FALLOUT SHELTER · SOURCE COPY"}</span>
-            <h2 id="source-clone-title">{historyOnly ? "Previous session logs" : mode === "shelter-replica" ? "Clone Fallout Shelter" : "Create Fallout Shelter"}</h2>
+            <span className="sidebar-kicker">{historyDisplayOnly ? "FALLOUT SHELTER · SESSION HISTORY" : mode === "shelter-replica" ? "VERIFIED FALLOUT SHELTER REPLICA" : resuming ? "FALLOUT SHELTER · RESUME IN PLACE" : "FALLOUT SHELTER · SOURCE COPY"}</span>
+            <h2 id="source-clone-title">{historyDisplayOnly ? "Previous session logs" : mode === "shelter-replica" ? "Clone Fallout Shelter" : resuming ? "Resume existing clone" : "Create Fallout Shelter"}</h2>
           </div>
-          {!busy && <button className="source-clone-close" onClick={closePanel} aria-label="Close"><FiX /></button>}
+          {(!busy || activeOperation) && <button className={`source-clone-close${activeOperation ? " source-clone-background" : ""}`} onClick={closePanel} aria-label={activeOperation ? "Continue in background" : "Close"} title={activeOperation ? "Continue this backup in the Fallout Shelter status panel" : "Close"}>{activeOperation ? "Continue in background" : <FiX />}</button>}
         </header>
 
         <div className="source-clone-sources">
-          <strong>{sources.length} selected source{sources.length === 1 ? "" : "s"}</strong>
-          <span>{sources.map((source) => `${source.label} · ${source.kind}`).join("  /  ")}</span>
+          <strong>{plan?.sourceLabels.length ?? sources.length} selected source{(plan?.sourceLabels.length ?? sources.length) === 1 ? "" : "s"}</strong>
+          <span>{plan ? plan.sourceLabels.join("  /  ") : sources.map((source) => `${source.label} · ${source.kind}`).join("  /  ")}</span>
         </div>
 
         <div className="source-clone-safety">
@@ -707,7 +753,12 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 const session = sessionLogs.find((item) => item.id === selectedSessionLogId)!;
                 return (
                   <div className="source-clone-session-detail">
-                    <div className="source-clone-session-meta">Silo {session.appVersion} · {session.platform} {session.architecture} · OS {session.osRelease}<br />{session.sourceCount} source{session.sourceCount === 1 ? "" : "s"} · {session.destinationCount} destination{session.destinationCount === 1 ? "" : "s"}{session.options.compress ? " · compressed" : ""}{session.options.timeMachineRequested ? " · Time Machine selected" : ""}</div>
+                    <div className="source-clone-session-meta">Silo {session.appVersion} · {session.platform} {session.architecture} · OS {session.osRelease}<br />{session.sourceCount} source{session.sourceCount === 1 ? "" : "s"} · {session.destinationCount} destination{session.destinationCount === 1 ? "" : "s"}{session.options.compress ? " · compressed" : ""}{session.options.includeCaches === undefined ? " · cache setting unknown" : session.options.includeCaches ? " · Silo caches included" : " · Silo caches skipped"}{session.options.timeMachineRequested ? " · Time Machine selected" : ""}<br />Last progress update: {session.latestProgress?.updatedAt ? new Date(session.latestProgress.updatedAt).toLocaleString() : new Date(session.updatedAt).toLocaleString()}</div>
+                    {(session.latestProgress?.sourceProgress ?? []).map((source, sourceIndex) => {
+                      const total = source.totalFiles ?? 0;
+                      const percent = total > 0 ? Math.round(Math.min(source.completedFiles, total) / total * 100) : 0;
+                      return <div className="source-clone-session-meta" key={`${source.sourceId}:${sourceIndex}`}>{source.label}: {source.completedFiles.toLocaleString()} / {total.toLocaleString()} present ({percent}%) · {source.verifiedFiles.toLocaleString()} SHA-256 verified</div>;
+                    })}
                     <div className="source-clone-session-events">
                       {session.events.map((event, index) => (
                         <div className="source-clone-session-event" key={`${session.id}-${event.at}-${index}`}>
@@ -719,6 +770,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                       ))}
                     </div>
                     <div className="source-clone-diagnostic-actions">
+                      {session.canResume && <button onClick={() => void resumeSavedSession(session.id)} disabled={busy || resuming}><FiRefreshCw /> Resume this clone in place</button>}
                       <button onClick={() => void downloadSavedSessionLog(session.id)} disabled={downloadingSessionLog}><FiDownload /> {downloadingSessionLog ? "Saving…" : "Download this log"}</button>
                       {sessionLogStatus && <small role="status">{sessionLogStatus}</small>}
                     </div>
@@ -763,6 +815,14 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
           </div>
         )}
 
+        {!plan && mode === "sources" && !historyOnly && (
+          <label className="source-clone-acknowledge source-clone-cache-option">
+            <input type="checkbox" checked={includeCaches} disabled={busy}
+              onChange={(event) => setIncludeCaches(event.target.checked)} />
+            <span><strong>Include Silo caches (optional).</strong> Cache folders can contain hundreds of thousands of changing files; leave this off for a source-only backup.</span>
+          </label>
+        )}
+
         {!plan && (
           <div className="source-clone-prepare">
             {!timeMachineOnly && destinations.map((destination) => <div className="source-clone-destination" key={destination}>
@@ -800,7 +860,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                   <progress value={progressValue} max={progressMax} />
                   <small>{progress.completedFiles.toLocaleString()} copied · {progress.verifiedFiles.toLocaleString()} verified · {progress.failedFiles.toLocaleString()} errors{progress.currentFile ? ` · ${progress.currentFile}` : ""}</small>
                 </div>
-                <SourceProgressRows sources={progress.sourceProgress ?? []} operationPhase={progress.phase} />
+                <SourceProgressRows sources={progress.sourceProgress ?? []} operationPhase={progress.phase} updatedAt={progress.updatedAt} />
                 <button className="source-clone-cancel" onClick={() => void cancel()} disabled={cancelPending}>{cancelPending ? "Stopping…" : "Cancel copy"}</button>
               </div>
             ) : progress?.phase === "scanning" || progress?.phase === "checking-space" || preparing ? (
@@ -819,7 +879,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                   <small className="source-clone-scan-note">Omitted paths include unsupported items and files or folders Silo cannot read; they are left out of the clone.</small>
                   {progress?.currentFile && <small className="source-clone-scan-current">Current path: {progress.currentFile}</small>}
                 </div>
-                <SourceProgressRows sources={progress?.sourceProgress ?? []} operationPhase={progress?.phase ?? "scanning"} />
+                <SourceProgressRows sources={progress?.sourceProgress ?? []} operationPhase={progress?.phase ?? "scanning"} updatedAt={progress?.updatedAt} />
                 {preparing && <button className="source-clone-cancel" onClick={() => void cancel()} disabled={cancelPending}>{cancelPending ? "Stopping…" : "Cancel scan"}</button>}
               </div>
             ) : timeMachineOnly ? (
@@ -850,8 +910,11 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
         {plan && (
           <div className="source-clone-plan">
             {plan.destinations.map((destination) => <div className="source-clone-destination" key={destination.cloneRoot}>
-              <span>{compress ? "Destination archive" : "Destination copy"}</span><strong title={compress ? `${destination.cloneRoot}.zip` : destination.cloneRoot}>{compress ? `${destination.cloneRoot}.zip` : destination.cloneRoot}</strong>
+              <span>{compress ? "Destination archive" : plan.resumingExisting ? "Resume destination" : "Destination copy"}</span><strong title={compress ? `${destination.cloneRoot}.zip` : destination.cloneRoot}>{compress ? `${destination.cloneRoot}.zip` : destination.cloneRoot}</strong>
             </div>)}
+            {plan.resumingExisting && <div className="source-clone-warning">
+              This is the same incomplete folder, not a new clone. Verified existing files are reused; staged bytes continue only when they match the source prefix. Any mismatch or unexpected path stops the resume and is left untouched. In-place resume is currently limited to single-destination, uncompressed source copies.
+            </div>}
             <div className="source-clone-estimates">
               <div><span>Unique files stored</span><strong>{plan.totalFiles.toLocaleString()}</strong></div>
               <div><span>Space per destination</span><strong>{formatBytes(plan.totalBytes)}</strong></div>
@@ -878,7 +941,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               {destination.destination}: {destination.shortfallBytes > 0 ? <>short by <strong>{formatBytes(destination.shortfallBytes)}</strong></> : <>free space {formatBytes(destination.freeBytes)} is sufficient</>}
             </div>)}
             <label className="source-clone-acknowledge source-clone-compress">
-              <input type="checkbox" checked={compress} disabled={busy || progress?.phase === "complete" || (createAppleCompatibleBackup && timeMachineMode === "as-well")}
+              <input type="checkbox" checked={compress} disabled={busy || progress?.phase === "complete" || plan.resumingExisting === true || (createAppleCompatibleBackup && timeMachineMode === "as-well")}
                 onChange={(event) => setCompress(event.target.checked)} />
               <span><strong>Compress</strong> into a single .zip archive for easier storage. Photos, video and other already-compressed media are stored as-is; documents and text are deflated. The archive is re-read and SHA-256 verified before it is kept, and can be restored with “Extract a .zip clone…”. Compression is disabled for “As Well” so the Silo copy remains directly browseable.</span>
             </label>
@@ -890,9 +953,11 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
             <label className="source-clone-acknowledge">
               <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />
               <span>
-                {createAppleCompatibleBackup && timeMachineMode === "as-well"
-                  ? "I understand this makes a separate readable Silo copy in the selected folder and also requests a separate Time Machine backup at macOS’s configured destination; originals and settings are not changed."
-                  : "I understand this makes a separate copy and does not alter the originals."}
+                {plan.resumingExisting
+                  ? "I understand this resumes the same marked clone folder, verifies existing files, and leaves any conflicting path untouched; originals are not changed."
+                  : createAppleCompatibleBackup && timeMachineMode === "as-well"
+                    ? "I understand this makes a separate readable Silo copy in the selected folder and also requests a separate Time Machine backup at macOS’s configured destination; originals and settings are not changed."
+                    : "I understand this makes a separate copy and does not alter the originals."}
                 {excludedPaths.length
                   ? ` I understand ${excludedPaths.length.toLocaleString()} source ${excludedPaths.length === 1 ? "path or subtree" : "paths or subtrees"} identified by preflight will be omitted. The resulting clone contains a verified copy of supported items, not a complete source mirror.`
                   : ""}
@@ -908,7 +973,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
                 </div>
                 <progress value={progressValue} max={progressMax} />
                 <small>{progress.completedFiles.toLocaleString()} copied · {progress.verifiedFiles.toLocaleString()} verified · {progress.failedFiles.toLocaleString()} errors{progress.currentFile ? ` · ${progress.currentFile}` : ""}</small>
-                <SourceProgressRows sources={progress.sourceProgress ?? []} operationPhase={progress.phase} />
+                <SourceProgressRows sources={progress.sourceProgress ?? []} operationPhase={progress.phase} updatedAt={progress.updatedAt} />
               </div>
             )}
             {!running && progress?.phase === "complete" && (
@@ -922,7 +987,7 @@ export default function SourceClonePanel({ electronAPI, sources, initialDestinat
               <div className="source-clone-warning insufficient">{progress.message}</div>
             )}
             <div className="source-clone-actions">
-              <button onClick={() => { if (operationIdRef.current) void electronAPI.dismissSourceCloneSession(operationIdRef.current); setPlan(null); setDestinations([]); }} disabled={busy}>Change destinations</button>
+              <button onClick={() => { if (operationIdRef.current) void electronAPI.dismissSourceCloneSession(operationIdRef.current); setPlan(null); setDestinations([]); }} disabled={busy || plan.resumingExisting === true} title={plan.resumingExisting ? "A resumed clone must stay in its original destination." : undefined}>{plan.resumingExisting ? "Keep original destination" : "Change destinations"}</button>
               {running ? (
                 <button className="source-clone-cancel" onClick={() => void cancel()} disabled={cancelPending}>{cancelPending ? "Stopping…" : "Cancel copy"}</button>
               ) : progress?.phase === "complete" ? (

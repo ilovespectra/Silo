@@ -97,12 +97,13 @@ contextBridge.exposeInMainWorld("electron", {
   },
   selectSourceCloneDestination: () =>
     ipcRenderer.invoke("select-source-clone-destination"),
-  prepareSourceClone: (sourceIds, destinations, operationId) =>
+  prepareSourceClone: (sourceIds, destinations, operationId, options) =>
     ipcRenderer.invoke(
       "prepare-source-clone",
       sourceIds,
       destinations,
       operationId,
+      options,
     ),
   prepareShelterReplica: (destinations, operationId) =>
     ipcRenderer.invoke("prepare-shelter-replica", destinations, operationId),
@@ -129,6 +130,8 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.invoke("save-source-clone-diagnostic-log", contents),
   getSourceCloneSessionLogs: () =>
     ipcRenderer.invoke("get-source-clone-session-logs"),
+  resumeSourceCloneSession: (id, operationId) =>
+    ipcRenderer.invoke("resume-source-clone-session", id, operationId),
   downloadSourceCloneSessionLog: (id) =>
     ipcRenderer.invoke("download-source-clone-session-log", id),
   dismissSourceCloneSession: (operationId) =>
