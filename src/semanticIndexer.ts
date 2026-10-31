@@ -498,6 +498,9 @@ export class SemanticIndexer {
   private backgroundIndexWorkListener:
     | ((changedFiles: Map<string, string>) => void)
     | null = null;
+  private sourceFileChangeListener:
+    | ((filePath: string, sourcePath: string) => void)
+    | null = null;
   private readonly searchEmbeddingCache = new Map<
     string,
     { document: Float32Array; image: Float32Array }
@@ -1101,6 +1104,12 @@ export class SemanticIndexer {
     listener: ((changedFiles: Map<string, string>) => void) | null,
   ) {
     this.backgroundIndexWorkListener = listener;
+  }
+
+  setSourceFileChangeListener(
+    listener: ((filePath: string, sourcePath: string) => void) | null,
+  ) {
+    this.sourceFileChangeListener = listener;
   }
 
   addIndexedImageListener(
@@ -2294,6 +2303,7 @@ export class SemanticIndexer {
                 (await isWithinSiloClone(changedPath, sourcePath))
               )
                 return;
+              this.sourceFileChangeListener?.(changedPath, sourcePath);
               this.dirtyWatchSources.add(sourcePath);
               // Writes below a held path (an active phone backup) wait for release.
               if (this.isHeld(changedPath)) return;

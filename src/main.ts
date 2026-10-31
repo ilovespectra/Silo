@@ -35,6 +35,7 @@ import {
   type IndexProgress,
   type SourceScanCheckpoint,
 } from "./semanticIndexer";
+import { isSemanticVideo, VideoSemanticIndexer } from "./videoSemanticIndexer";
 import { DuplicateState } from "./duplicateManager";
 import {
   FAVORITES_FOLDER_ID,
@@ -2954,7 +2955,22 @@ let rendererRecoveryTimer: NodeJS.Timeout | null = null;
 let stateStore: StateStore;
 let hiddenFolderPathCache = new Set<string>();
 let semanticIndexer: SemanticIndexer;
+let videoSemanticIndexer: VideoSemanticIndexer;
+let videoSemanticIndexReady = false;
+let videoSemanticIndexInitialization: Promise<void> | null = null;
 let libraryShareServer: LibraryShareServer | null = null;
+
+async function initializeVideoSemanticIndex() {
+  if (videoSemanticIndexReady) return;
+  if (!videoSemanticIndexer)
+    throw new Error("Video semantic indexing is not initialized yet.");
+  videoSemanticIndexInitialization ??= videoSemanticIndexer.initialize().then(() => {
+    videoSemanticIndexReady = true;
+  }).finally(() => {
+    videoSemanticIndexInitialization = null;
+  });
+  await videoSemanticIndexInitialization;
+}
 let libraryStatsManager: LibraryStatsManager | null = null;
 let faceIndexer: FaceIndexer;
 let aestheticScorer: AestheticScorer;
@@ -4961,6 +4977,7 @@ let recoverySearchSourcePaths: string[] = [];
 const queuedRecoveryStageIds = new Set<string>();
 const ALL_INDEX_RECOVERY_STAGES = [
   "search",
+  "video-semantic",
   "faces",
   "locations",
   "duplicates",
@@ -5135,6 +5152,7 @@ function hasRetryableSearchWork(sourcePaths: string[]) {
 
 function requestSourceProcessingStages(sourcePaths: string[]) {
   const stageIds = [
+    "video-semantic",
     "faces",
     "locations",
     "duplicates",
@@ -10423,10 +10441,16 @@ async function indexNewSources(sourcePaths: string[], reason: string) {
   );
   if (added.length === 0) return;
   await semanticIndexer.startWatching(activeSources);
+  if (indexStorageAvailable)
+    await videoSemanticIndexer.queueSourceRoots(added).catch((error) =>
+      runtimeLog("video-semantic-source-queue-error", {
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
   runtimeLog("auto-index-new-sources", { reason, sources: added });
   queueSemanticIndexWork(
     { fullScanRoots: added },
-    ["faces", "locations", "duplicates", "audio", "quality"],
+    ["video-semantic", "faces", "locations", "duplicates", "audio", "quality"],
   );
 }
 
@@ -10997,6 +11021,7 @@ function isBusyIndexStatus(status: string) {
 function indexStorageWritersBusy() {
   return Boolean(
     (semanticIndexer && isBusyIndexStatus(semanticIndexer.getProgress().status)) ||
+    (videoSemanticIndexer && isBusyIndexStatus(videoSemanticIndexer.getProgress().status)) ||
     (faceIndexer && isBusyIndexStatus(faceIndexer.getProgress().status)) ||
     (geoIndexer && isBusyIndexStatus(geoIndexer.getStatus().status)) ||
     (duplicateManager && duplicateManager.getState().status === "scanning") ||
@@ -11884,6 +11909,32 @@ app.whenReady().then(async () => {
   semanticIndexer.setBackgroundIndexWorkListener((changedFiles) =>
     queueSemanticIndexWork({ changedFiles }),
   );
+  videoSemanticIndexer = new VideoSemanticIndexer({
+    storageRoot: cacheDestinationRoot("semantic-index"),
+    scanSource: unifiedScanSource,
+    embedFrame: (framePath) => semanticIndexer.embedPreviewImage(framePath),
+    embedPrompts: (prompts) => semanticIndexer.embedPrompts(prompts),
+    resolveFilePath: resolveLocalPath,
+    onDiagnostic: (event, details) => runtimeLog(event, details ?? {}),
+    onProgress: (progress) => {
+      if (progress.status === "error") runtimeLog("video-semantic-progress-error", {
+        message: progress.message,
+        errors: progress.errors,
+      });
+    },
+    governor: indexerGovernor,
+  });
+  videoSemanticIndexer.setPerformanceSettings(
+    contentSettingsStore.getSearchPerformanceSnapshot().settings,
+  );
+  semanticIndexer.setSourceFileChangeListener((filePath, sourcePath) => {
+    if (!isSemanticVideo(filePath) && !videoSemanticIndexer.hasRecord(filePath)) return;
+    void videoSemanticIndexer.queueChangedFile(filePath, sourcePath)
+      .then(() => indexRecovery?.requestFairly("video-semantic"))
+      .catch((error) => runtimeLog("video-semantic-change-queue-error", {
+        message: error instanceof Error ? error.message : String(error),
+      }));
+  });
   libraryShareServer = new LibraryShareServer({
     getSources: async () =>
       (await listSources()).map(({ id, label, rootPath, kind, available }) => ({
@@ -11928,6 +11979,11 @@ app.whenReady().then(async () => {
   let lastSavedRecordCount = -1;
   let lastSavedRecordPhase = "";
   let lastSavedRecordPhaseProgress: number | null = null;
+  let lastSemanticLoadDiagnosticAt = 0;
+  let lastSemanticLoadDiagnosticPhase = "";
+  let semanticRuntimePreloadPromise: Promise<void> | null = null;
+  let semanticRuntimePreloadCompleted = false;
+  let semanticRuntimePreloadAttempts = 0;
   let searchPreparationFailureMessage = "Search index could not be opened.";
   let semanticAnnStartedAt = Date.now();
   let lastSemanticAnnDiagnosticAt = 0;
@@ -11957,6 +12013,21 @@ app.whenReady().then(async () => {
       lastSavedRecordCount = records;
       lastSavedRecordPhase = phase;
       lastSavedRecordPhaseProgress = measuredPhaseProgress;
+      const now = Date.now();
+      if (
+        phase !== lastSemanticLoadDiagnosticPhase ||
+        now - lastSemanticLoadDiagnosticAt >= 15000
+      ) {
+        runtimeLog("semantic-record-load-progress", {
+          phase,
+          percentage,
+          phaseProgress: measuredPhaseProgress,
+          records,
+          elapsedMs: now - startupStartedAt,
+        });
+        lastSemanticLoadDiagnosticAt = now;
+        lastSemanticLoadDiagnosticPhase = phase;
+      }
       const phaseLabel =
         phase === "reading"
           ? "Reading saved search records"
@@ -11975,6 +12046,121 @@ app.whenReady().then(async () => {
         `${phaseLabel}… ${records.toLocaleString()} records`,
       );
     });
+  const preloadSemanticRuntime = (requestedAttempt: number): Promise<void> => {
+    if (
+      semanticRuntimePreloadCompleted ||
+      semanticRuntimeProgress.status === "complete"
+    )
+      return Promise.resolve();
+    if (semanticRuntimePreloadPromise) return semanticRuntimePreloadPromise;
+
+    const attempts = Math.max(
+      requestedAttempt,
+      semanticRuntimePreloadAttempts + 1,
+    );
+    semanticRuntimePreloadAttempts = attempts;
+    const message =
+      attempts > 1
+        ? `Retrying offline search model (attempt ${attempts})…`
+        : "Starting the offline search model…";
+    semanticRuntimeProgress = { status: "loading-model", message };
+    updateSearchIndexReadiness({
+      status: "preparing",
+      percentage: 20,
+      phase: "Warming the offline search model",
+      phaseProgress: null,
+      records: loadedSearchRecords,
+      message,
+    });
+    runtimeLog("semantic-runtime-preload-start", {
+      attempt: attempts,
+      records: loadedSearchRecords,
+      elapsedMs: Date.now() - startupStartedAt,
+    });
+
+    const run = (async () => {
+      try {
+        await semanticIndexer.preloadClipModel();
+        semanticRuntimePreloadCompleted = true;
+        semanticRuntimeProgress = {
+          status: "complete",
+          message: "Offline search model ready.",
+        };
+        runtimeLog("search-model-preloaded", {
+          elapsedMs: Date.now() - startupStartedAt,
+          records: loadedSearchRecords,
+          attempt: attempts,
+        });
+        resolveSemanticRuntimeReady();
+      } catch (error) {
+        const rawMessage =
+          error instanceof Error ? error.message : String(error);
+        const timedOut = /timed out/i.test(rawMessage);
+        const safeMessage =
+          safeRuntimeDiagnosticText(rawMessage) ||
+          "Offline search model preload failed.";
+        semanticRuntimeProgress = {
+          status: "error",
+          message: `Preload failed during ${safeMessage}. Silo will retry automatically.`,
+        };
+        updateSearchIndexReadiness({
+          status: "error",
+          percentage: 20,
+          records: loadedSearchRecords,
+          message: `Offline search model unavailable. Automatic retry is scheduled. ${safeMessage}`,
+        });
+        runtimeLog("semantic-preload-recovery-failed", {
+          attempt: attempts,
+          message: safeMessage,
+        });
+        if (timedOut || attempts >= 3)
+          createSemanticPreloadDiagnosticReport(attempts, rawMessage, timedOut);
+        throw error;
+      }
+    })();
+    let tracked: Promise<void>;
+    tracked = run.finally(() => {
+      if (semanticRuntimePreloadPromise === tracked)
+        semanticRuntimePreloadPromise = null;
+    });
+    semanticRuntimePreloadPromise = tracked;
+    return tracked;
+  };
+  let semanticRuntimeWasPaused = false;
+  try {
+    const savedRecovery = JSON.parse(
+      fs.readFileSync(
+        path.join(app.getPath("userData"), "indexing-recovery.json"),
+        "utf8",
+      ),
+    );
+    semanticRuntimeWasPaused =
+      savedRecovery?.version === 1 &&
+      savedRecovery?.records?.["semantic-runtime"]?.userPaused === true;
+  } catch {
+    // A missing or unreadable recovery file does not block the fresh model preload.
+  }
+  // Do not make the model worker wait for face/location cache startup. The saved
+  // search records are now loaded, so the model can warm while those caches settle.
+  void semanticLoad
+    .then(() => {
+      if (
+        indexStorageInitializationDeferred ||
+        semanticRuntimeWasPaused
+      )
+        return;
+      return preloadSemanticRuntime(1);
+    })
+    .catch((error) =>
+      runtimeLog("semantic-runtime-early-preload-error", {
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+  void semanticLoad.then(async () => {
+    if (!indexStorageInitializationDeferred) await initializeVideoSemanticIndex();
+  }).catch((error) => runtimeLog("video-semantic-index-load-error", {
+    message: error instanceof Error ? error.message : String(error),
+  }));
   const semanticSearchReady = semanticLoad.then(async () => {
     if (indexStorageInitializationDeferred) return;
     // Opening the saved vectors is only half of search preparation. Start the
@@ -12583,7 +12769,7 @@ app.whenReady().then(async () => {
               lifetimeFullScanPending = false;
               queueSemanticIndexWork(
                 { fullScanAll: true, force: true },
-                ["faces", "locations", "duplicates", "audio", "quality"],
+                ["video-semantic", "faces", "locations", "duplicates", "audio", "quality"],
               );
             } else if (!pausedByUser) {
               queueSemanticIndexWork(
@@ -12597,7 +12783,7 @@ app.whenReady().then(async () => {
                     ...semanticIndexer.getRetryableFiles(sources),
                   ]),
                 },
-                ["faces", "locations", "duplicates", "audio", "quality"],
+                ["video-semantic", "faces", "locations", "duplicates", "audio", "quality"],
               );
             }
           } finally {
@@ -12713,58 +12899,7 @@ app.whenReady().then(async () => {
       checkOnStartup: true,
       start: async () => {
         const attempts = indexRecovery?.details("semantic-runtime").attempts ?? 1;
-        semanticRuntimeProgress = {
-          status: "loading-model",
-          message:
-            attempts > 1
-              ? `Retrying offline search model (attempt ${attempts})…`
-              : "Starting the offline search model…",
-        };
-        updateSearchIndexReadiness({
-          status: "preparing",
-          percentage: 20,
-          phase: "Warming the offline search model",
-          phaseProgress: null,
-          records: loadedSearchRecords,
-          message: semanticRuntimeProgress.message,
-        });
-        try {
-          await semanticIndexer.preloadClipModel();
-          semanticRuntimeProgress = {
-            status: "complete",
-            message: "Offline search model ready.",
-          };
-          runtimeLog("search-model-preloaded", {
-            elapsedMs: Date.now() - startupStartedAt,
-            records: loadedSearchRecords,
-            attempt: attempts,
-          });
-          resolveSemanticRuntimeReady();
-        } catch (error) {
-          const rawMessage =
-            error instanceof Error ? error.message : String(error);
-          const timedOut = /timed out/i.test(rawMessage);
-          const safeMessage =
-            safeRuntimeDiagnosticText(rawMessage) ||
-            "Offline search model preload failed.";
-          semanticRuntimeProgress = {
-            status: "error",
-            message: `Preload failed during ${safeMessage}. Silo will retry automatically.`,
-          };
-          updateSearchIndexReadiness({
-            status: "error",
-            percentage: 20,
-            records: loadedSearchRecords,
-            message: `Offline search model unavailable. Automatic retry is scheduled. ${safeMessage}`,
-          });
-          runtimeLog("semantic-preload-recovery-failed", {
-            attempt: attempts,
-            message: safeMessage,
-          });
-          if (timedOut || attempts >= 3)
-            createSemanticPreloadDiagnosticReport(attempts, rawMessage, timedOut);
-          throw error;
-        }
+        await preloadSemanticRuntime(attempts);
       },
     },
     {
@@ -12876,6 +13011,36 @@ app.whenReady().then(async () => {
         searchRecoveryPauseRequested = true;
         return semanticIndexer.pause({ checkpoint: false });
       },
+    },
+    {
+      id: "video-semantic",
+      lane: indexingCpuLane,
+      sliceMs: indexingSliceMs,
+      onDiagnostic: logRecoveryEvent("video-semantic"),
+      blockedReason: () =>
+        semanticRuntimeProgress.status !== "complete"
+          ? "Waiting for the offline search model."
+          : "Waiting for the main semantic index to settle.",
+      needsInitialCheck: true,
+      checkOnStartup: true,
+      progress: () => videoSemanticIndexer.getProgress(),
+      ready: () =>
+        indexStorageAvailable &&
+        semanticRuntimeProgress.status === "complete" &&
+        startupIndexReconciliationSettled &&
+        searchSettled(),
+      unresolvedWork: () => {
+        const progress = videoSemanticIndexer.getProgress();
+        return progress.errors
+          ? `${progress.errors.toLocaleString()} videos could not be indexed and will be retried.`
+          : null;
+      },
+      start: async () => {
+        await initializeVideoSemanticIndex();
+        const sources = await getAllIndexSources();
+        await videoSemanticIndexer.start(sources);
+      },
+      pause: () => videoSemanticIndexer.pause(),
     },
     {
       id: "faces",
@@ -13185,6 +13350,7 @@ app.on("before-quit", (event) => {
     const drains = await Promise.allSettled([
       semanticIndexer.cancelReconciliation(),
       semanticIndexer.pause(),
+      videoSemanticIndexer?.pause(),
       faceIndexer?.pause(),
       geoIndexer?.pause(),
       duplicateManager?.pause(),
@@ -13198,6 +13364,7 @@ app.on("before-quit", (event) => {
     await Promise.all([
       semanticIndexer.flushWrites(),
       semanticIndexer.flushVectorSearch(),
+      videoSemanticIndexer?.flush(),
     ]);
   })();
   let deadlineTimer: NodeJS.Timeout | undefined;
@@ -16053,7 +16220,7 @@ ipcMain.handle("start-indexing", async () => {
     fullAccessEnabled()
       ? { fullScanRoots: sources, force: true }
       : { fullScanAll: true, force: true },
-    ["faces", "locations", "duplicates", "audio", "quality"],
+    ["video-semantic", "faces", "locations", "duplicates", "audio", "quality"],
   );
   return semanticIndexer.getProgress();
 });
@@ -16215,6 +16382,7 @@ ipcMain.handle(
     };
 
     let latestSemanticResults: SearchResult[] = [];
+    let latestVideoResults: SearchResult[] = [];
     let semanticScanned = 0;
     let semanticTotal = 0;
     let semanticProgressMode: "ann" | "exact" | undefined;
@@ -16233,7 +16401,7 @@ ipcMain.handle(
       sender.send("semantic-search-progress", {
         requestId: progressRequestId,
         status,
-        results: rankResults(semanticResults),
+        results: rankResults([...semanticResults, ...latestVideoResults]),
         scanned,
         total,
         textCapped,
@@ -16257,6 +16425,22 @@ ipcMain.handle(
         },
       ),
     );
+    const videoResultsPromise = trackInteractiveSearch(async () => {
+      if (!videoSemanticIndexReady && indexStorageAvailable) {
+        try {
+          await initializeVideoSemanticIndex();
+        } catch (error) {
+          runtimeLog("video-semantic-search-init-error", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      return videoSemanticIndexer.search(query, sources, isCancelled);
+    }).then((results) => {
+      latestVideoResults = results;
+      publishProgress("searching");
+      return results;
+    });
     const textMatchesPromise = semanticIndexer.searchTextMatches(
       query,
       sources,
@@ -16381,13 +16565,15 @@ ipcMain.handle(
       }
     }
 
-    const [semanticResults] = await Promise.all([
+    const [semanticResults, videoResults] = await Promise.all([
       semanticResultsPromise,
       textMatchesPromise,
-    ]);
+      videoResultsPromise,
+    ]).then(([semantic, , videos]) => [semantic, videos] as const);
     if (isCancelled()) return [];
     latestSemanticResults = semanticResults;
-    const results = rankResults(semanticResults);
+    latestVideoResults = videoResults;
+    const results = rankResults([...semanticResults, ...videoResults]);
     sender.send("semantic-search-progress", {
       requestId: progressRequestId,
       status: "done",
