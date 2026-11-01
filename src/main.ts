@@ -116,6 +116,7 @@ import {
   readPreviewBytes,
 } from "./documentPreview";
 import { IndexingRecovery, isIndexStageUserPaused } from "./indexingRecovery";
+import { ThumbnailPregenerator } from "./thumbnailPregenerator";
 import {
   isLegacyLicenseRejected,
   persistLegacyLicenseRejection,
@@ -4953,6 +4954,7 @@ let startupIndexReconciliationSettled = false;
 let startupSearchDiscoveryAvailable = false;
 let indexRecovery: IndexingRecovery | null = null;
 let indexRecoveryTimer: NodeJS.Timeout | null = null;
+let thumbnailPregenerator: ThumbnailPregenerator | null = null;
 let activeInteractiveSearches = 0;
 function trackInteractiveSearch<T>(startSearch: () => Promise<T>): Promise<T> {
   activeInteractiveSearches += 1;
@@ -4982,6 +4984,7 @@ const ALL_INDEX_RECOVERY_STAGES = [
   "locations",
   "duplicates",
   "audio",
+  "thumbnails",
   "quality",
 ];
 let geocoder: Geocoder;
@@ -5157,6 +5160,7 @@ function requestSourceProcessingStages(sourcePaths: string[]) {
     "locations",
     "duplicates",
     "audio",
+    "thumbnails",
     "quality",
   ];
   if (
@@ -5171,6 +5175,10 @@ function requestSourceProcessingStages(sourcePaths: string[]) {
 }
 
 const GRID_THUMBNAIL_SIZE = 200;
+function isThumbnailMedia(fileName: string) {
+  const fileType = mime.getType(fileName);
+  return Boolean(fileType?.startsWith("image/") || fileType?.startsWith("video/"));
+}
 const PIPELINE_BUSY_STATUSES = new Set([
   "scanning",
   "loading-model",
@@ -10450,7 +10458,7 @@ async function indexNewSources(sourcePaths: string[], reason: string) {
   runtimeLog("auto-index-new-sources", { reason, sources: added });
   queueSemanticIndexWork(
     { fullScanRoots: added },
-    ["video-semantic", "faces", "locations", "duplicates", "audio", "quality"],
+    ["video-semantic", "faces", "locations", "duplicates", "audio", "thumbnails", "quality"],
   );
 }
 
@@ -11928,6 +11936,8 @@ app.whenReady().then(async () => {
     contentSettingsStore.getSearchPerformanceSnapshot().settings,
   );
   semanticIndexer.setSourceFileChangeListener((filePath, sourcePath) => {
+    if (isThumbnailMedia(filePath) && !thumbnailPregenerator?.includeFile(filePath))
+      requestIndexRecoveryStages(["thumbnails"]);
     if (!isSemanticVideo(filePath) && !videoSemanticIndexer.hasRecord(filePath)) return;
     void videoSemanticIndexer.queueChangedFile(filePath, sourcePath)
       .then(() => indexRecovery?.requestFairly("video-semantic"))
@@ -12830,8 +12840,16 @@ app.whenReady().then(async () => {
       details: Record<string, unknown>,
     ) => runtimeLog(`index-recovery-${event}`, { stage, ...details });
   let lastProgressiveIndexCount = 0;
+  let lastThumbnailRequestIndexCount = 0;
   const requestProgressiveIndexStages = () => {
     const indexed = semanticIndexer.getProgress().indexed;
+    if (indexed > lastThumbnailRequestIndexCount) {
+      const thumbnailRecovery = indexRecovery?.details("thumbnails");
+      if (!thumbnailRecovery?.recoveryRunning && !thumbnailRecovery?.resumeQueued) {
+        lastThumbnailRequestIndexCount = indexed;
+        indexRecovery?.requestFairly("thumbnails");
+      }
+    }
     if (indexed <= lastProgressiveIndexCount) return;
     lastProgressiveIndexCount = indexed;
     indexRecovery?.requestFairly("locations");
@@ -12879,6 +12897,27 @@ app.whenReady().then(async () => {
     !magicLibraryProgress.running;
   const diskIdle = () =>
     duplicateManager.getState().status !== "scanning";
+  thumbnailPregenerator = new ThumbnailPregenerator({
+    getSourceRoots: () => getAllIndexSources(),
+    isMedia: isThumbnailMedia,
+    isRemotePath,
+    listRemoteMediaFiles: async (sourcePath, isCancelled) => {
+      const entries = phoneManager.isPhonePath(sourcePath)
+        ? await phoneManager.listPhoneFilesRecursively(sourcePath, undefined, isCancelled)
+        : await googleManager.listFilesRecursively(sourcePath, undefined, isCancelled);
+      return entries
+        .filter((entry) => !entry.isDirectory && isThumbnailMedia(entry.name))
+        .map((entry) => entry.path);
+    },
+    generate: async (filePath) => Boolean(
+      await requestThumbnail(filePath, false, false, GRID_THUMBNAIL_SIZE, true),
+    ),
+    isInteractiveBusy: () => thumbnailJobs.some(
+      (job) => thumbnailJobPriority(job) === 0,
+    ),
+    getIndexingWaitMessage: getThumbnailIndexingWaitMessage,
+    onProgress: () => undefined,
+  });
   indexRecovery = new IndexingRecovery([
     {
       id: "semantic-runtime",
@@ -13172,6 +13211,25 @@ app.whenReady().then(async () => {
       },
     },
     {
+      id: "thumbnails",
+      lane: indexingDiskLane,
+      sliceMs: diskSliceMs,
+      onDiagnostic: logRecoveryEvent("thumbnails"),
+      blockedReason: () =>
+        getThumbnailIndexingWaitMessage() || "Waiting for thumbnail processing resources.",
+      needsInitialCheck: true,
+      checkOnStartup: true,
+      progress: () => thumbnailPregenerator!.getProgress(),
+      ready: () =>
+        indexStorageAvailable &&
+        startupIndexReconciliationSettled &&
+        searchSettled() &&
+        getThumbnailIndexingWaitMessage() === null,
+      start: () => thumbnailPregenerator!.start(),
+      pause: () => thumbnailPregenerator!.pause(),
+      resume: () => thumbnailPregenerator!.resume(),
+    },
+    {
       id: "quality",
       lane: indexingCpuLane,
       blockedReason: analysisBlocker,
@@ -13356,6 +13414,7 @@ app.on("before-quit", (event) => {
       duplicateManager?.pause(),
       libraryStatsManager?.cancelAndWait(),
       audioLibraryCache?.waitForIdle(),
+      thumbnailPregenerator?.cancel(),
       phoneManager?.unmountAll(),
       aestheticScorer?.setBackgroundPaused(true),
     ]);
@@ -15464,6 +15523,46 @@ ipcMain.handle("get-file-preview", async (_event, filePath: string) => {
   }
 });
 
+async function requestThumbnail(
+  filePath: string,
+  urgent = false,
+  force = false,
+  requestedSize = 480,
+  background = false,
+): Promise<string | null> {
+  if (typeof filePath !== "string") return null;
+  const remote = isRemotePath(filePath);
+  const thumbnailSize = Math.max(
+    120,
+    Math.min(480, Math.round(Number(requestedSize) || 480)),
+  );
+  if (!remote && !path.isAbsolute(filePath)) return null;
+  const pendingKey = `${filePath}:${thumbnailSize}`;
+  const pending = pendingThumbnails.get(pendingKey);
+  if (pending) {
+    if (urgent || force) {
+      for (const job of thumbnailJobs)
+        if (job.filePath === filePath) job.priority = 0;
+      sortThumbnailJobs();
+    }
+    return pending;
+  }
+  const request = (async () => {
+    const localPath = await resolveLocalPath(filePath);
+    if (background) return getThumbnail(localPath, force, thumbnailSize);
+    return await queueThumbnail(
+      filePath,
+      () => getThumbnail(localPath, force, thumbnailSize),
+      urgent || force,
+    );
+  })().catch(() => null);
+  pendingThumbnails.set(pendingKey, request);
+  return request.finally(() => {
+    if (pendingThumbnails.get(pendingKey) === request)
+      pendingThumbnails.delete(pendingKey);
+  });
+}
+
 ipcMain.handle(
   "get-thumbnail",
   async (
@@ -15472,38 +15571,7 @@ ipcMain.handle(
     urgent?: boolean,
     force?: boolean,
     requestedSize?: number,
-  ) => {
-    if (typeof filePath !== "string") return null;
-    const remote = isRemotePath(filePath);
-    const thumbnailSize = Math.max(
-      120,
-      Math.min(480, Math.round(Number(requestedSize) || 480)),
-    );
-    if (!remote && !path.isAbsolute(filePath)) return null;
-    const pendingKey = `${filePath}:${thumbnailSize}`;
-    const pending = pendingThumbnails.get(pendingKey);
-    if (pending) {
-      if (urgent || force) {
-        for (const job of thumbnailJobs)
-          if (job.filePath === filePath) job.priority = 0;
-        sortThumbnailJobs();
-      }
-      return pending;
-    }
-    const request = (async () => {
-      const localPath = await resolveLocalPath(filePath);
-      return await queueThumbnail(
-        filePath,
-        () => getThumbnail(localPath, force === true, thumbnailSize),
-        urgent === true || force === true,
-      );
-    })().catch(() => null);
-    pendingThumbnails.set(pendingKey, request);
-    return request.finally(() => {
-      if (pendingThumbnails.get(pendingKey) === request)
-        pendingThumbnails.delete(pendingKey);
-    });
-  },
+  ) => requestThumbnail(filePath, urgent === true, force === true, requestedSize),
 );
 
 ipcMain.on("update-visible-thumbnails", (_event, visiblePaths: string[]) => {
@@ -17432,6 +17500,14 @@ ipcMain.handle("get-indexing-overview", async () => {
       device,
     ]),
   );
+  const thumbnailProgress = thumbnailPregenerator?.getProgress() ?? {
+    status: "waiting",
+    processed: 0,
+    total: 0,
+    generated: 0,
+    failed: 0,
+    message: "Waiting for indexing services to start…",
+  };
   const phoneBackupStages = Array.from(new Set([
     ...phoneBackupStates.keys(),
     ...phoneStageDevices.keys(),
@@ -17568,6 +17644,17 @@ ipcMain.handle("get-indexing-overview", async () => {
           ? "Retry pending or authorization required"
           : "Recursive source inventory",
       detail: `${(audio?.files.length ?? 0).toLocaleString()} audio files`,
+    },
+    {
+      id: "thumbnails",
+      label: "File thumbnails",
+      status: thumbnailProgress.status,
+      processed: thumbnailProgress.processed,
+      total: thumbnailProgress.total,
+      unit: "files",
+      errors: thumbnailProgress.failed,
+      message: thumbnailProgress.message,
+      detail: `${thumbnailProgress.generated.toLocaleString()} generated · ${thumbnailProgress.failed.toLocaleString()} unavailable`,
     },
     {
       id: "quality",

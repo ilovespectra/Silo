@@ -11,6 +11,7 @@
     "react-build": "react-scripts build && node scripts/lockdown-built-csp.cjs",
     "react-test": "react-scripts test",
     "test:auto-indexing": "node test/runAutoIndexingTests.cjs",
+    "test:thumbnail-pregenerator": "node scripts/test-thumbnail-pregenerator.cjs",
     "test:cache-destinations": "node test/runCacheDestinationTests.cjs",
     "test:semantic-isolation": "node test/runSemanticIsolationTests.cjs",
     "test:video-semantic": "node scripts/test-video-semantic.cjs",
