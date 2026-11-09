@@ -1,6 +1,6 @@
 # Silo
 
-A local-first file browser built with Electron, React, and TypeScript. Browse drives, Time Machine backups, phones, and Google accounts from one interface — with offline semantic search, face grouping, and non-destructive "digital folders".
+Browse local drives, Time Machine backups, phones, and connected Google sources in one library. Search supported photos and documents by words or visual ideas, group people and pets, explore mapped photos, and review duplicates—without moving original files. Indexing and analysis run on your device after required models are available; connected sources and optional map services need internet access.
 
 ## Silo links
 
@@ -65,11 +65,11 @@ On recent versions of macOS:
 
 If macOS says Silo **is damaged** or **will damage your computer**, stop and do not bypass that alert. Re-download from the official release page, verify the checksum, and contact Silo support if it persists.
 
-## Preview release and license status
+## Downloads and license
 
-Silo 2.0.6 is a test preview. Its $25 lifetime license is intended for **one computer**; each computer needs its own verified purchase. Configuration export/import can transfer settings and indexes, but it excludes paid and beta licenses and the installation ID. Treat configuration exports as sensitive because they can contain account credentials.
+Get the latest published Mac and Windows installers, release notes, and SHA-256 checksums from [Silo Downloads](https://github.com/ilovespectra/silo-downloads/releases). The source package version may be newer than the latest published installer, so use the Releases page to see what is actually available. Mac installers are ad-hoc signed, not Developer ID signed or notarized; verify the published checksum before opening.
 
-End-to-end payment, signed activation, and one-computer enforcement still require verification on installed 2.0.6 builds. A ready relay health check confirms service availability only; it does not prove a payment or license activation.
+The current offer is a $25 one-time lifetime license for one computer, with future updates included; each additional computer needs its own purchase. Checkout starts in Silo and supports Solana Pay. Configuration exports can contain account credentials, and do not transfer paid or beta licenses or the installation ID.
 
 ## Development
 
