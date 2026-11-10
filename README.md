@@ -11,16 +11,14 @@ Browse local drives, Time Machine backups, phones, and connected Google sources 
 
 ## Developer Console
 
-The Silo maintainer console is a separate project: [Silo Dev Console](https://github.com/ilovespectra/silo-dev-console). It is not included in this app repository. Clone that repository and launch its existing npm start script:
+The Silo maintainer console is maintained in a separate, maintainer-only repository; it is not bundled with this app's source. From an authorized checkout of that console repository, run:
 
 ```sh
-git clone https://github.com/ilovespectra/silo-dev-console.git
-cd silo-dev-console
 npm install
 npm start
 ```
 
-If local console configuration is needed, copy `.env.example` to `.env` inside that checkout and configure it locally. Never commit credentials or a populated `.env` file.
+If local console configuration is needed, copy `.env.example` to `.env` in that checkout and configure it locally. Never commit credentials or a populated `.env` file.
 
 ## Features
 
