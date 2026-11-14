@@ -112,6 +112,59 @@ async function checkFaceInferenceThreadLimit() {
   }
 }
 
+async function checkSafetyStateCanLoadBeforeTheFaceJournal() {
+  const directory = await fsPromises.mkdtemp(
+    path.join(os.tmpdir(), "face-safety-state-test-"),
+  );
+  try {
+    const faceDirectory = path.join(directory, "face-index");
+    await fsPromises.mkdir(faceDirectory, { recursive: true });
+    const storedFace = face(
+      "stored-face",
+      "/photos/stored.jpg",
+      descriptor(1, 0),
+    );
+    await fsPromises.writeFile(
+      path.join(faceDirectory, "people.json"),
+      JSON.stringify({
+        version: 1,
+        people: [],
+        bannedFaces: {},
+        bannedPhotoPaths: ["/photos/hidden.jpg"],
+        missingPhotoPaths: ["/photos/missing.jpg"],
+      }),
+    );
+    await fsPromises.writeFile(
+      path.join(faceDirectory, "faces.jsonl"),
+      `${JSON.stringify({
+        imagePath: storedFace.imagePath,
+        signature: storedFace.signature,
+        faces: [storedFace],
+      })}\n`,
+    );
+
+    const indexer = new FaceIndexer(
+      directory,
+      directory,
+      directory,
+      () => [],
+      () => undefined,
+    );
+    await indexer.initializeSafetyState();
+    assert.ok(indexer.getBannedPhotoPaths().has("/photos/hidden.jpg"));
+    assert.equal(
+      (indexer as any).faces.size,
+      0,
+      "the safety-state pass does not load the large face journal",
+    );
+
+    await indexer.initialize();
+    assert.equal((indexer as any).faces.size, 1);
+  } finally {
+    await fsPromises.rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function checkFaceJournalRecovery() {
   const { directory } = await setup();
   try {
@@ -397,6 +450,7 @@ async function checkLargeFaceQueueResumeWithinProcess() {
 
 async function run() {
   await checkFaceInferenceThreadLimit();
+  await checkSafetyStateCanLoadBeforeTheFaceJournal();
   await checkFaceJournalRecovery();
   await checkFacePreparationCheckpoint();
   await checkLargeFaceQueueResumeWithinProcess();

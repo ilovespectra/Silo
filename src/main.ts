@@ -116,6 +116,7 @@ import {
   readPreviewBytes,
 } from "./documentPreview";
 import { IndexingRecovery, isIndexStageUserPaused } from "./indexingRecovery";
+import { prepareSearchReadiness } from "./searchReadiness";
 import { ThumbnailPregenerator } from "./thumbnailPregenerator";
 import {
   isLegacyLicenseRejected,
@@ -2974,6 +2975,12 @@ async function initializeVideoSemanticIndex() {
 }
 let libraryStatsManager: LibraryStatsManager | null = null;
 let faceIndexer: FaceIndexer;
+let faceCacheReadyPromise: Promise<void> | null = null;
+let faceCacheReady = false;
+async function waitForFaceCacheReady() {
+  if (faceCacheReadyPromise)
+    await faceCacheReadyPromise.catch(() => undefined);
+}
 let aestheticScorer: AestheticScorer;
 let petIndexer: PetIndexer;
 let phoneManager: PhoneManager;
@@ -12150,92 +12157,92 @@ app.whenReady().then(async () => {
   } catch {
     // A missing or unreadable recovery file does not block the fresh model preload.
   }
-  // Do not make the model worker wait for face/location cache startup. The saved
-  // search records are now loaded, so the model can warm while those caches settle.
-  void semanticLoad
-    .then(() => {
-      if (
-        indexStorageInitializationDeferred ||
-        semanticRuntimeWasPaused
-      )
-        return;
-      return preloadSemanticRuntime(1);
-    })
-    .catch((error) =>
+  // The local CLIP tokenizer and weights are independent of the saved search
+  // records. Warm the model immediately so a large external vector store cannot
+  // leave the dashboard reporting only that the model is still warming.
+  if (!indexStorageInitializationDeferred && !semanticRuntimeWasPaused) {
+    void preloadSemanticRuntime(1).catch((error) =>
       runtimeLog("semantic-runtime-early-preload-error", {
         message: error instanceof Error ? error.message : String(error),
       }),
     );
+  }
   void semanticLoad.then(async () => {
     if (!indexStorageInitializationDeferred) await initializeVideoSemanticIndex();
   }).catch((error) => runtimeLog("video-semantic-index-load-error", {
     message: error instanceof Error ? error.message : String(error),
   }));
-  const semanticSearchReady = semanticLoad.then(async () => {
-    if (indexStorageInitializationDeferred) return;
-    // Opening the saved vectors is only half of search preparation. Start the
-    // offline CLIP worker now so the first user query never pays its cold-start
-    // cost while the UI claims search is ready.
-    updateSearchIndexReadiness({
-      status: "preparing",
-      percentage: 20,
-      phase: "Warming the offline search model",
-      phaseProgress: null,
-      records: loadedSearchRecords,
-      message: "Warming the offline search model…",
-    });
-    reportStartupDetail("Warming the offline search model…");
-    searchPreparationFailureMessage =
-      "The offline search model could not be prepared.";
-    await semanticRuntimeReady;
-    runtimeLog("search-model-preloaded", {
-      elapsedMs: Date.now() - startupStartedAt,
-      records: loadedSearchRecords,
-    });
-    searchPreparationFailureMessage =
-      "The local semantic index could not be prepared.";
-    updateSearchIndexReadiness({
-      status: "preparing",
-      percentage: 30,
-      phase: "Building the fast local search index",
-      phaseProgress: 0,
-      records: loadedSearchRecords,
-      message: "Building the fast local search index…",
-    });
-    reportStartupDetail("Building the fast local search index…");
-    semanticAnnStartedAt = Date.now();
-    runtimeLog("search-ann-index-start", {
-      records: loadedSearchRecords,
-      elapsedMs: Date.now() - semanticAnnStartedAt,
-    });
-    await semanticIndexer.prepareVectorSearch((fraction, records) => {
-      const percentage = Math.min(99, 30 + Math.round(fraction * 69));
-      const phaseProgress = Math.round(fraction * 10000) / 100;
+  const semanticSearchReady = prepareSearchReadiness({
+    savedRecordsReady: semanticLoad,
+    modelReady: semanticRuntimeReady,
+    storageAvailable: !indexStorageInitializationDeferred,
+    onWaitingForModel: () => {
+      // The model warm-up starts independently above, while saved records load.
+      // Readiness still waits for both inputs and the prepared vector index.
       updateSearchIndexReadiness({
         status: "preparing",
-        percentage,
+        percentage: 20,
+        phase: "Warming the offline search model",
+        phaseProgress: null,
+        records: loadedSearchRecords,
+        message: "Warming the offline search model…",
+      });
+      reportStartupDetail("Warming the offline search model…");
+      searchPreparationFailureMessage =
+        "The offline search model could not be prepared.";
+    },
+    onPreparingVectorSearch: () => {
+      runtimeLog("search-model-preloaded", {
+        elapsedMs: Date.now() - startupStartedAt,
+        records: loadedSearchRecords,
+      });
+      searchPreparationFailureMessage =
+        "The local semantic index could not be prepared.";
+      updateSearchIndexReadiness({
+        status: "preparing",
+        percentage: 30,
         phase: "Building the fast local search index",
-        phaseProgress,
-        records: Math.max(loadedSearchRecords, records),
+        phaseProgress: 0,
+        records: loadedSearchRecords,
         message: "Building the fast local search index…",
       });
-      reportStartupDetail(
-        `Building the fast local search index… ${records.toLocaleString()} records`,
-      );
-      const now = Date.now();
-      if (now - lastSemanticAnnDiagnosticAt >= 15000) {
-        lastSemanticAnnDiagnosticAt = now;
-        runtimeLog("search-ann-index-progress", {
-          records,
-          fraction: Math.round(fraction * 1000) / 10,
-          elapsedMs: now - semanticAnnStartedAt,
+      reportStartupDetail("Building the fast local search index…");
+      semanticAnnStartedAt = Date.now();
+      runtimeLog("search-ann-index-start", {
+        records: loadedSearchRecords,
+        elapsedMs: Date.now() - semanticAnnStartedAt,
+      });
+    },
+    prepareVectorSearch: async () => {
+      await semanticIndexer.prepareVectorSearch((fraction, records) => {
+        const percentage = Math.min(99, 30 + Math.round(fraction * 69));
+        const phaseProgress = Math.round(fraction * 10000) / 100;
+        updateSearchIndexReadiness({
+          status: "preparing",
+          percentage,
+          phase: "Building the fast local search index",
+          phaseProgress,
+          records: Math.max(loadedSearchRecords, records),
+          message: "Building the fast local search index…",
         });
-      }
-    });
-    runtimeLog("search-ann-index-ready", {
-      records: loadedSearchRecords,
-      elapsedMs: Date.now() - semanticAnnStartedAt,
-    });
+        reportStartupDetail(
+          `Building the fast local search index… ${records.toLocaleString()} records`,
+        );
+        const now = Date.now();
+        if (now - lastSemanticAnnDiagnosticAt >= 15000) {
+          lastSemanticAnnDiagnosticAt = now;
+          runtimeLog("search-ann-index-progress", {
+            records,
+            fraction: Math.round(fraction * 1000) / 10,
+            elapsedMs: now - semanticAnnStartedAt,
+          });
+        }
+      });
+      runtimeLog("search-ann-index-ready", {
+        records: loadedSearchRecords,
+        elapsedMs: Date.now() - semanticAnnStartedAt,
+      });
+    },
   });
   const faceModelPath = app.isPackaged
     ? path.join(process.resourcesPath, "face-models")
@@ -12376,9 +12383,31 @@ app.whenReady().then(async () => {
   faceIndexer.setPeoplePhotoClassifier((images) =>
     aestheticScorer.classifyNonPhotoPeopleImages(images),
   );
-  const faceLoad = indexStorageInitializationDeferred
+  const faceSafetyLoad = indexStorageInitializationDeferred
     ? Promise.resolve()
+    : faceIndexer.initializeSafetyState();
+  const faceLoad = indexStorageInitializationDeferred
+    ? null
     : faceIndexer.initialize();
+  if (faceLoad) {
+    faceCacheReadyPromise = faceLoad;
+    void faceLoad.then(
+      () => {
+        faceCacheReady = true;
+        runtimeLog("face-cache-ready", {
+          elapsedMs: Date.now() - startupStartedAt,
+        });
+        sendToRenderer("photo-indicators-changed", null);
+        requestIndexRecoveryStages(["faces"]);
+      },
+      (error) => {
+        runtimeLog("face-cache-load-error", {
+          elapsedMs: Date.now() - startupStartedAt,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
+  }
   petIndexer = new PetIndexer(
     cacheDestinationRoot("pets"),
     indexStoragePath("semantic-index"),
@@ -12561,7 +12590,7 @@ app.whenReady().then(async () => {
   );
   const loadResults = await Promise.allSettled([
     trackLoad(libraryStatsLoad, "Inventory statistics ready"),
-    trackLoad(faceLoad, "Faces ready"),
+    trackLoad(faceSafetyLoad, "People protection ready"),
     trackLoad(petLoad, "Pets ready"),
     trackLoad(geoLoad, "Locations ready"),
     trackLoad(duplicateLoad, "Duplicates ready"),
@@ -13096,6 +13125,7 @@ app.whenReady().then(async () => {
         // Do not let it reserve the shared background lane while that walk is
         // still running; otherwise Search repeatedly yields to a blocked stage.
         startupIndexReconciliationSettled &&
+        faceCacheReady &&
         (
           searchRecoveryStartedThisSession ||
           isIndexStageUserPaused(indexRecovery?.details("search")) ||
@@ -16856,6 +16886,7 @@ ipcMain.handle("download-digital-folder", async (_event, folderId: string) => {
 });
 
 ipcMain.handle("get-face-state", async () => {
+  await waitForFaceCacheReady();
   const sources = new Set(await getEnabledIndexSources());
   const visiblePeople = getDemoPeople();
   const people = await Promise.all(
@@ -17926,6 +17957,7 @@ ipcMain.handle("dismiss-borrowed-location", async (_event, filePath: string) => 
   return getVisibleGeoState(state, sources);
 });
 ipcMain.handle("start-face-indexing", async () => {
+  await waitForFaceCacheReady();
   await retryIndexRecoveryStage("faces");
   return faceIndexer.getProgress();
 });
@@ -18290,7 +18322,9 @@ ipcMain.handle("get-photo-indicators", async (_event, filePaths: unknown) => {
   const paths = Array.isArray(filePaths)
     ? filePaths.filter((item): item is string => typeof item === "string")
     : [];
-  const personNames = faceIndexer.getPeopleForImages(paths);
+  const personNames = faceCacheReady
+    ? faceIndexer.getPeopleForImages(paths)
+    : {};
   const visibleNames = new Set(getDemoPeople().map((person) => person.name));
   const result = Object.fromEntries(
     paths.map((filePath) => [
@@ -20369,6 +20403,8 @@ ipcMain.handle(
   "start-face-indexing-for-source",
   async (_event, sourcePath: string) => {
     try {
+      // Wait for the saved face cache before starting any new indexing pass.
+      await waitForFaceCacheReady();
       // Face coverage is independent of source selection; preserve UI checkboxes.
       await retryIndexRecoveryStage("faces");
 

@@ -77,6 +77,7 @@ import {
   matchesMetadataFilters,
   MetadataFilter,
 } from "./utils/metadataFilters";
+import { filterToDigitalFolderScope } from "./utils/digitalFolderScope";
 import {
   GRID_THUMBNAIL_SIZE,
   LRUCache,
@@ -5951,18 +5952,24 @@ function App() {
     return folders.concat(files);
   }, [deferredBrowseViewInputs]);
 
+  const activeDigitalFolderPaths = useMemo(() => {
+    if (!activeDigitalFolderId) return null;
+    const folder = digitalFolders.find((item) => item.id === activeDigitalFolderId);
+    return new Set(folder?.filePaths ?? []);
+  }, [activeDigitalFolderId, digitalFolders]);
   const filteredAndSortedFiles = useMemo(
     () =>
-      activeDigitalFolderId
-        ? baseFilteredAndSortedFiles
-        : baseFilteredAndSortedFiles.filter((file) =>
-            pathIsVisibleForSelectedSources(
-              file.path,
-              deferredSourceVisibilityInputs.enabledSourcePaths,
-              deferredSourceVisibilityInputs.allSourcePaths,
-            ),
+      filterToDigitalFolderScope(
+        baseFilteredAndSortedFiles,
+        activeDigitalFolderPaths,
+        (filePath) =>
+          pathIsVisibleForSelectedSources(
+            filePath,
+            deferredSourceVisibilityInputs.enabledSourcePaths,
+            deferredSourceVisibilityInputs.allSourcePaths,
           ),
-    [activeDigitalFolderId, baseFilteredAndSortedFiles, deferredSourceVisibilityInputs],
+      ),
+    [activeDigitalFolderPaths, baseFilteredAndSortedFiles, deferredSourceVisibilityInputs],
   );
 
   const hasSelectableFiles = useMemo(

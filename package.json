@@ -46,6 +46,8 @@
     "test:ffmpeg-packaging": "node test/runFfmpegPackagingTests.cjs",
     "test:phone-restore-target": "node test/runPhoneRestoreTargetTests.cjs",
     "test:startup-smoke": "node test/runStartupSmokeTests.cjs",
+    "test:search-readiness": "node test/runSearchReadinessTests.cjs",
+    "test:digital-folder-scope": "node test/runDigitalFolderScopeTests.cjs",
     "test:portable-storage": "node test/runPortableStorageTests.cjs && node test/runConfigBundleRestoreTests.cjs && node test/runPhoneRestoreTargetTests.cjs && node test/runOfflinePhoneBackupTests.cjs",
     "test:progress-throttle": "node test/runProgressThrottleTests.cjs",
     "test:app-assets": "node test/runAppAssetsTests.cjs",

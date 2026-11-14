@@ -242,6 +242,7 @@ export class FaceIndexer {
   >();
   private readonly centroidDescriptorCounts = new Map<string, number>();
   private state: FaceState = { version: 1, people: [], bannedFaces: {} };
+  private safetyStatePromise: Promise<void> | null = null;
   private progress = { ...initialProgress };
   private runtime: FaceRuntime | null = null;
   private runPromise: Promise<void> | null = null;
@@ -301,23 +302,34 @@ export class FaceIndexer {
     this.governor.setPaceLimitPercent(percent);
   }
 
+  initializeSafetyState(): Promise<void> {
+    if (!this.safetyStatePromise) {
+      this.safetyStatePromise = (async () => {
+        try {
+          this.state = JSON.parse(
+            await fsPromises.readFile(this.statePath, "utf8"),
+          ) as FaceState;
+        } catch {
+          this.state = { version: 1, people: [], bannedFaces: {} };
+        }
+        this.bannedPhotoPaths = new Set(this.state.bannedPhotoPaths ?? []);
+        this.missingPhotos = new Set(this.state.missingPhotoPaths ?? []);
+        this.excludedPeoplePhotoPaths = new Set(
+          this.state.excludedPeoplePhotoPaths ?? [],
+        );
+      })();
+    }
+    return this.safetyStatePromise;
+  }
+
   async initialize() {
     await fsPromises.mkdir(this.cropsDirectory, { recursive: true });
+    await this.initializeSafetyState();
     await this.loadPhotoClassificationRecords();
-    let savedFaceRecordVersion: number | null = null;
-    let hasJournalVersion = false;
-    try {
-      this.state = JSON.parse(
-        await fsPromises.readFile(this.statePath, "utf8"),
-      ) as FaceState;
-      const storedVersion = this.state.faceRecordVersion;
-      if (Number.isSafeInteger(storedVersion) && storedVersion! >= 0) {
-        savedFaceRecordVersion = storedVersion!;
-        hasJournalVersion = true;
-      }
-    } catch {
-      this.state = { version: 1, people: [], bannedFaces: {} };
-    }
+    const storedVersion = this.state.faceRecordVersion;
+    const hasJournalVersion =
+      Number.isSafeInteger(storedVersion) && storedVersion! >= 0;
+    const savedFaceRecordVersion = hasJournalVersion ? storedVersion! : null;
     await this.loadRecords(savedFaceRecordVersion);
     try {
       this.progress = {
@@ -346,11 +358,6 @@ export class FaceIndexer {
     }
     if (!hasJournalVersion || recoveredJournal || migratedNameSources)
       await this.persistState();
-    this.bannedPhotoPaths = new Set(this.state.bannedPhotoPaths ?? []);
-    this.missingPhotos = new Set(this.state.missingPhotoPaths ?? []);
-    this.excludedPeoplePhotoPaths = new Set(
-      this.state.excludedPeoplePhotoPaths ?? [],
-    );
     await this.cleanExistingPeopleClusters();
     const recognitionNeedsRefresh = !hasJournalVersion || recoveredJournal;
     void this.recheckMissingPhotos().then((restoredPhotos) => {
